@@ -37,88 +37,6 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
-// test_read_layout_container
-void test_read_layout_container(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, bool verbose);
-RcppExport SEXP _rad_test_read_layout_container(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP verboseSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
-    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    test_read_layout_container(read_layout, misalignment_threshold, verbose);
-    return R_NilValue;
-END_RCPP
-}
-// test_sigstring_processing
-void test_sigstring_processing(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, const std::string& signature);
-RcppExport SEXP _rad_test_sigstring_processing(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP signatureSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
-    Rcpp::traits::input_parameter< const std::string& >::type signature(signatureSEXP);
-    test_sigstring_processing(read_layout, misalignment_threshold, signature);
-    return R_NilValue;
-END_RCPP
-}
-// VarTest
-void VarTest(DataFrame read_layout, DataFrame misalignment_threshold);
-RcppExport SEXP _rad_VarTest(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< DataFrame >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< DataFrame >::type misalignment_threshold(misalignment_thresholdSEXP);
-    VarTest(read_layout, misalignment_threshold);
-    return R_NilValue;
-END_RCPP
-}
-// test_read_layout_container
-void test_read_layout_container(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, bool verbose);
-RcppExport SEXP _rad_test_read_layout_container(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP verboseSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
-    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    test_read_layout_container(read_layout, misalignment_threshold, verbose);
-    return R_NilValue;
-END_RCPP
-}
-// test_read_layout_container_v2
-void test_read_layout_container_v2(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, bool verbose);
-RcppExport SEXP _rad_test_read_layout_container_v2(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP verboseSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
-    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    test_read_layout_container_v2(read_layout, misalignment_threshold, verbose);
-    return R_NilValue;
-END_RCPP
-}
-// test_read_layout_container_v2
-void test_read_layout_container_v2(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, bool verbose);
-RcppExport SEXP _rad_test_read_layout_container_v2(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP verboseSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
-    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    test_read_layout_container_v2(read_layout, misalignment_threshold, verbose);
-    return R_NilValue;
-END_RCPP
-}
-// VarTest
-void VarTest(const Rcpp::DataFrame& read_layout, bool verbose);
-RcppExport SEXP _rad_VarTest(SEXP read_layoutSEXP, SEXP verboseSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    VarTest(read_layout, verbose);
-    return R_NilValue;
-END_RCPP
-}
 // test_read_layout_container_v2
 void test_read_layout_container_v2(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, bool verbose);
 RcppExport SEXP _rad_test_read_layout_container_v2(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP verboseSEXP) {
@@ -152,18 +70,6 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< const Rcpp::StringVector& >::type sigstrings(sigstringsSEXP);
     Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
     SigTest(read_layout, misalignment_threshold, sigstrings, verbose);
-    return R_NilValue;
-END_RCPP
-}
-// prep_read_layout
-void prep_read_layout(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_thresholds, bool verbose);
-RcppExport SEXP _rad_prep_read_layout(SEXP read_layoutSEXP, SEXP misalignment_thresholdsSEXP, SEXP verboseSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_thresholds(misalignment_thresholdsSEXP);
-    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    prep_read_layout(read_layout, misalignment_thresholds, verbose);
     return R_NilValue;
 END_RCPP
 }
@@ -201,64 +107,16 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
-// prep_read_layout
-void prep_read_layout(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_thresholds, bool verbose);
-RcppExport SEXP _rad_prep_read_layout(SEXP read_layoutSEXP, SEXP misalignment_thresholdsSEXP, SEXP verboseSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_thresholds(misalignment_thresholdsSEXP);
-    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    prep_read_layout(read_layout, misalignment_thresholds, verbose);
-    return R_NilValue;
-END_RCPP
-}
-// test_sigstring
-void test_sigstring(const DataFrame& read_layout, const DataFrame& misalignment_thresholds, const std::string& sigstring, bool verbose);
-RcppExport SEXP _rad_test_sigstring(SEXP read_layoutSEXP, SEXP misalignment_thresholdsSEXP, SEXP sigstringSEXP, SEXP verboseSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const DataFrame& >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< const DataFrame& >::type misalignment_thresholds(misalignment_thresholdsSEXP);
-    Rcpp::traits::input_parameter< const std::string& >::type sigstring(sigstringSEXP);
-    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    test_sigstring(read_layout, misalignment_thresholds, sigstring, verbose);
-    return R_NilValue;
-END_RCPP
-}
-// test_read_layout_container_v2
-void test_read_layout_container_v2(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, bool verbose);
-RcppExport SEXP _rad_test_read_layout_container_v2(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP verboseSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
-    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    test_read_layout_container_v2(read_layout, misalignment_threshold, verbose);
-    return R_NilValue;
-END_RCPP
-}
 
 static const R_CallMethodDef CallEntries[] = {
     {"_rad_sigalign", (DL_FUNC) &_rad_sigalign, 4},
     {"_rad_sigalign_stats", (DL_FUNC) &_rad_sigalign_stats, 3},
-    {"_rad_test_read_layout_container", (DL_FUNC) &_rad_test_read_layout_container, 3},
-    {"_rad_test_sigstring_processing", (DL_FUNC) &_rad_test_sigstring_processing, 3},
-    {"_rad_VarTest", (DL_FUNC) &_rad_VarTest, 2},
-    {"_rad_test_read_layout_container", (DL_FUNC) &_rad_test_read_layout_container, 3},
-    {"_rad_test_read_layout_container_v2", (DL_FUNC) &_rad_test_read_layout_container_v2, 3},
-    {"_rad_test_read_layout_container_v2", (DL_FUNC) &_rad_test_read_layout_container_v2, 3},
-    {"_rad_VarTest", (DL_FUNC) &_rad_VarTest, 2},
     {"_rad_test_read_layout_container_v2", (DL_FUNC) &_rad_test_read_layout_container_v2, 3},
     {"_rad_VarTest", (DL_FUNC) &_rad_VarTest, 2},
     {"_rad_SigTest", (DL_FUNC) &_rad_SigTest, 4},
-    {"_rad_prep_read_layout", (DL_FUNC) &_rad_prep_read_layout, 3},
     {"_rad_revcomp", (DL_FUNC) &_rad_revcomp, 1},
     {"_rad_sequence_to_bits", (DL_FUNC) &_rad_sequence_to_bits, 1},
     {"_rad_bits_to_sequence", (DL_FUNC) &_rad_bits_to_sequence, 2},
-    {"_rad_prep_read_layout", (DL_FUNC) &_rad_prep_read_layout, 3},
-    {"_rad_test_sigstring", (DL_FUNC) &_rad_test_sigstring, 4},
-    {"_rad_test_read_layout_container_v2", (DL_FUNC) &_rad_test_read_layout_container_v2, 3},
     {NULL, NULL, 0}
 };
 

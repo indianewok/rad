@@ -9,34 +9,6 @@ sigalign_stats <- function(adapters, sequences, nthreads = 1L) {
     .Call(`_rad_sigalign_stats`, adapters, sequences, nthreads)
 }
 
-test_read_layout_container <- function(read_layout, misalignment_threshold, verbose = TRUE) {
-    invisible(.Call(`_rad_test_read_layout_container`, read_layout, misalignment_threshold, verbose))
-}
-
-test_sigstring_processing <- function(read_layout, misalignment_threshold, signature) {
-    invisible(.Call(`_rad_test_sigstring_processing`, read_layout, misalignment_threshold, signature))
-}
-
-VarTest <- function(read_layout, misalignment_threshold) {
-    invisible(.Call(`_rad_VarTest`, read_layout, misalignment_threshold))
-}
-
-test_read_layout_container <- function(read_layout, misalignment_threshold, verbose = TRUE) {
-    invisible(.Call(`_rad_test_read_layout_container`, read_layout, misalignment_threshold, verbose))
-}
-
-test_read_layout_container_v2 <- function(read_layout, misalignment_threshold, verbose = TRUE) {
-    invisible(.Call(`_rad_test_read_layout_container_v2`, read_layout, misalignment_threshold, verbose))
-}
-
-test_read_layout_container_v2 <- function(read_layout, misalignment_threshold, verbose = TRUE) {
-    invisible(.Call(`_rad_test_read_layout_container_v2`, read_layout, misalignment_threshold, verbose))
-}
-
-VarTest <- function(read_layout, verbose = TRUE) {
-    invisible(.Call(`_rad_VarTest`, read_layout, verbose))
-}
-
 test_read_layout_container_v2 <- function(read_layout, misalignment_threshold, verbose = TRUE) {
     invisible(.Call(`_rad_test_read_layout_container_v2`, read_layout, misalignment_threshold, verbose))
 }
@@ -49,10 +21,6 @@ SigTest <- function(read_layout, misalignment_threshold, sigstrings, verbose = F
     invisible(.Call(`_rad_SigTest`, read_layout, misalignment_threshold, sigstrings, verbose))
 }
 
-prep_read_layout <- function(read_layout, misalignment_thresholds, verbose = FALSE) {
-    invisible(.Call(`_rad_prep_read_layout`, read_layout, misalignment_thresholds, verbose))
-}
-
 revcomp <- function(sequences) {
     .Call(`_rad_revcomp`, sequences)
 }
@@ -63,17 +31,5 @@ sequence_to_bits <- function(sequences) {
 
 bits_to_sequence <- function(input, sequence_length) {
     .Call(`_rad_bits_to_sequence`, input, sequence_length)
-}
-
-prep_read_layout <- function(read_layout, misalignment_thresholds, verbose = FALSE) {
-    invisible(.Call(`_rad_prep_read_layout`, read_layout, misalignment_thresholds, verbose))
-}
-
-test_sigstring <- function(read_layout, misalignment_thresholds, sigstring, verbose = FALSE) {
-    invisible(.Call(`_rad_test_sigstring`, read_layout, misalignment_thresholds, sigstring, verbose))
-}
-
-test_read_layout_container_v2 <- function(read_layout, misalignment_threshold, verbose = TRUE) {
-    invisible(.Call(`_rad_test_read_layout_container_v2`, read_layout, misalignment_threshold, verbose))
 }
 

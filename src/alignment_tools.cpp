@@ -1,6 +1,6 @@
 // [[Rcpp::plugins(openmp)]]  // Enable OpenMP in Rcpp
-#include </dartfs-hpc/rc/home/3/f005f43/jaeger/src/edlib.h>
-#include </dartfs-hpc/rc/home/3/f005f43/jaeger/src/RcppInt64.h>
+#include "edlib.h"
+#include "RcppInt64.h"
 #include <Rcpp.h>
 #include <omp.h>  // Include OpenMP header for multi-threading
 #include <string>

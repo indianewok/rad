@@ -240,6 +240,7 @@ read_fastqas<-function(fn, type, full_id = FALSE, ...){
     }
 }
 #' @export
+#legacy command--simplify and clean up
 bajrun<-function(path_layout_form, read_layout_form, 
   test_mode = FALSE, nthreads_sigstrings = 1,
   nthreads_sigstract = 1, test_return_stage = NULL,
