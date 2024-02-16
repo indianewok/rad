@@ -7,28 +7,28 @@
 #' @importFrom glue glue
 #' @importFrom tools file_ext file_path_sans_ext
 #' @export
-stream_fastqas<-function(fn, type, seqkit_path = NULL, start, stop,...){
-  ext<-tools::file_ext(fn)
-  if (ext == "gz"){
-    cat_cmd<-"zcat"
-  }
-  else{
-    cat_cmd<-"cat"
-  }
-  if(type == "fq"){
-    res<-fread(cmd = glue::glue("{seqkit_path} range -r {start}:{stop} {fn} | paste - - - - | cut -f1,2,4"), 
-      col.names = c("id", "fastq_files","qc"), sep = "\t", quote = "", header = FALSE, ...)
-    res<-res[,c(1,3,2)]
-    res$id<-str_split(res$id, pattern = " ") %>% sapply(., function(x){x[1]}, USE.NAMES = FALSE)
-    return(res)
-  }
-  if(type == "fa"){
-    res<-fread(cmd = glue::glue("{seqkit_path} range -r {start}:{stop} | paste - - | cut -f1,2"),
-      quote ="", header = FALSE,
-      col.names = c("id", "seq"), sep = "\t", ...)
-    return(res)
-  }
-}
+# stream_fastqas<-function(fn, type, seqkit_path = NULL, start, stop,...){
+#   ext<-tools::file_ext(fn)
+#   if (ext == "gz"){
+#     cat_cmd<-"zcat"
+#   }
+#   else{
+#     cat_cmd<-"cat"
+#   }
+#   if(type == "fq"){
+#     res<-fread(cmd = glue::glue("{seqkit_path} range -r {start}:{stop} {fn} | paste - - - - | cut -f1,2,4"), 
+#       col.names = c("id", "fastq_files","qc"), sep = "\t", quote = "", header = FALSE, ...)
+#     res<-res[,c(1,3,2)]
+#     res$id<-str_split(res$id, pattern = " ") %>% sapply(., function(x){x[1]}, USE.NAMES = FALSE)
+#     return(res)
+#   }
+#   if(type == "fa"){
+#     res<-fread(cmd = glue::glue("{seqkit_path} range -r {start}:{stop} | paste - - | cut -f1,2"),
+#       quote ="", header = FALSE,
+#       col.names = c("id", "seq"), sep = "\t", ...)
+#     return(res)
+#   }
+# }
 #' @export
 whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
   print("Importing a little bit of sample data...")
@@ -66,100 +66,100 @@ whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
   }
 }
 #' @export
-prepare_to_anger<-function(read_layout_form, external_path_form, create_output_dir = TRUE,
-   data_table_nthreads = 1, seqkit_stats = TRUE, ...){
-  {
-    print("Importing read layout and figuring out its order!")
-    tidytable::setDTthreads(threads = 1)
-    read_layout<-data.table::fread(file = read_layout_form, header = TRUE, fill = TRUE, na.strings = "", skip = 1)
-    read_layout$expected_length[which(!is.na(read_layout$seq))]<-stringr::str_length(read_layout$seq[which(!is.na(read_layout$seq))])
-    if(any(read_layout$type %in% "poly_a" | read_layout$type %in% "poly_t")){
-      if(("poly_a" %in% read_layout$type) == TRUE){
-        read_layout$seq[which(read_layout$type %in% "poly_a")]<-"A{12,}+"
-      }
-      else{
-        read_layout$seq[which(read_layout$type %in% "poly_t")]<-"T{12,}+"
-      }
-    }
-    read_layout$order<-seq(1:nrow(read_layout))
-    read_layout$direction<-"forward"
-    barcode_position<-read_layout[order == min(order[type == "barcode"])]$order
-    adapters_near_barcode<-read_layout[type == "adapter" & (order - barcode_position) <= 1]
-    if(nrow(adapters_near_barcode) > 0){
-      flanking_adapter_id<-adapters_near_barcode[order(-expected_length), head(.SD, 1)]$id
-      read_layout[id == flanking_adapter_id, type := "flanking_adapter"]
-    }
-    
-    reverses_table<-copy(read_layout) %>%
-      .[, seq := ifelse(type == "poly_t", "A{12,}+", ifelse(type == "poly_a", "T{12,}+", sapply(seq, revcomp)))] %>% 
-      .[, id := ifelse(type %in% c("poly_a", "poly_t"), ifelse(type == "poly_a", "poly_t", "poly_a"),paste0("rc_", id))] %>% 
-      .[, type := ifelse(type == "poly_a", "poly_t", ifelse(type == "poly_t", "poly_a", type))] %>%
-      .[, direction := "reverse"]
-    
-    read_layout<-rbind(read_layout, reverses_table) #list2env this one
-    read_layout$order<-seq(1:nrow(read_layout))
-    #adapters<-read_layout$seq[grep(pattern = "adapter", x = read_layout$type)]
-    #names(adapters)<-read_layout$id[grep(pattern = "adapter", x = read_layout$type)] #list2env this one
-    adapters<-read_layout$seq[-which(is.na(read_layout$seq))]
-    names(adapters)<-read_layout$id[-which(is.na(read_layout$seq))]
-  }#preparing read layout and whatnot
-  {
-    print("Checking executable paths!")
-    path_layout<-data.table::fread(file = external_path_form, header = TRUE, fill = TRUE, na.strings = "", skip = 1,
-       key = "path_type", data.table = TRUE)
-    if(dir.exists(path_layout[path_type == "output_dir", actual_path]) == FALSE & create_output_dir == TRUE){
-      dir.create(path = path_layout[path_type == "output_dir", actual_path])
-    }
-    whitelist<-whitelist_importer(whitelist_path = path_layout[path_type == "whitelist", actual_path], ...)
-  }#preparing external paths for input
-  return(list2env(
-    x = list(read_layout = read_layout, 
-      path_layout = path_layout, 
-      adapters = adapters, 
-      whitelist = whitelist), envir = .GlobalEnv))
-}
+# prepare_to_anger<-function(read_layout_form, external_path_form, create_output_dir = TRUE,
+#    data_table_nthreads = 1, seqkit_stats = TRUE, ...){
+#   {
+#     print("Importing read layout and figuring out its order!")
+#     tidytable::setDTthreads(threads = 1)
+#     read_layout<-data.table::fread(file = read_layout_form, header = TRUE, fill = TRUE, na.strings = "", skip = 1)
+#     read_layout$expected_length[which(!is.na(read_layout$seq))]<-stringr::str_length(read_layout$seq[which(!is.na(read_layout$seq))])
+#     if(any(read_layout$type %in% "poly_a" | read_layout$type %in% "poly_t")){
+#       if(("poly_a" %in% read_layout$type) == TRUE){
+#         read_layout$seq[which(read_layout$type %in% "poly_a")]<-"A{12,}+"
+#       }
+#       else{
+#         read_layout$seq[which(read_layout$type %in% "poly_t")]<-"T{12,}+"
+#       }
+#     }
+#     read_layout$order<-seq(1:nrow(read_layout))
+#     read_layout$direction<-"forward"
+#     barcode_position<-read_layout[order == min(order[type == "barcode"])]$order
+#     adapters_near_barcode<-read_layout[type == "adapter" & (order - barcode_position) <= 1]
+#     if(nrow(adapters_near_barcode) > 0){
+#       flanking_adapter_id<-adapters_near_barcode[order(-expected_length), head(.SD, 1)]$id
+#       read_layout[id == flanking_adapter_id, type := "flanking_adapter"]
+#     }
+#     
+#     reverses_table<-copy(read_layout) %>%
+#       .[, seq := ifelse(type == "poly_t", "A{12,}+", ifelse(type == "poly_a", "T{12,}+", sapply(seq, revcomp)))] %>% 
+#       .[, id := ifelse(type %in% c("poly_a", "poly_t"), ifelse(type == "poly_a", "poly_t", "poly_a"),paste0("rc_", id))] %>% 
+#       .[, type := ifelse(type == "poly_a", "poly_t", ifelse(type == "poly_t", "poly_a", type))] %>%
+#       .[, direction := "reverse"]
+#     
+#     read_layout<-rbind(read_layout, reverses_table) #list2env this one
+#     read_layout$order<-seq(1:nrow(read_layout))
+#     #adapters<-read_layout$seq[grep(pattern = "adapter", x = read_layout$type)]
+#     #names(adapters)<-read_layout$id[grep(pattern = "adapter", x = read_layout$type)] #list2env this one
+#     adapters<-read_layout$seq[-which(is.na(read_layout$seq))]
+#     names(adapters)<-read_layout$id[-which(is.na(read_layout$seq))]
+#   }#preparing read layout and whatnot
+#   {
+#     print("Checking executable paths!")
+#     path_layout<-data.table::fread(file = external_path_form, header = TRUE, fill = TRUE, na.strings = "", skip = 1,
+#        key = "path_type", data.table = TRUE)
+#     if(dir.exists(path_layout[path_type == "output_dir", actual_path]) == FALSE & create_output_dir == TRUE){
+#       dir.create(path = path_layout[path_type == "output_dir", actual_path])
+#     }
+#     whitelist<-whitelist_importer(whitelist_path = path_layout[path_type == "whitelist", actual_path], ...)
+#   }#preparing external paths for input
+#   return(list2env(
+#     x = list(read_layout = read_layout, 
+#       path_layout = path_layout, 
+#       adapters = adapters, 
+#       whitelist = whitelist), envir = .GlobalEnv))
+# }
 #' @export
-stat_collector<-function(df, read_layout, mode = NULL){
-  forward_adapters<-read_layout[type %in% c("adapter", "flanking_adapter") & direction == "forward", id]
-  reverse_adapters<-read_layout[type %in% c("adapter", "flanking_adapter") & direction == "reverse", id]
-  df<-as_tidytable(df)
-  forward_zero_ids<-df %>%
-    tidytable::filter(query_id %in% forward_adapters) %>%
-    tidytable::group_by(id) %>%
-    tidytable::filter(all(best_edit_distance == 0)) %>%
-    tidytable::pull(id)
-  reverse_zero_ids<-df %>% 
-    tidytable::filter(query_id %in% reverse_adapters) %>%
-    tidytable::group_by(id) %>%
-    tidytable::filter(all(best_edit_distance == 0)) %>%
-    tidytable::pull(id)
-  if(mode == "stats"){
-    stats_reverse<-df %>%
-      tidytable::filter(id %in% forward_zero_ids, query_id %in% reverse_adapters) %>%
-      tidytable::group_by(query_id) %>%
-      tidytable::summarise(
-        null_distance = mean(best_edit_distance), 
-        sd_null = sd(best_edit_distance))
-    stats_forward<-df %>%
-      tidytable::filter(id %in% reverse_zero_ids, query_id %in% forward_adapters) %>%
-      tidytable::group_by(query_id) %>%
-      tidytable::summarise(
-        null_distance = mean(best_edit_distance), 
-        sd_null = sd(best_edit_distance))
-    null_distance<-rbind(stats_forward, stats_reverse)
-    return(null_distance)
-  }
-  if(mode == "graphics"){
-    stats_reverse<-df %>%
-      tidytable::filter(id %in% forward_zero_ids, query_id %in% reverse_adapters) %>%
-      tidytable::group_by(query_id)
-    stats_forward<-df %>%
-      tidytable::filter(id %in% reverse_zero_ids, query_id %in% forward_adapters) %>%
-      tidytable::group_by(query_id)
-    total_stats<-data.table::rbindlist(list(stats_forward, stats_reverse))
-    return(total_stats)
-  }
-}
+# stat_collector_old<-function(df, read_layout, mode = NULL){
+#   forward_adapters<-read_layout[type %in% c("adapter", "flanking_adapter") & direction == "forward", id]
+#   reverse_adapters<-read_layout[type %in% c("adapter", "flanking_adapter") & direction == "reverse", id]
+#   df<-as_tidytable(df)
+#   forward_zero_ids<-df %>%
+#     tidytable::filter(query_id %in% forward_adapters) %>%
+#     tidytable::group_by(id) %>%
+#     tidytable::filter(all(best_edit_distance == 0)) %>%
+#     tidytable::pull(id)
+#   reverse_zero_ids<-df %>% 
+#     tidytable::filter(query_id %in% reverse_adapters) %>%
+#     tidytable::group_by(id) %>%
+#     tidytable::filter(all(best_edit_distance == 0)) %>%
+#     tidytable::pull(id)
+#   if(mode == "stats"){
+#     stats_reverse<-df %>%
+#       tidytable::filter(id %in% forward_zero_ids, query_id %in% reverse_adapters) %>%
+#       tidytable::group_by(query_id) %>%
+#       tidytable::summarise(
+#         null_distance = mean(best_edit_distance), 
+#         sd_null = sd(best_edit_distance))
+#     stats_forward<-df %>%
+#       tidytable::filter(id %in% reverse_zero_ids, query_id %in% forward_adapters) %>%
+#       tidytable::group_by(query_id) %>%
+#       tidytable::summarise(
+#         null_distance = mean(best_edit_distance), 
+#         sd_null = sd(best_edit_distance))
+#     null_distance<-rbind(stats_forward, stats_reverse)
+#     return(null_distance)
+#   }
+#   if(mode == "graphics"){
+#     stats_reverse<-df %>%
+#       tidytable::filter(id %in% forward_zero_ids, query_id %in% reverse_adapters) %>%
+#       tidytable::group_by(query_id)
+#     stats_forward<-df %>%
+#       tidytable::filter(id %in% reverse_zero_ids, query_id %in% forward_adapters) %>%
+#       tidytable::group_by(query_id)
+#     total_stats<-data.table::rbindlist(list(stats_forward, stats_reverse))
+#     return(total_stats)
+#   }
+# }
 #' @export
 fastqa_writer<-function(df, fn, type, append = FALSE){
   if(type == "fq"){

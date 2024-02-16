@@ -1552,7 +1552,10 @@ std::string findPolyTail(const std::string& sequence, char poly_base, int window
 }
 
 // [[Rcpp::export]]
-Rcpp::CharacterVector sigalign(Rcpp::CharacterVector adapters, std::vector<std::string> sequences,
+Rcpp::CharacterVector sigalign(
+  Rcpp::CharacterVector adapters,
+  std::vector<std::string> sequences,
+  std::vector<std::string> ids,
   Rcpp::DataFrame misalignment_thresholds, int nthreads) {
   std::vector<std::string> queries = Rcpp::as<std::vector<std::string>>(adapters);
   std::vector<std::string> query_names = Rcpp::as<std::vector<std::string>>(adapters.names());
@@ -1569,6 +1572,7 @@ Rcpp::CharacterVector sigalign(Rcpp::CharacterVector adapters, std::vector<std::
     const auto& sequence =sequences[i];
     std::ostringstream signature;
     std::vector<std::string> temp_signature_parts;
+    int length = sequence.size();
     // Parallelize the inner loop through queries
     // Loop through each sequence
 #pragma omp parallel for
@@ -1651,6 +1655,7 @@ Rcpp::CharacterVector sigalign(Rcpp::CharacterVector adapters, std::vector<std::
       });
 #pragma omp critical
 {
+  final_signature += "<" + std::to_string(length) + ":" + ids[i] + ":undecided>";
   signature_map[i + 1] = final_signature;
 }
 temp_signature_parts.clear();

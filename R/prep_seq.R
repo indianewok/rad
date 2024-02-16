@@ -1,5 +1,5 @@
 prep_seq<-function(read_layout_form, external_path_form, create_output_dir = TRUE,
-  data_table_nthreads = 1, seqkit_stats = TRUE, ...){
+  data_table_nthreads = 1, ...){
   {
     print("Importing read layout and figuring out its order!")
     tidytable::setDTthreads(threads = 1)
@@ -57,7 +57,8 @@ prep_seq<-function(read_layout_form, external_path_form, create_output_dir = TRU
     #names(adapters)<-read_layout$id[grep(pattern = "adapter", x = read_layout$type)] #list2env this one
 
     adapters<-read_layout$seq[-which(is.na(read_layout$seq))]
-    names(adapters)<-read_layout$id[-which(is.na(read_layout$seq))]
+    names(adapters)<-read_layout$class_id[-which(is.na(read_layout$seq))]
+    #super quick fix to make the alignment adapter stuff work bc of hardcoded adapter name assumptions downstream, fix
 
   }#preparing read layout and whatnot
   {
