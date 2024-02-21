@@ -38,17 +38,17 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
-// sig_run
-Rcpp::CharacterVector sig_run(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, const Rcpp::StringVector& rcpp_sigstrings, bool verbose);
-RcppExport SEXP _rad_sig_run(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP rcpp_sigstringsSEXP, SEXP verboseSEXP) {
+// sigrun
+Rcpp::CharacterVector sigrun(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, const Rcpp::StringVector& sigstrings, bool verbose);
+RcppExport SEXP _rad_sigrun(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP sigstringsSEXP, SEXP verboseSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
     Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
-    Rcpp::traits::input_parameter< const Rcpp::StringVector& >::type rcpp_sigstrings(rcpp_sigstringsSEXP);
+    Rcpp::traits::input_parameter< const Rcpp::StringVector& >::type sigstrings(sigstringsSEXP);
     Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    rcpp_result_gen = Rcpp::wrap(sig_run(read_layout, misalignment_threshold, rcpp_sigstrings, verbose));
+    rcpp_result_gen = Rcpp::wrap(sigrun(read_layout, misalignment_threshold, sigstrings, verbose));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -74,6 +74,39 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// sequence_to_bitlist
+List sequence_to_bitlist(Rcpp::StringVector sequences);
+RcppExport SEXP _rad_sequence_to_bitlist(SEXP sequencesSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::StringVector >::type sequences(sequencesSEXP);
+    rcpp_result_gen = Rcpp::wrap(sequence_to_bitlist(sequences));
+    return rcpp_result_gen;
+END_RCPP
+}
+// qual_to_bits
+Rcpp::NumericVector qual_to_bits(Rcpp::StringVector sequences);
+RcppExport SEXP _rad_qual_to_bits(SEXP sequencesSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::StringVector >::type sequences(sequencesSEXP);
+    rcpp_result_gen = Rcpp::wrap(qual_to_bits(sequences));
+    return rcpp_result_gen;
+END_RCPP
+}
+// qual_to_bitlist
+List qual_to_bitlist(StringVector sequences);
+RcppExport SEXP _rad_qual_to_bitlist(SEXP sequencesSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< StringVector >::type sequences(sequencesSEXP);
+    rcpp_result_gen = Rcpp::wrap(qual_to_bitlist(sequences));
+    return rcpp_result_gen;
+END_RCPP
+}
 // bits_to_sequence
 Rcpp::StringVector bits_to_sequence(Rcpp::NumericVector input, Rcpp::IntegerVector sequence_length);
 RcppExport SEXP _rad_bits_to_sequence(SEXP inputSEXP, SEXP sequence_lengthSEXP) {
@@ -83,6 +116,18 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< Rcpp::NumericVector >::type input(inputSEXP);
     Rcpp::traits::input_parameter< Rcpp::IntegerVector >::type sequence_length(sequence_lengthSEXP);
     rcpp_result_gen = Rcpp::wrap(bits_to_sequence(input, sequence_length));
+    return rcpp_result_gen;
+END_RCPP
+}
+// bits_to_hex
+StringVector bits_to_hex(Rcpp::NumericVector input, int sequence_length);
+RcppExport SEXP _rad_bits_to_hex(SEXP inputSEXP, SEXP sequence_lengthSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type input(inputSEXP);
+    Rcpp::traits::input_parameter< int >::type sequence_length(sequence_lengthSEXP);
+    rcpp_result_gen = Rcpp::wrap(bits_to_hex(input, sequence_length));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -111,15 +156,42 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
-// generate_mutations
-Rcpp::NumericVector generate_mutations(Rcpp::NumericVector sequences, IntegerVector sequence_length);
-RcppExport SEXP _rad_generate_mutations(SEXP sequencesSEXP, SEXP sequence_lengthSEXP) {
+// generate_bit_mutations
+Rcpp::NumericVector generate_bit_mutations(Rcpp::NumericVector sequences, IntegerVector sequence_length);
+RcppExport SEXP _rad_generate_bit_mutations(SEXP sequencesSEXP, SEXP sequence_lengthSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< Rcpp::NumericVector >::type sequences(sequencesSEXP);
     Rcpp::traits::input_parameter< IntegerVector >::type sequence_length(sequence_lengthSEXP);
-    rcpp_result_gen = Rcpp::wrap(generate_mutations(sequences, sequence_length));
+    rcpp_result_gen = Rcpp::wrap(generate_bit_mutations(sequences, sequence_length));
+    return rcpp_result_gen;
+END_RCPP
+}
+// bit_substring
+Rcpp::NumericVector bit_substring(Rcpp::NumericVector bit_sequences, int start_pos, int stop_pos);
+RcppExport SEXP _rad_bit_substring(SEXP bit_sequencesSEXP, SEXP start_posSEXP, SEXP stop_posSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type bit_sequences(bit_sequencesSEXP);
+    Rcpp::traits::input_parameter< int >::type start_pos(start_posSEXP);
+    Rcpp::traits::input_parameter< int >::type stop_pos(stop_posSEXP);
+    rcpp_result_gen = Rcpp::wrap(bit_substring(bit_sequences, start_pos, stop_pos));
+    return rcpp_result_gen;
+END_RCPP
+}
+// kmer_circ
+Rcpp::NumericVector kmer_circ(SEXP sequence, int base_length, int kmerLength, bool verbose);
+RcppExport SEXP _rad_kmer_circ(SEXP sequenceSEXP, SEXP base_lengthSEXP, SEXP kmerLengthSEXP, SEXP verboseSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< SEXP >::type sequence(sequenceSEXP);
+    Rcpp::traits::input_parameter< int >::type base_length(base_lengthSEXP);
+    Rcpp::traits::input_parameter< int >::type kmerLength(kmerLengthSEXP);
+    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
+    rcpp_result_gen = Rcpp::wrap(kmer_circ(sequence, base_length, kmerLength, verbose));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -127,13 +199,19 @@ END_RCPP
 static const R_CallMethodDef CallEntries[] = {
     {"_rad_sigalign", (DL_FUNC) &_rad_sigalign, 5},
     {"_rad_sigalign_stats", (DL_FUNC) &_rad_sigalign_stats, 3},
-    {"_rad_sig_run", (DL_FUNC) &_rad_sig_run, 4},
+    {"_rad_sigrun", (DL_FUNC) &_rad_sigrun, 4},
     {"_rad_revcomp", (DL_FUNC) &_rad_revcomp, 1},
     {"_rad_sequence_to_bits", (DL_FUNC) &_rad_sequence_to_bits, 1},
+    {"_rad_sequence_to_bitlist", (DL_FUNC) &_rad_sequence_to_bitlist, 1},
+    {"_rad_qual_to_bits", (DL_FUNC) &_rad_qual_to_bits, 1},
+    {"_rad_qual_to_bitlist", (DL_FUNC) &_rad_qual_to_bitlist, 1},
     {"_rad_bits_to_sequence", (DL_FUNC) &_rad_bits_to_sequence, 2},
+    {"_rad_bits_to_hex", (DL_FUNC) &_rad_bits_to_hex, 2},
     {"_rad_revcomp_bits", (DL_FUNC) &_rad_revcomp_bits, 2},
     {"_rad_hamming_bits", (DL_FUNC) &_rad_hamming_bits, 3},
-    {"_rad_generate_mutations", (DL_FUNC) &_rad_generate_mutations, 2},
+    {"_rad_generate_bit_mutations", (DL_FUNC) &_rad_generate_bit_mutations, 2},
+    {"_rad_bit_substring", (DL_FUNC) &_rad_bit_substring, 3},
+    {"_rad_kmer_circ", (DL_FUNC) &_rad_kmer_circ, 4},
     {NULL, NULL, 0}
 };
 

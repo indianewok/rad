@@ -1,24 +1,4 @@
-// [[Rcpp::plugins(openmp)]]  // Enable OpenMP in Rcpp
-#include "edlib.h"
-#include "RcppInt64.h"
-#include <Rcpp.h>
-#include <omp.h>  // Include OpenMP header for multi-threading
-#include <string>
-#include <vector>
-#include <map>
-#include <set>
-#include <stdint.h>
-#include <cstdlib>
-#include <algorithm>
-#include <cstring>
-#include <sstream>
-#include <regex>
-#include <unordered_map>
-#include <cstdint>
-#include <unordered_set>
-#include <numeric>
-#include <cmath>
-
+#include "rad.h"
 using namespace std;
 using namespace Rcpp;
 
@@ -1493,7 +1473,6 @@ extern "C" void edlibFreeAlignResult(EdlibAlignResult result) {
   if (result.alignment) free(result.alignment);
 }
 
-// edlibR str_length input
 std::size_t strlen_utf8(const std::string& str) {
   std::size_t length = 0;
   for (char c : str) {
@@ -1503,27 +1482,6 @@ std::size_t strlen_utf8(const std::string& str) {
   }
   return length;
 }
-
-struct UniqueAlignment {
-  int edit_distance;
-  int start_position;
-  int end_position;
-
-  // Define how to compare two UniqueAlignments
-  bool operator<(const UniqueAlignment& other) const {
-    return std::tie(edit_distance, start_position, end_position) <
-      std::tie(other.edit_distance, other.start_position, other.end_position);
-  }
-};
-
-struct AlignmentInfo {
-  int best_edit_distance;
-  int best_start_pos;
-  int best_stop_pos;
-  int second_edit_distance;
-  int second_start_pos;
-  int second_stop_pos;
-};
 
 std::string findPolyTail(const std::string& sequence, char poly_base, int window_size, int min_count) {
   int start = -1;
@@ -1730,8 +1688,6 @@ Rcpp::DataFrame sigalign_stats(Rcpp::CharacterVector adapters, std::vector<std::
     secondBest.end_position
   });
 }
-
-// Don't forget to free the memory allocated by edlibAlign
 edlibFreeAlignResult(cresult);
     }
     sequence_counter++;
@@ -1754,7 +1710,6 @@ edlibFreeAlignResult(cresult);
       second_edit_distances.push_back(alignments[i].second_edit_distance);
     }
   }
-  // Create the DataFrame
   Rcpp::DataFrame result = Rcpp::DataFrame::create(
     Rcpp::Named("id") = ids,
     Rcpp::Named("query_id") = query_ids,  // new column for query IDs
@@ -1762,8 +1717,6 @@ edlibFreeAlignResult(cresult);
     Rcpp::Named("best_start_pos") = best_start_positions,
     Rcpp::Named("best_stop_pos") = best_stop_positions,
     Rcpp::Named("second_edit_distance") = second_edit_distances
-  // ... (potentially other fields)
   );
   return result;
 }
-

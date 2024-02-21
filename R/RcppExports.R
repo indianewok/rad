@@ -9,8 +9,8 @@ sigalign_stats <- function(adapters, sequences, nthreads = 1L) {
     .Call(`_rad_sigalign_stats`, adapters, sequences, nthreads)
 }
 
-sig_run <- function(read_layout, misalignment_threshold, rcpp_sigstrings, verbose = FALSE) {
-    .Call(`_rad_sig_run`, read_layout, misalignment_threshold, rcpp_sigstrings, verbose)
+sigrun <- function(read_layout, misalignment_threshold, sigstrings, verbose = FALSE) {
+    .Call(`_rad_sigrun`, read_layout, misalignment_threshold, sigstrings, verbose)
 }
 
 revcomp <- function(sequences) {
@@ -21,19 +21,43 @@ sequence_to_bits <- function(sequences) {
     .Call(`_rad_sequence_to_bits`, sequences)
 }
 
-bits_to_sequence <- function(input, sequence_length) {
+sequence_to_bitlist <- function(sequences) {
+    .Call(`_rad_sequence_to_bitlist`, sequences)
+}
+
+qual_to_bits <- function(sequences) {
+    .Call(`_rad_qual_to_bits`, sequences)
+}
+
+qual_to_bitlist <- function(sequences) {
+    .Call(`_rad_qual_to_bitlist`, sequences)
+}
+
+bits_to_sequence <- function(input, sequence_length = 16L) {
     .Call(`_rad_bits_to_sequence`, input, sequence_length)
 }
 
-revcomp_bits <- function(input, sequence_length) {
+bits_to_hex <- function(input, sequence_length = 16L) {
+    .Call(`_rad_bits_to_hex`, input, sequence_length)
+}
+
+revcomp_bits <- function(input, sequence_length = 16L) {
     .Call(`_rad_revcomp_bits`, input, sequence_length)
 }
 
-hamming_bits <- function(int64_a, int64_b, sequence_length) {
+hamming_bits <- function(int64_a, int64_b, sequence_length = 16L) {
     .Call(`_rad_hamming_bits`, int64_a, int64_b, sequence_length)
 }
 
-generate_mutations <- function(sequences, sequence_length) {
-    .Call(`_rad_generate_mutations`, sequences, sequence_length)
+generate_bit_mutations <- function(sequences, sequence_length = 16L) {
+    .Call(`_rad_generate_bit_mutations`, sequences, sequence_length)
+}
+
+bit_substring <- function(bit_sequences, start_pos, stop_pos) {
+    .Call(`_rad_bit_substring`, bit_sequences, start_pos, stop_pos)
+}
+
+kmer_circ <- function(sequence, base_length = 16L, kmerLength = 16L, verbose = FALSE) {
+    .Call(`_rad_kmer_circ`, sequence, base_length, kmerLength, verbose)
 }
 

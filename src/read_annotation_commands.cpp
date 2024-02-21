@@ -1,79 +1,10 @@
-#include <Rcpp.h>
-#include <boost/multi_index_container.hpp>
-#include <boost/multi_index/ordered_index.hpp>
-#include <boost/multi_index/member.hpp>
-#include <boost/multi_index/sequenced_index.hpp>
-#include <boost/optional.hpp>
-#include <boost/optional/optional_io.hpp>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <unordered_map>
-#include <algorithm>
-#include <utility>
-#include <functional>
-#include <unordered_map>
-
-using namespace Rcpp;
-using boost::multi_index_container;
-using namespace boost::multi_index;
+#include "rad.h"
 using namespace std;
+using namespace Rcpp;
+//preparing the read layout container
 
-// Define tags for multi-indexing
-struct id_tag {};
-struct length_tag {};
-struct type_tag {};
-struct order_tag {};
-struct direction_tag {};
-struct global_class_tag {};
-
-struct PositionInfo {
-  std::tuple<std::string, std::string, std::string, std::string> position_data; // Tuple of primary and secondary start positions
-};
-
-struct ReadElement {
-  std::string class_id;
-  std::string seq; // Sequence information, there's nothing in here tbh
-  std::string global_class;
-  boost::optional<int> expected_length; // Optional expected length
-  std::string type; // Type of the element (e.g., "static", "variable")
-  int order; // Order in the layout
-  std::string direction; // Direction (e.g., "forward", "reverse")
-  boost::optional<std::tuple<int, int, int>> misalignment_threshold; // Optional misalignment threshold
-  boost::optional<PositionInfo> position_data; // Optional position information for variable elements
-  
-  ReadElement(
-    const std::string& class_id,
-    const std::string& seq,
-    const boost::optional<int>& expected_length,
-    const std::string& type,
-    int order,
-    const std::string& direction,
-    const std::string& global_class,
-    const boost::optional<std::tuple<int, int, int>>& misalignment_threshold = boost::none,
-    const boost::optional<PositionInfo>& position_data = boost::none
-  ) : class_id(class_id),
-  seq(seq),
-  expected_length(expected_length),
-  type(type),
-  order(order),
-  direction(direction),
-  global_class(global_class),
-  misalignment_threshold(misalignment_threshold),
-  position_data(position_data) {}
-};
-
-typedef multi_index_container<
-  ReadElement,
-  indexed_by<
-    ordered_unique<tag<id_tag>, member<ReadElement, std::string, &ReadElement::class_id>>,
-    ordered_non_unique<tag<length_tag>, member<ReadElement, boost::optional<int>, &ReadElement::expected_length>>,
-    ordered_non_unique<tag<type_tag>, member<ReadElement, std::string, &ReadElement::type>>,
-    ordered_non_unique<tag<order_tag>, member<ReadElement, int, &ReadElement::order>>,
-    ordered_non_unique<tag<direction_tag>, member<ReadElement, std::string, &ReadElement::direction>>,
-    ordered_non_unique<tag<global_class_tag>, member<ReadElement, std::string, &ReadElement::global_class>>
-  >
-> ReadLayout;
+PositionFuncMap positionFuncMap;
+ReadLayout container;
 
 ReadLayout prep_read_layout_cpp(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold) {
   ReadLayout container;
@@ -82,21 +13,21 @@ ReadLayout prep_read_layout_cpp(const Rcpp::DataFrame& read_layout, const Rcpp::
   Rcpp::StringVector query_id = misalignment_threshold["query_id"];
   Rcpp::NumericVector misal_threshold = misalignment_threshold["misal_threshold"];
   Rcpp::NumericVector misal_sd = misalignment_threshold["misal_sd"];
-  
+
   for (int i = 0; i < query_id.size(); ++i) {
     double threshold = misal_threshold[i];
     double sd = std::ceil(misal_sd[i]);
-    
+
     int lower_bound = static_cast<int>(std::floor(threshold - sd));
     int upper_bound = static_cast<int>(std::ceil(threshold + sd));
-    
+
     thresholdsMap[Rcpp::as<std::string>(query_id[i])] = std::make_tuple(
       lower_bound,
       static_cast<int>(threshold),
       upper_bound
     );
   }
-  
+
   Rcpp::StringVector class_id = read_layout["class_id"];
   Rcpp::StringVector class_column = read_layout["class"];
   Rcpp::StringVector seq = read_layout["seq"];
@@ -104,23 +35,23 @@ ReadLayout prep_read_layout_cpp(const Rcpp::DataFrame& read_layout, const Rcpp::
   Rcpp::StringVector type = read_layout["type"];
   Rcpp::IntegerVector order = read_layout["order"];
   Rcpp::StringVector direction = read_layout["direction"];
-  
+
   for (int i = 0; i < class_id.size(); ++i) {
     std::string cid = Rcpp::as<std::string>(class_id[i]);
     std::string class_value = Rcpp::as<std::string>(class_column[i]); // Get the class value
-    
+
     boost::optional<std::tuple<int, int, int>> misalignment_threshold_opt;
     if (thresholdsMap.count(cid)) {
       misalignment_threshold_opt = boost::optional<std::tuple<int, int, int>>(thresholdsMap[cid]);
     }else{
       misalignment_threshold_opt = boost::none;
     }
-    
+
     boost::optional<int> expected_length_opt;
     if (class_value != "read") {
       expected_length_opt = expected_length[i];
     }
-    
+
     container.insert(ReadElement(
         cid,
         Rcpp::as<std::string>(seq[i]),
@@ -134,89 +65,6 @@ ReadLayout prep_read_layout_cpp(const Rcpp::DataFrame& read_layout, const Rcpp::
   }
   return container;
 }
-
-struct SigElement {
-  std::string class_id;
-  std::string global_class;
-  boost::optional<int> edit_distance; // Optional edit distance
-  std::pair<int, int> position;
-  std::string type;
-  int order;
-  std::string direction;
-  boost::optional<bool> element_pass;
-  
-  SigElement(
-    std::string class_id,
-    std::string global_class,
-    boost::optional<int> edit_distance,
-    std::pair<int, int> position,
-    std::string type,
-    int order,
-    std::string direction,
-    boost::optional<bool> element_pass = boost::none
-  ) : class_id(std::move(class_id)),
-  global_class(std::move(global_class)),
-  edit_distance(edit_distance),
-  position(position),
-  type(std::move(type)),
-  order(order),
-  direction(std::move(direction)),
-  element_pass(element_pass) {}
-};
-
-struct sig_id_tag {};
-struct sig_global_tag {};
-struct sig_ed_tag {};
-struct sig_dir_tag {};
-struct sig_order_tag {};
-struct sig_pass_tag {}; //added to be able to index by element_pass
-
-// Define the multi-index container for SigString
-typedef multi_index_container<
-  SigElement,
-  indexed_by<
-    ordered_non_unique<tag<sig_id_tag>, member<SigElement, std::string, &SigElement::class_id>>,
-    ordered_non_unique<tag<sig_global_tag>, member<SigElement, std::string, &SigElement::global_class>>,
-    ordered_non_unique<tag<sig_ed_tag>, member<SigElement, boost::optional<int>, &SigElement::edit_distance>>,
-    ordered_non_unique<tag<sig_order_tag>, member<SigElement, int, &SigElement::order>>,
-    ordered_non_unique<tag<sig_dir_tag>, member<SigElement, std::string, &SigElement::direction>>,
-    ordered_non_unique<tag<sig_pass_tag>, member<SigElement, boost::optional<bool>, &SigElement::element_pass>>
-  >
-> SigString;
-
-struct StringInfo {
-  int str_length;
-  std::string str_type;
-  std::string str_id;  // Make sure this is added
-  
-  StringInfo(int length = 0, std::string id = "NA", std::string type = "undefined")
-    : str_length(length), str_type(std::move(type)), str_id(std::move(id)) {}
-};
-
-struct ReadData {
-  std::unordered_map<std::string, StringInfo> string_info;
-  SigString sigstring;
-  
-  void addStringInfo(const std::string& key, int length, const std::string& type, const std::string& id) {
-    string_info[key] = StringInfo(length, type, id);
-  }
-};
-
-struct stat_elem {
-  int forw_pass = 0;
-  int rev_pass = 0;
-  int unique_forw_pass = 0; 
-  int unique_rev_pass = 0;
-  int term_forw_elements = 0;
-  int term_rev_elements = 0;
-};
-
-struct PositionCalcFunc {
-  std::function<int(const ReadData&)> primaryStartFunc;
-  std::function<int(const ReadData&)> secondaryStartFunc;
-  std::function<int(const ReadData&)> primaryStopFunc;
-  std::function<int(const ReadData&)> secondaryStopFunc;
-};
 
 // Parse static elements to the left of a read
 void parse_static_left(const ReadLayout& readLayout, const std::vector<int>& segment_orders,
@@ -642,111 +490,56 @@ void concat_scan(ReadData& readData, bool verbose) {
   }
 }
 
-void concat_solve_hybrid(ReadData& readData, bool verbose) {
-  auto& order_index = readData.sigstring.get<sig_order_tag>();
-  for (auto it = order_index.begin(); it != order_index.end(); ++it) {
-    if (it->global_class == "read") {
-      int newStartPos = it->position.first;
-      int newStopPos = it->position.second;
-      if (newStartPos == -1) {
-        auto preceding = it;
-        if (preceding != order_index.begin()) {
-          do {
-            --preceding;
-            if ((preceding->element_pass && *preceding->element_pass) || preceding->global_class == "poly_tail") {
-              newStartPos = preceding->position.second + 1;
-              break;
-            }
-          } while (preceding != order_index.begin());
+// Main function to filter sigstrings
+std::vector<std::string> split(const std::string &s, char delimiter) {
+std::vector<std::string> tokens;
+std::string token;
+std::istringstream tokenStream(s);
+while (std::getline(tokenStream, token, delimiter)) {
+  tokens.push_back(token);
+}
+return tokens;
+}
+void filter_sigstring(std::vector<std::string>& sigstrings) {
+  std::regex readPattern(R"((read|rc_read):(\d+):(\d+):(\d+))");
+  std::regex barcodePattern(R"(barcode:(\d+):(\d+):(\d+))");
+  std::smatch matches;
+  
+  for (auto& sigstring : sigstrings) {
+    bool hasRead = false, hasBarcode = false, isValid = true;
+    
+    auto elements = split(sigstring, '|');
+    for (const auto& element : elements) {
+      if (std::regex_search(element, matches, readPattern)) {
+        int startPos = std::stoi(matches.str(3));
+        int stopPos = std::stoi(matches.str(4));
+        if ((stopPos - startPos) <= 0 || (stopPos - startPos) < 150) {
+          isValid = false;
+          break;
         }
-        if (newStartPos == -1) newStartPos = 1;
+        hasRead = true;
+      } else if (std::regex_search(element, matches, barcodePattern)) {
+        hasBarcode = true;
       }
-      if (newStopPos == -1) {
-        auto succeeding = it;
-        ++succeeding;
-        while (succeeding != order_index.end()) {
-          if ((succeeding->element_pass && *succeeding->element_pass)||succeeding->global_class == "poly_tail") {
-            newStopPos = succeeding->position.first - 1;
-            break;
-          }
-          ++succeeding; 
+    }
+    
+    if (!isValid || !(hasRead && hasBarcode)) {
+      size_t endMetaPos = sigstring.rfind('>');
+      if (endMetaPos != std::string::npos) {
+        // Find the last colon before the '>' to identify where the 'F' or 'R' starts
+        size_t lastColonPos = sigstring.rfind(':', endMetaPos);
+        if (lastColonPos != std::string::npos) {
+          // Replace the 'F' or 'R' with "undecided"
+          std::string beforeType = sigstring.substr(0, lastColonPos + 1); // Keep everything before the type
+          std::string afterType = sigstring.substr(endMetaPos); // Keep everything after the type
+          sigstring = beforeType + "undecided" + afterType; // Combine with "undecided"
         }
-        if (newStopPos == -1) newStopPos = readData.string_info["type"].str_length;
-      }
-      // Apply the position updates
-      order_index.modify(it, [newStartPos, newStopPos](SigElement& elem) {
-        elem.position.first = newStartPos;
-        elem.position.second = newStopPos;
-      });
-      if (verbose) {
-        Rcpp::Rcout << "Read " << it->class_id << " adjusted to start: " << newStartPos << ", stop: " << newStopPos << "\n";
       }
     }
   }
 }
 
-std::vector<std::string> concat_solve_parallel(ReadData& readData, bool verbose) {
-  std::string readType = readData.string_info["type"].str_type;
-  std::vector<SigElement> elements;
-  for (const auto& elem : readData.sigstring) {
-    if(readType == "F_F"){
-      if (elem.direction == "forward" && elem.type == "static") {
-        elements.push_back(elem);
-      }  
-    } else if(readType == "R_R"){
-      if(elem.direction == "reverse" && elem.type == "static") {
-        elements.push_back(elem);
-      }
-    }
-  }
-  // First sort by order
-  std::sort(elements.begin(), elements.end(),
-    [](const SigElement& a, const SigElement& b) {
-      return a.order < b.order;
-    });
-  // Then stable sort by start position
-  std::stable_sort(elements.begin(), elements.end(),
-    [](const SigElement& a, const SigElement& b) {
-      return a.position.first < b.position.first;
-    });
-  // Detect where order decreases in next adjacent element
-  std::vector<int> decreasePoints; // Indices where a decrease in order occurs
-  for (size_t i = 0; i < elements.size() - 1; ++i) {
-    if (elements[i].order > elements[i + 1].order) {
-      // Detected a decrease in order, mark this point
-      decreasePoints.push_back(i);
-    }
-  }
-  // Split into two new sigstrings based on the first decrease point
-  std::string sigString1, sigString2;
-  int splitPoint = decreasePoints.empty() ? elements.size() : decreasePoints[0] + 1;
-  // Build the first sigstring
-  for (int i = 0; i < splitPoint; ++i) {
-    if (i > 0) sigString1 += "|";
-    sigString1 += elements[i].class_id + ":" + std::to_string(elements[i].edit_distance.value_or(0)) + ":" + std::to_string(elements[i].position.first) + ":" + std::to_string(elements[i].position.second);
-  }
-  // Append the new length position for the first string
-  if (!elements.empty() && splitPoint > 0) {
-    sigString1 += "<" + std::to_string(elements[splitPoint - 1].position.second) + ":undecided>";
-  }
-  // Build the second sigstring
-  for (size_t i = splitPoint; i < elements.size(); ++i) {
-    if (i > splitPoint) sigString2 += "|";
-    sigString2 += elements[i].class_id + ":" + std::to_string(elements[i].edit_distance.value_or(0)) + ":" + std::to_string(elements[i].position.first) + ":" + std::to_string(elements[i].position.second);
-  }
-  // Append the new length position for the second string
-  if (!elements.empty() && splitPoint < elements.size()) {
-    sigString2 += "<" + std::to_string(elements.back().position.second) + ":undecided>";
-  }
-  // Verbose output to demonstrate the two new sigstrings
-  if (verbose) {
-    Rcpp::Rcout << "First new sigstring: " << sigString1 << "\n";
-    Rcpp::Rcout << "Second new sigstring: " << sigString2 << "\n";
-  }
-  // Return the vector of sigstrings
-  return {sigString1, sigString2};
-}
-
+//using PositionFuncMap = std::unordered_map<std::string, PositionCalcFunc>;
 using PositionFuncMap = std::unordered_map<std::string, PositionCalcFunc>;
 PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool verbose) {
     PositionFuncMap funcMap;
@@ -786,13 +579,14 @@ PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool ver
                     const auto& order_index = readData.sigstring.get<sig_order_tag>();
                     auto refClass = id_index.find(refClassId);
                     auto it = id_index.equal_range(refClassId).first;
-
                     if (it != id_index.end() && 
                         ((refClass->type == "static" && refClass->element_pass && *refClass->element_pass) || 
                         (refClass->type == "variable") || (refClass->global_class == "poly_tail"))) {
+                      
                         if (verbose) {
                             Rcpp::Rcout << "Made it into the loop and past the if statements!\n";
                         }
+                        
                         int startPos = it->position.first;
                         int stopPos = it->position.second;
                         int basePos = (operation.find("start") != std::string::npos) ? it->position.first : it->position.second;
@@ -803,12 +597,14 @@ PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool ver
                             Rcpp::Rcout << "  Positional Information from start to stop: " << startPos << " and " << stopPos << "\n";
                             Rcpp::Rcout << "  Calculated Position: " << calculatedPos << "\n";
                         }
+                        
                         return calculatedPos;
+                        
                     } else if (!isPrimary && !additionalInfo.empty()) {
                       std::string readType = readData.string_info.at("type").str_type;
                       auto varClass = id_index.find(varElemClassId);
                       if(verbose){
-                        string result = isPrimary ? "Primary" : "Secondary";
+                        std::string result = isPrimary ? "Primary" : "Secondary";
                         Rcpp::Rcout << "Flagged for some failures, checking which one it is!\n";
                         Rcpp::Rcout << "The read type is " << result << "\n";
                         Rcpp::Rcout << additionalInfo << " is the additional info!\n";
@@ -826,7 +622,8 @@ PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool ver
                           int rel_edit_failure = 0;
                           double edit_distance = static_cast<double>(*prevClass->edit_distance);
                           int sequence_length = prevClass->position.second - prevClass->position.first + 1;
-                          rel_edit_failure = static_cast<int>((1.0 - (edit_distance / sequence_length)) * 100);                                         if(rel_edit_failure >= 70 && verbose){
+                          rel_edit_failure = static_cast<int>((1.0 - (edit_distance / sequence_length)) * 100);                                         
+                          if(rel_edit_failure >= 70 && verbose){
                             int new_terminal_pos = prevClass->position.second +1;
                           if(readData.string_info.at("type").str_type == "F" || readData.string_info.at("type").str_type == "R"){
                               Rcpp::Rcout << rel_pos_failure << " is the percent delta between EOS and the SNE!\n";
@@ -871,13 +668,13 @@ PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool ver
                             if(readData.string_info.find("type") != readData.string_info.end()){
                               return readData.string_info.at("type").str_length; // End of the sequence
                             }
-                        } else {
+                          } else {
                           return -2;
                           }
                         }
                       }
                     }
-                    return 0; // Default return value if conditions are not met
+                    return -1; // Default return value if conditions are not met
                 };
             };
             funcMap[element.class_id] = {
@@ -894,17 +691,58 @@ PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool ver
     return funcMap;
 }
 
-void concat_solve_hybrid_v2(ReadData& readData, const PositionFuncMap& positionFuncMap, bool verbose) {
-  if(verbose){
-    Rcpp::Rcout << "Solving a hybrid concatenate!\n";
+std::vector<std::string> processSigString(const std::string& sigstring) {
+  std::vector<std::string> parts;
+  size_t splitPos = sigstring.find("+");
+  
+  // Extracting the "<length:id:type>" part correctly
+  size_t infoStartPos = sigstring.rfind("<") + 1;
+  size_t infoEndPos = sigstring.find(">", infoStartPos);
+  std::string infoPart = sigstring.substr(infoStartPos, infoEndPos - infoStartPos);
+  // Parsing the length, ID, and type from the infoPart
+  std::istringstream infoStream(infoPart);
+  std::string lengthStr, id, type;
+  std::getline(infoStream, lengthStr, ':');
+  std::getline(infoStream, id, ':');
+  std::getline(infoStream, type);
+  if (splitPos != std::string::npos) {
+    std::string firstPart = sigstring.substr(0, splitPos);
+    std::string secondPart = sigstring.substr(splitPos + 1);
+    // Finding the last ":" before "<" in each part to capture the correct length
+    size_t lastColonInFirst = firstPart.rfind(":", firstPart.rfind("<"));
+    std::string lengthFirst = firstPart.substr(lastColonInFirst + 1, firstPart.rfind("<") - lastColonInFirst - 1);
+    size_t lastColonInSecond = secondPart.rfind(":", secondPart.rfind("<"));
+    std::string lengthSecond = secondPart.substr(lastColonInSecond + 1, secondPart.rfind("<") - lastColonInSecond - 1);
+    // Reconstructing the first and second parts with updated length and type
+    size_t endFirstPart = firstPart.rfind("<");
+    firstPart = firstPart.substr(0, endFirstPart) + "<" + lengthFirst + ":" + id + "+FR_RF:F>";
+    size_t endSecondPart = secondPart.rfind("<");
+    secondPart = secondPart.substr(0, endSecondPart) + "<" + lengthSecond + ":" + id + "+FR_RF:R>";
+    parts.push_back(firstPart);
+    parts.push_back(secondPart);
+  } else {
+    parts.push_back(sigstring); // Handling cases without "+"
   }
+  return parts;
+}
+
+void concat_solve_hybrid(ReadData& readData, const PositionFuncMap& positionFuncMap, bool verbose) {
+  std::string unrelated = "forw_primer:0:0:0|rev_primer:0:0:0+rc_rev_primer:0:0:0|rc_forw_primer:0:0:0<10:@theID:FR_RF>";
+  std::vector<std::string> results = processSigString(unrelated);
+  
+  if(verbose){
+    Rcpp::Rcout << "Solving a hybrid concatenate! First checking to see if the deconcatenating function works:\n";
+    for (const auto& part : results) {
+      Rcpp::Rcout << part << "\n";
+   }
+  }
+  auto& sig_id_index = readData.sigstring.get<sig_id_tag>();
   for (auto& element : readData.sigstring) {
     if (element.type == "variable" && positionFuncMap.count(element.class_id) > 0 && element.global_class != "read") {
       if(verbose) {
         Rcpp::Rcout << "Working on resolving: " << element.class_id << "\n";
         Rcpp::Rcout << "Now making the first pass...\n";
       }
-      auto& sig_id_index = readData.sigstring.get<sig_id_tag>();
       const auto& positionFuncs = positionFuncMap.at(element.class_id);
       int newStartPos = positionFuncs.primaryStartFunc(readData);
       if(newStartPos <= 0){
@@ -914,7 +752,6 @@ void concat_solve_hybrid_v2(ReadData& readData, const PositionFuncMap& positionF
       if(newStopPos <= 0){
         newStopPos = positionFuncs.secondaryStopFunc(readData);
       }
-      
       if(newStartPos == -1 || newStopPos == -1){
         auto prevClass = readData.sigstring.get<sig_order_tag>().find(element.order - 1);
         if(verbose) {
@@ -929,7 +766,7 @@ void concat_solve_hybrid_v2(ReadData& readData, const PositionFuncMap& positionF
         });
         
         std::string element_pass = prevClass->element_pass ? "PASS\n" : "FAIL\n";
-        
+
         if(verbose) {
           Rcpp::Rcout << "The previous class in order is " << prevClass->class_id << "\n";
           Rcpp::Rcout << "Testing to see if element pass works: " << element_pass;
@@ -962,7 +799,8 @@ void concat_solve_hybrid_v2(ReadData& readData, const PositionFuncMap& positionF
         if (verbose) {
           Rcpp::Rcout << "Updated positions for variable class_id: " << element.class_id
                       << ", New Start: " << newStartPos << ", New Stop: " << newStopPos << "\n";
-        }} else
+        }
+      } else
       if(newStartPos == -2 || newStopPos == -2){
         auto nextClass = readData.sigstring.get<sig_order_tag>().find(element.order + 1);
         if(verbose) {
@@ -971,9 +809,11 @@ void concat_solve_hybrid_v2(ReadData& readData, const PositionFuncMap& positionF
         }
         auto& sig_id_index = readData.sigstring.get<sig_id_tag>();
         bool tmp_edit_pass = true;
+        
         sig_id_index.modify(sig_id_index.iterator_to(*nextClass), [tmp_edit_pass](SigElement& elem) {
           elem.element_pass = tmp_edit_pass;
         });
+        
         newStartPos = positionFuncs.primaryStartFunc(readData);
         std::string element_pass = nextClass->element_pass ? "pass\n" : "fail\n";
         
@@ -1003,14 +843,14 @@ void concat_solve_hybrid_v2(ReadData& readData, const PositionFuncMap& positionF
           elem.element_pass = new_edit_pass;
         });
       }
-      
       else {
         sig_id_index.modify(sig_id_index.iterator_to(element), [newStartPos, newStopPos](SigElement& elem) {
           elem.position.first = newStartPos;
           elem.position.second = newStopPos;
         });
       }
-    } else {
+    }
+    else {
       continue;
     }
   }
@@ -1126,6 +966,133 @@ void concat_solve_hybrid_v2(ReadData& readData, const PositionFuncMap& positionF
         }
     }
   }
+  std::vector<std::string> sig_single_pass = generateSigString(readData);
+  std::vector<std::string> deconcatenated = processSigString(sig_single_pass[0]);
+  //std::string initial_pass = sig_single_pass.at(0);
+  if(verbose){
+    Rcpp::Rcout << "This is what a concatenate OG solution looks like:\n";
+    Rcpp::Rcout << sig_single_pass[0] << "\n";
+    Rcpp::Rcout << "And this is the deconcatenated version:\n";
+    for (const auto& part : deconcatenated) {
+      Rcpp::Rcout << part << "\n";
+    }
+  }
+  std::string forward_deconcatenated = deconcatenated[0];
+  std::string reverse_deconcatenated = deconcatenated[1];
+  // Assuming 'readData' is an instance of ReadData already defined elsewhere
+  if(!forward_deconcatenated.empty() || !reverse_deconcatenated.empty()) {
+    readData.sigstring.clear();
+    readData.secondary_sigstring = boost::none; // Reset optional secondary sigstring
+  }
+  // Process first sigstring
+  if (!forward_deconcatenated.empty()) {
+    fillSigString(readData, container, forward_deconcatenated, positionFuncMap, verbose);
+  }
+  if (!forward_deconcatenated.empty()) {
+    if (!reverse_deconcatenated.empty()) {
+      fillSigString(readData, container, reverse_deconcatenated, positionFuncMap, verbose);
+    }
+  }
+  readData.string_info["type"].str_type = "F-R";
+  readData.string_info["type"].split_types = std::make_pair("F","R");
+}
+
+void concat_solve_parallel(ReadData& readData, bool verbose) {
+  std::string readType = readData.string_info["type"].str_type;
+  std::vector<SigElement> elements;
+  for (const auto& elem : readData.sigstring) {
+    if(readType == "F_F"){
+      if (elem.direction == "forward" && elem.type == "static") {
+        elements.push_back(elem);
+      }  
+    } else if(readType == "R_R"){
+      if(elem.direction == "reverse" && elem.type == "static") {
+        elements.push_back(elem);
+      }
+    }
+  }
+  // First sort by order
+  std::sort(elements.begin(), elements.end(),
+    [](const SigElement& a, const SigElement& b) {
+      return a.order < b.order;
+    });
+  // Then stable sort by start position
+  std::stable_sort(elements.begin(), elements.end(),
+    [](const SigElement& a, const SigElement& b) {
+      return a.position.first < b.position.first;
+    });
+  // Detect where order decreases in next adjacent element
+  std::vector<int> decreasePoints; // Indices where a decrease in order occurs
+  for (size_t i = 0; i < elements.size() - 1; ++i) {
+    if (elements[i].order > elements[i + 1].order) {
+      // Detected a decrease in order, mark this point
+      decreasePoints.push_back(i);
+    }
+  }
+  // Split into two new sigstrings based on the first decrease point
+  std::string sigString1, sigString2;
+  std::string direction;
+  if(readData.string_info.at("type").str_type == "F_F"){
+    direction = "F";
+  } else {
+    direction = "R";
+  }
+  std::string id = readData.string_info.at("type").str_id;
+  int splitPoint = decreasePoints.empty() ? elements.size() : decreasePoints[0] + 1;
+  // Build the first sigstring
+  for (int i = 0; i < splitPoint; ++i) {
+    if (i > 0) sigString1 += "|";
+    sigString1 += elements[i].class_id + ":" + std::to_string(elements[i].edit_distance.value_or(0)) + ":" + std::to_string(elements[i].position.first) + ":" + std::to_string(elements[i].position.second);
+  }
+  // Append the new length position for the first string
+  if (!elements.empty() && splitPoint > 0) {
+   sigString1 += "<" + std::to_string(elements[splitPoint - 1].position.second) + ":" + id +  ":" + direction + ">";
+  }
+   //Build the second sigstring
+  for (size_t i = splitPoint; i < elements.size(); ++i) {
+    if (i > splitPoint) sigString2 += "|";
+    sigString2 += elements[i].class_id + ":" + std::to_string(elements[i].edit_distance.value_or(0)) + ":" + std::to_string(elements[i].position.first) + ":" + std::to_string(elements[i].position.second);
+  }
+  // Append the new length position for the second string
+  if (!elements.empty() && splitPoint < elements.size()) {
+   sigString2 += "<"+ std::to_string(elements.back().position.second) + ":" + id + ":" + direction + ">"; 
+  }
+  // Verbose output to demonstrate the two new sigstrings
+  if (verbose) {
+    Rcpp::Rcout << "First new sigstring after correction:\n" << sigString1 << "\n";
+    Rcpp::Rcout << "Second new sigstring after correction:\n" << sigString2 << "\n";
+  }
+  // Assuming 'readData' is an instance of ReadData already defined elsewhere
+  if(!sigString1.empty() || !sigString2.empty()) {
+    // If either sigString is not empty, clear existing data to prepare for new data
+    readData.sigstring.clear();
+    readData.secondary_sigstring = boost::none; // Reset optional secondary sigstring
+  }
+  // Process first sigstring
+  if (!sigString1.empty()) {
+    fillSigString(readData, container, sigString1, positionFuncMap, verbose);
+    pos_scan(readData, positionFuncMap, container, verbose);
+    //sigString1 = generateSigString(readData); // Reassign after processing
+  }
+  // Process second sigstring, if present
+  if (!sigString2.empty()) {
+    // Check if the primary sigstring was populated, then use secondary sigstring
+    if (!readData.sigstring.empty()) {
+      // Initialize secondary sigstring and process it
+      fillSigString(readData, container, sigString2, positionFuncMap, verbose); // Note: Assuming fillSigString can accept a flag to fill secondary sigstring
+      pos_scan(readData, positionFuncMap, container, verbose); // Assuming pos_scan can also handle secondary sigstring
+      //sigString2 = generateSigString(readData); // Generate from secondary, assuming overload of generateSigString for secondary sigstring
+    } else {
+      // If primary sigstring was not used, fill it now
+      fillSigString(readData, container, sigString2, positionFuncMap, verbose);
+      pos_scan(readData, positionFuncMap, container, verbose);
+      //sigString2 = generateSigString(readData); // Generate from primary as fallback
+    }
+  }
+  if (verbose) {
+    Rcpp::Rcout << "First new sigstring: " << sigString1 << "\n";
+    Rcpp::Rcout << "Second new sigstring: " << sigString2 << "\n";
+  }
 }
 
 //parsing a sigstring and adding stuff to it
@@ -1148,7 +1115,17 @@ void fillSigString(ReadData& readData, const ReadLayout& readLayout,
   }  
   // Populate StringInfo with length and type
   readData.addStringInfo("type", length, id, type);
-
+  
+  SigString* targetSigString = &readData.sigstring; // Default to primary sigstring
+  if (!readData.sigstring.empty() && !readData.secondary_sigstring) {
+    // Condition 2: sigstring is populated and secondary_sigstring is not, populate secondary_sigstring.
+    readData.secondary_sigstring = SigString(); // Initialize secondary_sigstring
+    targetSigString = &(*readData.secondary_sigstring); // Target secondary sigstring
+  } else if (!readData.sigstring.empty() && readData.secondary_sigstring) {
+    // Condition 3: Both sigstring and secondary_sigstring are populated, empty sigstring and refill it with the new sigstring data.
+    readData.sigstring.clear(); // Empty primary sigstring
+    targetSigString = &readData.sigstring; // Target primary sigstring
+  }
   // Process the signature and populate sigstring
   std::stringstream ss(signature);
   std::string token;
@@ -1185,7 +1162,7 @@ void fillSigString(ReadData& readData, const ReadLayout& readLayout,
           it->direction,
           element_pass
       );
-      readData.sigstring.insert(std::move(element));
+      targetSigString->insert(std::move(element));
     }
   }
   for (const auto& readElement : readLayout) {
@@ -1199,7 +1176,7 @@ void fillSigString(ReadData& readData, const ReadLayout& readLayout,
           readElement.order,
           readElement.direction
       );
-      readData.sigstring.insert(std::move(element));
+      targetSigString->insert(std::move(element));
     }
   }
 }
@@ -1250,36 +1227,88 @@ void displayOrderedSigString(const ReadData& readData) {
   }
 }
 
-std::string generateSigString(const ReadData& readData) {
-  std::stringstream sigStringStream;
-  // Function to append elements to the string stream based on direction
-  auto appendElements = [&](const std::string& direction) {
-    std::vector<SigElement> sorted_elements;
-    auto& dir_index = readData.sigstring.get<sig_dir_tag>();
-    auto dir_range = dir_index.equal_range(direction);
-    for (auto it = dir_range.first; it != dir_range.second; ++it) {
-      if (it->position.first <= 0 || it->position.second <= 0) continue; // Skip uninitialized elements
-      sorted_elements.push_back(*it);
+// std::string generateSigString(const ReadData& readData) {
+//   const auto& typeInfo = readData.string_info.at("type");
+//   if(typeInfo.str_type == "F_F"||typeInfo.str_type == "R_R"){
+//     std::string parallel = typeInfo.str_ext;
+//     return parallel + "<" + typeInfo.str_type + ">";
+//   }
+//   std::stringstream sigStringStream;
+//   // Function to append elements to the string stream based on direction
+//   auto appendElements = [&](const std::string& direction) {
+//     std::vector<SigElement> sorted_elements;
+//     auto& dir_index = readData.sigstring.get<sig_dir_tag>();
+//     auto dir_range = dir_index.equal_range(direction);
+//     for (auto it = dir_range.first; it != dir_range.second; ++it) {
+//       if (it->position.first <= 0 || it->position.second <= 0) continue; // Skip uninitialized elements
+//       sorted_elements.push_back(*it);
+//     }
+//     std::sort(sorted_elements.begin(), sorted_elements.end(),
+//       [](const SigElement& a, const SigElement& b) { return a.order < b.order; });
+//     for (size_t i = 0; i < sorted_elements.size(); ++i) {
+//       const auto& element = sorted_elements[i];
+//       if (i > 0) sigStringStream << "|";
+//       sigStringStream << element.class_id << ":" << element.edit_distance.value_or(0)
+//                       << ":" << element.position.first << ":" << element.position.second;
+//     }
+//   };
+//   // Process both forward and reverse elements
+//   appendElements("forward");
+//   if (readData.string_info.at("type").str_type == "R" || readData.string_info.at("type").str_type == "FR_RF") {
+//     if (!sigStringStream.str().empty()) sigStringStream << "+"; // Separator between directions if needed
+//     appendElements("reverse");
+//   }
+//   // Append the final part with length and type
+//   sigStringStream << "<" << typeInfo.str_length << ":" << typeInfo.str_id << ":"<< typeInfo.str_type << ">";
+//   return sigStringStream.str();
+// }
+
+std::vector<std::string> generateSigString(ReadData& readData) {  // Note: passing readData by non-const reference
+  std::vector<std::string> sigStrings; // Vector to hold one or two sigstrings
+  
+  auto& typeInfo = readData.string_info["type"];  // Getting a modifiable reference to typeInfo
+  
+  auto generateFromSigString = [&](const SigString& sigstring, const std::string& typeOverride) -> std::string {
+    std::stringstream sigStringStream;
+    auto appendElements = [&](const std::string& direction) {
+      std::vector<SigElement> sorted_elements;
+      auto& dir_index = sigstring.get<sig_dir_tag>();
+      auto dir_range = dir_index.equal_range(direction);
+      for (auto it = dir_range.first; it != dir_range.second; ++it) {
+        if (it->position.first <= 0 || it->position.second <= 0) continue; // Skip uninitialized elements
+        sorted_elements.push_back(*it);
+      }
+      std::sort(sorted_elements.begin(), sorted_elements.end(),
+        [](const SigElement& a, const SigElement& b) { return a.order < b.order; });
+      for (size_t i = 0; i < sorted_elements.size(); ++i) {
+        const auto& element = sorted_elements[i];
+        if (i > 0) sigStringStream << "|";
+        sigStringStream << element.class_id << ":" << element.edit_distance.value_or(0)
+                        << ":" << element.position.first << ":" << element.position.second;
+      }
+    };
+    appendElements("forward");
+    if (typeOverride == "R" || typeOverride == "FR_RF") {
+      if (!sigStringStream.str().empty()) sigStringStream << "+";
+      appendElements("reverse");
     }
-    std::sort(sorted_elements.begin(), sorted_elements.end(),
-      [](const SigElement& a, const SigElement& b) { return a.order < b.order; });
-    for (size_t i = 0; i < sorted_elements.size(); ++i) {
-      const auto& element = sorted_elements[i];
-      if (i > 0) sigStringStream << "|";
-      sigStringStream << element.class_id << ":" << element.edit_distance.value_or(0)
-                      << ":" << element.position.first << ":" << element.position.second;
-    }
+    sigStringStream << "<" << typeInfo.str_length << ":" << typeInfo.str_id << ":" << typeOverride << ">";
+    return sigStringStream.str();
   };
-  // Process both forward and reverse elements
-  appendElements("forward");
-  if (readData.string_info.at("type").str_type == "R" || readData.string_info.at("type").str_type == "FR_RF") {
-    if (!sigStringStream.str().empty()) sigStringStream << "+"; // Separator between directions if needed
-    appendElements("reverse");
+  // Logic to handle F-R type
+  if(typeInfo.str_type == "F-R") {
+    sigStrings.push_back(generateFromSigString(readData.sigstring, "F"));
+    if(readData.secondary_sigstring) {
+      sigStrings.push_back(generateFromSigString(*readData.secondary_sigstring, "R"));
+    }
+  } else {
+    // Default behavior for other types
+    sigStrings.push_back(generateFromSigString(readData.sigstring, typeInfo.str_type));
+    if(readData.secondary_sigstring) {
+      sigStrings.push_back(generateFromSigString(*readData.secondary_sigstring, typeInfo.str_type));
+    }
   }
-  // Append the final part with length and type
-  const auto& typeInfo = readData.string_info.at("type");
-  sigStringStream << "<" << typeInfo.str_length << ":" << typeInfo.str_id << ":"<< typeInfo.str_type << ">";
-  return sigStringStream.str();
+  return sigStrings;
 }
 
 void pos_scan(ReadData& readData, const PositionFuncMap& positionFuncMap, const ReadLayout& readLayout, bool verbose) {
@@ -1361,117 +1390,44 @@ void pos_scan(ReadData& readData, const PositionFuncMap& positionFuncMap, const 
       displayOrderedSigString(readData);
     }
   } else if(readType == "FR_RF"){
-    // for (auto& element : readData.sigstring) {
-    //   if (element.type == "variable" && positionFuncMap.count(element.class_id) > 0 && element.global_class != "read") {
-    //     if(verbose) {
-    //       Rcpp::Rcout << "Dealing with everything that's not a read!\n";
-    //       Rcpp::Rcout << "Working on " << element.class_id << "\n";
-    //     }
-    //     const auto& positionFuncs = positionFuncMap.at(element.class_id);
-    //     int newStartPos = positionFuncs.primaryStartFunc(readData);
-    //     if(verbose){
-    //       Rcpp::Rcout << newStartPos << "\n";
-    //     }
-    //     if(newStartPos <= 0){
-    //       if(verbose){
-    //         Rcpp::Rcout << "Triggered secondary func\n";
-    //       }
-    //       newStartPos = positionFuncs.secondaryStartFunc(readData);
-    //     }
-    //     int newStopPos = positionFuncs.primaryStopFunc(readData);
-    //     if(verbose){
-    //       Rcpp::Rcout << newStopPos << "\n";
-    //     }
-    //     if(newStopPos <= 0){ 
-    //       if(verbose){
-    //         Rcpp::Rcout << "Triggered secondary func\n";
-    //       }
-    //       newStopPos = positionFuncs.secondaryStopFunc(readData);
-    //     } 
-    //     sig_id_index.modify(sig_id_index.iterator_to(element), [newStartPos, newStopPos](SigElement& elem) {
-    //       elem.position.first = newStartPos;
-    //       elem.position.second = newStopPos;
-    //     });
-    //     if (verbose) {
-    //       Rcpp::Rcout << "Updated positions for variable class_id: " << element.class_id
-    //                   << ", New Start: " << newStartPos << ", New Stop: " << newStopPos << "\n";
-    //     }
-    //   } else {
-    //     continue;
-    //   }
-    // }
-    // for (auto& element : readData.sigstring) {
-    //   if (element.type == "variable" && positionFuncMap.count(element.class_id) > 0 && element.global_class == "read") {
-    //     if(verbose) {
-    //       Rcpp::Rcout << "Dealing with everything that's IS a read!\n";
-    //     }
-    //     const auto& positionFuncs = positionFuncMap.at(element.class_id);
-    //     int newStartPos = positionFuncs.primaryStartFunc(readData);
-    //     if(newStartPos <= 0){
-    //       newStartPos = positionFuncs.secondaryStartFunc(readData);
-    //     }
-    //     int newStopPos = positionFuncs.primaryStopFunc(readData);
-    //     if(newStopPos <= 0){ 
-    //       newStopPos = positionFuncs.secondaryStopFunc(readData);
-    //     }
-    //     sig_id_index.modify(sig_id_index.iterator_to(element), [newStartPos, newStopPos](SigElement& elem) {
-    //       elem.position.first = newStartPos;
-    //       elem.position.second = newStopPos;
-    //     });
-    //     if (verbose) {
-    //       Rcpp::Rcout << "Updated positions for the read: " << element.class_id
-    //                   << ", New Start: " << newStartPos << ", New Stop: " << newStopPos << "\n";
-    //     }
-    //   }
-    // }
-    // concat_solve_hybrid(readData, verbose);
-    concat_solve_hybrid_v2(readData, positionFuncMap, verbose);
-    // for (auto it = readData.sigstring.begin(); it != readData.sigstring.end(); ) {
-    //   // Check if element_pass has a value and if the value is true
-    //   if((it->element_pass && *(it->element_pass)) || it->type == "variable" || it->global_class == "poly_tail") {
-    //     ++it; // Keep this element, move to the next
-    //   }
-    //   else {
-    //     it = readData.sigstring.erase(it); // Erase this element
-    //   }
-    // }
-    if(verbose){
-      displayOrderedSigString(readData);
-    }
+    concat_solve_hybrid(readData, positionFuncMap, verbose);
   } else if(readType == "F_F"||readType == "R_R"){
-    std::vector<std::string> new_sigs = concat_solve_parallel(readData, verbose);
-    //for(const auto& sig: new_sigs){
-      //Rcpp::Rcout << sig << "\n";
-      //ReadData readData_new;
-      //fillSigString(readData_new, readLayout, sig, positionFuncMap, verbose);
-      //concat_scan(readData_new, verbose);
-      //pos_scan(readData_new, positionFuncMap, readLayout, verbose);
-      //break;
-    //}
+    concat_solve_parallel(readData, verbose);
   }
 }
 
-Rcpp::CharacterVector SigRun(const ReadLayout& readLayout, 
-  const std::vector<std::string>& sigstrings, const PositionFuncMap& positionFuncMap, bool verbose) {
+Rcpp::CharacterVector process_sigstrings(const ReadLayout& readLayout, 
+  const std::vector<std::string>& sigs, const PositionFuncMap& positionFuncMap, bool verbose) {
   std::vector<std::string> processed_sigstrings;
-  for (const auto& sigstring : sigstrings) {
+  for (const auto& sigstring : sigs) {
     ReadData readData;
     fillSigString(readData, readLayout, sigstring, positionFuncMap, verbose);
     concat_scan(readData, verbose);
     pos_scan(readData, positionFuncMap, readLayout, verbose);
-    std::string processed_sigstring = generateSigString(readData); // Ensure this function is implemented
-    processed_sigstrings.push_back(processed_sigstring);
+    std::vector<std::string> generated_sigstrings = generateSigString(readData);
+    for (const auto& sigstring : generated_sigstrings) {
+      processed_sigstrings.push_back(sigstring);
+    }
   }
-  return wrap(processed_sigstrings); // Convert std::vector<std::string> to Rcpp::CharacterVector
+  filter_sigstring(processed_sigstrings);
+  return wrap(processed_sigstrings);
 }
 
 // [[Rcpp::export]]
-Rcpp::CharacterVector sig_run(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, 
-  const Rcpp::StringVector& rcpp_sigstrings, bool verbose = false) {
-  ReadLayout container = prep_read_layout_cpp(read_layout, misalignment_threshold);
-  VarScan(container, verbose);
-  PositionFuncMap positionFuncMap = createPositionFunctionMap(container, verbose);
-  std::vector<std::string> sigstrings = Rcpp::as<std::vector<std::string>>(rcpp_sigstrings);
-  return SigRun(container, sigstrings, positionFuncMap, verbose); // Capture and return the result of SigRun
+Rcpp::CharacterVector sigrun(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, 
+  const Rcpp::StringVector& sigstrings, bool verbose = false) {
+  if (container.empty()){
+    if(verbose){
+      Rcpp::Rcout << "Populating the read layout container and position function maps!\n";
+    }
+    container = prep_read_layout_cpp(read_layout, misalignment_threshold);
+    VarScan(container, verbose);
+  } else {
+    if(verbose){
+      Rcpp::Rcout << "Read layout container and position function already generated!\n";
+    }
+  }
+  positionFuncMap = createPositionFunctionMap(container, verbose);
+  std::vector<std::string> sigs = Rcpp::as<std::vector<std::string>>(sigstrings);
+  return process_sigstrings(container, sigs, positionFuncMap, verbose);
 }
-
