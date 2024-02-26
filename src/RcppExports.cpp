@@ -11,17 +11,17 @@ Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
 // sigalign
-Rcpp::CharacterVector sigalign(Rcpp::CharacterVector adapters, std::vector<std::string> sequences, std::vector<std::string> ids, Rcpp::DataFrame misalignment_thresholds, int nthreads);
-RcppExport SEXP _rad_sigalign(SEXP adaptersSEXP, SEXP sequencesSEXP, SEXP idsSEXP, SEXP misalignment_thresholdsSEXP, SEXP nthreadsSEXP) {
+Rcpp::CharacterVector sigalign(Rcpp::CharacterVector adapters, std::vector<std::string> sequences, std::vector<std::string> ids, const Rcpp::DataFrame& misalignment_threshold, int nthreads);
+RcppExport SEXP _rad_sigalign(SEXP adaptersSEXP, SEXP sequencesSEXP, SEXP idsSEXP, SEXP misalignment_thresholdSEXP, SEXP nthreadsSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< Rcpp::CharacterVector >::type adapters(adaptersSEXP);
     Rcpp::traits::input_parameter< std::vector<std::string> >::type sequences(sequencesSEXP);
     Rcpp::traits::input_parameter< std::vector<std::string> >::type ids(idsSEXP);
-    Rcpp::traits::input_parameter< Rcpp::DataFrame >::type misalignment_thresholds(misalignment_thresholdsSEXP);
+    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
     Rcpp::traits::input_parameter< int >::type nthreads(nthreadsSEXP);
-    rcpp_result_gen = Rcpp::wrap(sigalign(adapters, sequences, ids, misalignment_thresholds, nthreads));
+    rcpp_result_gen = Rcpp::wrap(sigalign(adapters, sequences, ids, misalignment_threshold, nthreads));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -38,17 +38,90 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// dl_dist_rcpp
+Rcpp::IntegerVector dl_dist_rcpp(Rcpp::NumericVector src_input, Rcpp::NumericVector tgt_input, unsigned int maxDistance);
+RcppExport SEXP _rad_dl_dist_rcpp(SEXP src_inputSEXP, SEXP tgt_inputSEXP, SEXP maxDistanceSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type src_input(src_inputSEXP);
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type tgt_input(tgt_inputSEXP);
+    Rcpp::traits::input_parameter< unsigned int >::type maxDistance(maxDistanceSEXP);
+    rcpp_result_gen = Rcpp::wrap(dl_dist_rcpp(src_input, tgt_input, maxDistance));
+    return rcpp_result_gen;
+END_RCPP
+}
+// populate_whitelist
+void populate_whitelist(NumericVector barcodes, NumericVector poisson_data, NumericVector counts);
+RcppExport SEXP _rad_populate_whitelist(SEXP barcodesSEXP, SEXP poisson_dataSEXP, SEXP countsSEXP) {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< NumericVector >::type barcodes(barcodesSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type poisson_data(poisson_dataSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type counts(countsSEXP);
+    populate_whitelist(barcodes, poisson_data, counts);
+    return R_NilValue;
+END_RCPP
+}
+// wl_to_df
+Rcpp::DataFrame wl_to_df();
+RcppExport SEXP _rad_wl_to_df() {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    rcpp_result_gen = Rcpp::wrap(wl_to_df());
+    return rcpp_result_gen;
+END_RCPP
+}
+// clear_whitelist
+void clear_whitelist();
+RcppExport SEXP _rad_clear_whitelist() {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    clear_whitelist();
+    return R_NilValue;
+END_RCPP
+}
+// correct_barcodes
+Rcpp::StringVector correct_barcodes(Rcpp::NumericVector barcodes, bool verbose, int nthreads);
+RcppExport SEXP _rad_correct_barcodes(SEXP barcodesSEXP, SEXP verboseSEXP, SEXP nthreadsSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type barcodes(barcodesSEXP);
+    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
+    Rcpp::traits::input_parameter< int >::type nthreads(nthreadsSEXP);
+    rcpp_result_gen = Rcpp::wrap(correct_barcodes(barcodes, verbose, nthreads));
+    return rcpp_result_gen;
+END_RCPP
+}
+// sig_extractor
+List sig_extractor(const DataFrame& read_layout, const DataFrame& misalignment_threshold, const DataFrame& df, const CharacterVector& processed_sigstrings, bool verbose);
+RcppExport SEXP _rad_sig_extractor(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP dfSEXP, SEXP processed_sigstringsSEXP, SEXP verboseSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const DataFrame& >::type read_layout(read_layoutSEXP);
+    Rcpp::traits::input_parameter< const DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
+    Rcpp::traits::input_parameter< const DataFrame& >::type df(dfSEXP);
+    Rcpp::traits::input_parameter< const CharacterVector& >::type processed_sigstrings(processed_sigstringsSEXP);
+    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
+    rcpp_result_gen = Rcpp::wrap(sig_extractor(read_layout, misalignment_threshold, df, processed_sigstrings, verbose));
+    return rcpp_result_gen;
+END_RCPP
+}
 // sigrun
-Rcpp::CharacterVector sigrun(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, const Rcpp::StringVector& sigstrings, bool verbose);
-RcppExport SEXP _rad_sigrun(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP sigstringsSEXP, SEXP verboseSEXP) {
+Rcpp::CharacterVector sigrun(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, const Rcpp::StringVector& sigstrings, int nthreads, bool verbose);
+RcppExport SEXP _rad_sigrun(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP sigstringsSEXP, SEXP nthreadsSEXP, SEXP verboseSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
     Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
     Rcpp::traits::input_parameter< const Rcpp::StringVector& >::type sigstrings(sigstringsSEXP);
+    Rcpp::traits::input_parameter< int >::type nthreads(nthreadsSEXP);
     Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    rcpp_result_gen = Rcpp::wrap(sigrun(read_layout, misalignment_threshold, sigstrings, verbose));
+    rcpp_result_gen = Rcpp::wrap(sigrun(read_layout, misalignment_threshold, sigstrings, nthreads, verbose));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -168,6 +241,18 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// generate_recursive_mutations
+Rcpp::NumericVector generate_recursive_mutations(Rcpp::NumericVector sequences, int mutation_rounds);
+RcppExport SEXP _rad_generate_recursive_mutations(SEXP sequencesSEXP, SEXP mutation_roundsSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type sequences(sequencesSEXP);
+    Rcpp::traits::input_parameter< int >::type mutation_rounds(mutation_roundsSEXP);
+    rcpp_result_gen = Rcpp::wrap(generate_recursive_mutations(sequences, mutation_rounds));
+    return rcpp_result_gen;
+END_RCPP
+}
 // bit_substring
 Rcpp::NumericVector bit_substring(Rcpp::NumericVector bit_sequences, int start_pos, int stop_pos);
 RcppExport SEXP _rad_bit_substring(SEXP bit_sequencesSEXP, SEXP start_posSEXP, SEXP stop_posSEXP) {
@@ -199,7 +284,13 @@ END_RCPP
 static const R_CallMethodDef CallEntries[] = {
     {"_rad_sigalign", (DL_FUNC) &_rad_sigalign, 5},
     {"_rad_sigalign_stats", (DL_FUNC) &_rad_sigalign_stats, 3},
-    {"_rad_sigrun", (DL_FUNC) &_rad_sigrun, 4},
+    {"_rad_dl_dist_rcpp", (DL_FUNC) &_rad_dl_dist_rcpp, 3},
+    {"_rad_populate_whitelist", (DL_FUNC) &_rad_populate_whitelist, 3},
+    {"_rad_wl_to_df", (DL_FUNC) &_rad_wl_to_df, 0},
+    {"_rad_clear_whitelist", (DL_FUNC) &_rad_clear_whitelist, 0},
+    {"_rad_correct_barcodes", (DL_FUNC) &_rad_correct_barcodes, 3},
+    {"_rad_sig_extractor", (DL_FUNC) &_rad_sig_extractor, 5},
+    {"_rad_sigrun", (DL_FUNC) &_rad_sigrun, 5},
     {"_rad_revcomp", (DL_FUNC) &_rad_revcomp, 1},
     {"_rad_sequence_to_bits", (DL_FUNC) &_rad_sequence_to_bits, 1},
     {"_rad_sequence_to_bitlist", (DL_FUNC) &_rad_sequence_to_bitlist, 1},
@@ -210,6 +301,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_rad_revcomp_bits", (DL_FUNC) &_rad_revcomp_bits, 2},
     {"_rad_hamming_bits", (DL_FUNC) &_rad_hamming_bits, 3},
     {"_rad_generate_bit_mutations", (DL_FUNC) &_rad_generate_bit_mutations, 2},
+    {"_rad_generate_recursive_mutations", (DL_FUNC) &_rad_generate_recursive_mutations, 2},
     {"_rad_bit_substring", (DL_FUNC) &_rad_bit_substring, 3},
     {"_rad_kmer_circ", (DL_FUNC) &_rad_kmer_circ, 4},
     {NULL, NULL, 0}

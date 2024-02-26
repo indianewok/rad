@@ -1514,14 +1514,14 @@ Rcpp::CharacterVector sigalign(
   Rcpp::CharacterVector adapters,
   std::vector<std::string> sequences,
   std::vector<std::string> ids,
-  Rcpp::DataFrame misalignment_thresholds, int nthreads) {
+  const Rcpp::DataFrame& misalignment_threshold, int nthreads) {
   std::vector<std::string> queries = Rcpp::as<std::vector<std::string>>(adapters);
   std::vector<std::string> query_names = Rcpp::as<std::vector<std::string>>(adapters.names());
   std::map<int, std::string> signature_map;
   std::map<std::string, std::pair<double, double>> null_dist_map;
-  Rcpp::StringVector query_id = misalignment_thresholds["query_id"];
-  Rcpp::NumericVector misal_threshold = misalignment_thresholds["misal_threshold"];
-  Rcpp::NumericVector misal_sd = misalignment_thresholds["misal_sd"];
+  Rcpp::StringVector query_id = misalignment_threshold["query_id"];
+  Rcpp::NumericVector misal_threshold = misalignment_threshold["misal_threshold"];
+  Rcpp::NumericVector misal_sd = misalignment_threshold["misal_sd"];
   for(int i = 0; i < query_id.size(); ++i) {
     null_dist_map[Rcpp::as<std::string>(query_id[i])] = std::make_pair((double) misal_threshold[i], (double) misal_sd[i]);
   }
@@ -1541,7 +1541,7 @@ Rcpp::CharacterVector sigalign(
       if (query_name == "poly_a" || query_name == "poly_t") {
         // Handle the regex query here.
         char poly_base = (query_name == "poly_a") ? 'A' : 'T';
-        std::string match_str = findPolyTail(sequence, poly_base, 16, 12);  // assuming window_size = 12 and min_count = 16
+        std::string match_str = findPolyTail(sequence, poly_base, 14, 12);  // assuming window_size = 16 and min_count = 12
         if (!match_str.empty()){
 #pragma omp critical
 {

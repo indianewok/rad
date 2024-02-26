@@ -4,12 +4,16 @@
 //but it's mainly because I've never used a header file before so I don't even know which ones of these i can drop yet.
 // [[Rcpp::plugins(openmp)]]  // Enable OpenMP in Rcpp
 #include <Rcpp.h>
+#include <boost/regex.hpp>
 #include <boost/multi_index_container.hpp>
 #include <boost/multi_index/ordered_index.hpp>
 #include <boost/multi_index/member.hpp>
 #include <boost/multi_index/sequenced_index.hpp>
 #include <boost/optional.hpp>
 #include <boost/optional/optional_io.hpp>
+#include <boost/bimap.hpp>
+#include <boost/optional.hpp>
+#include <boost/bimap/unordered_set_of.hpp>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -31,6 +35,7 @@
 #include <regex>
 #include <numeric>
 #include <cmath>
+#include <iostream>
 
 //structs for alignment tools
 struct UniqueAlignment {
@@ -55,6 +60,7 @@ struct AlignmentInfo {
 };
 
 // Define tags for multi-indexing
+
 struct id_tag {};
 struct length_tag {};
 struct type_tag {};
@@ -119,7 +125,7 @@ struct SigElement {
   int order;
   std::string direction;
   boost::optional<bool> element_pass;
-  boost::optional<std::vector<int64_t>> seq;
+  boost::optional<std::string> seq;
   
   SigElement(
     std::string class_id,
@@ -129,7 +135,8 @@ struct SigElement {
     std::string type,
     int order,
     std::string direction,
-    boost::optional<bool> element_pass = boost::none
+    boost::optional<bool> element_pass = boost::none,
+    boost::optional<std::string> seq = boost::none
   ) : class_id(std::move(class_id)),
   global_class(std::move(global_class)),
   edit_distance(edit_distance),
@@ -199,10 +206,29 @@ struct PositionCalcFunc {
   std::function<int(const ReadData&)> secondaryStopFunc;
 };
 
-using PositionFuncMap = std::unordered_map<std::string, PositionCalcFunc>;
+struct barcode_data {
+  boost::optional<int> count;
+  boost::optional<double> poisson_score; // Now using a double directly
+};
 
-extern PositionFuncMap positionFuncMap;
+struct NanoRead {
+  std::string qual;
+  std::string seq;
+};
+
+using whitelist = std::unordered_map<int64_t, barcode_data>;
+extern whitelist wl;
+
+using PositionFuncMap = std::unordered_map<std::string, PositionCalcFunc>;
+//extern PositionFuncMap positionFuncMap;
+
 extern ReadLayout container;
+
+struct dictionary{
+  unsigned int key;
+  unsigned int value;
+  struct dictionary* next;
+};
 
 //now defining the shared sequence manipulation functions
 
@@ -250,5 +276,7 @@ std::vector<int64_t> extract_subsequence_cpp(const std::vector<int64_t>& input, 
 std::string to_binary_string(int64_t value, int total_length);
 
 std::vector<int64_t> kmer_circ_cpp(int64_t sequence, int base_length, int kmerLength, bool verbose);
+
+std::vector<unsigned int> bits_to_uint_cpp(const std::vector<int64_t>& input, int sequence_length);
 
 #endif

@@ -142,6 +142,23 @@ std::string bits_to_sequence_cpp(const std::vector<int64_t>& input, int sequence
   return final_sequence;
 }
 
+std::vector<unsigned int> bits_to_uint_cpp(const std::vector<int64_t>& input, int sequence_length) {
+  int n = input.size();
+  std::vector<unsigned int> final_sequence;
+  int chunk_size = 32; // Assuming 32 bases per int64_t value
+  for (int i = 0; i < n; ++i) {
+    int64_t int64_code = input[i];
+    int bases_to_decode = (i < n - 1) ? chunk_size : sequence_length % chunk_size;
+    bases_to_decode = (bases_to_decode == 0) ? chunk_size : bases_to_decode;
+    for (int j = 0; j < bases_to_decode; ++j) {
+      unsigned int base = int64_code & 3; // Extract the last two bits
+      final_sequence.push_back(base); // Add the base as an unsigned int to the sequence
+      int64_code >>= 2; // Move to the next base
+    }
+  }
+  return final_sequence;
+}
+
 // [[Rcpp::export]]
 Rcpp::StringVector bits_to_sequence(Rcpp::NumericVector input, Rcpp::IntegerVector sequence_length = 16) {
   // Convert the entire NumericVector to std::vector<int64_t>
@@ -151,8 +168,6 @@ Rcpp::StringVector bits_to_sequence(Rcpp::NumericVector input, Rcpp::IntegerVect
   int seq_length = use_sl ? sequence_length[0] : 0; // Use this if only one length is provided
   Rcpp::StringVector final_sequences(n);
   for (int i = 0; i < n; ++i) {
-    // Since each input is a single int64 representing a barcode or sequence,
-    // we use a vector with a single element for bits_to_sequence_cpp.
     std::vector<int64_t> bits_input = {cpp_input_list[i]}; // Single element vector
     int seqlength = use_sl ? seq_length : sequence_length[i]; // Use the single length or individual lengths
     // Process the single sequence
@@ -302,16 +317,27 @@ Rcpp::NumericVector generate_bit_mutations(Rcpp::NumericVector sequences, Intege
 }
 
 std::vector<int64_t> generate_recursive_mutations_cpp(int64_t sequence, int mutation_rounds) {
-  std::unordered_set<int64_t> mutations {sequence};
+  std::unordered_set<int64_t> mutations{sequence};
+  std::unordered_set<int64_t> new_mutations;
   for (int round = 0; round < mutation_rounds; ++round) {
-    std::unordered_set<int64_t> new_mutations;
     for (const auto& seq : mutations) {
       std::vector<int64_t> current_mutations = generate_bit_mutations_cpp(seq, 16);
       new_mutations.insert(current_mutations.begin(), current_mutations.end());
     }
     mutations.insert(new_mutations.begin(), new_mutations.end());
   }
+  mutations.erase(sequence);
   return std::vector<int64_t>(mutations.begin(), mutations.end());
+}
+// [[Rcpp::export]]
+Rcpp::NumericVector generate_recursive_mutations(Rcpp::NumericVector sequences, int mutation_rounds = 2) {
+  std::vector<int64_t> cpp_input_list = Rcpp::as<std::vector<int64_t>>(sequences);
+  std::vector<int64_t> results;
+  for (int64_t bits_input : cpp_input_list) {
+    std::vector<int64_t> subresult = generate_recursive_mutations_cpp(bits_input, mutation_rounds); 
+    results.insert(results.end(), subresult.begin(), subresult.end());
+  }
+  return Rcpp::wrap(results);
 }
 
 std::vector<int64_t> extract_subsequence_cpp(const std::vector<int64_t>& input, int start_pos, int stop_pos) {

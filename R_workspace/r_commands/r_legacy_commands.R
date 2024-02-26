@@ -161,7 +161,7 @@ whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
 #   }
 # }
 #' @export
-fastqa_writer<-function(df, fn, type, append = FALSE){
+write_fastqas<-function(df, fn, type, append = FALSE){
   if(type == "fq"){
     fq_list<-df %>%
       dplyr::mutate(dummy = "+") %>%
@@ -442,3 +442,50 @@ for (col in names(df)) {
 }
 return(df)
 }
+
+setkey(df, "id")
+str_extract(processed_sigstrings[1], pattern = "barcode:0:\\d+.?.:\\d+.?.?(?=\\|)") %>% str_split(., pattern = ":")
+str_extract(processed_sigstrings[1], pattern = "<.+?.>") %>% str_split(., pattern = ":")
+
+str_extract(processed_sigstrings[7], pattern = "<.+?.>") %>% str_split(., pattern = ":") %>% {.[[1]][2]}
+
+barcode_extractor<-function(processed_sigstring){
+  barcode_coords<-str_extract(processed_sigstring, 
+    pattern = "barcode:0:\\d+.?.:\\d+.?.?(?=\\|)") %>% 
+    str_split(., pattern = ":") %>%
+    {.[[1]][3:4]}
+  id<-str_extract(processed_sigstring, pattern = "<.+?.>") %>% 
+    str_split(., pattern = ":") %>% {.[[1]][2]} %>% 
+    {ifelse(test = grep(pattern = "+", x = .), 
+    yes = str_remove(., pattern = "\\+.+.?$"), no = "")}
+  barcode = substr(df[id, "seq"], start = barcode_coords[1], stop = barcode_coords[2]) 
+  barcode<-ifelse(test = grepl(pattern = ":R>$", x = processed_sigstring), yes =revcomp(barcode), no = barcode)
+  return(barcode)
+}
+
+extract_barcodes<-function(processed_sigstrings){
+  out<-vector(mode = "list", length = length(processed_sigstrings))
+  out<-lapply(processed_sigstrings, FUN = function(x){barcode_extractor(x)})
+  return(out)
+}
+
+extract_components_dt <- function(dt, sig_col_name, components, id_col_name = "id") {
+  pattern <- sprintf("(%s):0:(\\d+):(\\d+)(?=\\|)", paste(components, collapse = "|"))
+  dt[, (components) := lapply(components, function(component) {
+    matches <- stringi::stri_match_all_regex(get(sig_col_name), pattern)[[1]]
+    sapply(1:nrow(matches), function(i) {
+      comp_match <- matches[i, , drop = FALSE]
+      if (comp_match[1, 1] == component) {
+        start <- as.integer(comp_match[1, 3])
+        end <- as.integer(comp_match[1, 4])
+        seq <- dt[get(id_col_name) == id, seq]
+        if (!is.null(seq) && start > 0 && end <= nchar(seq)) {
+          return(substring(seq, start, end))
+        }
+      }
+      return(NA_character_)
+    })
+  }), by = .(id_col_name)]
+}
+
+processed_sigstrings

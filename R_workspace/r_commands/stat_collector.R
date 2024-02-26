@@ -1,6 +1,6 @@
 stat_collector<-function(df, read_layout, mode = "stats"){
-  forward_adapters<-read_layout[type %in% c("static") & direction == "forward" & class != "poly_tail", class_id]
-  reverse_adapters<-read_layout[type %in% c("static") & direction == "reverse" & class != "poly_tail", class_id]
+  forward_adapters<-read_layout[type %in% c("static") & direction == "forward" & class != "poly_tail", .(class_id)]
+  reverse_adapters<-read_layout[type %in% c("static") & direction == "reverse" & class != "poly_tail", .(class_id)]
   df<-tidytable::as_tidytable(df)
   forward_zero_ids<-df %>%
     tidytable::filter(query_id %in% forward_adapters) %>%

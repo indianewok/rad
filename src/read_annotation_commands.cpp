@@ -122,39 +122,7 @@ void parse_static_left(const ReadLayout& readLayout, const std::vector<int>& seg
                 if(NextElem->type == "static"){
                   secondaryStart = NextElem->class_id + "|start-" + std::to_string(*NextElem->expected_length);
                   secondaryStop = NextElem->class_id + "|start-1";
-                }
-              // Assuming it_var is initialized correctly before this loop
-              // while (it_var->order < read_order + 1) {
-              //    auto NextElem = readLayout.get<order_tag>().find(it_var->order+1);
-              //   if (verbose) {
-              //     Rcpp::Rcout << "In the while loop!\n";
-              //     Rcpp::Rcout << "Current class_id is " << it_var->class_id << "\n";
-              //     Rcpp::Rcout << "Current order is " << it_var->order << "\n";
-              //     Rcpp::Rcout << "Read order is " << read_order + 1 << "\n";
-              //     Rcpp::Rcout << "Next class_id is " << NextElem->class_id << "\n";
-              //   }
-              //   if (NextElem->type == "static") {
-              //     int sum_lengths = 0;
-              //     auto tempIt = it_var;
-              //     while (tempIt->order <= NextElem->order) {
-              //       --tempIt; // Move backwards
-              //       if (tempIt->type == "static" && tempIt->expected_length) {
-              //         sum_lengths += *tempIt->expected_length;
-              //       }
-              //     }
-              //     std::string secondaryStart;
-              //     std::string secondaryStop;
-              //     if (NextElem->expected_length) {
-              //       secondaryStart = NextElem->class_id + "|start-" + std::to_string(sum_lengths + 1); 
-              //       secondaryStop = NextElem->class_id + "|start-1";
-              //     }
-              //     if (verbose) {
-              //       Rcpp::Rcout << "Secondary Start: " << secondaryStart << ", Secondary Stop: " << secondaryStop << "\n";
-              //     }
-              //   }
-              //   ++it_var; // Always proceed to the next element to avoid infinite loop
-              // }
-                 else {
+                } else {
                 secondaryStart = std::get<0>(prevAssigned) + "|chained_start";
                 secondaryStop = std::get<2>(prevAssigned) + "|chained_stop";
               }
@@ -167,9 +135,10 @@ void parse_static_left(const ReadLayout& readLayout, const std::vector<int>& seg
                   secondaryStart = secondaryStart + "|chained_start";
                   }
                 } else {
-              secondaryStart = prevElem->class_id + "|none|left_terminal_linked";
+              secondaryStart = prevElem->class_id + "|start+1|left_terminal_linked";
                   }
-              secondaryStop = prevElem->class_id + "|none|left_terminal_linked";
+                int offset_result = (*it_var->expected_length + 1);
+              secondaryStop = prevElem->class_id + "|stop+" + std::to_string(offset_result) + "|left_terminal_linked";
             }
           } else {
             if (prevType == "variable" && assignedPositions.find(prevElem->class_id) != assignedPositions.end()) {
@@ -185,7 +154,7 @@ void parse_static_left(const ReadLayout& readLayout, const std::vector<int>& seg
                   secondaryStart = secondaryStart + "|chained_start";
                 }
               } else {
-                secondaryStart = prevElem->class_id + "|none|left_terminal_linked";
+                secondaryStart = prevElem->class_id + "|start+1|left_terminal_linked";
               }
               auto nextElem = readLayout.get<order_tag>().find(it_var->order + 1);
               if(nextElem->global_class == "poly_tail"){
@@ -193,7 +162,7 @@ void parse_static_left(const ReadLayout& readLayout, const std::vector<int>& seg
                 // move one over from the poly tail if there is one
                 secondaryStop = skipElem->class_id+"|start-1|poly_skipped";
               } else {
-                secondaryStop = prevElem->class_id + "|none|left_terminal_linked";
+                secondaryStop = nextElem->class_id + "|start-1|left_terminal_linked";
               }
             }
           }
@@ -285,13 +254,14 @@ void parse_static_right(const ReadLayout& readLayout, const std::vector<int>& se
                 secondaryStop = std::get<2>(nextAssigned) + "|chained_stop";
               }
             } else if (nextType == "static") {
-              secondaryStart = nextElem->class_id + "|none|right_terminal_linked";
+              secondaryStart = nextElem->class_id + "|start+1|right_terminal_linked";
               if(*nextElem->expected_length < 15 && nextElem->global_class != "poly_tail"){
                 auto post_nextElem = readLayout.get<order_tag>().find(it_var->order + 2);
                 int offset_result = (*it_var->expected_length + 1);
                 secondaryStop = post_nextElem->class_id + "|stop+" + std::to_string(offset_result);
               } else {
-                secondaryStop = nextElem->class_id + "|none|right_terminal_linked";
+                int offset_result = (*it_var->expected_length + 1);
+                secondaryStop = nextElem->class_id + "|stop+" + std::to_string(offset_result) + "|right_terminal_linked";
               }
             }
           } else {
@@ -318,7 +288,7 @@ void parse_static_right(const ReadLayout& readLayout, const std::vector<int>& se
                   int offset_result = (*it_var->expected_length + 1);
                   secondaryStart = pre_prevElem->class_id + "|stop+" + std::to_string(offset_result);
                   } else {
-                    secondaryStart = prevElem->class_id + "|none|left_terminal_linked";
+                    secondaryStart = prevElem->class_id + "|start+1|left_terminal_linked";
                   }
               }
               auto nextElem = readLayout.get<order_tag>().find(it_var->order + 1);
@@ -331,7 +301,7 @@ void parse_static_right(const ReadLayout& readLayout, const std::vector<int>& se
                   int offset_result = (*it_var->expected_length + 1);
                   secondaryStop = post_nextElem->class_id + "|stop+" + std::to_string(offset_result);
                   } else {
-                    secondaryStop = nextElem->class_id + "|none|right_terminal_linked";
+                    secondaryStop = nextElem->class_id + "|stop|right_terminal_linked";
                 }
               }
             }
@@ -490,7 +460,7 @@ void concat_scan(ReadData& readData, bool verbose) {
   }
 }
 
-// Main function to filter sigstrings
+// Main function to filter sigstrings--TODO ADD FLAGS FOR FILTERING
 std::vector<std::string> split(const std::string &s, char delimiter) {
 std::vector<std::string> tokens;
 std::string token;
@@ -502,27 +472,35 @@ return tokens;
 }
 void filter_sigstring(std::vector<std::string>& sigstrings) {
   std::regex readPattern(R"((read|rc_read):(\d+):(\d+):(\d+))");
-  std::regex barcodePattern(R"(barcode:(\d+):(\d+):(\d+))");
+  std::regex barcodePattern(R"((barcode|rc_barcode):(\d+):(\d+):(\d+))");
   std::smatch matches;
-  
   for (auto& sigstring : sigstrings) {
     bool hasRead = false, hasBarcode = false, isValid = true;
-    
-    auto elements = split(sigstring, '|');
+    auto elements = split(sigstring, '|'); // Assuming you have a split function defined
     for (const auto& element : elements) {
       if (std::regex_search(element, matches, readPattern)) {
+        
         int startPos = std::stoi(matches.str(3));
         int stopPos = std::stoi(matches.str(4));
-        if ((stopPos - startPos) <= 0 || (stopPos - startPos) < 150) {
+        //Rcpp::Rcout << "Caught at this filter because I think that " << stopPos << " is this and " << startPos << " is this!\n";
+        if ((stopPos - startPos) <= 0 || (stopPos - startPos) < 100) {
           isValid = false;
           break;
         }
         hasRead = true;
       } else if (std::regex_search(element, matches, barcodePattern)) {
+        int startPos = std::stoi(matches.str(3));
+        int stopPos = std::stoi(matches.str(4));
+        // Check barcode length
+        if ((stopPos - startPos + 1) < 16) {
+          //Rcpp::Rcout << "Caught at this filter because I think that " << stopPos << " is this and " << startPos << " is this!\n";
+          
+          isValid = false;
+         break;
+        }
         hasBarcode = true;
       }
     }
-    
     if (!isValid || !(hasRead && hasBarcode)) {
       size_t endMetaPos = sigstring.rfind('>');
       if (endMetaPos != std::string::npos) {
@@ -569,16 +547,18 @@ PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool ver
                     std::string offsetStr = operation.substr(operation.find_first_of("+-"));
                     offset = std::stoi(offsetStr);
                 }
-      return [varElemClassId, refClassId, offset, additionalInfo, &isPrimary, 
+      return [varElemClassId, refClassId, offset, additionalInfo, isPrimary, 
         operation, verbose](const ReadData& readData) -> int {
-                    if (verbose) {
-                        Rcpp::Rcout << "Made it into the lambda function!\n";
-                    }
-
                     const auto& id_index = readData.sigstring.get<sig_id_tag>();
                     const auto& order_index = readData.sigstring.get<sig_order_tag>();
                     auto refClass = id_index.find(refClassId);
                     auto it = id_index.equal_range(refClassId).first;
+                    if (verbose) {
+                      Rcpp::Rcout << "Made it into the lambda function!\n";
+                      Rcpp::Rcout << refClass->type << " is the type of the element.\n";
+                      std::string result = isPrimary ? "Primary" : "Secondary";
+                      Rcpp::Rcout << "The position is flagged as a " << result << "\n";
+                    }
                     if (it != id_index.end() && 
                         ((refClass->type == "static" && refClass->element_pass && *refClass->element_pass) || 
                         (refClass->type == "variable") || (refClass->global_class == "poly_tail"))) {
@@ -600,7 +580,7 @@ PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool ver
                         
                         return calculatedPos;
                         
-                    } else if (!isPrimary && !additionalInfo.empty()) {
+                    }else if (!isPrimary && !additionalInfo.empty()) {
                       std::string readType = readData.string_info.at("type").str_type;
                       auto varClass = id_index.find(varElemClassId);
                       if(verbose){
@@ -624,8 +604,15 @@ PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool ver
                           int sequence_length = prevClass->position.second - prevClass->position.first + 1;
                           rel_edit_failure = static_cast<int>((1.0 - (edit_distance / sequence_length)) * 100);                                         
                           if(rel_edit_failure >= 70 && verbose){
-                            int new_terminal_pos = prevClass->position.second +1;
+                            int new_terminal_pos;
+                            if(operation == "start"){
+                              new_terminal_pos = prevClass->position.second +1;
+                            } else {
+                              new_terminal_pos = prevClass->position.second + offset;
+                            }
                           if(readData.string_info.at("type").str_type == "F" || readData.string_info.at("type").str_type == "R"){
+                              Rcpp::Rcout << operation << " is the operation!\n";
+                              Rcpp::Rcout << offset << " is the offset!\n";
                               Rcpp::Rcout << rel_pos_failure << " is the percent delta between EOS and the SNE!\n";
                               Rcpp::Rcout << rel_edit_failure << " is the percent error of the next element!\n";
                               Rcpp::Rcout << prevClass->edit_distance << " is the edit distance of the previous ordered element!\n";
@@ -749,11 +736,17 @@ void concat_solve_hybrid(ReadData& readData, const PositionFuncMap& positionFunc
         newStartPos = positionFuncs.secondaryStartFunc(readData);
       }
       int newStopPos = positionFuncs.primaryStopFunc(readData);
-      if(newStopPos <= 0){
-        newStopPos = positionFuncs.secondaryStopFunc(readData);
+       if(newStopPos <= 0){
+         newStopPos = positionFuncs.secondaryStopFunc(readData);
       }
       if(newStartPos == -1 || newStopPos == -1){
         auto prevClass = readData.sigstring.get<sig_order_tag>().find(element.order - 1);
+        if(prevClass->global_class == "poly_tail"){
+          if(verbose){
+            Rcpp::Rcout << "The previous class in the order was a poly-tail. Skipping back one even farther...\n";
+          }
+           prevClass = readData.sigstring.get<sig_order_tag>().find(element.order -2);
+        }
         if(verbose) {
           Rcpp::Rcout << "The previous class in order is " << prevClass->class_id << "\n";
           Rcpp::Rcout << "Now moving to the second pass...\n";
@@ -869,8 +862,15 @@ void concat_solve_hybrid(ReadData& readData, const PositionFuncMap& positionFunc
         newStopPos = positionFuncs.secondaryStopFunc(readData);
       }
       //once for left_terminal linkages...and one for right.......yeah dude just copy paste code if it works the first time it's gotta work the n'th time amirite you moron
-      if(newStartPos == -1 || newStopPos == -1){
+      if (newStartPos == -1 || newStopPos == -1){
         auto prevClass = readData.sigstring.get<sig_order_tag>().find(element.order - 1);
+        if(prevClass->global_class == "poly_tail"||(prevClass->global_class == "other" && (prevClass->position.second- prevClass->position.first < 15))){
+          if(verbose){
+            Rcpp::Rcout << "The previous class in the order was a poly-tail, or too short. Skipping back one even farther...\n";
+          }
+          prevClass = readData.sigstring.get<sig_order_tag>().find(element.order -2);
+        }
+        
         if(verbose) {
           Rcpp::Rcout << "The previous class in order is " << prevClass->class_id << "\n";
           Rcpp::Rcout << "Now moving to the second pass...\n";
@@ -899,11 +899,34 @@ void concat_solve_hybrid(ReadData& readData, const PositionFuncMap& positionFunc
         if(newStopPos <= 0){
           newStopPos = positionFuncs.secondaryStopFunc(readData);
         }
-        
+        if(newStopPos <= 0){
+          if(verbose){
+            Rcpp::Rcout << "Something's weird here. New Stop Pos is " << newStopPos << "\n";
+          }
+          if(newStopPos == -1){
+            if(verbose){
+              Rcpp::Rcout << "New Stop Pos is -1, meaning the right bound of the object still hasn't been set.\n";
+            }
+            auto nextClass = readData.sigstring.get<sig_order_tag>().find(element.order + 2);
+            if(nextClass->global_class == "poly_tail"||nextClass->global_class == "rev_primer"||(nextClass->global_class == "other" && 
+              (nextClass->position.second - nextClass->position.first < 15))){
+              if(verbose){
+                Rcpp::Rcout << "The next class in the order was extraneous or short. Skipping one even farther...\n";
+              }
+              nextClass = readData.sigstring.get<sig_order_tag>().find(element.order  + 3);
+          }
+            if(verbose){
+              Rcpp::Rcout << "Last-ditch effort to save this one...\n";
+              Rcpp::Rcout << "Your final hope rests on " << nextClass->class_id << "\n";
+              Rcpp::Rcout << "Your final hope rests on the position" << nextClass->position.first << "\n";
+            }
+          newStopPos = nextClass->position.first-1;
+        }
         sig_id_index.modify(sig_id_index.iterator_to(element), [newStartPos, newStopPos](SigElement& elem) {
           elem.position.first = newStartPos;
           elem.position.second = newStopPos;
         });
+        }
         
         if(verbose){
           Rcpp::Rcout << "New pretend start pos: " << newStartPos << " to " << newStopPos << "\n";
@@ -916,11 +939,18 @@ void concat_solve_hybrid(ReadData& readData, const PositionFuncMap& positionFunc
         if (verbose) {
           Rcpp::Rcout << "Updated positions for variable class_id: " << element.class_id
                       << ", New Start: " << newStartPos << ", New Stop: " << newStopPos << "\n";
-        }} else
-      if(newStartPos == -2 || newStopPos == -2){
+        }
+      } else
+      if (newStartPos == -2 || newStopPos == -2){
             auto nextClass = readData.sigstring.get<sig_order_tag>().find(element.order + 1);
+        if(nextClass->global_class == "poly_tail"||(nextClass->global_class == "other" && (nextClass->position.second - nextClass->position.first < 15))){
+          if(verbose){
+            Rcpp::Rcout << "The next class in the order was extraneous or short. Skipping one even farther...\n";
+          }
+          nextClass = readData.sigstring.get<sig_order_tag>().find(element.order  +2);
+        }
             if(verbose) {
-              Rcpp::Rcout << "The previous class in order is " << nextClass->class_id << "\n";
+              Rcpp::Rcout << "The next class in order is " << nextClass->class_id << "\n";
               Rcpp::Rcout << "Now making the second pass...\n";
             }
             auto& sig_id_index = readData.sigstring.get<sig_id_tag>();
@@ -1181,6 +1211,116 @@ void fillSigString(ReadData& readData, const ReadLayout& readLayout,
   }
 }
 
+using df_map = std::unordered_map<std::string, NanoRead>;
+void df_to_unordered_map(const Rcpp::DataFrame& df, df_map& map) {
+  Rcpp::StringVector ids = df["id"];
+  Rcpp::StringVector quals = df["qual"];
+  Rcpp::StringVector seqs = df["seq"];
+  
+  for(int i = 0; i < ids.size(); ++i) {
+    std::string id = Rcpp::as<std::string>(ids[i]);
+    std::string qual = Rcpp::as<std::string>(quals[i]);
+    std::string seq = Rcpp::as<std::string>(seqs[i]);
+    map[id] = {qual, seq};
+  }
+}
+
+List sig_extraction(const ReadLayout& readLayout, const std::vector<std::string>& sigstrings, 
+  Rcpp::DataFrame df, bool verbose) {
+  df_map idMap;
+  df_to_unordered_map(df, idMap);
+  
+  std::vector<std::string> ids;
+  std::map<std::string, std::vector<std::string>> columns;
+  
+  for (int i = 0; i < sigstrings.size(); ++i) {
+    ReadData readData;
+    std::string signature = sigstrings[i];
+    ids.push_back(signature);
+  auto read_info_pos = signature.find_last_of('<');
+  std::string lengthTypeStr = signature.substr(read_info_pos + 1, signature.length() - read_info_pos - 2);
+  std::stringstream lengthTypeStream(lengthTypeStr);
+  std::string lengthStr, read_id, type;
+  std::getline(lengthTypeStream, lengthStr, ':');
+  std::getline(lengthTypeStream, read_id, ':');
+  std::getline(lengthTypeStream, type);
+  int length = std::stoi(lengthStr);
+  size_t plusPos = read_id.find("+FR_RF");
+  if (plusPos != std::string::npos) {
+    read_id = read_id.substr(0, plusPos);
+  }
+  readData.addStringInfo("type", length, read_id, type);
+  SigString* targetSigString = &readData.sigstring;
+  std::stringstream ss(signature);
+  std::string token;
+  // Process each token (element) in signature
+  while (std::getline(ss, token, '|')) {
+    std::string id;
+    int editDistance, startPos, endPos;
+    std::stringstream tokenStream(token);
+    
+    std::getline(tokenStream, id, ':');
+    tokenStream >> editDistance;
+    tokenStream.ignore(1); // Ignore the colon
+    tokenStream >> startPos;
+    tokenStream.ignore(1); // Ignore the colon
+    tokenStream >> endPos;
+
+    // Check if element_id is of type "variable" in readLayout
+    auto& class_id_index = readLayout.get<id_tag>();
+    auto it = class_id_index.find(id);
+    if(it->type == "variable") {
+      // Found a variable type element
+      boost::optional<std::string> final_seq;
+      std::string extracted_seq;
+      if (idMap.find(read_id) != idMap.end()) {
+        const auto& qualSeq = idMap[read_id];
+        if (startPos > 0 && endPos >= startPos && (qualSeq.seq.length() > endPos)) {
+          extracted_seq = qualSeq.seq.substr(startPos - 1, endPos - startPos + 1); // Corrected substring extraction
+          if (it->direction != "forward"){
+            extracted_seq = revcomp_cpp(extracted_seq);
+          }
+        }
+        final_seq = extracted_seq;
+      }
+      SigElement element(
+          id,
+          it->global_class,
+          editDistance,
+          std::make_pair(startPos, endPos),
+          it->type,
+          it->order,
+          it->direction,
+          boost::none,
+          final_seq
+      );
+      targetSigString->insert(std::move(element));
+      // Verbose output
+    }
+  }
+  for (const auto& element : readData.sigstring) {
+    if (element.type == "variable" && element.seq) {
+      columns[element.global_class].push_back(*element.seq);
+      }
+    }
+  }
+  List data(columns.size() + 1); // +1 for the ID column
+  CharacterVector colNames(columns.size() + 1);
+  colNames[0] = "sig_id";
+  data[0] = wrap(ids);
+  if(verbose){
+    Rcpp::Rcout << "Making it to after wrapping the ids!\n";
+  }
+  int colIndex = 1;
+  for (const auto& col : columns) {
+    colNames[colIndex] = col.first; // global_class as column name
+    data[colIndex] = wrap(col.second); // Associated sequences
+    ++colIndex;
+  }
+  data.attr("names") = colNames;
+  return data;
+}
+
 //displaying a sigstring
 void displayOrderedSigString(const ReadData& readData) {
   auto printOrderedDirection = [&](const std::string& direction) {
@@ -1226,42 +1366,6 @@ void displayOrderedSigString(const ReadData& readData) {
     printOrderedDirection("reverse");
   }
 }
-
-// std::string generateSigString(const ReadData& readData) {
-//   const auto& typeInfo = readData.string_info.at("type");
-//   if(typeInfo.str_type == "F_F"||typeInfo.str_type == "R_R"){
-//     std::string parallel = typeInfo.str_ext;
-//     return parallel + "<" + typeInfo.str_type + ">";
-//   }
-//   std::stringstream sigStringStream;
-//   // Function to append elements to the string stream based on direction
-//   auto appendElements = [&](const std::string& direction) {
-//     std::vector<SigElement> sorted_elements;
-//     auto& dir_index = readData.sigstring.get<sig_dir_tag>();
-//     auto dir_range = dir_index.equal_range(direction);
-//     for (auto it = dir_range.first; it != dir_range.second; ++it) {
-//       if (it->position.first <= 0 || it->position.second <= 0) continue; // Skip uninitialized elements
-//       sorted_elements.push_back(*it);
-//     }
-//     std::sort(sorted_elements.begin(), sorted_elements.end(),
-//       [](const SigElement& a, const SigElement& b) { return a.order < b.order; });
-//     for (size_t i = 0; i < sorted_elements.size(); ++i) {
-//       const auto& element = sorted_elements[i];
-//       if (i > 0) sigStringStream << "|";
-//       sigStringStream << element.class_id << ":" << element.edit_distance.value_or(0)
-//                       << ":" << element.position.first << ":" << element.position.second;
-//     }
-//   };
-//   // Process both forward and reverse elements
-//   appendElements("forward");
-//   if (readData.string_info.at("type").str_type == "R" || readData.string_info.at("type").str_type == "FR_RF") {
-//     if (!sigStringStream.str().empty()) sigStringStream << "+"; // Separator between directions if needed
-//     appendElements("reverse");
-//   }
-//   // Append the final part with length and type
-//   sigStringStream << "<" << typeInfo.str_length << ":" << typeInfo.str_id << ":"<< typeInfo.str_type << ">";
-//   return sigStringStream.str();
-// }
 
 std::vector<std::string> generateSigString(ReadData& readData) {  // Note: passing readData by non-const reference
   std::vector<std::string> sigStrings; // Vector to hold one or two sigstrings
@@ -1311,7 +1415,8 @@ std::vector<std::string> generateSigString(ReadData& readData) {  // Note: passi
   return sigStrings;
 }
 
-void pos_scan(ReadData& readData, const PositionFuncMap& positionFuncMap, const ReadLayout& readLayout, bool verbose) {
+void pos_scan(ReadData& readData, const PositionFuncMap& positionFuncMap, const ReadLayout& readLayout, 
+  bool verbose) {
   std::string readType = readData.string_info["type"].str_type;
   auto& sig_id_index = readData.sigstring.get<sig_id_tag>();
   if(readType == "F" || readType == "R"){
@@ -1397,37 +1502,47 @@ void pos_scan(ReadData& readData, const PositionFuncMap& positionFuncMap, const 
 }
 
 Rcpp::CharacterVector process_sigstrings(const ReadLayout& readLayout, 
-  const std::vector<std::string>& sigs, const PositionFuncMap& positionFuncMap, bool verbose) {
+  const std::vector<std::string>& sigs, const PositionFuncMap& positionFuncMap, bool verbose, int nthreads = 1) {
+  omp_set_num_threads(nthreads);
   std::vector<std::string> processed_sigstrings;
-  for (const auto& sigstring : sigs) {
-    ReadData readData;
-    fillSigString(readData, readLayout, sigstring, positionFuncMap, verbose);
-    concat_scan(readData, verbose);
-    pos_scan(readData, positionFuncMap, readLayout, verbose);
-    std::vector<std::string> generated_sigstrings = generateSigString(readData);
-    for (const auto& sigstring : generated_sigstrings) {
-      processed_sigstrings.push_back(sigstring);
+  #pragma omp parallel
+  {
+    std::vector<std::string> local_processed_sigstrings;
+    #pragma omp for nowait
+    for (int i = 0; i < sigs.size(); ++i) {
+      const auto& sigstring = sigs[i];
+      ReadData readData;
+      fillSigString(readData, readLayout, sigstring, positionFuncMap, verbose);
+      concat_scan(readData, verbose);
+      pos_scan(readData, positionFuncMap, readLayout, verbose);
+      std::vector<std::string> generated_sigstrings = generateSigString(readData);
+      filter_sigstring(generated_sigstrings);
+      local_processed_sigstrings.insert(local_processed_sigstrings.end(), 
+        generated_sigstrings.begin(), 
+        generated_sigstrings.end());
     }
+    #pragma omp critical
+      processed_sigstrings.insert(processed_sigstrings.end(), local_processed_sigstrings.begin(), local_processed_sigstrings.end());
   }
-  filter_sigstring(processed_sigstrings);
   return wrap(processed_sigstrings);
 }
 
 // [[Rcpp::export]]
+List sig_extractor(const DataFrame& read_layout, const DataFrame& misalignment_threshold,
+  const DataFrame& df, const CharacterVector& processed_sigstrings, bool verbose) {
+  ReadLayout container = prep_read_layout_cpp(read_layout, misalignment_threshold);
+  VarScan(container, verbose);
+  positionFuncMap = createPositionFunctionMap(container, verbose);
+  std::vector<std::string> sigs = Rcpp::as<std::vector<std::string>>(processed_sigstrings);
+  return sig_extraction(container, sigs, df, verbose);
+}
+
+// [[Rcpp::export]]
 Rcpp::CharacterVector sigrun(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, 
-  const Rcpp::StringVector& sigstrings, bool verbose = false) {
-  if (container.empty()){
-    if(verbose){
-      Rcpp::Rcout << "Populating the read layout container and position function maps!\n";
-    }
-    container = prep_read_layout_cpp(read_layout, misalignment_threshold);
-    VarScan(container, verbose);
-  } else {
-    if(verbose){
-      Rcpp::Rcout << "Read layout container and position function already generated!\n";
-    }
-  }
+  const Rcpp::StringVector& sigstrings, int nthreads = 1, bool verbose = false) {
+  container = prep_read_layout_cpp(read_layout, misalignment_threshold);
+  VarScan(container, verbose);
   positionFuncMap = createPositionFunctionMap(container, verbose);
   std::vector<std::string> sigs = Rcpp::as<std::vector<std::string>>(sigstrings);
-  return process_sigstrings(container, sigs, positionFuncMap, verbose);
+  return process_sigstrings(container, sigs, positionFuncMap, verbose, nthreads);
 }

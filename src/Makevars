@@ -1,4 +1,4 @@
-PKG_CPPFLAGS = -I../inst/include
+#PKG_CPPFLAGS = -I../inst/include
 ifeq ($(OS_TYPE),apple)
 	SHLIB_OPENMP_CFLAGS=-Xpreprocessor -fopenmp
 	SHLIB_OPENMP_CXXFLAGS=-Xpreprocessor -fopenmp
