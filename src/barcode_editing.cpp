@@ -140,26 +140,33 @@ Rcpp::IntegerVector dl_dist_rcpp(Rcpp::NumericVector src_input, Rcpp::NumericVec
 }
 
 void generate_whitelist(const std::vector<int64_t>& barcodes) {
+  wl.clear();
   for (int64_t barcode : barcodes) {
-      wl[barcode] = barcode_data{boost::none, boost::none};
+    wl[barcode] = barcode_data{};
   }
 }
 
 // [[Rcpp::export]]
 void populate_whitelist(NumericVector barcodes, 
   NumericVector poisson_data = NumericVector(), 
-  NumericVector counts = NumericVector()) {
+  NumericVector counts = NumericVector(), bool verbose = false) {
   std::vector<int64_t> cpp_barcodes = as<std::vector<int64_t>>(barcodes);
   if (wl.empty()) {
     generate_whitelist(cpp_barcodes);
+    if(verbose){
+      Rcpp::Rcout << "This whitelist is empty!\n"; 
+    }
   }
   bool has_poisson_data = poisson_data.size() == barcodes.size();
   bool has_count_data = counts.size() == barcodes.size();
   for (size_t i = 0; i < cpp_barcodes.size(); ++i) {
     int64_t barcode = cpp_barcodes[i];
     auto it = wl.find(barcode);
-    
     if (it != wl.end()) {
+      if(verbose){
+        Rcpp::Rcout << "Barcode has been found!\n";
+        Rcpp::Rcout << barcode << "\n";
+      }
       // Existing entry found, update it carefully
       if (has_poisson_data && !Rcpp::NumericVector::is_na(poisson_data[i])) {
         it->second.poisson_score = static_cast<double>(poisson_data[i]); // Ensure correct type
@@ -169,6 +176,9 @@ void populate_whitelist(NumericVector barcodes,
       }
     } else {
       // Entry not found, insert a new one
+      if(verbose){
+        Rcpp::Rcout << "Barcode not found!\n";
+      }
       barcode_data data;
       if (has_poisson_data && !Rcpp::NumericVector::is_na(poisson_data[i])) {
         data.poisson_score = static_cast<double>(poisson_data[i]);
@@ -183,16 +193,14 @@ void populate_whitelist(NumericVector barcodes,
 
 // [[Rcpp::export]]
 Rcpp::DataFrame wl_to_df() {
-  std::vector<std::string> sequences;
+  Rcpp::NumericVector sequences; // Use NumericVector to store int64_t values
   std::vector<int> counts;
   std::vector<double> poisson_scores;
   for (const auto& item : wl) {
-    // Create a temporary vector with a single int64_t value for barcode conversion
-    std::vector<int64_t> barcodeVec = {item.first};
-    // Assuming a fixed sequence length, e.g., 16
-    sequences.push_back(bits_to_sequence_cpp(barcodeVec, 16));
-    counts.push_back(item.second.count ? *(item.second.count) : NA_INTEGER);
-    poisson_scores.push_back(item.second.poisson_score ? *(item.second.poisson_score) : NA_REAL);
+    // Directly push the int64_t barcode value, cast to double for R compatibility
+    sequences.push_back(static_cast<double>(item.first));
+    counts.push_back(item.second.count);
+    poisson_scores.push_back(item.second.poisson_score >= 0.0 ? item.second.poisson_score : NA_REAL);
   }
   return Rcpp::DataFrame::create(
     Rcpp::Named("sequence") = sequences,
@@ -204,71 +212,245 @@ Rcpp::DataFrame wl_to_df() {
 
 // [[Rcpp::export]]
 void clear_whitelist() {
+  Rcpp::Rcout << "Clearing whitelist, previous size: " << wl.size() << "\n";
   wl.clear();
+  Rcpp::Rcout << "Whitelist cleared, new size: " << wl.size() << "\n";
 }
 
 // [[Rcpp::export]]
-Rcpp::StringVector correct_barcodes(Rcpp::NumericVector barcodes, bool verbose = false, int nthreads = 1) {
+int whitelist_size() {
+  return wl.size();
+}
+
+// [[Rcpp::export]]
+NumericVector correct_barcodes_v1(NumericVector barcodes, bool verbose = false, int nthreads = 1, 
+  int depth = 3, int breadth = 2) {
   int n = barcodes.size();
-  Rcpp::StringVector results(n);
+  NumericVector results(n, NA_REAL);
   std::vector<int64_t> cpp_barcodes = Rcpp::as<std::vector<int64_t>>(barcodes);
-  omp_set_num_threads(nthreads); // Set the desired number of threads
-  #pragma omp parallel for schedule(dynamic)
-    for (int i = 0; i < n; ++i) {
-      int64_t barcode = cpp_barcodes[i];
-      std::string result;
-      auto wl_it = wl.find(barcode);
-      if (wl_it != wl.end()) {
-        #pragma omp critical
-      {
-        if (wl_it->second.count) *(wl_it->second.count) += 1;
-        else wl_it->second.count = boost::optional<int>(1);
-      }
-        std::vector<int64_t> barcodeVec = {barcode};
-        result = "match:" + bits_to_sequence_cpp(barcodeVec, 16);
-        if(verbose) {
-            #pragma omp critical
-        Rcpp::Rcout << "Direct match found for barcode: " << barcode << std::endl;
-      }
-    } else {
-      std::unordered_set<int64_t> combined;
-      std::vector<int64_t> circularized_sequences = kmer_circ_cpp(barcode, 16, 16, false);
-      for (auto& circ_seq : circularized_sequences) {
-        std::vector<int64_t> mutations = generate_recursive_mutations_cpp(circ_seq, 2);
-        combined.insert(mutations.begin(), mutations.end());
-      }
-      std::vector<int64_t> original_mutations = generate_recursive_mutations_cpp(barcode, 3);
-      combined.insert(original_mutations.begin(), original_mutations.end());
-      double max_poisson = -1;
-      int64_t best_seq_poisson = 0;
-      for (const auto& seq : combined) {
-        auto seq_it = wl.find(seq);
-        if (seq_it != wl.end() && seq_it->second.poisson_score && *seq_it->second.poisson_score > max_poisson) {
-          max_poisson = *seq_it->second.poisson_score;
-          best_seq_poisson = seq;
-        }
-      }
-      if (best_seq_poisson != 0) {
-                #pragma omp critical
-                            {
-                              auto best_it = wl.find(best_seq_poisson);
-                              if (best_it != wl.end()) {
-                              if (best_it->second.count) *(best_it->second.count) += 1;
-                              else best_it->second.count = boost::optional<int>(1);
-                            }
-                      }
-        std::vector<int64_t> bestSeqVec = {best_seq_poisson};
-        result = bits_to_sequence_cpp(bestSeqVec, 16);
-        if(verbose) {
-            #pragma omp critical
-          Rcpp::Rcout << "Poisson score match found for barcode: " << bits_to_sequence_cpp(bestSeqVec, 16) << std::endl;
-        }
-      } else { 
-        result = "no_match";
+  omp_set_num_threads(nthreads);
+#pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < n; ++i) {
+    int64_t barcode = cpp_barcodes[i];
+    std::vector<int64_t> candidates; // Store all possible candidates
+    // First, handle original barcode mutations
+    std::vector<int64_t> mutations = generate_recursive_mutations_cpp(barcode, depth);
+    for (auto& mutation : mutations) {
+      if (wl.find(mutation) != wl.end()) {
+        candidates.push_back(mutation);
       }
     }
-    results[i] = result;
+    // Then, handle circularized sequence mutations if no candidates found from original mutations
+    if (candidates.empty()) {
+      std::vector<int64_t> circularizedSequences = kmer_circ_cpp(barcode, 16, 16, verbose);
+      for (auto& circSeq : circularizedSequences) {
+        std::vector<int64_t> circMutations = generate_recursive_mutations_cpp(circSeq, breadth);
+        for (auto& mutation : circMutations) {
+          if (wl.find(mutation) != wl.end()) {
+            candidates.push_back(mutation);
+          }
+        }
+      }
+    }
+    // Rank candidates based on Poisson score and DL distance
+    int64_t best_candidate = 0;
+    double highest_poisson_score = -1.0;
+    int best_dl_distance = INT_MAX;
+    for (auto& candidate : candidates) {
+      auto& candidate_data = wl[candidate];
+      int dl_distance = dl_dist_cpp({barcode}, {candidate}, 10)[0];
+      if(verbose){
+        Rcpp::Rcout << dl_distance << "\n";
+      }
+      if ((candidate_data.poisson_score > highest_poisson_score) ||
+        (candidate_data.poisson_score == highest_poisson_score && dl_distance < best_dl_distance)) {
+        best_candidate = candidate;
+        highest_poisson_score = candidate_data.poisson_score;
+        best_dl_distance = dl_distance;
+      }
+    }
+    if (best_candidate != 0) {
+      wl[best_candidate].count++; // Increment count for the best match
+      results[i] = static_cast<double>(best_candidate); // Store the best candidate as a double
+      if (verbose) {
+#pragma omp critical
+        Rcpp::Rcout << "Best match found for barcode: " << barcode << " with Poisson score: " << 
+          highest_poisson_score << ", DL distance: " << best_dl_distance << std::endl;
+      }
+    }
   }
   return results;
 }
-  
+
+// [[Rcpp::export]]
+Rcpp::NumericVector correct_barcodes_v2(Rcpp::NumericVector barcodes, bool verbose = false,
+  int nthreads = 1, int maxDistance = 3) {
+  int n = barcodes.size();
+  Rcpp::NumericVector results(n, NA_REAL);
+  std::vector<int64_t> cpp_barcodes = Rcpp::as<std::vector<int64_t>>(barcodes);
+  omp_set_num_threads(nthreads);
+#pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < n; ++i) {
+    int64_t barcode = cpp_barcodes[i];
+    int64_t best_match = 0;
+    double highest_poisson_score = -1.0;
+    int best_dl_distance = std::numeric_limits<int>::max();
+    for (const auto& wl_entry : wl) {
+      std::vector<int> dl_distances = dl_dist_cpp({barcode}, {wl_entry.first}, maxDistance);
+      if (!dl_distances.empty() && dl_distances[0] >= 0 && dl_distances[0] <= maxDistance) {
+        double poisson_score = wl_entry.second.poisson_score;
+        if (poisson_score > highest_poisson_score || 
+          (poisson_score == highest_poisson_score && dl_distances[0] < best_dl_distance)) {
+          best_match = wl_entry.first;
+          highest_poisson_score = poisson_score;
+          best_dl_distance = dl_distances[0];
+        }
+      }
+    }
+    if (best_match != 0) {
+      wl[best_match].count++;
+      results[i] = static_cast<double>(best_match);
+      if (verbose) {
+#pragma omp critical
+        Rcpp::Rcout << "Best match for barcode " << barcode << ": " << best_match 
+                    << " with Poisson score: " << highest_poisson_score 
+                    << " and DL distance: " << best_dl_distance << std::endl;
+      }
+    }
+  }
+  return results;
+}
+
+// [[Rcpp::export]]
+Rcpp::NumericVector correct_barcodes_deprecated(Rcpp::NumericVector barcodes, bool verbose = false, 
+  int nthreads = 1, int breadth = 2, int depth = 2, int maxDistance = 3) {
+  int n = barcodes.size();
+  Rcpp::NumericVector results(n, NA_REAL);
+  std::vector<int64_t> cpp_barcodes = Rcpp::as<std::vector<int64_t>>(barcodes);
+  omp_set_num_threads(nthreads);
+#pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < n; ++i) {
+    int64_t barcode = cpp_barcodes[i];
+    double highest_poisson_score = -1.0;
+    int best_dl_distance = std::numeric_limits<int>::max();
+    int64_t best_match = 0;
+    for (const auto& wl_entry : wl) {
+      int dl_distance = dl_dist_cpp({barcode}, {wl_entry.first}, maxDistance)[0];
+      if (dl_distance >= 0 && dl_distance <= maxDistance) {
+        double poisson_score = wl_entry.second.poisson_score;
+        if (poisson_score > highest_poisson_score || (poisson_score == highest_poisson_score && dl_distance < best_dl_distance)) {
+          best_match = wl_entry.first;
+          highest_poisson_score = poisson_score;
+          best_dl_distance = dl_distance;
+        }
+      }
+    }
+    if (best_match == 0) {
+      auto mutations = generate_recursive_mutations_cpp(barcode, depth);
+      for (auto mutation : mutations) {
+        if (wl.find(mutation) != wl.end()) {
+          int dl_distance = dl_dist_cpp({barcode}, {mutation}, maxDistance)[0];
+          if (dl_distance <= maxDistance) {
+            double poisson_score = wl[mutation].poisson_score;
+            if (poisson_score > highest_poisson_score || (poisson_score == highest_poisson_score && dl_distance < best_dl_distance)) {
+              best_match = mutation;
+              highest_poisson_score = poisson_score;
+              best_dl_distance = dl_distance;
+            }
+          }
+        }
+      }
+      // Circularized sequence mutations
+      if (best_match == 0) {
+        auto circularizedSequences = kmer_circ_cpp(barcode, 16, 16, verbose);
+        for (auto circSeq : circularizedSequences) {
+          auto circMutations = generate_recursive_mutations_cpp(circSeq, breadth);
+          for (auto mutation : circMutations) {
+            if (wl.find(mutation) != wl.end()) {
+              int dl_distance = dl_dist_cpp({barcode}, {mutation}, maxDistance)[0];
+              if (dl_distance <= maxDistance) {
+                double poisson_score = wl[mutation].poisson_score;
+                if (poisson_score > highest_poisson_score || (poisson_score == highest_poisson_score && dl_distance < best_dl_distance)) {
+                  best_match = mutation;
+                  highest_poisson_score = poisson_score;
+                  best_dl_distance = dl_distance;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    // Update results
+    if (best_match != 0) {
+      wl[best_match].count++; // Increment the count for the best match
+      results[i] = static_cast<double>(best_match); // Convert the best match to double and assign
+      if (verbose) {
+#pragma omp critical
+        Rcpp::Rcout << "Best match found for barcode: " << barcode << " is: " << best_match 
+                    << " with Poisson score: " << highest_poisson_score << " and DL distance: " << best_dl_distance << std::endl;
+      }
+    }
+  }
+  return results;
+}
+
+// [[Rcpp::export]]
+Rcpp::NumericVector correct_barcodes(Rcpp::NumericVector barcodes, bool verbose = false, 
+  int nthreads = 1, int depth = 2, int breadth = 2, bool high_speed = false, int maxDistance = 3) {
+  int n = barcodes.size();
+  Rcpp::NumericVector results(n, NA_REAL);
+  std::vector<int64_t> cpp_barcodes = Rcpp::as<std::vector<int64_t>>(barcodes);
+  omp_set_num_threads(nthreads);
+#pragma omp parallel for schedule(dynamic)
+  for (int i = 0; i < n; ++i) {
+    int64_t barcode = cpp_barcodes[i];
+    int64_t best_match = 0;
+    double highest_poisson_score = -1.0;
+    int best_dl_distance = std::numeric_limits<int>::max();
+    auto mutations = generate_recursive_mutations_cpp(barcode, depth);
+    for (auto mutation : mutations) {
+      if (wl.find(mutation) != wl.end()) {
+        int dl_distance = dl_dist_cpp({barcode}, {mutation}, maxDistance)[0];
+        if (dl_distance <= maxDistance) {
+          double poisson_score = wl[mutation].poisson_score;
+          if (poisson_score > highest_poisson_score || (poisson_score == highest_poisson_score && dl_distance < best_dl_distance)) {
+            best_match = mutation;
+            highest_poisson_score = poisson_score;
+            best_dl_distance = dl_distance;
+          }
+        }
+      }
+    }
+    if (!high_speed && best_match == 0) {
+      auto circularizedSequences = kmer_circ_cpp(barcode, 16, 16, verbose);
+      for (auto circSeq : circularizedSequences) {
+        auto circMutations = generate_recursive_mutations_cpp(circSeq, breadth);
+        for (auto mutation : circMutations) {
+          if (wl.find(mutation) != wl.end()) {
+            int dl_distance = dl_dist_cpp({barcode}, {mutation}, maxDistance)[0];
+            if (dl_distance <= maxDistance) {
+              double poisson_score = wl[mutation].poisson_score;
+              if (poisson_score > highest_poisson_score || (poisson_score == highest_poisson_score && dl_distance < best_dl_distance)) {
+                best_match = mutation;
+                highest_poisson_score = poisson_score;
+                best_dl_distance = dl_distance;
+              }
+            }
+          }
+        }
+      }
+    }
+    if (best_match != 0) {
+      wl[best_match].count++;
+      results[i] = static_cast<double>(best_match);
+      if (verbose) {
+#pragma omp critical
+        Rcpp::Rcout << "Best match found for barcode: " << barcode << " is: " << best_match 
+                    << " with Poisson score: " << highest_poisson_score << " and DL distance: " << best_dl_distance << std::endl;
+      }
+    }
+  }
+  return results;
+}
+

@@ -207,8 +207,8 @@ struct PositionCalcFunc {
 };
 
 struct barcode_data {
-  boost::optional<int> count;
-  boost::optional<double> poisson_score; // Now using a double directly
+  int count = 0; // 0 implies no count or default
+  double poisson_score = -1.0; // 0.0 implies no score or default
 };
 
 struct NanoRead {
@@ -220,7 +220,6 @@ using whitelist = std::unordered_map<int64_t, barcode_data>;
 extern whitelist wl;
 
 using PositionFuncMap = std::unordered_map<std::string, PositionCalcFunc>;
-//extern PositionFuncMap positionFuncMap;
 
 extern ReadLayout container;
 
@@ -229,8 +228,6 @@ struct dictionary{
   unsigned int value;
   struct dictionary* next;
 };
-
-//now defining the shared sequence manipulation functions
 
 std::string findPolyTail(const std::string& sequence, char poly_base, int window_size, int min_count);
 

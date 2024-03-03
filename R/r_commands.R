@@ -112,8 +112,7 @@ read_fastqas<-function(fn, type, full_id = FALSE, ...){
     return(rfq_single(fn = fn, type = type, full_id = FALSE, ...))  
   }
 }
-prep_seq<-function(read_layout_form, external_path_form, create_output_dir = TRUE,
-  data_table_nthreads = 1, ...){
+prep_seq<-function(read_layout_form, external_path_form, create_output_dir = TRUE, data_table_nthreads = 1, ...){
   {
     print("Importing read layout and figuring out its order!")
     tidytable::setDTthreads(threads = 1)
@@ -290,16 +289,19 @@ subset_module_analysis<-function(df, whitelist){
   colnames(barcodes)<-c("bc","concatenate_extracted","freq")
   barcodes$wl_matched<-barcodes$bc %>% sequence_to_bits(.) %>% {.%in%whitelist$whitelist_bcs}
 }
-synth_data_processor<-function(fn, type, df){
+synth_data_processor<-function(fn, type, df_out){
   if(type == "gz"){
     cat_cmd<-"zcat"
   } else {
     cat_cmd<-"cat"
   }
-  cmd<-glue::glue("{cat_cmd} {fn} | paste - - - - | awk -F'\t' '{{ split($1, a, \" \"); print a[1]\",\"a[2] }}' | cut -d',' -f1,2,3,4,5,6,7")
+  cmd<-glue::glue("{cat_cmd} {fn} | paste - - - - | awk -F'\t' '{{ split($1, a,
+     \" \"); print a[1]\",\"a[2] }}' | cut -d',' -f1,2,3,4,5,6,7")
   res<-fread(cmd = cmd, sep = ",", header = FALSE, quote = "", fill = TRUE)
-  df_out$id<-stringr::str_extract(string = df_out$sig_id, pattern = "<.+?>") %>% DescTools::StrExtractBetween(x = ., left = ":", right = ":")
-  df_out$concatenate_state<-ifelse(test = grepl(pattern = "+FR_RF", x = df$sig_id, fixed = TRUE),
+  df_out$id<-stringr::str_extract(string = df_out$sig_id, pattern = "<.+?>") %>% 
+  DescTools::StrExtractBetween(x = ., left = ":", right = ":")
+  df_out$concatenate_state<-ifelse(test = grepl(pattern = "+FR_RF",
+     x = df_out$sig_id, fixed = TRUE),
     yes = {
       "TRUE"
     },
@@ -311,12 +313,61 @@ synth_data_processor<-function(fn, type, df){
   df_new[, c("original_barcode", "original_umi", "original_read") := tstrsplit(V2, "_", type.convert = TRUE)]
   df_new$original_barcode<-gsub(pattern = "random", replacement = NA, x = df_new$original_barcode)
   df_new$original_umi<-gsub(pattern = "seq", replacement = NA, x = df_new$original_barcode)
-  df_new<-df_new[-grep(pattern = "junk", x = df_new$original_barcode),] #the adapter sequences and original read structure mess up jr here
+  if(length(grep(pattern = "junk", x = df_new$original_barcode)) > 1){
+    df_new<-df_new[-grep(pattern = "junk", x = df_new$original_barcode),]
+    #the adapter sequences and original read structure mess up jr here
+  }
   return(df_new)
 }
-whitelist_generator<-function(df){
-  barcodes<-table(df$barcode[grep(pattern = "FR_RF", x = df$sig_id, invert = TRUE)]) %>% data.table::as.data.table(.)
+whitelist_generator<-function(df, original_whitelist = NULL, correct_mode = FALSE, nthreads = NULL){
+  if(!is.null(original_whitelist)){
+    barcodes<-table(df$barcode) %>% data.table::as.data.table(.)
+  } else {
+    barcodes<-table(df$barcode[grep(pattern = "FR_RF", x = df$sig_id, invert = TRUE)]) %>% data.table::as.data.table(.)
+  }
+  ratio<-nrow(barcodes)/nrow(df)
+  if(ratio > 0.5){
+    rescue_repeats<-6
+  } else {
+    rescue_repeats<-8
+  }
   barcodes$pois_dist<-stats::ppois(q = barcodes$N, lambda = mean(barcodes$N))
+  filter_runs<-sapply(X = c("A","C","T","G"), FUN = function(X){
+    paste0(replicate(X, n = rescue_repeats), collapse = "") %>% {which(grepl(pattern = .,  x = barcodes$V1) == TRUE)}
+  }) %>% unlist %>% unique
+  barcodes<-barcodes[-filter_runs,]
   print(length(which(barcodes$pois > 0.9)))
-  return(barcodes)
+  barcodes$V1<-sequence_to_bits(barcodes$V1)
+  chunk_whitelist<-barcodes[which(barcodes$pois > 0.9),]
+  query_list<-barcodes[which(barcodes$pois < 0.9),]
+  if(!is.null(original_whitelist)){
+    chunk_whitelist<-chunk_whitelist[chunk_whitelist$V1 %in% original_whitelist$whitelist_bcs,]
+  }
+  print(nrow(chunk_whitelist))
+  print(whitelist_size())
+  populate_whitelist(barcodes = chunk_whitelist$V1, poisson_data = chunk_whitelist$pois_dist, counts = chunk_whitelist$N)
+  print(whitelist_size())
+  query_list<-query_list[order(query_list$pois_dist, decreasing = TRUE),]
+  if(correct_mode == TRUE && !is.null(nthreads)){
+    
+    query_list$corrected<-NA
+    query_list$corrected<-correct_barcodes(barcodes = query_list$V1, high_speed = FALSE, nthreads = nthreads)
+    df$barcode<-sequence_to_bits(df$barcode)
+    
+    query_list<-query_list[which(!is.na(query_list$corrected)),]
+    query_list<-hamming_bits(bit64::as.integer64(query_list$V1), 
+                    bit64::as.integer64(query_list$corrected)) %>% 
+      {query_list[which(. <= 6),]}
+    
+    
+    df[query_list, barcode := bit64::as.integer64(i.corrected), on = .(barcode = V1)]
+    df<-df[which(df$barcode %in% generated_whitelist$V1),]
+    
+    output<-list(generated_whitelist = chunk_whitelist, query_list = query_list, df_filtered = df)
+    
+    list2env(output, .GlobalEnv)
+  } else {
+    output<-list(generated_whitelist = chunk_whitelist, query_list = query_list)
+    list2env(output, .GlobalEnv)
+  }
 }

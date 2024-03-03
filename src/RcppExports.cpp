@@ -52,14 +52,15 @@ BEGIN_RCPP
 END_RCPP
 }
 // populate_whitelist
-void populate_whitelist(NumericVector barcodes, NumericVector poisson_data, NumericVector counts);
-RcppExport SEXP _rad_populate_whitelist(SEXP barcodesSEXP, SEXP poisson_dataSEXP, SEXP countsSEXP) {
+void populate_whitelist(NumericVector barcodes, NumericVector poisson_data, NumericVector counts, bool verbose);
+RcppExport SEXP _rad_populate_whitelist(SEXP barcodesSEXP, SEXP poisson_dataSEXP, SEXP countsSEXP, SEXP verboseSEXP) {
 BEGIN_RCPP
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< NumericVector >::type barcodes(barcodesSEXP);
     Rcpp::traits::input_parameter< NumericVector >::type poisson_data(poisson_dataSEXP);
     Rcpp::traits::input_parameter< NumericVector >::type counts(countsSEXP);
-    populate_whitelist(barcodes, poisson_data, counts);
+    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
+    populate_whitelist(barcodes, poisson_data, counts, verbose);
     return R_NilValue;
 END_RCPP
 }
@@ -82,16 +83,75 @@ BEGIN_RCPP
     return R_NilValue;
 END_RCPP
 }
-// correct_barcodes
-Rcpp::StringVector correct_barcodes(Rcpp::NumericVector barcodes, bool verbose, int nthreads);
-RcppExport SEXP _rad_correct_barcodes(SEXP barcodesSEXP, SEXP verboseSEXP, SEXP nthreadsSEXP) {
+// whitelist_size
+int whitelist_size();
+RcppExport SEXP _rad_whitelist_size() {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    rcpp_result_gen = Rcpp::wrap(whitelist_size());
+    return rcpp_result_gen;
+END_RCPP
+}
+// correct_barcodes_v1
+NumericVector correct_barcodes_v1(NumericVector barcodes, bool verbose, int nthreads, int depth, int breadth);
+RcppExport SEXP _rad_correct_barcodes_v1(SEXP barcodesSEXP, SEXP verboseSEXP, SEXP nthreadsSEXP, SEXP depthSEXP, SEXP breadthSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< NumericVector >::type barcodes(barcodesSEXP);
+    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
+    Rcpp::traits::input_parameter< int >::type nthreads(nthreadsSEXP);
+    Rcpp::traits::input_parameter< int >::type depth(depthSEXP);
+    Rcpp::traits::input_parameter< int >::type breadth(breadthSEXP);
+    rcpp_result_gen = Rcpp::wrap(correct_barcodes_v1(barcodes, verbose, nthreads, depth, breadth));
+    return rcpp_result_gen;
+END_RCPP
+}
+// correct_barcodes_v2
+Rcpp::NumericVector correct_barcodes_v2(Rcpp::NumericVector barcodes, bool verbose, int nthreads, int maxDistance);
+RcppExport SEXP _rad_correct_barcodes_v2(SEXP barcodesSEXP, SEXP verboseSEXP, SEXP nthreadsSEXP, SEXP maxDistanceSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< Rcpp::NumericVector >::type barcodes(barcodesSEXP);
     Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
     Rcpp::traits::input_parameter< int >::type nthreads(nthreadsSEXP);
-    rcpp_result_gen = Rcpp::wrap(correct_barcodes(barcodes, verbose, nthreads));
+    Rcpp::traits::input_parameter< int >::type maxDistance(maxDistanceSEXP);
+    rcpp_result_gen = Rcpp::wrap(correct_barcodes_v2(barcodes, verbose, nthreads, maxDistance));
+    return rcpp_result_gen;
+END_RCPP
+}
+// correct_barcodes_deprecated
+Rcpp::NumericVector correct_barcodes_deprecated(Rcpp::NumericVector barcodes, bool verbose, int nthreads, int breadth, int depth, int maxDistance);
+RcppExport SEXP _rad_correct_barcodes_deprecated(SEXP barcodesSEXP, SEXP verboseSEXP, SEXP nthreadsSEXP, SEXP breadthSEXP, SEXP depthSEXP, SEXP maxDistanceSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type barcodes(barcodesSEXP);
+    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
+    Rcpp::traits::input_parameter< int >::type nthreads(nthreadsSEXP);
+    Rcpp::traits::input_parameter< int >::type breadth(breadthSEXP);
+    Rcpp::traits::input_parameter< int >::type depth(depthSEXP);
+    Rcpp::traits::input_parameter< int >::type maxDistance(maxDistanceSEXP);
+    rcpp_result_gen = Rcpp::wrap(correct_barcodes_deprecated(barcodes, verbose, nthreads, breadth, depth, maxDistance));
+    return rcpp_result_gen;
+END_RCPP
+}
+// correct_barcodes
+Rcpp::NumericVector correct_barcodes(Rcpp::NumericVector barcodes, bool verbose, int nthreads, int depth, int breadth, bool high_speed, int maxDistance);
+RcppExport SEXP _rad_correct_barcodes(SEXP barcodesSEXP, SEXP verboseSEXP, SEXP nthreadsSEXP, SEXP depthSEXP, SEXP breadthSEXP, SEXP high_speedSEXP, SEXP maxDistanceSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type barcodes(barcodesSEXP);
+    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
+    Rcpp::traits::input_parameter< int >::type nthreads(nthreadsSEXP);
+    Rcpp::traits::input_parameter< int >::type depth(depthSEXP);
+    Rcpp::traits::input_parameter< int >::type breadth(breadthSEXP);
+    Rcpp::traits::input_parameter< bool >::type high_speed(high_speedSEXP);
+    Rcpp::traits::input_parameter< int >::type maxDistance(maxDistanceSEXP);
+    rcpp_result_gen = Rcpp::wrap(correct_barcodes(barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -285,10 +345,14 @@ static const R_CallMethodDef CallEntries[] = {
     {"_rad_sigalign", (DL_FUNC) &_rad_sigalign, 5},
     {"_rad_sigalign_stats", (DL_FUNC) &_rad_sigalign_stats, 3},
     {"_rad_dl_dist_rcpp", (DL_FUNC) &_rad_dl_dist_rcpp, 3},
-    {"_rad_populate_whitelist", (DL_FUNC) &_rad_populate_whitelist, 3},
+    {"_rad_populate_whitelist", (DL_FUNC) &_rad_populate_whitelist, 4},
     {"_rad_wl_to_df", (DL_FUNC) &_rad_wl_to_df, 0},
     {"_rad_clear_whitelist", (DL_FUNC) &_rad_clear_whitelist, 0},
-    {"_rad_correct_barcodes", (DL_FUNC) &_rad_correct_barcodes, 3},
+    {"_rad_whitelist_size", (DL_FUNC) &_rad_whitelist_size, 0},
+    {"_rad_correct_barcodes_v1", (DL_FUNC) &_rad_correct_barcodes_v1, 5},
+    {"_rad_correct_barcodes_v2", (DL_FUNC) &_rad_correct_barcodes_v2, 4},
+    {"_rad_correct_barcodes_deprecated", (DL_FUNC) &_rad_correct_barcodes_deprecated, 6},
+    {"_rad_correct_barcodes", (DL_FUNC) &_rad_correct_barcodes, 7},
     {"_rad_sig_extractor", (DL_FUNC) &_rad_sig_extractor, 5},
     {"_rad_sigrun", (DL_FUNC) &_rad_sigrun, 5},
     {"_rad_revcomp", (DL_FUNC) &_rad_revcomp, 1},

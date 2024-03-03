@@ -13,8 +13,8 @@ dl_dist_rcpp <- function(src_input, tgt_input, maxDistance) {
     .Call(`_rad_dl_dist_rcpp`, src_input, tgt_input, maxDistance)
 }
 
-populate_whitelist <- function(barcodes, poisson_data = numeric(), counts = numeric()) {
-    invisible(.Call(`_rad_populate_whitelist`, barcodes, poisson_data, counts))
+populate_whitelist <- function(barcodes, poisson_data = numeric(), counts = numeric(), verbose = FALSE) {
+    invisible(.Call(`_rad_populate_whitelist`, barcodes, poisson_data, counts, verbose))
 }
 
 wl_to_df <- function() {
@@ -25,8 +25,24 @@ clear_whitelist <- function() {
     invisible(.Call(`_rad_clear_whitelist`))
 }
 
-correct_barcodes <- function(barcodes, verbose = FALSE, nthreads = 1L) {
-    .Call(`_rad_correct_barcodes`, barcodes, verbose, nthreads)
+whitelist_size <- function() {
+    .Call(`_rad_whitelist_size`)
+}
+
+correct_barcodes_v1 <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 3L, breadth = 2L) {
+    .Call(`_rad_correct_barcodes_v1`, barcodes, verbose, nthreads, depth, breadth)
+}
+
+correct_barcodes_v2 <- function(barcodes, verbose = FALSE, nthreads = 1L, maxDistance = 3L) {
+    .Call(`_rad_correct_barcodes_v2`, barcodes, verbose, nthreads, maxDistance)
+}
+
+correct_barcodes_deprecated <- function(barcodes, verbose = FALSE, nthreads = 1L, breadth = 2L, depth = 2L, maxDistance = 3L) {
+    .Call(`_rad_correct_barcodes_deprecated`, barcodes, verbose, nthreads, breadth, depth, maxDistance)
+}
+
+correct_barcodes <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 2L, high_speed = FALSE, maxDistance = 3L) {
+    .Call(`_rad_correct_barcodes`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance)
 }
 
 sig_extractor <- function(read_layout, misalignment_threshold, df, processed_sigstrings, verbose) {

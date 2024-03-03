@@ -2,10 +2,15 @@
 if (!requireNamespace("shiny", quietly = TRUE)) install.packages("shiny")
 if (!requireNamespace("rhandsontable", quietly = TRUE)) install.packages("rhandsontable")
 if (!requireNamespace("DT", quietly = TRUE)) install.packages("DT")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("ggpubr", quietly = TRUE)) install.packages("ggpubr")
+
 
 library(shiny)
 library(rhandsontable)
 library(DT)
+library(ggplot2)
+library(ggpubr)
 
 ui<-fluidPage(
   titlePanel("Prepare to Anger!"),
@@ -99,7 +104,7 @@ server<-function(input, output, session){
       data$xmax <- cumsum(data$expected_length)
       # Manually specify colors for each type
       color_map<-c("barcode" = "#70AD47", "adapter" = "black", "extraneous" = "gold", "UMI" = "orange", "read" = "lightgrey", "TSO" = "#20B7AD","poly_a" = "red", "poly_t" = "#008BD3")
-      plot_obj<-ggplot(data, aes(xmin = xmin, xmax = xmax, ymin = 0.4, ymax = 0.6, fill = type)) +
+      plot_obj<-ggplot2::ggplot(data, aes(xmin = xmin, xmax = xmax, ymin = 0.4, ymax = 0.6, fill = type)) +
         geom_rect(na.rm = TRUE)+
         scale_fill_manual(values = color_map)+
         theme_void()
