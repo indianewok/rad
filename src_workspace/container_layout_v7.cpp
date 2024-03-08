@@ -987,4 +987,120 @@ void SigTest (const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalig
   }
 }
 
+// [[Rcpp::export]]
+Rcpp::CharacterVector sigalign_deprecated(
+    Rcpp::CharacterVector adapters,
+    std::vector<std::string> sequences,
+    std::vector<std::string> ids,
+    const Rcpp::DataFrame& misalignment_threshold, int nthreads) {
+  std::vector<std::string> queries = Rcpp::as<std::vector<std::string>>(adapters);
+  std::vector<std::string> query_names = Rcpp::as<std::vector<std::string>>(adapters.names());
+  std::map<int, std::string> signature_map;
+  std::map<std::string, std::pair<double, double>> null_dist_map;
+  Rcpp::StringVector query_id = misalignment_threshold["query_id"];
+  Rcpp::NumericVector misal_threshold = misalignment_threshold["misal_threshold"];
+  Rcpp::NumericVector misal_sd = misalignment_threshold["misal_sd"];
+  for(int i = 0; i < query_id.size(); ++i) {
+    null_dist_map[Rcpp::as<std::string>(query_id[i])] = std::make_pair((double) misal_threshold[i], (double) misal_sd[i]);
+  }
+  omp_set_num_threads(nthreads);
+  for (int i = 0; i < sequences.size(); ++i) {
+    const auto& sequence =sequences[i];
+    std::ostringstream signature;
+    std::vector<std::string> temp_signature_parts;
+    int length = sequence.size();
+    // Parallelize the inner loop through queries
+    // Loop through each sequence
+#pragma omp parallel for
+    for (int j = 0; j < queries.size(); ++j) {
+      const auto& query = queries[j];
+      const auto& query_name = query_names[j];
+      int query_counter = j + 1;  // Local query_counter, initialized to the loop index + 1
+      if (query_name == "poly_a" || query_name == "poly_t") {
+        // Handle the regex query here.
+        char poly_base = (query_name == "poly_a") ? 'A' : 'T';
+        std::string match_str = findPolyTail(sequence, poly_base, 14, 12);  // assuming window_size = 16 and min_count = 12
+        if (!match_str.empty()){
+#pragma omp critical
+{
+  temp_signature_parts.push_back(match_str);
+}
+        }
+      } else {
+        EdlibAlignConfig config = edlibNewAlignConfig(-1, EDLIB_MODE_HW, EDLIB_TASK_LOC, NULL, 0);
+        std::set<UniqueAlignment> uniqueAlignments;
+        char* cquery = const_cast<char*>(query.c_str());
+        char* csequence = const_cast<char*>(sequence.c_str());
+        EdlibAlignResult cresult = edlibAlign(cquery, query.size(), csequence, sequence.size(), config);
+        std::vector<int> start_positions(cresult.startLocations, cresult.startLocations + cresult.numLocations);
+        std::vector<int> end_positions(cresult.endLocations, cresult.endLocations + cresult.numLocations);
+        for (int& pos : start_positions) { ++pos; }
+        for (int& pos : end_positions) { ++pos; }
+        std::sort(start_positions.begin(), start_positions.end());
+        std::sort(end_positions.begin(), end_positions.end());
+        // Remove duplicates from start_positions
+        auto last = std::unique(start_positions.begin(), start_positions.end());
+        start_positions.erase(last, start_positions.end());
+        // Find minimal 'end' for each unique 'start'
+        std::vector<int> unique_end_positions;
+        for (const auto& start : start_positions) {
+          auto pos = std::find(start_positions.begin(), start_positions.end(), start) - start_positions.begin();
+          unique_end_positions.push_back(end_positions[pos]);
+        }
+        int edit_distance = cresult.editDistance;
+        for (size_t i = 0; i < start_positions.size(); ++i) {
+          UniqueAlignment ua = {edit_distance, start_positions[i], end_positions[i]};
+          uniqueAlignments.insert(ua);
+        }
+        // Extract the two best unique alignments
+        auto it = uniqueAlignments.begin();
+        UniqueAlignment best = (it != uniqueAlignments.end()) ? *it : UniqueAlignment{-1, -1, -1}; ++it;
+        UniqueAlignment secondBest = (it != uniqueAlignments.end()) ? *it : UniqueAlignment{-1, -1, -1};
+        bool skip_second_best = false;  // Variable to control whether to skip appending the second-best alignment
+        auto null_data = null_dist_map.find(query_name);
+        if (null_data != null_dist_map.end()) {
+          double threshold = null_data->second.first - null_data->second.second;
+          if (secondBest.edit_distance >= threshold || secondBest.edit_distance == -1) {
+            skip_second_best = true;
+          }
+        }
+#pragma omp critical
+{
+  std::string best_signature_part = query_name + ":" + std::to_string(best.edit_distance) + ":" + std::to_string(best.start_position) + ":" + std::to_string(best.end_position);
+  temp_signature_parts.push_back(best_signature_part);
+  if (!skip_second_best) {
+    std::string second_best_signature_part = query_name + ":" + std::to_string(secondBest.edit_distance) + ":" + std::to_string(secondBest.start_position) + ":" + std::to_string(secondBest.end_position);
+    temp_signature_parts.push_back(second_best_signature_part);
+  }
+}
+        edlibFreeAlignResult(cresult);
+      }
+    }
+    std::sort(temp_signature_parts.begin(), temp_signature_parts.end(),
+      [](const std::string &a, const std::string &b) -> bool {
+        // Assumes the format is "query_name:edit_distance:start_position:end_position"
+        int start_pos_a = std::stoi(a.substr(a.find_last_of(":") + 1));
+        int start_pos_b = std::stoi(b.substr(b.find_last_of(":") + 1));
+        return start_pos_a < start_pos_b;
+      }
+    );
+    std::string final_signature = std::accumulate(temp_signature_parts.begin(), temp_signature_parts.end(),
+      std::string(),
+      [](const std::string& a, const std::string& b) -> std::string {
+        return a + (a.length() > 0 ? "|" : "") + b;
+      });
+#pragma omp critical
+{
+  final_signature += "<" + std::to_string(length) + ":" + ids[i] + ":undecided>";
+  signature_map[i + 1] = final_signature;
+}
+temp_signature_parts.clear();
+  }
+  // Convert signature_map to something R-friendly
+  Rcpp::CharacterVector signature_strings(signature_map.size());
+  for (const auto& pair : signature_map) {
+    signature_strings[pair.first - 1] = pair.second;
+  }
+  return signature_strings;
+}
 

@@ -1212,7 +1212,7 @@ void fillSigString(ReadData& readData, const ReadLayout& readLayout,
 }
 
 using df_map = std::unordered_map<std::string, NanoRead>;
-void df_to_unordered_map(const Rcpp::DataFrame& df, df_map& map) {
+void df_to_unordered_map(const Rcpp::DataFrame& df, df_map& map, bool verbose) {
   Rcpp::StringVector ids = df["id"];
   Rcpp::StringVector quals = df["qual"];
   Rcpp::StringVector seqs = df["seq"];
@@ -1223,12 +1223,39 @@ void df_to_unordered_map(const Rcpp::DataFrame& df, df_map& map) {
     std::string seq = Rcpp::as<std::string>(seqs[i]);
     map[id] = {qual, seq};
   }
+  if (verbose) {
+    Rcpp::Rcout << "Map populated. Entries: " << map.size() << "\n";
+  }
 }
 
-List sig_extraction(const ReadLayout& readLayout, const std::vector<std::string>& sigstrings, 
+using df_map_v2 = std::unordered_map<std::string, NanoRead_v2>;
+void df_to_unordered_map_refs(const Rcpp::DataFrame& df, df_map_v2& map, bool verbose) {
+  Rcpp::StringVector ids = df["id"];
+  Rcpp::StringVector quals = df["qual"];
+  Rcpp::StringVector seqs = df["seq"];
+  for(int i = 0; i < ids.size(); ++i) {
+    std::string id = Rcpp::as<std::string>(ids[i]);
+    map[id] = {i, i}; // Store indices
+  }
+  if (verbose) {
+    Rcpp::Rcout << "Map populated. Entries: " << map.size() << "\n";
+  }
+}
+
+void clearMap(df_map& map, bool verbose) {
+  if (verbose) {
+    Rcpp::Rcout << "Clearing map. Entries before: " << map.size();
+  }
+  map.clear();
+  if (verbose) {
+    Rcpp::Rcout << ". Entries after: " << map.size() << "\n";
+  }
+}
+
+Rcpp::List sig_extraction(const ReadLayout& readLayout, const std::vector<std::string>& sigstrings, 
   Rcpp::DataFrame df, bool verbose) {
   df_map idMap;
-  df_to_unordered_map(df, idMap);
+  df_to_unordered_map(df, idMap, verbose);
   
   std::vector<std::string> ids;
   std::map<std::string, std::vector<std::string>> columns;
@@ -1300,11 +1327,113 @@ List sig_extraction(const ReadLayout& readLayout, const std::vector<std::string>
   }
   for (const auto& element : readData.sigstring) {
     if (element.type == "variable" && element.seq) {
-      columns[element.global_class].push_back(*element.seq);
+      columns[element.global_class].push_back(*element.seq); // this is pretty weird
       }
     }
   }
-  List data(columns.size() + 1); // +1 for the ID column
+  Rcpp::List data(columns.size() + 1); // +1 for the ID column
+  CharacterVector colNames(columns.size() + 1);
+  colNames[0] = "sig_id";
+  data[0] = wrap(ids);
+  if(verbose){
+    Rcpp::Rcout << "Making it to after wrapping the ids!\n";
+  }
+  int colIndex = 1;
+  for (const auto& col : columns) {
+    colNames[colIndex] = col.first; // global_class as column name
+    data[colIndex] = wrap(col.second); // Associated sequences
+    ++colIndex;
+  }
+  data.attr("names") = colNames;
+  clearMap(idMap, verbose);
+  return data;
+}
+
+Rcpp::List sig_extraction_v2(const ReadLayout& readLayout, const std::vector<std::string>& sigstrings, 
+  Rcpp::DataFrame df, bool verbose) {
+  df_map_v2 idMap;
+  df_to_unordered_map_refs(df, idMap, verbose);
+  
+  std::vector<std::string> ids;
+  std::map<std::string, std::vector<std::string>> columns;
+  
+  Rcpp::StringVector quals = df["qual"];
+  Rcpp::StringVector seqs = df["seq"];
+  
+  for (int i = 0; i < sigstrings.size(); ++i) {
+    ReadData readData;
+    std::string signature = sigstrings[i];
+    ids.push_back(signature);
+    auto read_info_pos = signature.find_last_of('<');
+    std::string lengthTypeStr = signature.substr(read_info_pos + 1, signature.length() - read_info_pos - 2);
+    std::stringstream lengthTypeStream(lengthTypeStr);
+    std::string lengthStr, read_id, type;
+    std::getline(lengthTypeStream, lengthStr, ':');
+    std::getline(lengthTypeStream, read_id, ':');
+    std::getline(lengthTypeStream, type);
+    int length = std::stoi(lengthStr);
+    size_t plusPos = read_id.find("+FR_RF");
+    if (plusPos != std::string::npos) {
+      read_id = read_id.substr(0, plusPos);
+    }
+    readData.addStringInfo("type", length, read_id, type);
+    SigString* targetSigString = &readData.sigstring;
+    std::stringstream ss(signature);
+    std::string token;
+    // Process each token (element) in signature
+    while (std::getline(ss, token, '|')) {
+      std::string id;
+      int editDistance, startPos, endPos;
+      std::stringstream tokenStream(token);
+      
+      std::getline(tokenStream, id, ':');
+      tokenStream >> editDistance;
+      tokenStream.ignore(1); // Ignore the colon
+      tokenStream >> startPos;
+      tokenStream.ignore(1); // Ignore the colon
+      tokenStream >> endPos;
+      
+      // Check if element_id is of type "variable" in readLayout
+      auto& class_id_index = readLayout.get<id_tag>();
+      auto it = class_id_index.find(id);
+      if(it->type == "variable") {
+        boost::optional<std::string> final_seq;
+        std::string extracted_seq;
+        if (idMap.find(read_id) != idMap.end()) {
+          auto& ref = idMap[read_id];
+
+          std::string seq = Rcpp::as<std::string>(seqs[ref.seq]);
+          
+          if (startPos > 0 && endPos >= startPos && (seq.length() > endPos)) {
+            extracted_seq = seq.substr(startPos - 1, endPos - startPos + 1); // Corrected substring extraction
+            if (it->direction != "forward"){
+              extracted_seq = revcomp_cpp(extracted_seq);
+            }
+          }
+          final_seq = extracted_seq;
+        }
+        SigElement element(
+            id,
+            it->global_class,
+            editDistance,
+            std::make_pair(startPos, endPos),
+            it->type,
+            it->order,
+            it->direction,
+            boost::none,
+            final_seq
+        );
+        targetSigString->insert(std::move(element));
+        // Verbose output
+      }
+    }
+    for (const auto& element : readData.sigstring) {
+      if (element.type == "variable" && element.seq) {
+        columns[element.global_class].push_back(*element.seq); // this is pretty weird
+      }
+    }
+  }
+  Rcpp::List data(columns.size() + 1); // +1 for the ID column
   CharacterVector colNames(columns.size() + 1);
   colNames[0] = "sig_id";
   data[0] = wrap(ids);
@@ -1320,6 +1449,7 @@ List sig_extraction(const ReadLayout& readLayout, const std::vector<std::string>
   data.attr("names") = colNames;
   return data;
 }
+
 
 //displaying a sigstring
 void displayOrderedSigString(const ReadData& readData) {
@@ -1528,7 +1658,7 @@ Rcpp::CharacterVector process_sigstrings(const ReadLayout& readLayout,
 }
 
 // [[Rcpp::export]]
-List sig_extractor(const DataFrame& read_layout, const DataFrame& misalignment_threshold,
+Rcpp::List sig_extractor(const DataFrame& read_layout, const DataFrame& misalignment_threshold,
   const DataFrame& df, const CharacterVector& processed_sigstrings, bool verbose) {
   ReadLayout container = prep_read_layout_cpp(read_layout, misalignment_threshold);
   VarScan(container, verbose);
@@ -1536,6 +1666,17 @@ List sig_extractor(const DataFrame& read_layout, const DataFrame& misalignment_t
   std::vector<std::string> sigs = Rcpp::as<std::vector<std::string>>(processed_sigstrings);
   return sig_extraction(container, sigs, df, verbose);
 }
+
+// [[Rcpp::export]]
+Rcpp::DataFrame sig_extractor_v2(const DataFrame& read_layout, const DataFrame& misalignment_threshold,
+  DataFrame& df, const CharacterVector& processed_sigstrings, bool verbose) {
+  ReadLayout container = prep_read_layout_cpp(read_layout, misalignment_threshold);
+  VarScan(container, verbose);
+  positionFuncMap = createPositionFunctionMap(container, verbose);
+  std::vector<std::string> sigs = Rcpp::as<std::vector<std::string>>(processed_sigstrings);
+  return sig_extraction_v2(container, sigs, df, verbose);
+}
+
 
 // [[Rcpp::export]]
 Rcpp::CharacterVector sigrun(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, 

@@ -148,6 +148,8 @@ struct SigElement {
   seq(seq) {}
 };
 
+//manual memory release function for boost
+
 struct sig_id_tag {};
 struct sig_global_tag {};
 struct sig_ed_tag {};
@@ -211,10 +213,16 @@ struct barcode_data {
   double poisson_score = -1.0; // 0.0 implies no score or default
 };
 
+struct NanoRead_v2 {
+  std::size_t qual;
+  std::size_t seq;
+};
+
 struct NanoRead {
   std::string qual;
   std::string seq;
 };
+
 
 using whitelist = std::unordered_map<int64_t, barcode_data>;
 extern whitelist wl;

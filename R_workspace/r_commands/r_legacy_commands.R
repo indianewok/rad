@@ -450,14 +450,14 @@ str_extract(processed_sigstrings[1], pattern = "<.+?.>") %>% str_split(., patter
 str_extract(processed_sigstrings[7], pattern = "<.+?.>") %>% str_split(., pattern = ":") %>% {.[[1]][2]}
 
 barcode_extractor<-function(processed_sigstring){
-  barcode_coords<-str_extract(processed_sigstring, 
+  barcode_coords<-stringr::str_extract(processed_sigstring, 
     pattern = "barcode:0:\\d+.?.:\\d+.?.?(?=\\|)") %>% 
-    str_split(., pattern = ":") %>%
+    stringr::str_split(., pattern = ":") %>%
     {.[[1]][3:4]}
-  id<-str_extract(processed_sigstring, pattern = "<.+?.>") %>% 
-    str_split(., pattern = ":") %>% {.[[1]][2]} %>% 
+  id<-stringr::str_extract(processed_sigstring, pattern = "<.+?.>") %>% 
+    stringr::str_split(., pattern = ":") %>% {.[[1]][2]} %>% 
     {ifelse(test = grep(pattern = "+", x = .), 
-    yes = str_remove(., pattern = "\\+.+.?$"), no = "")}
+    yes = stringr::str_remove(., pattern = "\\+.+.?$"), no = "")}
   barcode = substr(df[id, "seq"], start = barcode_coords[1], stop = barcode_coords[2]) 
   barcode<-ifelse(test = grepl(pattern = ":R>$", x = processed_sigstring), yes =revcomp(barcode), no = barcode)
   return(barcode)

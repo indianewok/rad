@@ -10,6 +10,8 @@
 #' @importFrom data.table .N
 #' @importFrom data.table .NGRP
 #' @importFrom data.table .SD
+#' @importFrom data.table copy
 #' @importFrom data.table data.table
+#' @importFrom magrittr %>%
 ## usethis namespace: end
 NULL

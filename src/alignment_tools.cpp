@@ -1511,10 +1511,11 @@ std::string findPolyTail(const std::string& sequence, char poly_base, int window
 
 // [[Rcpp::export]]
 Rcpp::CharacterVector sigalign(
-  Rcpp::CharacterVector adapters,
-  std::vector<std::string> sequences,
-  std::vector<std::string> ids,
-  const Rcpp::DataFrame& misalignment_threshold, int nthreads) {
+    Rcpp::CharacterVector adapters,
+    std::vector<std::string> sequences,
+    std::vector<std::string> ids,
+    const Rcpp::DataFrame& misalignment_threshold, int nthreads) {
+  
   std::vector<std::string> queries = Rcpp::as<std::vector<std::string>>(adapters);
   std::vector<std::string> query_names = Rcpp::as<std::vector<std::string>>(adapters.names());
   std::map<int, std::string> signature_map;
@@ -1522,35 +1523,30 @@ Rcpp::CharacterVector sigalign(
   Rcpp::StringVector query_id = misalignment_threshold["query_id"];
   Rcpp::NumericVector misal_threshold = misalignment_threshold["misal_threshold"];
   Rcpp::NumericVector misal_sd = misalignment_threshold["misal_sd"];
+  
   for(int i = 0; i < query_id.size(); ++i) {
     null_dist_map[Rcpp::as<std::string>(query_id[i])] = std::make_pair((double) misal_threshold[i], (double) misal_sd[i]);
   }
   omp_set_num_threads(nthreads);
+#pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < sequences.size(); ++i) {
-    const auto& sequence =sequences[i];
-    std::ostringstream signature;
+    const auto& sequence = sequences[i];
     std::vector<std::string> temp_signature_parts;
     int length = sequence.size();
-    // Parallelize the inner loop through queries
-    // Loop through each sequence
-#pragma omp parallel for
     for (int j = 0; j < queries.size(); ++j) {
       const auto& query = queries[j];
       const auto& query_name = query_names[j];
-      int query_counter = j + 1;  // Local query_counter, initialized to the loop index + 1
       if (query_name == "poly_a" || query_name == "poly_t") {
-        // Handle the regex query here.
         char poly_base = (query_name == "poly_a") ? 'A' : 'T';
-        std::string match_str = findPolyTail(sequence, poly_base, 14, 12);  // assuming window_size = 16 and min_count = 12
-        if (!match_str.empty()){
+        std::string match_str = findPolyTail(sequence, poly_base, 14, 12);
+        if (!match_str.empty()) {
 #pragma omp critical
-{
-  temp_signature_parts.push_back(match_str);
-}
+          temp_signature_parts.push_back(match_str);
         }
       } else {
         EdlibAlignConfig config = edlibNewAlignConfig(-1, EDLIB_MODE_HW, EDLIB_TASK_LOC, NULL, 0);
         std::set<UniqueAlignment> uniqueAlignments;
+        
         char* cquery = const_cast<char*>(query.c_str());
         char* csequence = const_cast<char*>(sequence.c_str());
         EdlibAlignResult cresult = edlibAlign(cquery, query.size(), csequence, sequence.size(), config);
@@ -1612,19 +1608,19 @@ Rcpp::CharacterVector sigalign(
         return a + (a.length() > 0 ? "|" : "") + b;
       });
 #pragma omp critical
-{
-  final_signature += "<" + std::to_string(length) + ":" + ids[i] + ":undecided>";
-  signature_map[i + 1] = final_signature;
-}
-temp_signature_parts.clear();
+    {
+    final_signature += "<" + std::to_string(length) + ":" + ids[i] + ":undecided>";
+    signature_map[i+1] = final_signature;
+    temp_signature_parts.clear();
+    }
   }
-  // Convert signature_map to something R-friendly
   Rcpp::CharacterVector signature_strings(signature_map.size());
   for (const auto& pair : signature_map) {
-    signature_strings[pair.first - 1] = pair.second;
+    signature_strings[pair.first -1] = pair.second;
   }
   return signature_strings;
 }
+
 
 // [[Rcpp::export]]
 Rcpp::DataFrame sigalign_stats(Rcpp::CharacterVector adapters, std::vector<std::string> sequences,

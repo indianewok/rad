@@ -37,8 +37,24 @@ correct_barcodes_v2 <- function(barcodes, verbose = FALSE, nthreads = 1L, maxDis
     .Call(`_rad_correct_barcodes_v2`, barcodes, verbose, nthreads, maxDistance)
 }
 
-correct_barcodes_deprecated <- function(barcodes, verbose = FALSE, nthreads = 1L, breadth = 2L, depth = 2L, maxDistance = 3L) {
-    .Call(`_rad_correct_barcodes_deprecated`, barcodes, verbose, nthreads, breadth, depth, maxDistance)
+correct_barcodes_v3 <- function(barcodes, verbose = FALSE, nthreads = 1L, breadth = 2L, depth = 2L, maxDistance = 3L) {
+    .Call(`_rad_correct_barcodes_v3`, barcodes, verbose, nthreads, breadth, depth, maxDistance)
+}
+
+correct_barcodes_v4 <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 2L, high_speed = FALSE, maxDistance = 3L) {
+    .Call(`_rad_correct_barcodes_v4`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance)
+}
+
+correct_barcodes_v5 <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 2L, high_speed = FALSE, maxDistance = 3L) {
+    .Call(`_rad_correct_barcodes_v5`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance)
+}
+
+correct_barcodes_v6 <- function(barcodes, verbose = FALSE, nthreads = 1L, maxDistance = 3L) {
+    .Call(`_rad_correct_barcodes_v6`, barcodes, verbose, nthreads, maxDistance)
+}
+
+correct_barcodes_v7 <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 2L, high_speed = FALSE, maxDistance = 3L) {
+    .Call(`_rad_correct_barcodes_v7`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance)
 }
 
 correct_barcodes <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 2L, high_speed = FALSE, maxDistance = 3L) {
@@ -47,6 +63,10 @@ correct_barcodes <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2
 
 sig_extractor <- function(read_layout, misalignment_threshold, df, processed_sigstrings, verbose) {
     .Call(`_rad_sig_extractor`, read_layout, misalignment_threshold, df, processed_sigstrings, verbose)
+}
+
+sig_extractor_v2 <- function(read_layout, misalignment_threshold, df, processed_sigstrings, verbose) {
+    .Call(`_rad_sig_extractor_v2`, read_layout, misalignment_threshold, df, processed_sigstrings, verbose)
 }
 
 sigrun <- function(read_layout, misalignment_threshold, sigstrings, nthreads = 1L, verbose = FALSE) {
