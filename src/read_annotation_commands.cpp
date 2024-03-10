@@ -1235,7 +1235,7 @@ void df_to_unordered_map_refs(const Rcpp::DataFrame& df, df_map_v2& map, bool ve
   Rcpp::StringVector seqs = df["seq"];
   for(int i = 0; i < ids.size(); ++i) {
     std::string id = Rcpp::as<std::string>(ids[i]);
-    map[id] = {i, i}; // Store indices
+    map[id] = {static_cast<std::size_t>(i), static_cast<std::size_t>(i)};
   }
   if (verbose) {
     Rcpp::Rcout << "Map populated. Entries: " << map.size() << "\n";

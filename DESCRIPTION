@@ -10,6 +10,7 @@ License: GPL (>= 2)
 Imports: 
     data.table,
     magrittr,
+    memuse,
     Rcpp (>= 1.0.9),
     stringr
 LinkingTo: Rcpp, BH

@@ -167,7 +167,7 @@ void populate_whitelist(NumericVector barcodes,
         Rcpp::Rcout << "Barcode has been found!\n";
         Rcpp::Rcout << barcode << "\n";
       }
-      // Existing entry found, update it carefully
+      // Existing entry found, update it
       if (has_poisson_data && !Rcpp::NumericVector::is_na(poisson_data[i])) {
         it->second.poisson_score = static_cast<double>(poisson_data[i]); // Ensure correct type
       }
