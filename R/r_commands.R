@@ -268,7 +268,7 @@ rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_fi
   if(verbose == TRUE){
     print("Check #1--pre-sigalign.")
     print(lobstr::mem_used())
-    print(memuse::Sys.procmem())
+    print(memuse::Sys.procmem(gcFirst = FALSE))
   }
   
   sigstrings<-vector(length = length(df$seq))
@@ -277,7 +277,7 @@ rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_fi
   if(verbose == TRUE){
     print("Check #2--post-alignment.")
     print(lobstr::mem_used())
-    print(memuse::Sys.procmem())
+    print(memuse::Sys.procmem(gcFirst = FALSE))
   }
   
   sigstrings<-sigrun(read_layout, misalignment_threshold, sigstrings = sigstrings, 
@@ -285,7 +285,7 @@ rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_fi
   if(verbose == TRUE){
     print("Check #3--post-processing.")
     print(lobstr::mem_used())
-    print(memuse::Sys.procmem())
+    print(memuse::Sys.procmem(gcFirst = FALSE))
   }
   
   df<-sig_extractor_v2(read_layout, misalignment_threshold = misalignment_threshold, df = df,
@@ -294,14 +294,14 @@ rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_fi
    if(verbose == TRUE){
      print("Check #4--extracting sigs to generate the df.")
      print(lobstr::mem_used())
-     print(memuse::Sys.procmem())
+     print(memuse::Sys.procmem(gcFirst = FALSE))
    }
    aggc()
    rm(sigstrings)
    if(verbose == TRUE){
      print("Check #5--clearing processed_sigs.")
      print(lobstr::mem_used())
-     print(memuse::Sys.procmem())
+     print(memuse::Sys.procmem(gcFirst = FALSE))
    }
    
    length_filter<-apply(df, MARGIN = 2, FUN = function(x){which(stringr::str_length(x) <= 2)},
@@ -469,3 +469,58 @@ aggc<-function(){
 # print(memuse::Sys.procmem())
 # return(df)
 # })
+# 
+# 
+
+tcr_out<-lapply(seq(from = 100000, to = 1000000, by = 100000), FUN = function(x){
+  clear_whitelist()
+  print(paste0("Starting on ", x, "!"))
+  whitelist_generator(tcr_df[sample(1:1000000, size = x, replace= FALSE),], 
+    original_whitelist = cr_whitelist, correct_mode = FALSE)
+  aggc()
+  print(paste0("Done with ", x, "!"))
+  return(generated_whitelist)
+})
+
+scmix_micro<-lapply(seq(from = 10000, to = 100000, by = 10000), FUN = function(x){
+  clear_whitelist()
+  print(paste0("Starting on ", x, "!"))
+  whitelist_generator(scmix_df[sample(1:1000000, size = x, replace= FALSE),], 
+    original_whitelist = cr_whitelist, correct_mode = FALSE)
+  aggc()
+  print(paste0("Done with ", x, "!"))
+  return(generated_whitelist)
+})
+
+scmix_macro<-lapply(seq(from = 100000, to = 1000000, by = 100000), FUN = function(x){
+  clear_whitelist()
+  print(paste0("Starting on ", x, "!"))
+  whitelist_generator(scmix_df[sample(1:1000000, size = x, replace= FALSE),], 
+    original_whitelist = cr_whitelist, correct_mode = FALSE)
+  aggc()
+  print(paste0("Done with ", x, "!"))
+  return(generated_whitelist)
+})
+
+output_list<-list()for(i in 1:20){
+  print(paste0("On iteration ",i,"!"))
+  clear_whitelist()
+  barcodes<-sample(scmix_df$barcode[grep(pattern = "FR_RF", x = scmix_df$sig_id, invert = TRUE)], replace = FALSE,
+    size = 10000)
+  barcodes<-table(barcodes) %>% data.table::as.data.table(.)
+  filter_runs<-sapply(X = c("A","C","T","G"), FUN = function(X){
+    paste0(replicate(X, n = 8), collapse = "") %>% {which(grepl(pattern = .,  x = barcodes) == TRUE)}
+  }) %>% unlist %>% unique
+  barcodes<-barcodes[-filter_runs,]
+  barcodes$pois<-stats::ppois(q = barcodes$N, lambda = mean(barcodes$N))
+  print(length(which(barcodes$pois > 0.9)))
+  entries<-which(barcodes$pois > 0.9)
+  chunk_whitelist<-barcodes[entries,]
+  chunk_whitelist$barcodes<-sequence_to_bits(chunk_whitelist$barcodes)
+  whitelist_info<-which(chunk_whitelist$barcodes %in% cr_whitelist$whitelist_bcs)
+  chunk_whitelist<-chunk_whitelist[whitelist_info,]
+  print(nrow(chunk_whitelist))
+  print(table(chunk_whitelist$barcodes %in% sequence_to_bits(scmix_og)))
+  populate_whitelist(barcodes = chunk_whitelist$barcodes, counts = chunk_whitelist$N, poisson_data = chunk_whitelist$pois)
+  output_list[[i]]<-chunk_whitelist
+}
