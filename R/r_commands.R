@@ -35,7 +35,7 @@ whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
     }
   }
 }
-write_fastqas<-function(df, fn, type, append = FALSE){
+write_fastqas<-function(df, fn, type, append = FALSE, nthreads = 1){
   if(type == "fq"){
     fq_list<-df %>%
       dplyr::mutate(dummy = "+") %>%
@@ -44,10 +44,10 @@ write_fastqas<-function(df, fn, type, append = FALSE){
       t() %>%
       as.character() %>%
       tibble::as_tibble()
-    data.table::fwrite(fq_list, file = fn, compress = "auto", col.names = FALSE, quote = FALSE, append = append)
+    data.table::fwrite(fq_list, file = fn, compress = "auto", col.names = FALSE, quote = FALSE, append = append, nThread = nthreads)
   }
   if(type == "fa"){
-    if(any(grepl(">", df$id)) == FALSE){
+    if(any(grepl("^>", df$id)) == FALSE){
       df$id<-paste0(">",df$id)
       fa_list<-df %>%
         dplyr::select(id, seq) %>%
@@ -55,15 +55,16 @@ write_fastqas<-function(df, fn, type, append = FALSE){
         t() %>%
         as.character() %>%
         tibble::as_tibble()
-      data.table::fwrite(fa_list, file = fn, compress = "auto", col.names = FALSE, quote = FALSE, append = append)
-    }
+      data.table::fwrite(fa_list, file = fn, compress = "auto", col.names = FALSE, quote = FALSE, append = append, nThread = nthreads)
+    } else {
     fa_list<-df %>%
       dplyr::select(id, seq) %>%
       as.matrix() %>%
       t() %>%
       as.character() %>%
       tibble::as_tibble()
-    data.table::fwrite(fa_list, file = fn, compress = "auto", col.names = FALSE, quote = FALSE, append = append)
+    data.table::fwrite(fa_list, file = fn, compress = "auto", col.names = FALSE, quote = FALSE, append = append, nThread = nthreads)
+    }
   }
 }
 read_fastqas<-function(fn, type, full_id = FALSE, ...){
@@ -332,7 +333,7 @@ read_paf<-function(path, ...){
   }
   return(df)
 }
-rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_file, verbose = FALSE){
+rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_dir, verbose = FALSE){
   baseline_filter <- sum(na.omit(read_layout[direction == "forward", expected_length])) + 100
   df <- df[stringr::str_length(seq) >= baseline_filter]
   if(verbose == TRUE){
@@ -344,6 +345,12 @@ rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_fi
   sigstrings<-vector(length = length(df$seq))
   sigstrings<-sigalign(adapters = adapters, sequences = df$seq, ids = df$id, 
     misalignment_threshold = misalignment_threshold, nthreads = nthreads)
+  
+  output_path<-paste0(output_dir, "/sigstrings")
+  append_sigstrings<-file.exists(paste0(output_path, "sigsummary_unprocessed.txt"))
+  write(x = sigstrings, file = paste0(output_path, "/sigsummary_unprocessed.txt"), 
+    append = append_sigstrings)
+  
   if(verbose == TRUE){
     print("Check #2--post-alignment.")
     print(lobstr::mem_used())
@@ -352,6 +359,12 @@ rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_fi
   
   sigstrings<-sigrun(read_layout, misalignment_threshold, sigstrings = sigstrings, 
     nthreads = nthreads, verbose = FALSE)
+  
+  output_path<-paste0(output_dir, "/sigstrings")
+  append_sigstrings<-file.exists(paste0(output_path, "sigsummary_processed.txt"))
+  write(x = sigstrings, file = paste0(output_path, "/sigsummary_processed.txt"), 
+    append = append_sigstrings)
+  
   if(verbose == TRUE){
     print("Check #3--post-processing.")
     print(lobstr::mem_used())
@@ -361,13 +374,16 @@ rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_fi
   df<-sig_extractor_v2(read_layout, misalignment_threshold = misalignment_threshold, df = df,
      processed_sigstrings = sigstrings[grep(pattern = "undecided", x = sigstrings, invert = TRUE)],
     verbose = FALSE) %>% data.table::as.data.table(.)
+  
    if(verbose == TRUE){
      print("Check #4--extracting sigs to generate the df.")
      print(lobstr::mem_used())
      print(memuse::Sys.procmem(gcFirst = FALSE))
    }
+  
    aggc()
    rm(sigstrings)
+   
    if(verbose == TRUE){
      print("Check #5--clearing processed_sigs.")
      print(lobstr::mem_used())
@@ -426,15 +442,24 @@ synth_data_processor<-function(fn, type, df_out){
   }
   return(df_new)
 }
-barcode_handler<-function(df, original_whitelist = NULL, prefiltered_whitelist = NULL,
-  generate = TRUE, correct = FALSE, nthreads = NULL, breadth = 2, depth = 2, maxDist = 5, 
-  hs_correct = FALSE){
+barcode_handler<-function(df, output_dir = NULL,
+  original_whitelist = NULL, prefiltered_whitelist = NULL,
+  generate = TRUE, correct = FALSE, nthreads = NULL,
+  breadth = 2, depth = 2, maxDist = 5, 
+  high_speed = FALSE, verbose = FALSE){
     if(!is.null(original_whitelist)){
       barcodes<-table(df$barcode) %>% data.table::as.data.table(.)
     } else {
       barcodes<-table(df$barcode[grep(pattern = "FR_RF", x = df$sig_id, invert = TRUE)]) %>% data.table::as.data.table(.)
     }
+  if(verbose){
+    print(paste0("Number of total barcodes: ", nrow(barcodes)))
+    print(whitelist_size())
+  }
     ratio<-nrow(barcodes)/nrow(df)
+  if(verbose){
+      print(paste0("Ratio of unique barcodes to unique reads: ", ratio))
+  }
     if(ratio > 0.5){
       rescue_repeats<-6
       maxDist<-2
@@ -461,22 +486,27 @@ barcode_handler<-function(df, original_whitelist = NULL, prefiltered_whitelist =
       }
       suppressWarnings(fitcheck<-MASS::fitdistr(chunk_whitelist$N, "negative binomial"))
       chunk_whitelist<-chunk_whitelist[order(chunk_whitelist$N, decreasing = TRUE),]
-      if(fitcheck$estimate[1] < 1){
-        chunk_whitelist$ncsum<-pnbinom(size = fitcheck$estimate[1], mu = fitcheck$estimate[2], chunk_whitelist$N)
+      if(!is.null(output_dir)){
+        output<-ggpubr::gghistogram(chunk_whitelist, x = "N", weight = "N", bins = 40)
+        filename<-paste0(output_dir,"/weighted_barcode_histogram.png")
+        ggplot2::ggsave(filename, output)
+      }
+      chunk_whitelist$ncsum<-pnbinom(size = fitcheck$estimate[1], mu = fitcheck$estimate[2], chunk_whitelist$N)
+      chunk_whitelist$csum<-(cumsum(chunk_whitelist$N)/sum(chunk_whitelist$N))*100
+      nbin<-which(chunk_whitelist$ncsum >= 0.7)
+      csm<-which(chunk_whitelist$csum <= 99)
+      if(length(nbin) > length(csm)){
         chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$ncsum >= 0.7),]
         query_list<-data.table::rbindlist(l = list(chunk_whitelist[which(chunk_whitelist$ncsum >= 0.7),1:3], query_list))
-        print(fitcheck)
       } else {
-        chunk_whitelist$csum<-(cumsum(chunk_whitelist$N)/sum(chunk_whitelist$N))*100
         chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$csum <= 99),]
         query_list<-data.table::rbindlist(l = list(chunk_whitelist[which(chunk_whitelist$csum >= 99),1:3], query_list))
       }
       print(nrow(chunk_whitelist))
-      print(whitelist_size())
       populate_whitelist(barcodes = chunk_whitelist$V1, poisson_data = chunk_whitelist$pois_dist, counts = chunk_whitelist$N)
       print(whitelist_size())
       output<-list(generated_whitelist = chunk_whitelist)
-      list2env(output, .GlobalEnv)
+      return(list2env(output, .GlobalEnv))
     }
    if(correct == TRUE){
     if(whitelist_size() < 10){
@@ -488,111 +518,49 @@ barcode_handler<-function(df, original_whitelist = NULL, prefiltered_whitelist =
       query_list<-barcodes[!barcodes$V1 %in% gen_whitelist$sequence,]
       query_list<-query_list[order(query_list$N, decreasing = TRUE),]
       query_list$corrected<-NA
-      if(!is.null(nthreads)){
-        query_list$corrected<-correct_barcodes(barcodes = query_list$V1,breadth = breadth, depth = depth, high_speed = FALSE, nthreads = nthreads, maxDistance = maxDist)
-        df$barcode<-sequence_to_bits(df$barcode)
-        df[query_list, barcode := bit64::as.integer64(i.corrected), on = .(barcode = V1)]
-        query_list<-query_list[which(!is.na(query_list$corrected)),]
-        #df<-df[which(df$barcode %in% chunk_whitelist$V1),]
-        df$pass_fail<-df$barcode %in% gen_whitelist$sequence
-        output<-list(df_filtered = df)
-        return(list2env(output, .GlobalEnv))
+      if(verbose){
+        print(paste0("The length of the barcodes are: ", nrow(barcodes)))
+        print(head(barcodes))
+        print(paste0("The length of the gen_whitelist is ", nrow(gen_whitelist)))
+        print(head(gen_whitelist))
+        print(paste0("the length of the query list is ", nrow(query_list)))
+        print(head(query_list))
+        print(class(query_list$V1))
       }
+      query_list$corrected<-correct_barcodes(barcodes = query_list$V1, breadth = 2, depth = 2,
+      high_speed = FALSE, nthreads = nthreads, maxDistance = 4)
+      df$barcode<-sequence_to_bits(df$barcode)
+      df[query_list, barcode := bit64::as.integer64(i.corrected), on = .(barcode = V1)]
+      query_list<-query_list[which(!is.na(query_list$corrected)),]
+      #df<-df[which(df$barcode %in% chunk_whitelist$V1),]
+      df$pass_fail<-df$barcode %in% gen_whitelist$sequence
+      output<-list(df_filtered = df)
+      return(list2env(output, .GlobalEnv))
     }
   }
 }
-
+post_processor<-function(df){
+  df$sig_id<-stringr::str_extract(string = df$sig_id, pattern = "<.+.(?=:)") 
+  df$barcode<-df$barcode %>% bit64::as.integer64(.) %>% bits_to_sequence(.)
+  df<-df %>% tidytable::unite("id", c("sig_id", "barcode", "umi"), sep = "_", remove = FALSE) %>%
+    .[,c("id","read")] %>% data.table::setnames("read","seq")
+ return(df)
+}
+single_batch_processor<-function(df){
+  df<-rad_chunk(df, read_layout, misalignment_threshold, nthreads = nthreads, output_dir = output_dir, verbose = FALSE)
+  barcode_handler(df = df, original_whitelist = original_whitelist, 
+    generate = FALSE, correct = TRUE, verbose = TRUE, nthreads = nthreads)
+  pass_fail<-table(df_filtered$pass_fail) %>% data.table::as.data.table(.)
+  per_section_pass<-file.exists(paste0(output_dir,"/pass_fail_chunk_stats.csv"))
+  
+  data.table::fwrite(pass_fail, file = paste0(output_dir, "/pass_fail_chunk_stats.csv"), append = per_section_pass)
+  df_filtered<-df_filtered[which(df_filtered$pass_fail == TRUE),]
+  df_filtered<-post_processor(df_filtered)
+  append_fasta<-file.exists(paste0(output_dir, "/output/filtered_reads.fasta.gz"))
+  write_fastqas(df = df_filtered, fn = paste0(output_dir, "/output/filtered_reads.fasta.gz"), 
+    type = "fa", append = append_fasta, nthreads = nthreads)
+}
 aggc<-function(){
   gc()
   mallinfo::malloc.trim()
 }
-
-# output_list<-list()
-# for(i in 1:20){
-#   barcodes<-sample(tcr_processed_df$barcode[grep(pattern = "FR_RF", x = tcr_processed_df$sig_id, invert = TRUE)], replace = FALSE, 
-#     size = 10000)
-#   barcodes<-table(barcodes) %>% data.table::as.data.table(.)
-#   filter_runs<-sapply(X = c("A","C","T","G"), FUN = function(X){
-#     paste0(replicate(X, n = 8), collapse = "") %>% {which(grepl(pattern = .,  x = barcodes) == TRUE)}
-#   }) %>% unlist %>% unique
-#   barcodes<-barcodes[-filter_runs,]
-#   barcodes$pois<-stats::ppois(q = barcodes$N, lambda = mean(barcodes$N))
-#   print(length(which(barcodes$pois > 0.9)))
-#   entries<-which(barcodes$pois > 0.9)
-#   chunk_whitelist<-barcodes[entries,]
-#   chunk_whitelist$barcodes<-sequence_to_bits(chunk_whitelist$barcodes)
-#   whitelist_info<-which(chunk_whitelist$barcodes %in% whitelist$whitelist_bcs)
-#   chunk_whitelist<-chunk_whitelist[whitelist_info,]
-#   print(nrow(chunk_whitelist))
-#   print(table(chunk_whitelist$barcodes %in% scmix_sub))
-#   populate_whitelist(barcodes = chunk_whitelist$barcodes, counts = chunk_whitelist$N, poisson_data = chunk_whitelist$pois)
-#   output_list[[i]]<-chunk_whitelist
-# }
-# 
-# 
-# 
-# three_prime<-lapply(three_prime, FUN = function(x){
-# print(memuse::Sys.procmem())
-# df<-read_fastqas(fn = x, type = "fq")
-# misalignment_threshold<-sigalign_stats(adapters[-grep("poly", x = names(adapters))],
-#   sequences = df$seq[1:100000], nthreads = 1) %>% stat_collector(., read_layout, mode = "stats")
-# df<-rad_chunk(df, read_layout, misalignment_threshold, nthreads = 32, output_file = "", verbose= TRUE)
-# aggc()
-# print(memuse::Sys.procmem())
-# return(df)
-# })
-# 
-# 
-
-# tcr_out<-lapply(seq(from = 100000, to = 1000000, by = 100000), FUN = function(x){
-#   clear_whitelist()
-#   print(paste0("Starting on ", x, "!"))
-#   whitelist_generator(tcr_df[sample(1:1000000, size = x, replace= FALSE),], 
-#     original_whitelist = cr_whitelist, correct_mode = FALSE)
-#   aggc()
-#   print(paste0("Done with ", x, "!"))
-#   return(generated_whitelist)
-# })
-# 
-# scmix_micro<-lapply(seq(from = 10000, to = 100000, by = 10000), FUN = function(x){
-#   clear_whitelist()
-#   print(paste0("Starting on ", x, "!"))
-#   whitelist_generator(scmix_df[sample(1:1000000, size = x, replace= FALSE),], 
-#     original_whitelist = cr_whitelist, correct_mode = FALSE)
-#   aggc()
-#   print(paste0("Done with ", x, "!"))
-#   return(generated_whitelist)
-# })
-# 
-# scmix_macro<-lapply(seq(from = 100000, to = 1000000, by = 100000), FUN = function(x){
-#   clear_whitelist()
-#   print(paste0("Starting on ", x, "!"))
-#   whitelist_generator(scmix_df[sample(1:1000000, size = x, replace= FALSE),], 
-#     original_whitelist = cr_whitelist, correct_mode = FALSE)
-#   aggc()
-#   print(paste0("Done with ", x, "!"))
-#   return(generated_whitelist)
-# })
-# 
-# output_list<-list()for(i in 1:20){
-#   print(paste0("On iteration ",i,"!"))
-#   clear_whitelist()
-#   barcodes<-sample(scmix_df$barcode[grep(pattern = "FR_RF", x = scmix_df$sig_id, invert = TRUE)], replace = FALSE,
-#     size = 10000)
-#   barcodes<-table(barcodes) %>% data.table::as.data.table(.)
-#   filter_runs<-sapply(X = c("A","C","T","G"), FUN = function(X){
-#     paste0(replicate(X, n = 8), collapse = "") %>% {which(grepl(pattern = .,  x = barcodes) == TRUE)}
-#   }) %>% unlist %>% unique
-#   barcodes<-barcodes[-filter_runs,]
-#   barcodes$pois<-stats::ppois(q = barcodes$N, lambda = mean(barcodes$N))
-#   print(length(which(barcodes$pois > 0.9)))
-#   entries<-which(barcodes$pois > 0.9)
-#   chunk_whitelist<-barcodes[entries,]
-#   chunk_whitelist$barcodes<-sequence_to_bits(chunk_whitelist$barcodes)
-#   whitelist_info<-which(chunk_whitelist$barcodes %in% cr_whitelist$whitelist_bcs)
-#   chunk_whitelist<-chunk_whitelist[whitelist_info,]
-#   print(nrow(chunk_whitelist))
-#   print(table(chunk_whitelist$barcodes %in% sequence_to_bits(scmix_og)))
-#   populate_whitelist(barcodes = chunk_whitelist$barcodes, counts = chunk_whitelist$N, poisson_data = chunk_whitelist$pois)
-#   output_list[[i]]<-chunk_whitelist
-# }

@@ -392,6 +392,7 @@ bajrun<-function(path_layout_form, read_layout_form,
       {df_new[which(.%in%whitelist$whitelist_bcs),]}
     }
     
+    
     df_true$id<-DescTools::StrExtractBetween(x = df_true$sig_id, left = "^", right = "\\*")
     df_true<-df_true %>% tidytable::unite("id", c("id", "umi", "barcode"), sep = "_", remove = FALSE) %>% 
       .[,c("id","filtered_read","filtered_qc")] %>% 
