@@ -57,7 +57,7 @@ correct_barcodes_v7 <- function(barcodes, verbose = FALSE, nthreads = 1L, depth 
     .Call(`_rad_correct_barcodes_v7`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance)
 }
 
-correct_barcodes <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 2L, high_speed = FALSE, maxDistance = 3L) {
+correct_barcodes <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 1L, high_speed = TRUE, maxDistance = 2L) {
     .Call(`_rad_correct_barcodes`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance)
 }
 

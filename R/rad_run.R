@@ -1,6 +1,7 @@
-rad_run<-function(read_layout_form, read_dir, output_dir_, whitelist_path, nthreads = 1,
-  SETUP_DRY_RUN = FALSE, FULL_RUN = FALSE, VERBOSE = FALSE){
-  if(VERBOSE){
+rad_run<-function(read_layout_form, read_dir, output_dir, whitelist_path, nthreads = 1,
+  SETUP_DRY_RUN = FALSE, FULL_RUN = FALSE, VERBOSE = FALSE, KINDA_VERBOSE = FALSE, 
+  ORIGINAL_CHUNK_SIZE = 5e5){
+  if(VERBOSE||KINDA_VERBOSE){
     print("Welcome to RAD! Now testing that everything's in the right place...")
     print(paste0("The files are coming in from ", read_dir, " and the files are going to be written to ", output_dir, "..."))
   }
@@ -11,7 +12,7 @@ rad_run<-function(read_layout_form, read_dir, output_dir_, whitelist_path, nthre
     }
     dir.create(path = output_dir)
   } else {
-    if(VERBOSE){
+    if(VERBOSE||KINDA_VERBOSE){
       print("Directory exists! Checking subdirectories now...")
     }
   }
@@ -33,8 +34,8 @@ rad_run<-function(read_layout_form, read_dir, output_dir_, whitelist_path, nthre
     if(VERBOSE){
       print("Done with directory setup! Everything looks good on this end. Now checking the files coming in...")
       print(paste0("Directory with your reads in it: ", read_dir))
+      print(subdirs)
     }
-    print(subdirs)
     if(VERBOSE){
       ifelse(test = file.exists(read_dir),yes = {
         print("Directory found! Things are going swimmingly...")
@@ -43,7 +44,7 @@ rad_run<-function(read_layout_form, read_dir, output_dir_, whitelist_path, nthre
         stop()
       })
     }
-  files<-list.files(path = read_dir, pattern = ".fastq.gz", full.names = TRUE)
+  files<-list.files(path = read_dir, pattern = "\\d.fastq.gz", full.names = TRUE)
   file_size<-memuse::Sys.filesize(files[1])
   if(VERBOSE){
     print(paste0("Found ", length(files), " in the directory with the extension .fastq.gz. Each one is about ", file_size, " large."))
@@ -57,10 +58,12 @@ rad_run<-function(read_layout_form, read_dir, output_dir_, whitelist_path, nthre
     stop()
   }
   if(nrow(test_file) != 0){
+    file_rows<-nrow(test_file)
+    
     if(VERBOSE){
       print(paste0("This .fastq has ", nrow(test_file), " reads in it and will be ", memuse::memuse(test_file), " in total."))
-      size<-ceiling(5e5/(nrow(test_file)))
-      print(paste0("That'd be about ", size,  " .fastq file imports and will take about ",
+      size<-ceiling(ORIGINAL_CHUNK_SIZE/(nrow(test_file)))
+      print(paste0("That'd be about ", size,  " .fastq files and will take about ",
         memuse::memuse(test_file)*size, "."))
     }
   } else {
@@ -70,23 +73,25 @@ rad_run<-function(read_layout_form, read_dir, output_dir_, whitelist_path, nthre
     stop()
   }
   if(SETUP_DRY_RUN != FALSE){
-    if(VERBOSE){
+    if(VERBOSE||KINDA_VERBOSE){
       print("Stopping here! Things that work on your computer: read_fastqas, file calculations, and making directories!")
     }
     return(list2env(list(test_file = test_file), .GlobalEnv))
   } else {
     print("Now importing...")
   }
-  setup_chunk_size<-ceiling(5e5/nrow(test_file))
+  setup_chunk_size<-ceiling(ORIGINAL_CHUNK_SIZE/nrow(test_file))
   df<-read_fastqas(fn = files[1:setup_chunk_size], type = "fq")
-  if(VERBOSE){
+  if(VERBOSE||KINDA_VERBOSE){
     print(nrow(df))
-    print(paste0("Total size of imported chunk in memory: ", memuse::memuse(df)))
-    total_mem<-memuse::Sys.meminfo()[1]
-    print(total_mem)
-    print(paste0("Now that import looks good, let's check our read layout and our misalignment thresholds!"))
-    #MISALIGNMENT THRESHOLD & READ LAYOUT
-    print(paste0("Read layout form is at ", read_layout_form))
+    if(VERBOSE){
+      print(paste0("Total size of imported chunk in memory: ", memuse::memuse(df)))
+      total_mem<-memuse::Sys.meminfo()[1]
+      print(total_mem)
+      print(paste0("Now that import looks good, let's check our read layout and our misalignment thresholds!"))
+      #MISALIGNMENT THRESHOLD & READ LAYOUT
+      print(paste0("Read layout form is at ", read_layout_form))
+    }
   }
   prep_read_layout(read_layout_form)
   if(VERBOSE){
@@ -98,34 +103,39 @@ rad_run<-function(read_layout_form, read_dir, output_dir_, whitelist_path, nthre
   }
   baseline_filter <- sum(na.omit(read_layout[direction == "forward", expected_length])) + 100
   df <- df[stringr::str_length(seq) >= baseline_filter]
+  strl<-ggpubr::ggdensity(stringr::str_length(df$seq), xscale = "log10")
+  ggplot2::ggsave(filename = paste0(output_dir,"/read_length.png"), strl)
+  rm(strl)
   misalignment_threshold<-sigalign_stats(adapters = adapters[-grep("poly", x = names(adapters))], 
     sequences = df$seq[1:100000], nthreads = 1) %>% stat_collector(., read_layout, mode = "stats")
   data.table::fwrite(misalignment_threshold, file = paste0(output_dir, "/misalignment_threshold.csv"))
   print(misalignment_threshold)
   #INSERT MISALIGNMENT THRESHOLD WRITE HERE
-  if(VERBOSE){
-    print("Cool! Got that. Now checking if our end-to-end rad_chunk function works on a read subset...")
+  if(VERBOSE||KINDA_VERBOSE){
+    print("Cool! Got the misalignment thresholds. Now checking if our end-to-end rad_chunk function works on a read subset...")
   }
   if(nthreads > 1){
     if(VERBOSE){
-      print("Also checking to see if our multi-core code works!")
+      print("Using multiple cores!")
     }
   }
   df<-rad_chunk(df = df, read_layout = read_layout, misalignment_threshold = misalignment_threshold, 
-    nthreads = nthreads, output_dir = output_dir, verbose = FALSE)
-  if(VERBOSE){
+    nthreads = nthreads, output_dir = output_dir, verbose = VERBOSE)
+  if(VERBOSE||KINDA_VERBOSE){
     print("Looks like it works like a charm! Now generating whitelist from the first subset of reads...")
   }
   original_whitelist<-NULL
   if(file.exists(whitelist_path)){
     original_whitelist<-whitelist_importer(whitelist_path = whitelist_path)
   }
-  barcode_handler(df = df, original_whitelist = original_whitelist, 
-    generate = TRUE, correct = FALSE, verbose = TRUE, output_dir = subdirs[1], nthreads = nthreads)
-  print("Whitelist is generated! Now correcting the df in question...")
+  whitelist_generator(df = df, original_whitelist = original_whitelist,
+     prefiltered_whitelist = NULL, output_dir = output_dir, stringency = "DEFAULT", verbose = VERBOSE)
+  if(VERBOSE){
+    print("Whitelist is generated! Now correcting the df in question...")
+  }
   data.table::fwrite(generated_whitelist, file = paste0(output_dir,"/barcode_info/generated_whitelist.csv"))
-  barcode_handler(df = df, original_whitelist = original_whitelist, 
-    generate = FALSE, correct = TRUE, verbose = TRUE, nthreads = nthreads)
+  barcode_corrector(df, gen_whitelist = generated_whitelist, breadth = 1, depth = 2, high_speed = TRUE,
+     nthreads = nthreads, maxDistance = 2, verbose = VERBOSE)
   per_section_pass<-file.exists(paste0(output_dir,"/pass_fail_chunk_stats.csv"))
   pass_fail<-table(df_filtered$pass_fail) %>% data.table::as.data.table(.)
   data.table::fwrite(pass_fail, file = paste0(output_dir, "/pass_fail_chunk_stats.csv"), append = per_section_pass)
@@ -137,7 +147,25 @@ rad_run<-function(read_layout_form, read_dir, output_dir_, whitelist_path, nthre
     type = "fa", append = append_fasta, nthreads = nthreads)
   #add dots for internal barcode assignment--fix this part
   aggc()
-  print("All done with a *first batch*!")
+  if(VERBOSE||KINDA_VERBOSE){
+    print("All done with a *first batch*!")
+  }
   list2env(x = list(misalignment_threshold = misalignment_threshold, original_whitelist = original_whitelist), envir = .GlobalEnv)
-  single_batch_processor(df = read_fastqas(fn = files[100:120], type = "fq"))
+  if(FULL_RUN == TRUE){
+    files<-files[-c(1:setup_chunk_size)]
+    file_chunk_divisor<-20
+    if(file_rows > 20000){
+      file_chunk_divisor<-10
+    }
+    file_chunks<-split(files, ceiling(seq_along(files) / file_chunk_divisor))
+    if(VERBOSE){
+      length(file_chunks)
+    }
+    pbapply::pblapply(file_chunks, FUN = function(x){
+      print(length(x))
+      single_processor(fastqas = x, nthreads = nthreads, output_dir = output_dir)
+      aggc()
+    })
+  }
+  on.exit(expr = aggc())
 }

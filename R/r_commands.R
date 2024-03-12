@@ -336,6 +336,7 @@ read_paf<-function(path, ...){
 rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_dir, verbose = FALSE){
   baseline_filter <- sum(na.omit(read_layout[direction == "forward", expected_length])) + 100
   df <- df[stringr::str_length(seq) >= baseline_filter]
+  write_out<-(nchar(output_dir) > 0)
   if(verbose == TRUE){
     print("Check #1--pre-sigalign.")
     print(lobstr::mem_used())
@@ -346,10 +347,12 @@ rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_di
   sigstrings<-sigalign(adapters = adapters, sequences = df$seq, ids = df$id, 
     misalignment_threshold = misalignment_threshold, nthreads = nthreads)
   
-  output_path<-paste0(output_dir, "/sigstrings")
-  append_sigstrings<-file.exists(paste0(output_path, "sigsummary_unprocessed.txt"))
-  write(x = sigstrings, file = paste0(output_path, "/sigsummary_unprocessed.txt"), 
-    append = append_sigstrings)
+  if(write_out){
+    output_path<-paste0(output_dir, "/sigstrings")
+    append_sigstrings<-file.exists(paste0(output_path, "sigsummary_unprocessed.txt"))
+    write(x = sigstrings, file = paste0(output_path, "/sigsummary_unprocessed.txt"), 
+      append = append_sigstrings)
+  }
   
   if(verbose == TRUE){
     print("Check #2--post-alignment.")
@@ -360,10 +363,12 @@ rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_di
   sigstrings<-sigrun(read_layout, misalignment_threshold, sigstrings = sigstrings, 
     nthreads = nthreads, verbose = FALSE)
   
-  output_path<-paste0(output_dir, "/sigstrings")
-  append_sigstrings<-file.exists(paste0(output_path, "sigsummary_processed.txt"))
-  write(x = sigstrings, file = paste0(output_path, "/sigsummary_processed.txt"), 
-    append = append_sigstrings)
+  if(write_out){
+    output_path<-paste0(output_dir, "/sigstrings")
+    append_sigstrings<-file.exists(paste0(output_path, "sigsummary_processed.txt"))
+    write(x = sigstrings, file = paste0(output_path, "/sigsummary_processed.txt"), 
+      append = append_sigstrings)
+  }
   
   if(verbose == TRUE){
     print("Check #3--post-processing.")
@@ -396,11 +401,12 @@ rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_di
      df<-df[-length_filter,]
    }
    
-  if(verbose){
+  if(verbose == TRUE){
     print("Final check!")
     print(lobstr::mem_used())
     print(memuse::Sys.procmem())
   }
+   
    on.exit(expr = aggc(), add = TRUE)
   return(df)
 }
@@ -442,24 +448,120 @@ synth_data_processor<-function(fn, type, df_out){
   }
   return(df_new)
 }
-barcode_handler<-function(df, output_dir = NULL,
-  original_whitelist = NULL, prefiltered_whitelist = NULL,
-  generate = TRUE, correct = FALSE, nthreads = NULL,
-  breadth = 2, depth = 2, maxDist = 5, 
-  high_speed = FALSE, verbose = FALSE){
+
+whitelist_generator<-function(df, original_whitelist = NULL, prefiltered_whitelist = NULL, 
+  output_dir = NULL, verbose = FALSE, stringency = "LOW"){
+  if(!is.null(original_whitelist)||!is.null(prefiltered_whitelist)){
+    barcodes<-table(df$barcode) %>% data.table::as.data.table(.)
+  } else {
+    barcodes<-table(df$barcode[grep(pattern = "FR_RF", x = df$sig_id, invert = TRUE)]) %>% data.table::as.data.table(.)
+  }
+  ratio<-nrow(barcodes)/nrow(df)
+  if(verbose){
+    print(paste0("Number of total barcodes: ", nrow(barcodes)))
+    print(whitelist_size())
+    print(paste0("Ratio of unique barcodes to unique reads: ", ratio))
+  }
+  if(ratio > 0.5){
+    rescue_repeats<-6
+  } else {
+    rescue_repeats<-8
+  }
+  filter_runs<-sapply(X = c("A","C","T","G"), FUN = function(X){
+    paste0(replicate(X, n = rescue_repeats), collapse = "") %>% {which(grepl(pattern = .,  x = barcodes$V1) == TRUE)}
+  }) %>% unlist %>% unique
+  barcodes<-barcodes[-filter_runs,]
+  barcodes$pois_dist<-stats::ppois(q = barcodes$N, lambda = mean(barcodes$N))
+  barcodes$V1<-sequence_to_bits(barcodes$V1)
+  if(verbose){
+    print(head(barcodes))
+  }
+  if(!is.null(original_whitelist)){
+    if(verbose){
+      print(table(barcodes$V1 %in% original_whitelist$whitelist_bcs))
+    }
+    chunk_whitelist<-barcodes[barcodes$V1 %in% original_whitelist$whitelist_bcs,]
+    if(verbose){
+      print(nrow(chunk_whitelist))
+    }
+  } else if(!is.null(prefiltered_whitelist)){
+    if(verbose){
+      print(table(barcodes$V1 %in% prefiltered_whitelist$whitelist_bcs))
+    }
+    chunk_whitelist<-barcodes[barcodes$V1 %in% prefiltered_whitelist$whitelist_bcs,]
+  } else
+  if(is.null(prefiltered_whitelist) && is.null(original_whitelist)){
+    chunk_whitelist<-barcodes[which(barcodes$pois > 0.9),] #first pass
+  }
+  {
+    if(verbose){
+      print(head(chunk_whitelist))
+    }
+    chunk_whitelist<-chunk_whitelist[order(chunk_whitelist$N, decreasing = TRUE),]
+    chunk_whitelist$pois_dist<-stats::ppois(q = chunk_whitelist$N, lambda = mean(chunk_whitelist$N))*100
+    suppressWarnings(fitcheck<-MASS::fitdistr(chunk_whitelist$N, "negative binomial"))
+    chunk_whitelist$ncsum<-pnbinom(size = fitcheck$estimate[1], mu = fitcheck$estimate[2], chunk_whitelist$N)*100
+    chunk_whitelist$csum<-(cumsum(chunk_whitelist$N)/sum(chunk_whitelist$N))*100
+    if(verbose){
+      print(head(chunk_whitelist))
+    }
+    #hardcoded for the back-two vars
+    if(!is.null(output_dir)){
+      output<-ggdensity(chunk_whitelist, x = "pois_dist", weight = "N")
+      filename<-paste0(output_dir,"/weighted_poisson_distribution_density.png")
+      ggplot2::ggsave(filename, output)
+    }
+    if(stringency != "EXTRA"){
+      if(stringency == "LOW"){
+        stringency_params<-c(2,2,2,2)
+      } else
+        if(stringency == "DEFAULT"){
+          stringency_params<-c(2,2,2,1)
+        } else 
+          if(stringency == "HIGH"){
+            stringency_params<-c(2,2,1,1)
+          }
+      chunk_whitelist<-whitelist_filterer(df = chunk_whitelist, 
+        stringency_params = stringency_params, verbose= TRUE)
+    }
+    if(stringency == "EXTRA"){
+      stringency_params<-c(2,2,1,1)
+      chunk_whitelist<-whitelist_filterer(df = chunk_whitelist, 
+        stringency_params = stringency_params, verbose= TRUE) %>% 
+        {whitelist_filterer(df = ., 
+        stringency_params = c(2,1,1,1), verbose= TRUE)}
+    }
+    if(stringency == "NEUROTIC"){
+      
+    }
+  }#stats module
+  if(verbose){
+    print(head(chunk_whitelist))
+    print(nrow(chunk_whitelist))
+  }
+  output<-list(generated_whitelist = chunk_whitelist, original_whitelist = original_whitelist)
+  return(list2env(output, .GlobalEnv))
+}
+barcode_corrector<-function(df, gen_whitelist, breadth = 1, depth = 2, high_speed = TRUE, nthreads = 1,
+   maxDistance = 2, verbose = FALSE){
+  populate_whitelist(barcodes = gen_whitelist$V1, poisson_data = gen_whitelist$pois_dist, counts = gen_whitelist$N)
+    gen_whitelist<-wl_to_df()
+    if(whitelist_size() < 10){
+      stop()
+    }
     if(!is.null(original_whitelist)){
       barcodes<-table(df$barcode) %>% data.table::as.data.table(.)
     } else {
       barcodes<-table(df$barcode[grep(pattern = "FR_RF", x = df$sig_id, invert = TRUE)]) %>% data.table::as.data.table(.)
     }
-  if(verbose){
-    print(paste0("Number of total barcodes: ", nrow(barcodes)))
-    print(whitelist_size())
-  }
+    if(verbose){
+      print(paste0("Number of total barcodes: ", nrow(barcodes)))
+      print(whitelist_size())
+    }
     ratio<-nrow(barcodes)/nrow(df)
-  if(verbose){
+    if(verbose){
       print(paste0("Ratio of unique barcodes to unique reads: ", ratio))
-  }
+    }
     if(ratio > 0.5){
       rescue_repeats<-6
       maxDist<-2
@@ -470,74 +572,38 @@ barcode_handler<-function(df, output_dir = NULL,
       paste0(replicate(X, n = rescue_repeats), collapse = "") %>% {which(grepl(pattern = .,  x = barcodes$V1) == TRUE)}
     }) %>% unlist %>% unique
     barcodes<-barcodes[-filter_runs,]
-  if(generate == TRUE){
-      barcodes$pois_dist<-stats::ppois(q = barcodes$N, lambda = mean(barcodes$N))
-      print(length(which(barcodes$pois > 0.9)))
-      barcodes$V1<-sequence_to_bits(barcodes$V1)
-      if(!is.null(prefiltered_whitelist)){
-        chunk_whitelist<-barcodes[barcodes$V1 %in% prefiltered_whitelist$whitelist_bcs,]
-        query_list<-barcodes[!barcodes$V1 %in% prefiltered_whitelist$whitelist_bcs,]
-      } else {
-        chunk_whitelist<-barcodes[which(barcodes$pois > 0.9),]
-        query_list<-barcodes[which(barcodes$pois < 0.9),]
-        if(!is.null(original_whitelist)){
-          chunk_whitelist<-chunk_whitelist[chunk_whitelist$V1 %in% original_whitelist$whitelist_bcs,]
-        }
-      }
-      suppressWarnings(fitcheck<-MASS::fitdistr(chunk_whitelist$N, "negative binomial"))
-      chunk_whitelist<-chunk_whitelist[order(chunk_whitelist$N, decreasing = TRUE),]
-      if(!is.null(output_dir)){
-        output<-ggpubr::gghistogram(chunk_whitelist, x = "N", weight = "N", bins = 40)
-        filename<-paste0(output_dir,"/weighted_barcode_histogram.png")
-        ggplot2::ggsave(filename, output)
-      }
-      chunk_whitelist$ncsum<-pnbinom(size = fitcheck$estimate[1], mu = fitcheck$estimate[2], chunk_whitelist$N)
-      chunk_whitelist$csum<-(cumsum(chunk_whitelist$N)/sum(chunk_whitelist$N))*100
-      nbin<-which(chunk_whitelist$ncsum >= 0.7)
-      csm<-which(chunk_whitelist$csum <= 99)
-      if(length(nbin) > length(csm)){
-        chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$ncsum >= 0.7),]
-        query_list<-data.table::rbindlist(l = list(chunk_whitelist[which(chunk_whitelist$ncsum >= 0.7),1:3], query_list))
-      } else {
-        chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$csum <= 99),]
-        query_list<-data.table::rbindlist(l = list(chunk_whitelist[which(chunk_whitelist$csum >= 99),1:3], query_list))
-      }
-      print(nrow(chunk_whitelist))
-      populate_whitelist(barcodes = chunk_whitelist$V1, poisson_data = chunk_whitelist$pois_dist, counts = chunk_whitelist$N)
-      print(whitelist_size())
-      output<-list(generated_whitelist = chunk_whitelist)
-      return(list2env(output, .GlobalEnv))
+    if(verbose){
+      print(head(gen_whitelist))
     }
-   if(correct == TRUE){
-    if(whitelist_size() < 10){
-      stop()
-    } else {
-      gen_whitelist<-wl_to_df()
-      barcodes$V1<-sequence_to_bits(barcodes$V1)
-      gen_whitelist$sequence<-bit64::as.integer64(gen_whitelist$sequence)
-      query_list<-barcodes[!barcodes$V1 %in% gen_whitelist$sequence,]
-      query_list<-query_list[order(query_list$N, decreasing = TRUE),]
-      query_list$corrected<-NA
-      if(verbose){
-        print(paste0("The length of the barcodes are: ", nrow(barcodes)))
-        print(head(barcodes))
-        print(paste0("The length of the gen_whitelist is ", nrow(gen_whitelist)))
-        print(head(gen_whitelist))
-        print(paste0("the length of the query list is ", nrow(query_list)))
-        print(head(query_list))
-        print(class(query_list$V1))
-      }
-      query_list$corrected<-correct_barcodes(barcodes = query_list$V1, breadth = 2, depth = 2,
-      high_speed = FALSE, nthreads = nthreads, maxDistance = 4)
-      df$barcode<-sequence_to_bits(df$barcode)
-      df[query_list, barcode := bit64::as.integer64(i.corrected), on = .(barcode = V1)]
-      query_list<-query_list[which(!is.na(query_list$corrected)),]
-      #df<-df[which(df$barcode %in% chunk_whitelist$V1),]
-      df$pass_fail<-df$barcode %in% gen_whitelist$sequence
-      output<-list(df_filtered = df)
-      return(list2env(output, .GlobalEnv))
+    gen_whitelist$sequence<-bit64::as.integer64(gen_whitelist$sequence)
+    barcodes$V1<-sequence_to_bits(barcodes$V1)
+    query_list<-barcodes[!barcodes$V1 %in% gen_whitelist$sequence,]
+    query_list<-query_list[order(query_list$N, decreasing = TRUE),]
+    query_list$corrected<-NA
+    
+    if(verbose){
+      print(paste0("The length of the barcodes are: ", nrow(barcodes)))
+      print(head(barcodes))
+      print(paste0("The length of the gen_whitelist is ", nrow(gen_whitelist)))
+      print(head(gen_whitelist))
+      print(paste0("the length of the query list is ", nrow(query_list)))
+      print(head(query_list))
+      print(class(query_list$V1))
     }
-  }
+    query_list$corrected<-correct_barcodes(
+      barcodes = query_list$V1, 
+      breadth = breadth, depth = depth,
+      high_speed = high_speed, nthreads = nthreads, maxDistance = 4)
+    
+    df$barcode<-sequence_to_bits(df$barcode)
+    df[query_list, barcode := bit64::as.integer64(i.corrected), on = .(barcode = V1)]
+    query_list<-query_list[which(!is.na(query_list$corrected)),]
+    
+    #df<-df[which(df$barcode %in% chunk_whitelist$V1),]
+    
+    df$pass_fail<-df$barcode %in% gen_whitelist$sequence
+    output<-list(df_filtered = df)
+    return(list2env(output, .GlobalEnv))
 }
 post_processor<-function(df){
   df$sig_id<-stringr::str_extract(string = df$sig_id, pattern = "<.+.(?=:)") 
@@ -546,10 +612,12 @@ post_processor<-function(df){
     .[,c("id","read")] %>% data.table::setnames("read","seq")
  return(df)
 }
-single_batch_processor<-function(df){
+single_processor<-function(fastqas, nthreads, output_dir){
+  df<-read_fastqas(fn = fastqas, type = "fq")
   df<-rad_chunk(df, read_layout, misalignment_threshold, nthreads = nthreads, output_dir = output_dir, verbose = FALSE)
-  barcode_handler(df = df, original_whitelist = original_whitelist, 
-    generate = FALSE, correct = TRUE, verbose = TRUE, nthreads = nthreads)
+  barcode_corrector(df, gen_whitelist = generated_whitelist, breadth = 1, depth = 2, high_speed = TRUE,
+    nthreads = nthreads, maxDistance = 2, verbose = FALSE)
+  
   pass_fail<-table(df_filtered$pass_fail) %>% data.table::as.data.table(.)
   per_section_pass<-file.exists(paste0(output_dir,"/pass_fail_chunk_stats.csv"))
   
@@ -560,7 +628,32 @@ single_batch_processor<-function(df){
   write_fastqas(df = df_filtered, fn = paste0(output_dir, "/output/filtered_reads.fasta.gz"), 
     type = "fa", append = append_fasta, nthreads = nthreads)
 }
+whitelist_filterer<-function(df, stringency_params, verbose = FALSE){
+  if(verbose){
+    print(stringency_params)
+  }
+  fpoisson<-table(df$pois_dist) %>% data.table::as.data.table(.)
+  if(verbose){
+    print(head(fpoisson))
+  }
+  fpoisson<-fpoisson[order(as.numeric(fpoisson$V1), decreasing = FALSE),]
+  min_idx<-diff(fpoisson$N, differences = stringency_params[1], lag = stringency_params[2]) %>% 
+    sign %>% {diff(.,differences = stringency_params[3], lag = stringency_params[4]) != 0} %>% #toggle lag for param sensitivity?
+    which(. == TRUE) %>% 
+    min(.)
+  df<-fpoisson$V1[min_idx] %>% 
+    as.numeric %>% 
+    {df[which(df$pois_dist >= .),]}
+  if(verbose){
+    print(head(df))
+  }
+    return(df)
+}
 aggc<-function(){
   gc()
   mallinfo::malloc.trim()
 }
+
+#1316.625s 560.9 2153.2 1t promethION
+#872.798s next
+#scmixology2: 770.915s 1t

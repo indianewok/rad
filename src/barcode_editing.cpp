@@ -661,7 +661,7 @@ Rcpp::NumericVector correct_barcodes_v7(Rcpp::NumericVector barcodes, bool verbo
 
 // [[Rcpp::export]]
 Rcpp::NumericVector correct_barcodes(Rcpp::NumericVector barcodes, bool verbose = false, 
-  int nthreads = 1, int depth = 2, int breadth = 2, bool high_speed = false, int maxDistance = 3) {
+  int nthreads = 1, int depth = 2, int breadth = 1, bool high_speed = true, int maxDistance = 2) {
   int n = barcodes.size();
   Rcpp::NumericVector results(n, NA_REAL); // Initialize results with NA_REAL
   std::vector<int64_t> cpp_barcodes = Rcpp::as<std::vector<int64_t>>(barcodes);
