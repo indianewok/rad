@@ -29,7 +29,7 @@ whitelist_size <- function() {
     .Call(`_rad_whitelist_size`)
 }
 
-correct_barcodes_v1 <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 3L, breadth = 2L) {
+correct_barcodes_v1 <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 1L) {
     .Call(`_rad_correct_barcodes_v1`, barcodes, verbose, nthreads, depth, breadth)
 }
 

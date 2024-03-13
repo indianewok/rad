@@ -1,5 +1,6 @@
 rad_run<-function(read_layout_form, read_dir, output_dir, whitelist_path, nthreads = 1,
-  SETUP_DRY_RUN = FALSE, FULL_RUN = FALSE, VERBOSE = FALSE, KINDA_VERBOSE = FALSE, 
+  GENERATE_WHITELIST_ONLY = FALSE, SETUP_DRY_RUN = FALSE, FULL_RUN = FALSE, 
+  VERBOSE = FALSE, KINDA_VERBOSE = FALSE, 
   ORIGINAL_CHUNK_SIZE = 5e5){
   if(VERBOSE||KINDA_VERBOSE){
     print("Welcome to RAD! Now testing that everything's in the right place...")
@@ -130,6 +131,9 @@ rad_run<-function(read_layout_form, read_dir, output_dir, whitelist_path, nthrea
   }
   whitelist_generator(df = df, original_whitelist = original_whitelist,
      prefiltered_whitelist = NULL, output_dir = output_dir, stringency = "DEFAULT", verbose = VERBOSE)
+  if(GENERATE_WHITELIST_ONLY == TRUE){
+    return(print("Whitelist generated!"))
+  }
   if(VERBOSE){
     print("Whitelist is generated! Now correcting the df in question...")
   }
@@ -154,9 +158,9 @@ rad_run<-function(read_layout_form, read_dir, output_dir, whitelist_path, nthrea
   if(FULL_RUN == TRUE){
     files<-files[-c(1:setup_chunk_size)]
     file_chunk_divisor<-20
-    if(file_rows > 20000){
-      file_chunk_divisor<-10
-    }
+    # if(file_rows > 20000){
+    #   file_chunk_divisor<-10
+    # }
     file_chunks<-split(files, ceiling(seq_along(files) / file_chunk_divisor))
     if(VERBOSE){
       length(file_chunks)

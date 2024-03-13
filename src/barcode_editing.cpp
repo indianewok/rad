@@ -224,7 +224,7 @@ int whitelist_size() {
 
 // [[Rcpp::export]]
 NumericVector correct_barcodes_v1(NumericVector barcodes, bool verbose = false, int nthreads = 1, 
-  int depth = 3, int breadth = 2) {
+  int depth = 2, int breadth = 1) {
   int n = barcodes.size();
   NumericVector results(n, NA_REAL);
   std::vector<int64_t> cpp_barcodes = Rcpp::as<std::vector<int64_t>>(barcodes);

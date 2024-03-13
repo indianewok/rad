@@ -333,7 +333,7 @@ read_paf<-function(path, ...){
   }
   return(df)
 }
-rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_dir, verbose = FALSE){
+rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_dir, verbose = FALSE, write_out = TRUE){
   baseline_filter <- sum(na.omit(read_layout[direction == "forward", expected_length])) + 100
   df <- df[stringr::str_length(seq) >= baseline_filter]
   write_out<-(nchar(output_dir) > 0)
@@ -507,22 +507,32 @@ whitelist_generator<-function(df, original_whitelist = NULL, prefiltered_whiteli
     }
     #hardcoded for the back-two vars
     if(!is.null(output_dir)){
-      output<-ggdensity(chunk_whitelist, x = "pois_dist", weight = "N")
+      output<-ggpubr::ggdensity(chunk_whitelist, x = "pois_dist", weight = "N")
       filename<-paste0(output_dir,"/weighted_poisson_distribution_density.png")
       ggplot2::ggsave(filename, output)
     }
     if(stringency != "EXTRA"){
       if(stringency == "LOW"){
         stringency_params<-c(2,2,2,2)
+        chunk_whitelist<-whitelist_filterer(df = chunk_whitelist, 
+          stringency_params = stringency_params, verbose= TRUE)
+        quant_cutoff<-quantile(chunk_whitelist$pois_dist)[1]
+        chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
       } else
         if(stringency == "DEFAULT"){
           stringency_params<-c(2,2,2,1)
+          chunk_whitelist<-whitelist_filterer(df = chunk_whitelist, 
+            stringency_params = stringency_params, verbose= TRUE)
+          quant_cutoff<-quantile(chunk_whitelist$pois_dist)[2]
+          chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
         } else 
           if(stringency == "HIGH"){
             stringency_params<-c(2,2,1,1)
-          }
-      chunk_whitelist<-whitelist_filterer(df = chunk_whitelist, 
-        stringency_params = stringency_params, verbose= TRUE)
+            chunk_whitelist<-whitelist_filterer(df = chunk_whitelist, 
+              stringency_params = stringency_params, verbose= TRUE)
+            quant_cutoff<-quantile(chunk_whitelist$pois_dist)[3]
+            chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
+        }
     }
     if(stringency == "EXTRA"){
       stringency_params<-c(2,2,1,1)
@@ -530,6 +540,8 @@ whitelist_generator<-function(df, original_whitelist = NULL, prefiltered_whiteli
         stringency_params = stringency_params, verbose= TRUE) %>% 
         {whitelist_filterer(df = ., 
         stringency_params = c(2,1,1,1), verbose= TRUE)}
+      quant_cutoff<-quantile(chunk_whitelist$pois_dist)[4]
+      chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
     }
     if(stringency == "NEUROTIC"){
       
