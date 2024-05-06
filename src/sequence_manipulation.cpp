@@ -409,12 +409,49 @@ std::vector<int64_t> kmer_circ_cpp(int64_t sequence, int base_length, int kmerLe
   return kmers;
 }
 
+std::vector<int64_t> kmer_circ_cpp_v2(int64_t sequence, int base_length, int kmerLength, bool verbose = false) {
+  if (base_length > 32) {
+    throw std::runtime_error("Base length exceeds 32 base pairs limit for int64_t representation.");
+  }
+  int64_t circularizedSequence = sequence | (sequence << (base_length * 2));
+  if (verbose) {
+    Rcpp::Rcout << "Original sequence in binary: " << to_binary_string(sequence, base_length * 2) << "\n";
+    Rcpp::Rcout << "Circularized sequence in binary: " << to_binary_string(circularizedSequence, base_length * 4) << "\n";
+  }
+  std::vector<int64_t> kmers;
+  int totalBases = base_length * 2;
+  int endRange = totalBases - kmerLength - 1;
+  // Extract the first two kmers
+  for (int start_pos = 1; start_pos <= 2; ++start_pos) {
+    int stop_pos = start_pos + kmerLength - 1;
+    std::vector<int64_t> subsequence = extract_subsequence_cpp({circularizedSequence}, start_pos, stop_pos);
+    if (!subsequence.empty()) {
+      kmers.push_back(subsequence[0]);
+      if (verbose) {
+        Rcpp::Rcout << "Kmer " << start_pos << " in binary: " << to_binary_string(subsequence[0], kmerLength * 2) << "\n";
+      }
+    }
+  }
+  // Extract the last two kmers
+  for (int start_pos = endRange - 1; start_pos <= endRange; ++start_pos) {
+    int stop_pos = start_pos + kmerLength - 1;
+    std::vector<int64_t> subsequence = extract_subsequence_cpp({circularizedSequence}, start_pos, stop_pos);
+    if (!subsequence.empty()) {
+      kmers.push_back(subsequence[0]);
+      if (verbose) {
+        Rcpp::Rcout << "Kmer " << start_pos << " in binary: " << to_binary_string(subsequence[0], kmerLength * 2) << "\n";
+      }
+    }
+  }
+  return kmers;
+}
+
 // [[Rcpp::export]]
 Rcpp::NumericVector kmer_circ(SEXP sequence, int base_length = 16, int kmerLength = 16, bool verbose = false) {
   std::vector<int64_t> sequenceVec = Rcpp::as<std::vector<int64_t>>(Rcpp::NumericVector(sequence));
   if (sequenceVec.size() != 1) {
     stop("Expected a single integer64 value.");
   }
-  std::vector<int64_t> kmers = kmer_circ_cpp(sequenceVec[0], base_length, kmerLength, verbose);
+  std::vector<int64_t> kmers = kmer_circ_cpp_v2(sequenceVec[0], base_length, kmerLength, verbose);
   return Rcpp::wrap(kmers);
 }

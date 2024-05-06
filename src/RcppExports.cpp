@@ -250,6 +250,21 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// sig_extractor_v3
+Rcpp::DataFrame sig_extractor_v3(const DataFrame& read_layout, const DataFrame& misalignment_threshold, DataFrame& df, const CharacterVector& processed_sigstrings, bool verbose);
+RcppExport SEXP _rad_sig_extractor_v3(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP dfSEXP, SEXP processed_sigstringsSEXP, SEXP verboseSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const DataFrame& >::type read_layout(read_layoutSEXP);
+    Rcpp::traits::input_parameter< const DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
+    Rcpp::traits::input_parameter< DataFrame& >::type df(dfSEXP);
+    Rcpp::traits::input_parameter< const CharacterVector& >::type processed_sigstrings(processed_sigstringsSEXP);
+    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
+    rcpp_result_gen = Rcpp::wrap(sig_extractor_v3(read_layout, misalignment_threshold, df, processed_sigstrings, verbose));
+    return rcpp_result_gen;
+END_RCPP
+}
 // sigrun
 Rcpp::CharacterVector sigrun(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, const Rcpp::StringVector& sigstrings, int nthreads, bool verbose);
 RcppExport SEXP _rad_sigrun(SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP sigstringsSEXP, SEXP nthreadsSEXP, SEXP verboseSEXP) {
@@ -439,6 +454,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_rad_correct_barcodes", (DL_FUNC) &_rad_correct_barcodes, 7},
     {"_rad_sig_extractor", (DL_FUNC) &_rad_sig_extractor, 5},
     {"_rad_sig_extractor_v2", (DL_FUNC) &_rad_sig_extractor_v2, 5},
+    {"_rad_sig_extractor_v3", (DL_FUNC) &_rad_sig_extractor_v3, 5},
     {"_rad_sigrun", (DL_FUNC) &_rad_sigrun, 5},
     {"_rad_revcomp", (DL_FUNC) &_rad_revcomp, 1},
     {"_rad_sequence_to_bits", (DL_FUNC) &_rad_sequence_to_bits, 1},

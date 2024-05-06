@@ -69,6 +69,10 @@ sig_extractor_v2 <- function(read_layout, misalignment_threshold, df, processed_
     .Call(`_rad_sig_extractor_v2`, read_layout, misalignment_threshold, df, processed_sigstrings, verbose)
 }
 
+sig_extractor_v3 <- function(read_layout, misalignment_threshold, df, processed_sigstrings, verbose) {
+    .Call(`_rad_sig_extractor_v3`, read_layout, misalignment_threshold, df, processed_sigstrings, verbose)
+}
+
 sigrun <- function(read_layout, misalignment_threshold, sigstrings, nthreads = 1L, verbose = FALSE) {
     .Call(`_rad_sigrun`, read_layout, misalignment_threshold, sigstrings, nthreads, verbose)
 }

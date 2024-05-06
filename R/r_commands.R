@@ -376,7 +376,7 @@ rad_chunk<-function(df, read_layout, misalignment_threshold, nthreads, output_di
     print(memuse::Sys.procmem(gcFirst = FALSE))
   }
   
-  df<-sig_extractor_v2(read_layout, misalignment_threshold = misalignment_threshold, df = df,
+  df<-sig_extractor_v3(read_layout, misalignment_threshold = misalignment_threshold, df = df,
      processed_sigstrings = sigstrings[grep(pattern = "undecided", x = sigstrings, invert = TRUE)],
     verbose = FALSE) %>% data.table::as.data.table(.)
   
@@ -665,7 +665,3 @@ aggc<-function(){
   gc()
   mallinfo::malloc.trim()
 }
-
-#1316.625s 560.9 2153.2 1t promethION
-#872.798s next
-#scmixology2: 770.915s 1t
