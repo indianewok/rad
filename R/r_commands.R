@@ -71,7 +71,11 @@ read_fastqas<-function(fn, type, full_id = FALSE, ...){
   rfq_single<-function(fn, type, full_id = FALSE, ...){
     ext<-tools::file_ext(fn)
     if (ext == "gz"){
-      cat_cmd<-"zcat"
+      if(Sys.info()["sysname"]=="Linux"){
+        cat_cmd<-"zcat"
+      } else {
+        cat_cmd<-"gunzip -c"
+      }
     }
     else{
       cat_cmd<-"cat"

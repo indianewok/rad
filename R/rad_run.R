@@ -7,6 +7,10 @@ rad_run<-function(read_layout_form, read_dir, output_dir, whitelist_path, nthrea
     print(paste0("The files are coming in from ", read_dir, " and the files are going to be written to ", output_dir, "..."))
   }
   #DIRECTORY SETUP & MEMORY
+  if(is.na(output_dir)){
+    print("No output directory provided! Please provide one and try again!")
+    stop()
+  }
   if(!dir.exists(output_dir)){
     if(VERBOSE){
       print("Output directory doesn't exist (yet!) Making it now.")
