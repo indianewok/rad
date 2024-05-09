@@ -67,34 +67,34 @@ write_fastqas<-function(df, fn, type, append = FALSE, nthreads = 1){
     }
   }
 }
-read_fastqas<-function(fn, type, full_id = FALSE, ...) {
-  rfq_single<-function(fn, type, full_id = FALSE, ...) {
+read_fastqas<-function(fn, type, full_id = FALSE, ...){
+  rfq_single<-function(fn, type, full_id = FALSE, ...){
     ext<-tools::file_ext(fn)
-    sysname <- Sys.info()[["sysname"]]
-    if (ext == "gz") {
-      if (sysname == "Linux") {
+    sysname<-Sys.info()[["sysname"]]
+    if (ext == "gz"){
+      if(sysname == "Linux"){
         cat_cmd<-"zcat"
-      } else if (sysname == "Darwin") {
+      }else if(sysname =="Darwin"){
         cat_cmd<-"gunzip -c"
-      } else {
+      }else{
         stop("Unsupported OS")
       }
     } else {
       cat_cmd<-"cat"
     }
-    if (type == "fq") {
+    if (type == "fq"){
       res<-data.table::fread(
         cmd = glue::glue("{cat_cmd} {fn} | paste - - - - | cut -f1,2,4"),
         col.names = c("id", "seq", "qual"),
         sep = "\t", header = FALSE, quote = "", data.table = TRUE, ...
       )
-      res<-res[, .(id = tstrsplit(id, " ", fixed = TRUE)[[1]], qual, seq)]
+      res<-res[, .(id = data.table::tstrsplit(id, " ", fixed = TRUE)[[1]], qual, seq)]
       if (full_id) {
         res[, full_id := id]
       }
       return(res)
     }
-    if (type == "fa") {
+    if(type == "fa"){
       awk_cmd<-'awk \'/^>/{if (NR>1) printf("\\n"); printf("%s\\t",$0); next} {printf("%s",$0);} END {printf("\\n");}\''
       res<-data.table::fread(
         cmd = glue::glue("{cat_cmd} {fn} | {awk_cmd}"),
