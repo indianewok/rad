@@ -67,60 +67,54 @@ write_fastqas<-function(df, fn, type, append = FALSE, nthreads = 1){
     }
   }
 }
-read_fastqas<-function(fn, type, full_id = FALSE, ...){
-  rfq_single<-function(fn, type, full_id = FALSE, ...){
+read_fastqas<-function(fn, type, full_id = FALSE, ...) {
+  rfq_single<-function(fn, type, full_id = FALSE, ...) {
     ext<-tools::file_ext(fn)
-    if (ext == "gz"){
-      if(Sys.info()["sysname"]=="Linux"){
+    sysname <- Sys.info()[["sysname"]]
+    if (ext == "gz") {
+      if (sysname == "Linux") {
         cat_cmd<-"zcat"
-      } else {
+      } else if (sysname == "Darwin") {
         cat_cmd<-"gunzip -c"
+      } else {
+        stop("Unsupported OS")
       }
-    }
-    else{
+    } else {
       cat_cmd<-"cat"
     }
-    if(type == "fq"){
-      res<-data.table::fread(cmd = glue::glue("{cat_cmd} {fn} | paste - - - - | cut -f1,2,4"), col.names = c("id", "seq","qual"),
-        sep = "\t", header = FALSE, quote = "", data.table = TRUE, ...)
-      res<-res[,c(1,3,2)]
-      if(full_id == TRUE){
-        if (full_id) {
-          set(res, j = "full_id", value = res$id)
-        }
-        res[, id := data.table::tstrsplit(id, " ", fixed = TRUE)[[1]]]
-        return(res)
-      } else {
-        res[, id := data.table::tstrsplit(id, " ", fixed = TRUE)[[1]]]
-        return(res)
-      }
-    }
-    if(type == "fa"){
-      awk_cmd <- 'awk \'/^>/{if (NR>1) printf("\\n"); printf("%s\\t",$0); next} {printf("%s",$0);} END {printf("\\n");}\''
-      if(ext == "gz"){
-        res<-data.table::fread(cmd = glue::glue("gunzip -c {fn} | {awk_cmd}"), col.names = c("id", "seq"), sep = "\t",data.table = TRUE, ...)
-      } else {
-        res<-data.table::fread(cmd = glue::glue("{awk_cmd} {fn}"), col.names = c("id", "seq"), sep = "\t", data.table = TRUE, ...)
+    if (type == "fq") {
+      res<-data.table::fread(
+        cmd = glue::glue("{cat_cmd} {fn} | paste - - - - | cut -f1,2,4"),
+        col.names = c("id", "seq", "qual"),
+        sep = "\t", header = FALSE, quote = "", data.table = TRUE, ...
+      )
+      res<-res[, .(id = tstrsplit(id, " ", fixed = TRUE)[[1]], qual, seq)]
+      if (full_id) {
+        res[, full_id := id]
       }
       return(res)
     }
-    
+    if (type == "fa") {
+      awk_cmd<-'awk \'/^>/{if (NR>1) printf("\\n"); printf("%s\\t",$0); next} {printf("%s",$0);} END {printf("\\n");}\''
+      res<-data.table::fread(
+        cmd = glue::glue("{cat_cmd} {fn} | {awk_cmd}"),
+        col.names = c("id", "seq"),
+        sep = "\t", data.table = TRUE, ...
+      )
+      return(res)
+    }
   }
-  if(class(fn) == "list"||length(fn) > 1){
-    out<-pbapply::pblapply(X = fn, FUN = function(X){
-      if(length(X) == 1){
-        return(rfq_single(fn = X, full_id = FALSE, type = type, showProgress = FALSE, ...))
-      } else {
-        return(NA)
-      }
-    })
+  if (is.list(fn) || length(fn) > 1) {
+    out<-pbapply::pblapply(fn, FUN = function(X) {
+      rfq_single(fn = X, type = type, full_id = full_id, ...)
+    }, ...)
     dt<-data.table::rbindlist(out)
-    rm(out)
     return(dt)
   } else {
-    return(rfq_single(fn = fn, type = type, full_id = FALSE, ...))  
+    return(rfq_single(fn = fn, type = type, full_id = full_id, ...))
   }
 }
+
 prep_seq<-function(read_layout_form, external_path_form, create_output_dir = TRUE, data_table_nthreads = 1, ...){
   {
     print("Importing read layout and figuring out its order!")
