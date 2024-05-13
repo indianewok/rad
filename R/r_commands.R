@@ -459,11 +459,11 @@ whitelist_generator<-function(df, original_whitelist = NULL, prefiltered_whiteli
     print(paste0("Number of total barcodes: ", nrow(barcodes)))
     print(whitelist_size())
     print(paste0("Ratio of unique barcodes to unique reads: ", ratio))
-    if(nrow(barcodes) == 0){
-      print("Something's a little funky, returning all of the material on hand and stopping execution!")
-      troubleshooting_output<-list(barcodes = barcodes, df = df)
-      return(list2env(troubleshooting_output))
-    }
+  }
+  if(nrow(barcodes) == 0){
+    print("Something's a little funky, returning all of the material on hand and stopping execution!")
+    troubleshooting_output<-list(barcodes = barcodes, df = df)
+    return(list2env(troubleshooting_output))
     stop()
   }
   if(ratio > 0.5){
