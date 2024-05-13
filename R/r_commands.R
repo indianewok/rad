@@ -661,6 +661,7 @@ whitelist_filterer<-function(df, stringency_params, verbose = FALSE){
 }
 aggc<-function(){
   gc()
+  sysname<-Sys.info()[["sysname"]]
   if(sysname == "Linux"){
     mallinfo::malloc.trim()
   }
