@@ -463,8 +463,8 @@ whitelist_generator<-function(df, original_whitelist = NULL, prefiltered_whiteli
       print("Something's a little funky, returning all of the material on hand and stopping execution!")
       troubleshooting_output<-list(barcodes = barcodes, df = df)
       return(list2env(troubleshooting_output))
-      stop()
     }
+    stop()
   }
   if(ratio > 0.5){
     rescue_repeats<-6
