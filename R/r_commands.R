@@ -462,7 +462,7 @@ whitelist_generator<-function(df, original_whitelist = NULL, prefiltered_whiteli
   }
   if(nrow(barcodes) == 0){
     print("Something's a little funky, returning all of the material on hand and stopping execution!")
-    troubleshooting_output<-list(barcodes = barcodes, df = df)
+    troubleshooting_output<-list(barcodes = barcodes, df = df, fail = TRUE)
     return(list2env(troubleshooting_output))
     stop()
   }

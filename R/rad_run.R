@@ -138,6 +138,11 @@ rad_run<-function(read_layout_form, read_dir, output_dir, whitelist_path, nthrea
   if(GENERATE_WHITELIST_ONLY == TRUE){
     return(print("Whitelist generated!"))
   }
+  if(fail||!exists("generated_whitelist")){
+    print("Something failed with the whitelist generation!")
+    troubleshooting_output<-list(barcodes = barcodes, df = df)
+    return(list2env(troubleshooting_output))
+  }
   if(VERBOSE){
     print("Whitelist is generated! Now correcting the df in question...")
   }
