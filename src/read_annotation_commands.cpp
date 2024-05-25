@@ -1532,6 +1532,62 @@ Rcpp::List sig_extraction_v3(const ReadLayout& readLayout, const std::vector<std
   return data;
 }
 
+Rcpp::DataFrame sig_extraction_v4(const ReadLayout& readLayout, const std::vector<std::string>& sigstrings, 
+  Rcpp::DataFrame df, bool verbose, int version = 1) {
+  std::unordered_map<std::string, std::vector<std::string>> extractedData;
+  std::unordered_map<std::string, std::vector<int>> columnCount;
+  
+  Rcpp::StringVector ids = df["id"];
+  Rcpp::StringVector quals = df["qual"];
+  Rcpp::StringVector seqs = df["seq"];
+  
+  for (int i = 0; i < sigstrings.size(); ++i) {
+    ReadData readData;
+    std::string signature = sigstrings[i];
+    parse_signature(signature, readData, readLayout);
+    
+    std::string read_id = readData.string_info.at("type").str_id;
+    extractedData["id"].push_back(read_id);
+    
+    for (const auto& element : readData.sigstring) {
+      if (element.type == "variable" && idMap.find(read_id) != idMap.end()) {
+        auto& ref = idMap[read_id];
+        std::string seq = Rcpp::as<std::string>(seqs[ref.seq]);
+        std::string extracted_seq;
+        
+        if (element.position.first > 0 && element.position.second >= element.position.first && (seq.length() > element.position.second)) {
+          extracted_seq = seq.substr(element.position.first - 1, element.position.second - element.position.first + 1);
+          if (element.direction != "forward") {
+            extracted_seq = revcomp_cpp(extracted_seq);
+          }
+        }
+        
+        std::string column_name = element.global_class;
+        if (columnCount[column_name].size() > 0) {
+          column_name += "_" + std::to_string(++columnCount[column_name].back());
+        } else {
+          columnCount[column_name].push_back(1);
+        }
+        extractedData[column_name].push_back(extracted_seq);
+      }
+    }
+  }
+  
+  // Create the resulting data frame
+  Rcpp::List result(extractedData.size());
+  Rcpp::CharacterVector colNames(extractedData.size());
+  
+  int colIndex = 0;
+  for (const auto& col : extractedData) {
+    colNames[colIndex] = col.first;
+    result[colIndex] = wrap(col.second);
+    ++colIndex;
+  }
+  
+  result.attr("names") = colNames;
+  return Rcpp::DataFrame(result);
+}
+
 //displaying a sigstring
 void displayOrderedSigString(const ReadData& readData) {
   auto printOrderedDirection = [&](const std::string& direction) {
@@ -1712,32 +1768,6 @@ void pos_scan(ReadData& readData, const PositionFuncMap& positionFuncMap, const 
   }
 }
 
-Rcpp::CharacterVector process_sigstrings(const ReadLayout& readLayout, 
-  const std::vector<std::string>& sigs, const PositionFuncMap& positionFuncMap, bool verbose, int nthreads = 1) {
-  omp_set_num_threads(nthreads);
-  std::vector<std::string> processed_sigstrings;
-  #pragma omp parallel
-  {
-    std::vector<std::string> local_processed_sigstrings;
-    #pragma omp for nowait
-    for (int i = 0; i < sigs.size(); ++i) {
-      const auto& sigstring = sigs[i];
-      ReadData readData;
-      fillSigString(readData, readLayout, sigstring, positionFuncMap, verbose);
-      concat_scan(readData, verbose);
-      pos_scan(readData, positionFuncMap, readLayout, verbose);
-      std::vector<std::string> generated_sigstrings = generateSigString(readData);
-      filter_sigstring(generated_sigstrings);
-      local_processed_sigstrings.insert(local_processed_sigstrings.end(), 
-        generated_sigstrings.begin(), 
-        generated_sigstrings.end());
-    }
-    #pragma omp critical
-      processed_sigstrings.insert(processed_sigstrings.end(), local_processed_sigstrings.begin(), local_processed_sigstrings.end());
-  }
-  return wrap(processed_sigstrings);
-}
-
 // [[Rcpp::export]]
 Rcpp::List sig_extractor(const DataFrame& read_layout, const DataFrame& misalignment_threshold,
   const DataFrame& df, const CharacterVector& processed_sigstrings, bool verbose) {
@@ -1768,6 +1798,42 @@ Rcpp::DataFrame sig_extractor_v3(const DataFrame& read_layout, const DataFrame& 
   return sig_extraction_v3(container, sigs, df, verbose);
 }
 
+// [[Rcpp::export]]
+Rcpp::DataFrame sig_extractor_v4(const DataFrame& read_layout, const DataFrame& misalignment_threshold,
+  DataFrame& df, const CharacterVector& processed_sigstrings, bool verbose) {
+  ReadLayout container = prep_read_layout_cpp(read_layout, misalignment_threshold);
+  VarScan(container, verbose);
+  positionFuncMap = createPositionFunctionMap(container, verbose);
+  std::vector<std::string> sigs = Rcpp::as<std::vector<std::string>>(processed_sigstrings);
+  return sig_extraction(container, sigs, df, verbose);
+}
+
+
+Rcpp::CharacterVector process_sigstrings(const ReadLayout& readLayout, 
+  const std::vector<std::string>& sigs, const PositionFuncMap& positionFuncMap, bool verbose, int nthreads = 1) {
+  omp_set_num_threads(nthreads);
+  std::vector<std::string> processed_sigstrings;
+  #pragma omp parallel
+  {
+    std::vector<std::string> local_processed_sigstrings;
+    #pragma omp for nowait
+    for (int i = 0; i < sigs.size(); ++i) {
+      const auto& sigstring = sigs[i];
+      ReadData readData;
+      fillSigString(readData, readLayout, sigstring, positionFuncMap, verbose);
+      concat_scan(readData, verbose);
+      pos_scan(readData, positionFuncMap, readLayout, verbose);
+      std::vector<std::string> generated_sigstrings = generateSigString(readData);
+      filter_sigstring(generated_sigstrings);
+      local_processed_sigstrings.insert(local_processed_sigstrings.end(), 
+        generated_sigstrings.begin(), 
+        generated_sigstrings.end());
+    }
+    #pragma omp critical
+      processed_sigstrings.insert(processed_sigstrings.end(), local_processed_sigstrings.begin(), local_processed_sigstrings.end());
+  }
+  return wrap(processed_sigstrings);
+}
 
 // [[Rcpp::export]]
 Rcpp::CharacterVector sigrun(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, 
