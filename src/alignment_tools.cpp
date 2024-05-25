@@ -1621,7 +1621,6 @@ Rcpp::CharacterVector sigalign(
   return signature_strings;
 }
 
-
 // [[Rcpp::export]]
 Rcpp::DataFrame sigalign_stats(Rcpp::CharacterVector adapters, std::vector<std::string> sequences,
   int nthreads = 1) {
@@ -1672,6 +1671,101 @@ Rcpp::DataFrame sigalign_stats(Rcpp::CharacterVector adapters, std::vector<std::
       UniqueAlignment best = (it != uniqueAlignments.end()) ? *it : UniqueAlignment{-1, -1, -1}; ++it;
       UniqueAlignment secondBest = (it != uniqueAlignments.end()) ? *it : UniqueAlignment{-1, -1, -1};
 
+      // Synchronize threads when updating `all_alignments`
+#pragma omp critical
+{
+  all_alignments[sequence_counter].push_back({
+    best.edit_distance,
+    best.start_position,
+    best.end_position,
+    secondBest.edit_distance,
+    secondBest.start_position,
+    secondBest.end_position
+  });
+}
+edlibFreeAlignResult(cresult);
+    }
+    sequence_counter++;
+  }
+  std::vector<int> ids;
+  std::vector<std::string> query_ids;  // to store the query ID for each alignment
+  std::vector<int> best_edit_distances;
+  std::vector<int> best_start_positions;
+  std::vector<int> best_stop_positions;
+  std::vector<int> second_edit_distances;
+  for (const auto& pair : all_alignments) {
+    int sequence_id = pair.first;
+    const auto& alignments = pair.second;
+    for (size_t i = 0; i < alignments.size(); ++i) {
+      ids.push_back(sequence_id);
+      query_ids.push_back(query_names[i]);  // assuming `queries` is the vector of query sequences
+      best_edit_distances.push_back(alignments[i].best_edit_distance);
+      best_start_positions.push_back(alignments[i].best_start_pos);
+      best_stop_positions.push_back(alignments[i].best_stop_pos);
+      second_edit_distances.push_back(alignments[i].second_edit_distance);
+    }
+  }
+  Rcpp::DataFrame result = Rcpp::DataFrame::create(
+    Rcpp::Named("id") = ids,
+    Rcpp::Named("query_id") = query_ids,  // new column for query IDs
+    Rcpp::Named("best_edit_distance") = best_edit_distances,
+    Rcpp::Named("best_start_pos") = best_start_positions,
+    Rcpp::Named("best_stop_pos") = best_stop_positions,
+    Rcpp::Named("second_edit_distance") = second_edit_distances
+  );
+  return result;
+}
+
+// [[Rcpp::export]]
+Rcpp::DataFrame sigimmune_stats(Rcpp::CharacterVector adapters, std::vector<std::string> sequences,
+  int nthreads = 1) {
+  std::vector<std::string> queries = Rcpp::as<std::vector<std::string>>(adapters);
+  std::vector<std::string> query_names = adapters.names();
+  std::map<int, std::vector<AlignmentInfo>> all_alignments;
+  // Set the number of threads for OpenMP
+  omp_set_num_threads(nthreads);
+  int sequence_counter = 1;
+  for (const auto& sequence : sequences) {
+    all_alignments[sequence_counter] = std::vector<AlignmentInfo>();
+#pragma omp parallel for
+    for (int j = 0; j < queries.size(); ++j) {
+      const auto& query = queries[j];
+      EdlibAlignConfig config = edlibNewAlignConfig(-1, EDLIB_MODE_HW, EDLIB_TASK_LOC, NULL, 0);
+      std::set<UniqueAlignment> uniqueAlignments;
+      char* cquery = const_cast<char*>(query.c_str());
+      char* csequence = const_cast<char*>(sequence.c_str());
+      EdlibAlignResult cresult = edlibAlign(cquery, query.size(), csequence, sequence.size(), config);
+      std::vector<int> start_positions(cresult.startLocations, cresult.startLocations + cresult.numLocations);
+      std::vector<int> end_positions(cresult.endLocations, cresult.endLocations + cresult.numLocations);
+      for (int& pos : start_positions) { ++pos; }
+      for (int& pos : end_positions) { ++pos; }
+      
+      std::sort(start_positions.begin(), start_positions.end());
+      std::sort(end_positions.begin(), end_positions.end());
+      
+      // Remove duplicates from start_positions
+      auto last = std::unique(start_positions.begin(), start_positions.end());
+      start_positions.erase(last, start_positions.end());
+      
+      // Find minimal 'end' for each unique 'start'
+      std::vector<int> unique_end_positions;
+      for (const auto& start : start_positions) {
+        auto pos = std::find(start_positions.begin(), start_positions.end(), start) - start_positions.begin();
+        unique_end_positions.push_back(end_positions[pos]);
+      }
+      
+      int edit_distance = cresult.editDistance;
+      
+      for (size_t i = 0; i < start_positions.size(); ++i) {
+        UniqueAlignment ua = {edit_distance, start_positions[i], end_positions[i]};
+        uniqueAlignments.insert(ua);
+      }
+      
+      // Extract the two best unique alignments
+      auto it = uniqueAlignments.begin();
+      UniqueAlignment best = (it != uniqueAlignments.end()) ? *it : UniqueAlignment{-1, -1, -1}; ++it;
+      UniqueAlignment secondBest = (it != uniqueAlignments.end()) ? *it : UniqueAlignment{-1, -1, -1};
+      
       // Synchronize threads when updating `all_alignments`
 #pragma omp critical
 {

@@ -106,8 +106,8 @@ rad_run<-function(read_layout_form, read_dir, output_dir, whitelist_path, nthrea
     print(adapters)
     print("Now calculating misalignment threshold...")
   }
-  baseline_filter <- sum(na.omit(read_layout[direction == "forward", expected_length])) + 100
-  df <- df[stringr::str_length(seq) >= baseline_filter]
+  baseline_filter<-sum(na.omit(read_layout[direction == "forward", expected_length])) + 100
+  df<-df[stringr::str_length(seq) >= baseline_filter]
   strl<-ggpubr::ggdensity(stringr::str_length(df$seq), xscale = "log10")
   ggplot2::ggsave(filename = paste0(output_dir,"/read_length.png"), strl)
   rm(strl)

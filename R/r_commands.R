@@ -1,7 +1,7 @@
 .datatable.aware = TRUE
 
 whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
-  print("Importing a little bit of sample data...")
+  print("Importing a little bit of your whitelist to figure out its type...")
   whitelist<-data.table::fread(input = whitelist_path, header = FALSE, data.table = TRUE, nrows = 10, nThread = 1,
     col.names = "whitelist_bcs")
   if(class(whitelist$whitelist_bcs) == "character"){
@@ -31,6 +31,8 @@ whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
       whitelist<-data.table::fread(input = whitelist_path, header = FALSE, data.table = TRUE, nThread = 1,
         col.names = "whitelist_bcs", key = "whitelist_bcs", integer64 = "integer64")
       gc()
+      print(paste0("Your whitelist is ", nrow(whitelist), " barcodes long!"))
+      print(head(whitelist))
       return(whitelist)
     }
   }
@@ -452,7 +454,6 @@ whitelist_generator<-function(df, original_whitelist = NULL, prefiltered_whiteli
   if(!is.null(original_whitelist)||!is.null(prefiltered_whitelist)){
     barcodes<-table(df$barcode) %>% data.table::as.data.table(.)
   } else {
-    barcodes<-table(df$barcode[grep(pattern = "FR_RF", x = df$sig_id, invert = TRUE)]) %>% data.table::as.data.table(.)
   }
   ratio<-nrow(barcodes)/nrow(df)
   if(verbose){
