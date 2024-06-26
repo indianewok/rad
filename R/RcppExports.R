@@ -29,48 +29,24 @@ whitelist_size <- function() {
     .Call(`_rad_whitelist_size`)
 }
 
-correct_barcodes_v1 <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 1L) {
-    .Call(`_rad_correct_barcodes_v1`, barcodes, verbose, nthreads, depth, breadth)
+correct_barcodes <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 1L, high_speed = TRUE, maxDistance = 2L, sequence_length = 16L) {
+    .Call(`_rad_correct_barcodes`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance, sequence_length)
 }
 
-correct_barcodes_v2 <- function(barcodes, verbose = FALSE, nthreads = 1L, maxDistance = 3L) {
-    .Call(`_rad_correct_barcodes_v2`, barcodes, verbose, nthreads, maxDistance)
+generate_recursive_mutations_gw <- function(barcodes, alpha, error_rate, num_cycles = 10L) {
+    .Call(`_rad_generate_recursive_mutations_gw`, barcodes, alpha, error_rate, num_cycles)
 }
 
-correct_barcodes_v3 <- function(barcodes, verbose = FALSE, nthreads = 1L, breadth = 2L, depth = 2L, maxDistance = 3L) {
-    .Call(`_rad_correct_barcodes_v3`, barcodes, verbose, nthreads, breadth, depth, maxDistance)
+prep_read_layout_rcpp <- function(read_layout, misalignment_threshold, verbose) {
+    invisible(.Call(`_rad_prep_read_layout_rcpp`, read_layout, misalignment_threshold, verbose))
 }
 
-correct_barcodes_v4 <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 2L, high_speed = FALSE, maxDistance = 3L) {
-    .Call(`_rad_correct_barcodes_v4`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance)
+single_test_run_new <- function(read_layout, misalignment_threshold) {
+    invisible(.Call(`_rad_single_test_run_new`, read_layout, misalignment_threshold))
 }
 
-correct_barcodes_v5 <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 2L, high_speed = FALSE, maxDistance = 3L) {
-    .Call(`_rad_correct_barcodes_v5`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance)
-}
-
-correct_barcodes_v6 <- function(barcodes, verbose = FALSE, nthreads = 1L, maxDistance = 3L) {
-    .Call(`_rad_correct_barcodes_v6`, barcodes, verbose, nthreads, maxDistance)
-}
-
-correct_barcodes_v7 <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 2L, high_speed = FALSE, maxDistance = 3L) {
-    .Call(`_rad_correct_barcodes_v7`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance)
-}
-
-correct_barcodes <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 1L, high_speed = TRUE, maxDistance = 2L) {
-    .Call(`_rad_correct_barcodes`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance)
-}
-
-sig_extractor <- function(read_layout, misalignment_threshold, df, processed_sigstrings, verbose) {
-    .Call(`_rad_sig_extractor`, read_layout, misalignment_threshold, df, processed_sigstrings, verbose)
-}
-
-sig_extractor_v2 <- function(read_layout, misalignment_threshold, df, processed_sigstrings, verbose) {
-    .Call(`_rad_sig_extractor_v2`, read_layout, misalignment_threshold, df, processed_sigstrings, verbose)
-}
-
-sig_extractor_v3 <- function(read_layout, misalignment_threshold, df, processed_sigstrings, verbose) {
-    .Call(`_rad_sig_extractor_v3`, read_layout, misalignment_threshold, df, processed_sigstrings, verbose)
+sig_extraction <- function(read_layout, misalignment_threshold, df, processed_sigstrings, verbose) {
+    .Call(`_rad_sig_extraction`, read_layout, misalignment_threshold, df, processed_sigstrings, verbose)
 }
 
 sigrun <- function(read_layout, misalignment_threshold, sigstrings, nthreads = 1L, verbose = FALSE) {
@@ -117,8 +93,8 @@ generate_bit_mutations <- function(sequences, sequence_length = 16L) {
     .Call(`_rad_generate_bit_mutations`, sequences, sequence_length)
 }
 
-generate_recursive_mutations <- function(sequences, mutation_rounds = 2L) {
-    .Call(`_rad_generate_recursive_mutations`, sequences, mutation_rounds)
+generate_recursive_mutations <- function(sequences, mutation_rounds = 2L, sequence_length = 16L) {
+    .Call(`_rad_generate_recursive_mutations`, sequences, mutation_rounds, sequence_length)
 }
 
 bit_substring <- function(bit_sequences, start_pos, stop_pos) {
@@ -127,5 +103,13 @@ bit_substring <- function(bit_sequences, start_pos, stop_pos) {
 
 kmer_circ <- function(sequence, base_length = 16L, kmerLength = 16L, verbose = FALSE) {
     .Call(`_rad_kmer_circ`, sequence, base_length, kmerLength, verbose)
+}
+
+misalignment_stream <- function(fastq_path, adapters, nthreads = 1L, max_sequences = -1L) {
+    .Call(`_rad_misalignment_stream`, fastq_path, adapters, nthreads, max_sequences)
+}
+
+sigalign_stream <- function(inputFilePath, outputFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, fastaOutputPath) {
+    invisible(.Call(`_rad_sigalign_stream`, inputFilePath, outputFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, fastaOutputPath))
 }
 

@@ -3,31 +3,31 @@ using namespace std;
 using namespace Rcpp;
 //preparing the read layout container
 
-PositionFuncMap positionFuncMap;
 ReadLayout container;
+PositionFuncMap positionFuncMap;
 
-ReadLayout prep_read_layout_cpp(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold) {
+ReadLayout prep_read_layout_cpp(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, bool verbose) {
   ReadLayout container;
-  // Assume 'query_id' matches 'class_id' from 'read_layout'
   std::unordered_map<std::string, std::tuple<int, int, int>> thresholdsMap;
   Rcpp::StringVector query_id = misalignment_threshold["query_id"];
   Rcpp::NumericVector misal_threshold = misalignment_threshold["misal_threshold"];
   Rcpp::NumericVector misal_sd = misalignment_threshold["misal_sd"];
-
+  
+  // Populate the thresholds map
   for (int i = 0; i < query_id.size(); ++i) {
     double threshold = misal_threshold[i];
     double sd = std::ceil(misal_sd[i]);
-
+    
     int lower_bound = static_cast<int>(std::floor(threshold - sd));
     int upper_bound = static_cast<int>(std::ceil(threshold + sd));
-
+    
     thresholdsMap[Rcpp::as<std::string>(query_id[i])] = std::make_tuple(
       lower_bound,
       static_cast<int>(threshold),
       upper_bound
     );
   }
-
+  
   Rcpp::StringVector class_id = read_layout["class_id"];
   Rcpp::StringVector class_column = read_layout["class"];
   Rcpp::StringVector seq = read_layout["seq"];
@@ -35,297 +35,369 @@ ReadLayout prep_read_layout_cpp(const Rcpp::DataFrame& read_layout, const Rcpp::
   Rcpp::StringVector type = read_layout["type"];
   Rcpp::IntegerVector order = read_layout["order"];
   Rcpp::StringVector direction = read_layout["direction"];
-
+  
+  // Iterate over the read_layout and populate the ReadLayout container
   for (int i = 0; i < class_id.size(); ++i) {
     std::string cid = Rcpp::as<std::string>(class_id[i]);
-    std::string class_value = Rcpp::as<std::string>(class_column[i]); // Get the class value
-
+    std::string class_value = Rcpp::as<std::string>(class_column[i]);
+    
     boost::optional<std::tuple<int, int, int>> misalignment_threshold_opt;
     if (thresholdsMap.count(cid)) {
       misalignment_threshold_opt = boost::optional<std::tuple<int, int, int>>(thresholdsMap[cid]);
-    }else{
+    } else {
       misalignment_threshold_opt = boost::none;
     }
-
+    
     boost::optional<int> expected_length_opt;
     if (class_value != "read") {
       expected_length_opt = expected_length[i];
     }
-
-    container.insert(ReadElement(
+    
+    // Create a new ReadElement and insert it into the container
+    ReadElement elem(
         cid,
         Rcpp::as<std::string>(seq[i]),
         expected_length_opt,
         Rcpp::as<std::string>(type[i]),
         order[i],
         Rcpp::as<std::string>(direction[i]),
-        Rcpp::as<std::string>(class_column[i]),
+        class_value,
         misalignment_threshold_opt
-    ));
+    );
+    
+    container.insert(elem);
+    
+    if(verbose){
+      Rcpp::Rcout << "Inserted ReadElement:\n"
+                  << "  class_id: " << elem.class_id << "\n"
+                  << "  seq: " << elem.seq << "\n"
+                  << "  expected_length: " << (elem.expected_length ? std::to_string(*elem.expected_length) : "none") << "\n"
+                  << "  type: " << elem.type << "\n"
+                  << "  order: " << elem.order << "\n"
+                  << "  direction: " << elem.direction << "\n"
+                  << "  global_class: " << elem.global_class << "\n"
+                  << "  misalignment_threshold: "
+                  << (elem.misalignment_threshold ? 
+      std::to_string(std::get<0>(*elem.misalignment_threshold)) + ", " +
+      std::to_string(std::get<1>(*elem.misalignment_threshold)) + ", " +
+      std::to_string(std::get<2>(*elem.misalignment_threshold)) 
+        : "none") << "\n";
+    }
   }
+  
   return container;
 }
 
-// Parse static elements to the left of a read
-void parse_static_left(const ReadLayout& readLayout, const std::vector<int>& segment_orders,
+// [[Rcpp::export]]
+void prep_read_layout_rcpp(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, bool verbose) {
+  prep_read_layout_cpp(read_layout, misalignment_threshold, verbose);
+}
+
+void parse_static_left_new(const ReadLayout& readLayout, const std::vector<int>& segment_orders,
   const std::string& direction, bool verbose, std::unordered_map<std::string,
-    std::tuple<std::string, std::string, std::string, std::string>>& assignedPositions, bool static_mode) {
+    std::tuple<std::string, std::string, std::string, std::string>>& assignedPositions) {
+  
   auto& order_index = readLayout.get<order_tag>();
   auto& type_index = readLayout.get<type_tag>();
-  auto& direction_index = readLayout.get<direction_tag>();
   auto var_elements = type_index.equal_range("variable");
   int read_order = *std::max_element(segment_orders.begin(), segment_orders.end());
+  
   for (auto it_var = var_elements.first; it_var != var_elements.second; ++it_var) {
-    if(static_mode){
-      if (it_var->type != "variable" || !it_var->expected_length || it_var->direction != direction) {
-        continue;
-      }
-      if (std::find(segment_orders.begin(), segment_orders.end(), it_var->order) == segment_orders.end()) {
-        continue;
-      }
-    } else {
-      if(it_var -> global_class != "read"){
-        continue;
-      }
-    }
-    if (it_var->order <= read_order) {
-      // Find previous element
+    if (it_var->type != "variable" || it_var->direction != direction) {
       if (verbose) {
-        Rcpp::Rcout << "Processing varElem: " << it_var->class_id << "\n";
+        Rcpp::Rcout << "Skipping " << it_var->class_id << "\n";
       }
-      if (it_var->order > 1) {
-        auto prevElem = readLayout.get<order_tag>().find(it_var->order - 1);
-        std::string prevType = prevElem->type;
-        std::string primaryStart;
-        std::string primaryStop;
-        std::string secondaryStart;
-        std::string secondaryStop;
-        
-        if (prevElem != order_index.end()) {
-          std::string primaryStart;
-          primaryStart = prevElem->class_id + "|stop+1";
-          
-          if(static_mode){
-            primaryStop = prevElem->class_id + "|stop+" + std::to_string(*it_var->expected_length);
-          } else {
-            auto nextElem = readLayout.get<order_tag>().find(it_var->order + 1);
-            primaryStop = nextElem->class_id + "|start-1";
+      continue;
+    }
+    
+    if (std::find(segment_orders.begin(), segment_orders.end(), it_var->order) == segment_orders.end()) {
+      continue;
+    }
+    
+    if (it_var->order <= read_order && it_var->order > 1) {
+      auto prevElem = readLayout.get<order_tag>().find(it_var->order - 1);
+      auto nextElem = readLayout.get<order_tag>().find(it_var->order + 1);
+      auto pre_prevElem = readLayout.get<order_tag>().find(it_var->order - 2);
+      auto next_nextElem = readLayout.get<order_tag>().find(it_var->order + 2);
+      
+      bool prevElemExists = (prevElem != order_index.end());
+      bool nextElemExists = (nextElem != order_index.end());
+      bool prePrevElemExists = (pre_prevElem != order_index.end());
+      bool nextNextElemExists = (next_nextElem != order_index.end());
+      
+      int nextElem_val = (nextElemExists && (nextElem->global_class == "stop")) ? 0 : 1;
+      int prevElem_val = (prevElemExists && (prevElem->global_class == "start")) ? 0 : 1;
+      int prevElem_stop_val = (prevElemExists && (prevElem->global_class == "start")) ? 1 : 0;
+      
+      
+      if (verbose) {
+        Rcpp::Rcout << "Processing varElem, global class: " << it_var->global_class << "\n";
+        Rcpp::Rcout << "Processing varElem, class ID: " << it_var->class_id << "\n";
+        if (prevElemExists) Rcpp::Rcout << "Previous element: " << prevElem->class_id << "\n";
+        if (prevElemExists) Rcpp::Rcout << "Previous element, global_class: " << prevElem->global_class << "\n";
+        if (prePrevElemExists) Rcpp::Rcout << "Pre-previous element: " << pre_prevElem->class_id << "\n";
+        if (nextElemExists) Rcpp::Rcout << "Next element: " << nextElem->class_id << "\n";
+        if (nextNextElemExists) Rcpp::Rcout << "Next-next element: " << next_nextElem->class_id << "\n";
+      }
+      
+      int offset_result = 0;
+      bool offset_available = true;
+      bool is_read = false;
+      if (it_var->expected_length && it_var->global_class != "read") {
+        offset_result = (*it_var->expected_length);
+      } else {
+        offset_result = 0;
+        offset_available = false;
+        is_read = true;
+      }
+      if (verbose) {
+        Rcpp::Rcout << "Offset result is " << std::to_string(offset_result) << "\n";
+        Rcpp::Rcout << "Offset available: " << (offset_available ? "true" : "false") << "\n";
+      }
+      std::string primaryStart, primaryStop, secondaryStart, secondaryStop;
+      if (prevElemExists) {
+        primaryStart = prevElem->class_id + "|stop+" + std::to_string(prevElem_val);
+        if (is_read) {
+          if (verbose) {
+            Rcpp::Rcout << "Found the read.\n";
+            if (prevElemExists) Rcpp::Rcout << "prevElem exists: true\nprevElem class_id: " << prevElem->class_id << "\n";
+            if (nextElemExists) Rcpp::Rcout << "nextElem exists: true\nnextElem class_id: " << nextElem->class_id << "\n";
           }
-          // Check for chained variables
-          if(static_mode){
-            if (prevType == "variable" && assignedPositions.find(prevElem->class_id) != assignedPositions.end()) {
-              auto& prevAssigned = assignedPositions[prevElem->class_id];
-              primaryStart = primaryStart + "|chained_start";
-              primaryStop = primaryStop + "|chained_stop";
-             int read_order = *std::max_element(segment_orders.begin(), segment_orders.end());
-              auto NextElem = readLayout.get<order_tag>().find(it_var->order+1);
-                if(NextElem->type == "static"){
-                  secondaryStart = NextElem->class_id + "|start-" + std::to_string(*NextElem->expected_length);
-                  secondaryStop = NextElem->class_id + "|start-1";
-                } else {
-                secondaryStart = std::get<0>(prevAssigned) + "|chained_start";
-                secondaryStop = std::get<2>(prevAssigned) + "|chained_stop";
-              }
-            } else if (prevType == "static") {
-              if(*prevElem->expected_length < 15 && prevElem->global_class != "poly_tail"){
-                auto pre_prevElem = readLayout.get<order_tag>().find(it_var->order - 2);
-                int offset_result = (*it_var->expected_length + 1);
-                secondaryStart = pre_prevElem->class_id + "|stop+" + std::to_string(offset_result);
-                if(pre_prevElem->type == "variable"){
-                  secondaryStart = secondaryStart + "|chained_start";
-                  }
-                } else {
-              secondaryStart = prevElem->class_id + "|start+1|left_terminal_linked";
-                  }
-                int offset_result = (*it_var->expected_length + 1);
-              secondaryStop = prevElem->class_id + "|stop+" + std::to_string(offset_result) + "|left_terminal_linked";
-            }
-          } else {
-            if (prevType == "variable" && assignedPositions.find(prevElem->class_id) != assignedPositions.end()) {
-              auto& prevAssigned = assignedPositions[prevElem->class_id];
-                secondaryStart = std::get<0>(prevAssigned) + "|chained_start";
-                secondaryStop = std::get<2>(prevAssigned) + "|chained_stop";
-            } else if (prevType == "static") {
-              if(*prevElem->expected_length < 15 && prevElem->global_class != "poly_tail"){
-                auto pre_prevElem = readLayout.get<order_tag>().find(it_var->order - 2);
-                int offset_result = (*it_var->expected_length + 1);
-                secondaryStart = pre_prevElem->class_id + "|stop+" + std::to_string(offset_result);
-                if(pre_prevElem->type == "variable"){
-                  secondaryStart = secondaryStart + "|chained_start";
-                }
+          bool prevPolyTail = prevElemExists && prevElem->global_class == "poly_tail";
+          bool nextPolyTail = nextElemExists && nextElem->global_class == "poly_tail";
+          bool prevShortStatic = prevElemExists && prevElem->type == "static" && *prevElem->expected_length <= 13 && prevElem->global_class != "poly_tail";
+          bool nextShortStatic = nextElemExists && nextElem->type == "static" && *nextElem->expected_length <= 13 && nextElem->global_class != "poly_tail";
+          if (prevPolyTail || prevShortStatic) {
+            if (prePrevElemExists && pre_prevElem->type == "static") {
+              if (prevPolyTail) {
+                secondaryStart = pre_prevElem->class_id + "|stop+1|poly_skipped";
               } else {
-                secondaryStart = prevElem->class_id + "|start+1|left_terminal_linked";
-              }
-              auto nextElem = readLayout.get<order_tag>().find(it_var->order + 1);
-              if(nextElem->global_class == "poly_tail"){
-                auto skipElem = readLayout.get<order_tag>().find(it_var->order + 2); 
-                // move one over from the poly tail if there is one
-                secondaryStop = skipElem->class_id+"|start-1|poly_skipped";
-              } else {
-                secondaryStop = nextElem->class_id + "|start-1|left_terminal_linked";
+                int prevElem_offset = *prevElem->expected_length;
+                secondaryStart = pre_prevElem->class_id + "|stop+" + std::to_string(prevElem_offset) + "|skipped";
               }
             }
           }
-          // Update assignedPositions
-          if(assignedPositions.find(it_var->class_id) != assignedPositions.end()) {
-            auto& existingEntry = assignedPositions[it_var->class_id];
-            if(std::get<0>(existingEntry) != primaryStart){
-              std::get<1>(existingEntry) = primaryStart; // Update secondary start with new primary start
+          if (nextPolyTail || nextShortStatic) {
+            if (nextNextElemExists && next_nextElem->type == "static") {
+              secondaryStop = next_nextElem->class_id + "|start-1";
+              if (nextPolyTail) {
+                secondaryStop += "|poly_skipped";
+              }
             }
-            if(std::get<2>(existingEntry) != primaryStop){
-              std::get<3>(existingEntry) = primaryStop;  // Update secondary stop with new primary stop
-            }
+          }
+        } else {
+          primaryStop = prevElem->class_id + "|stop+" + std::to_string(offset_result - prevElem_stop_val);
+        }
+        // Check for chained variables
+        if (prevElemExists && prevElem->type == "variable" &! is_read) {
+          auto& prevAssigned = assignedPositions[prevElem->class_id];
+          primaryStart += "|chained_start";
+          primaryStop += "|chained_stop";
+          if (nextElemExists && nextElem->type == "static") {
+            secondaryStart = nextElem->class_id + "|start-" + std::to_string(offset_result);
+            secondaryStop = nextElem->class_id + "|start-1";
           } else {
-            assignedPositions[it_var->class_id] = std::make_tuple(primaryStart, secondaryStart, primaryStop, secondaryStop);
+            secondaryStart = std::get<0>(prevAssigned) + "|chained_start";
+            secondaryStop = std::get<2>(prevAssigned) + "|chained_stop";
           }
-          if(verbose) {
-            Rcpp::Rcout << "Parse Left: Primary Start " << primaryStart << " & Secondary Start: " << secondaryStart << "\n";
-            Rcpp::Rcout << "Parse Left: Primary Stop "  << primaryStop << " & Secondary Stop: " << secondaryStop << "\n";
+        } else if (prevElemExists && prevElem->type == "static" &! is_read) {
+          if (nextElemExists && nextElem->type == "static" && (nextElem->expected_length >= 13) && nextElem->global_class != "poly_tail") {
+            secondaryStart = nextElem->class_id + "|start-" + std::to_string(offset_result);
+            secondaryStop = nextElem->class_id + "|start-1";
+          } else {
+            if (nextNextElemExists && next_nextElem->type == "static" && nextElem->global_class != "read" && next_nextElem->global_class != "poly_tail") {
+              int nextElem_offset = *nextElem->expected_length;
+              secondaryStart = next_nextElem->class_id + "|start-" + std::to_string(nextElem_offset+offset_result) + "|skipped";
+              secondaryStop = next_nextElem->class_id + "|start-" + std::to_string(nextElem_offset) + "|skipped";
+            } else {
+              if (prevElem->global_class == "poly_tail" && prePrevElemExists && pre_prevElem->global_class != "read") {
+                secondaryStart = pre_prevElem->class_id + "|stop+1|poly_skipped";
+              } else {
+                secondaryStart = prevElem->class_id + "|stop+1|left_terminal_linked";
+                secondaryStop = prevElem->class_id + "|stop+" + std::to_string(offset_result) + "|left_terminal_linked";
+              }
+            }
           }
         }
+        // Update assignedPositions
+        if (assignedPositions.find(it_var->class_id) != assignedPositions.end()) {
+          auto& existingEntry = assignedPositions[it_var->class_id];
+          if (std::get<0>(existingEntry) != primaryStart) {
+            std::get<1>(existingEntry) = primaryStart; // Update secondary start with new primary start
+          }
+          if (std::get<2>(existingEntry) != primaryStop) {
+            std::get<3>(existingEntry) = primaryStop;  // Update secondary stop with new primary stop
+          }
+        } else {
+          assignedPositions[it_var->class_id] = std::make_tuple(primaryStart, secondaryStart, primaryStop, secondaryStop);
+        }
+        if (verbose) {
+          Rcpp::Rcout << "Parse Left: Primary Start " << primaryStart << " & Secondary Start: " << secondaryStart << "\n";
+          Rcpp::Rcout << "Parse Left: Primary Stop " << primaryStop << " & Secondary Stop: " << secondaryStop << "\n";
+        }
       }
-      if (verbose) {
-        Rcpp::Rcout << "Parse left varElem: " << it_var->class_id << "\n";
-      }
+    }
+    if (verbose) {
+      Rcpp::Rcout << "Completed parsing left varElem: " << it_var->class_id << "\n";
     }
   }
 }
 
-//Parse static elements to the right of a read
-void parse_static_right(const ReadLayout& readLayout, const std::vector<int>& segment_orders,
+void parse_static_right_new(const ReadLayout& readLayout, const std::vector<int>& segment_orders,
   const std::string& direction, bool verbose, std::unordered_map<std::string,
-    std::tuple<std::string, std::string, std::string, std::string>>& assignedPositions, bool static_mode) {
+    std::tuple<std::string, std::string, std::string, std::string>>& assignedPositions) {
   auto& order_index = readLayout.get<order_tag>();
   auto& type_index = readLayout.get<type_tag>();
   auto var_elements = type_index.equal_range("variable");
   int read_order = *std::min_element(segment_orders.begin(), segment_orders.end());
   for (auto it_var = std::make_reverse_iterator(var_elements.second); it_var != std::make_reverse_iterator(var_elements.first); ++it_var) {
-    if(static_mode){
-      if (it_var->type != "variable" || !it_var->expected_length || it_var->direction != direction) {
-        continue;
+    if (it_var->type != "variable" || it_var->direction != direction) {
+      if (verbose) {
+        Rcpp::Rcout << "Skipping " << it_var->class_id << "\n";
       }
-      if (std::find(segment_orders.begin(), segment_orders.end(), it_var->order) == segment_orders.end()) {
-        continue;
-      }
-    } else {
-      if(it_var -> global_class != "read"){
-        continue;
-      }
+      continue;
     }
+    if (std::find(segment_orders.begin(), segment_orders.end(), it_var->order) == segment_orders.end()) {
+      continue;
+    }
+    
     if (it_var->order >= read_order) {
+      auto nextElem = readLayout.get<order_tag>().find(it_var->order + 1);
+      auto prevElem = readLayout.get<order_tag>().find(it_var->order - 1);
+      auto next_nextElem = readLayout.get<order_tag>().find(it_var->order + 2);
+      auto pre_prevElem = readLayout.get<order_tag>().find(it_var->order - 2);
+      
+      bool nextElemExists = (nextElem != order_index.end());
+      bool prevElemExists = (prevElem != order_index.end());
+      bool nextNextElemExists = (next_nextElem != order_index.end());
+      bool prePrevElemExists = (pre_prevElem != order_index.end());
+      
+      int nextElem_val = (nextElemExists && (nextElem->global_class == "stop")) ? 0 : 1;
+      int prevElem_val = (prevElemExists && (prevElem->global_class == "start")) ? 0 : 1;
+      int nextElem_stop_val = (nextElemExists && (nextElem->global_class == "stop")) ? 1 : 0;
       
       if (verbose) {
-        Rcpp::Rcout << "Processing varElem: " << it_var->class_id << "\n";
+        Rcpp::Rcout << "Processing varElem, global class: " << it_var->global_class << "\n";
+        Rcpp::Rcout << "Processing varElem, class ID: " << it_var->class_id << "\n";
+        if (prevElemExists) Rcpp::Rcout << "Previous element: " << prevElem->class_id << "\n";
+        if (prevElemExists) Rcpp::Rcout << "Previous element, global class: " << prevElem->global_class << "\n";
+        if (prePrevElemExists) Rcpp::Rcout << "Pre-previous element: " << pre_prevElem->class_id << "\n";
+        if (nextElemExists) Rcpp::Rcout << "Next element: " << nextElem->class_id << "\n";
+        if (nextNextElemExists) Rcpp::Rcout << "Next-next element: " << next_nextElem->class_id << "\n";
       }
-      
-      if (it_var->order < segment_orders.back()) {
-        auto nextElem = readLayout.get<order_tag>().find(it_var->order + 1);
-        std::string nextType = nextElem->type;
-        
-        std::string primaryStart;
-        std::string primaryStop;
-        std::string secondaryStart;
-        std::string secondaryStop;
-        
-        //added in to try to ameliorate the issue here w/short static sequences
-        if (nextElem != order_index.end()) {
-          if(static_mode){
-            primaryStart = nextElem->class_id + "|start-" + std::to_string(*it_var->expected_length);
-          } else {
-            auto prevElem = readLayout.get<order_tag>().find(it_var->order - 1);
-            std::string prevType = prevElem->type;
-            primaryStart = prevElem->class_id + "|stop+1";
+      int offset_result = 0;
+      bool offset_available = true;
+      bool is_read = false;
+      if (it_var->expected_length && it_var->global_class != "read") {
+        offset_result = (*it_var->expected_length);
+      } else {
+        offset_available = false;
+        is_read = true;
+      }
+      if (verbose) {
+        Rcpp::Rcout << "Offset result is " << std::to_string(offset_result) << "\n";
+        Rcpp::Rcout << "Offset available: " << (offset_available ? "true" : "false") << "\n";
+      }
+      std::string primaryStart, primaryStop, secondaryStart, secondaryStop;
+      if (prevElemExists && nextElemExists) {
+        primaryStart = prevElem->class_id + "|stop+" + std::to_string(prevElem_val);
+        primaryStop = nextElem->class_id + "|start-" + std::to_string(nextElem_val+nextElem_stop_val);
+        secondaryStart = prevElem->class_id + "|stop+" + std::to_string(prevElem_val) + "|left_terminal_linked";
+        secondaryStop = nextElem->class_id + "|start-" + std::to_string(nextElem_val) + "|right_terminal_linked";
+        // Handle read element separately
+        if (is_read) {
+          if (verbose) {
+            Rcpp::Rcout << "Found the read.\n";
+            if (prevElemExists) Rcpp::Rcout << "prevElem exists: true\nprevElem class_id: " << prevElem->class_id << "\n";
+            if (nextElemExists) Rcpp::Rcout << "nextElem exists: true\nnextElem class_id: " << nextElem->class_id << "\n";
           }
-            primaryStop = nextElem->class_id + "|start-1";
-          // Check for chained variables
-          if(static_mode){
-            if (nextType == "variable" && assignedPositions.find(nextElem->class_id) != assignedPositions.end()) {
-              auto& nextAssigned = assignedPositions[nextElem->class_id];
-              primaryStart = primaryStart + "|chained_start";
-              primaryStop = primaryStop + "|chained_stop";
-
-                auto prevElem = readLayout.get<order_tag>().find(it_var->order-1);
-                if(prevElem->type == "static"){
-                  secondaryStart = prevElem->class_id + "|stop+1";
-                  secondaryStop = prevElem->class_id + "|stop+"+ std::to_string(*prevElem->expected_length);
-                }
-               else {
-                secondaryStart = std::get<0>(nextAssigned) + "|chained_start";
-                secondaryStop = std::get<2>(nextAssigned) + "|chained_stop";
-              }
-            } else if (nextType == "static") {
-              secondaryStart = nextElem->class_id + "|start+1|right_terminal_linked";
-              if(*nextElem->expected_length < 15 && nextElem->global_class != "poly_tail"){
-                auto post_nextElem = readLayout.get<order_tag>().find(it_var->order + 2);
-                int offset_result = (*it_var->expected_length + 1);
-                secondaryStop = post_nextElem->class_id + "|stop+" + std::to_string(offset_result);
+          // Check for poly_tail or short static element in previous or next elements
+          bool prevPolyTail = prevElemExists && prevElem->global_class == "poly_tail";
+          bool nextPolyTail = nextElemExists && nextElem->global_class == "poly_tail";
+          bool prevShortStatic = prevElemExists && prevElem->type == "static" && *prevElem->expected_length <= 13 && prevElem->global_class != "poly_tail";
+          bool nextShortStatic = nextElemExists && nextElem->type == "static" && *nextElem->expected_length <= 13 && nextElem->global_class != "poly_tail";
+          if(verbose){
+            if(prevPolyTail) Rcpp::Rcout << "Previous element is a poly tail!\n";
+            if(nextPolyTail) Rcpp::Rcout << "Next element is a poly tail!\n";
+          }
+          if (prevPolyTail || prevShortStatic) {
+            if (prePrevElemExists) {
+              if (prevPolyTail) {
+                secondaryStart = pre_prevElem->class_id + "|stop+1|poly_skipped";
               } else {
-                int offset_result = (*it_var->expected_length + 1);
-                secondaryStop = nextElem->class_id + "|stop+" + std::to_string(offset_result) + "|right_terminal_linked";
-              }
-            }
-          } else {
-            if (nextType == "variable" && assignedPositions.find(nextElem->class_id) != assignedPositions.end()) {
-              auto& nextAssigned = assignedPositions[nextElem->class_id];
-              if(it_var->order+1 < read_order){
-                auto NextElem = readLayout.get<order_tag>().find(it_var->order+1);
-                if(NextElem->type == "static"){
-                  secondaryStart = NextElem->class_id + "stop+1";
-                  secondaryStop = NextElem->class_id + "stop+"+ std::to_string(*NextElem->expected_length);
-                }
-              } else {
-                secondaryStart = std::get<0>(nextAssigned) + "|chained_start";
-                secondaryStop = std::get<2>(nextAssigned) + "|chained_stop";
-              }
-            } else if (nextType == "static") {
-              auto prevElem = readLayout.get<order_tag>().find(it_var->order - 1);
-              if(prevElem->global_class == "poly_tail"){
-                auto skipElem = readLayout.get<order_tag>().find(it_var->order-2);
-                secondaryStart = skipElem->class_id+"|stop+1|poly_skipped";
-              } else {
-                if(*prevElem->expected_length < 15 && prevElem->global_class != "poly_tail"){
-                  auto pre_prevElem = readLayout.get<order_tag>().find(it_var->order - 2);
-                  int offset_result = (*it_var->expected_length + 1);
-                  secondaryStart = pre_prevElem->class_id + "|stop+" + std::to_string(offset_result);
-                  } else {
-                    secondaryStart = prevElem->class_id + "|start+1|left_terminal_linked";
-                  }
-              }
-              auto nextElem = readLayout.get<order_tag>().find(it_var->order + 1);
-              if(nextElem->global_class == "poly_tail"){
-                auto skipElem = readLayout.get<order_tag>().find(it_var->order + 2); // move one over from the poly tail if there is one
-                secondaryStop = skipElem->class_id+"|start-1|poly_skipped";
-              } else {
-                if(*nextElem->expected_length < 15 && nextElem->global_class != "poly_tail"){
-                  auto post_nextElem = readLayout.get<order_tag>().find(it_var->order + 2);
-                  int offset_result = (*it_var->expected_length + 1);
-                  secondaryStop = post_nextElem->class_id + "|stop+" + std::to_string(offset_result);
-                  } else {
-                    secondaryStop = nextElem->class_id + "|stop|right_terminal_linked";
-                }
+                int prevElem_offset = *prevElem->expected_length;
+                secondaryStart = pre_prevElem->class_id + "|stop+" + std::to_string(prevElem_offset) + "|skipped";
               }
             }
           }
-          if(assignedPositions.find(it_var->class_id) != assignedPositions.end()) {
-            auto& existingEntry = assignedPositions[it_var->class_id];
-            if(std::get<0>(existingEntry) != primaryStart){
-              std::get<1>(existingEntry) = primaryStart; // Update secondary start with new primary start
+          if (nextPolyTail || nextShortStatic) {
+            if (nextNextElemExists) {
+              if (nextPolyTail) {
+                secondaryStop = next_nextElem->class_id + "|stop+1|poly_skipped";
+              } else {
+                int nextElem_offset = *nextElem->expected_length;
+                secondaryStop = next_nextElem->class_id + "|stop+" + std::to_string(nextElem_offset) + "|skipped";
+              }
             }
-            if(std::get<2>(existingEntry) != primaryStop){
-              std::get<3>(existingEntry) = primaryStop;  // Update secondary stop with new primary stop
-            }
-          } else {
-            assignedPositions[it_var->class_id] = std::make_tuple(primaryStart, secondaryStart, primaryStop, secondaryStop);
           }
-          if(verbose) {
-            Rcpp::Rcout << "Parse Right: Primary Start " << primaryStart << " & Secondary Start: " << secondaryStart << "\n";
-            Rcpp::Rcout << "Parse Right: Primary Stop "  << primaryStop << " & Secondary Stop: " << secondaryStop << "\n";
+          else {
+            secondaryStop = nextElem->class_id + "|start-" + std::to_string(nextElem_val) + "|right_terminal_linked";
+          }
+        } else {
+          primaryStart = nextElem->class_id + "|start-" + std::to_string(offset_result);
+        }
+        // Check for chained variables
+        if (nextElemExists && nextElem->type == "variable" && !is_read) {
+          auto& nextAssigned = assignedPositions[nextElem->class_id];
+          primaryStart += "|chained_start";
+          primaryStop += "|chained_stop";
+          if (prevElemExists && prevElem->type == "static") {
+            secondaryStart = prevElem->class_id + "|stop+" + std::to_string(prevElem_val);
+            secondaryStop = prevElem->class_id + "|stop+" + std::to_string(offset_result);
+          } else {
+            secondaryStart = std::get<0>(nextAssigned) + "|chained_start";
+            secondaryStop = std::get<2>(nextAssigned) + "|chained_stop";
+          }
+        } else if (nextElemExists && nextElem->type == "static" && !is_read) {
+          if (prevElemExists && prevElem->type == "static") {
+            secondaryStart = prevElem->class_id + "|stop+" + std::to_string(prevElem_val);
+            secondaryStop = prevElem->class_id + "|stop+" + std::to_string(offset_result);
+          } else {
+            if (prePrevElemExists && pre_prevElem->type == "static" && prevElem->global_class != "read") {
+              int prevElem_offset = *prevElem->expected_length;
+              secondaryStart = pre_prevElem->class_id + "|stop+" + std::to_string(prevElem_offset);
+              secondaryStop = pre_prevElem->class_id + "|stop+" + std::to_string(prevElem_offset + offset_result);
+            } else if (prePrevElemExists && pre_prevElem->type == "variable" && prevElem->global_class != "read") {
+              if (prevElem->global_class == "poly_tail"||*prevElem->expected_length < 13) {
+                secondaryStart = pre_prevElem->class_id + "|stop+1|skipped";
+                secondaryStop = pre_prevElem->class_id + "|stop+" + std::to_string(offset_result) + "|skipped";
+              } else {
+                secondaryStart = nextElem->class_id + "|start-" + std::to_string(offset_result) + "|right_terminal_linked";
+                secondaryStop = nextElem->class_id + "|start-" + std::to_string(nextElem_val) + "|right_terminal_linked";
+              }
+            }
           }
         }
+        // Update assignedPositions
+        if (assignedPositions.find(it_var->class_id) != assignedPositions.end()) {
+          auto& existingEntry = assignedPositions[it_var->class_id];
+          if (std::get<0>(existingEntry) != primaryStart) {
+            std::get<1>(existingEntry) = primaryStart; // Update secondary start with new primary start
+          }
+          if (std::get<2>(existingEntry) != primaryStop) {
+            std::get<3>(existingEntry) = primaryStop;  // Update secondary stop with new primary stop
+          }
+        } else {
+          assignedPositions[it_var->class_id] = std::make_tuple(primaryStart, secondaryStart, primaryStop, secondaryStop);
+        }
+        if (verbose) {
+          Rcpp::Rcout << "Parse Right: Primary Start " << primaryStart << " & Secondary Start: " << secondaryStart << "\n";
+          Rcpp::Rcout << "Parse Right: Primary Stop " << primaryStop << " & Secondary Stop: " << secondaryStop << "\n";
+        }
       }
-      if (verbose) {
-        Rcpp::Rcout << "Parse right varElem: " << it_var->class_id << "\n";
-      }
+    }
+    if (verbose) {
+      Rcpp::Rcout << "Completed parsing right varElem: " << it_var->class_id << "\n";
     }
   }
 }
@@ -364,12 +436,25 @@ void VarScan(ReadLayout& readLayout, bool verbose) {
       right_vector = std::vector<int>(read_order_here, reverse_orders.end());
     }
     
+    if (verbose) {
+      Rcpp::Rcout << "Read direction: " << read_direction << ", Read order: " << read_order << "\n";
+      Rcpp::Rcout << "Left vector: ";
+      for (const auto& order : left_vector) {
+        Rcpp::Rcout << order << " ";
+      }
+      Rcpp::Rcout << "\nRight vector: ";
+      for (const auto& order : right_vector) {
+        Rcpp::Rcout << order << " ";
+      }
+      Rcpp::Rcout << "\n";
+    }
+    
     //Parse static elements
-    parse_static_left(readLayout, left_vector, read_direction, verbose, assignedPositions, true);
-    parse_static_right(readLayout, right_vector, read_direction, verbose, assignedPositions, true);
+    parse_static_left_new(readLayout, left_vector, read_direction, verbose, assignedPositions); //, true);
+    parse_static_right_new(readLayout, right_vector, read_direction, verbose, assignedPositions);//, true);
     //Parse read elements
-    parse_static_left(readLayout, left_vector, read_direction, verbose, assignedPositions, false);
-    parse_static_right(readLayout, right_vector, read_direction, verbose, assignedPositions, false);
+    //parse_static_left_new(readLayout, left_vector, read_direction, verbose, assignedPositions); //, false);
+   //parse_static_right_new(readLayout, right_vector, read_direction, verbose, assignedPositions);//, false);
   }
   for (const auto& entry : assignedPositions) {
     const auto& class_id = entry.first;
@@ -398,6 +483,14 @@ void VarScan(ReadLayout& readLayout, bool verbose) {
                   << "  Secondary Stop: " << std::get<3>(positions) << "\n";
     }
   }
+}
+
+// [[Rcpp::export]]
+void single_test_run_new(Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold) {
+  container = prep_read_layout_cpp(read_layout, misalignment_threshold, true);
+  VarScan(container, true);
+  using PositionFuncMap = std::unordered_map<std::string, PositionCalcFunc>;
+  positionFuncMap = createPositionFunctionMap(container, true);
 }
 
 //StatCounts from a sigstring, tabulate forward and reverse elements
@@ -472,11 +565,11 @@ return tokens;
 }
 void filter_sigstring(std::vector<std::string>& sigstrings) {
   std::regex readPattern(R"((read|rc_read):(\d+):(\d+):(\d+))");
-  std::regex barcodePattern(R"((barcode|rc_barcode):(\d+):(\d+):(\d+))");
+  std::regex barcodePattern(R"((barcode(?:_\d+)?|rc_barcode(?:_\d+)?):(\d+):(\d+):(\d+))");
   std::smatch matches;
   for (auto& sigstring : sigstrings) {
     bool hasRead = false, hasBarcode = false, isValid = true;
-    auto elements = split(sigstring, '|'); // Assuming you have a split function defined
+    auto elements = split(sigstring, '|');
     for (const auto& element : elements) {
       if (std::regex_search(element, matches, readPattern)) {
         
@@ -492,7 +585,7 @@ void filter_sigstring(std::vector<std::string>& sigstrings) {
         int startPos = std::stoi(matches.str(3));
         int stopPos = std::stoi(matches.str(4));
         // Check barcode length
-        if ((stopPos - startPos + 1) < 16) {
+        if ((stopPos - startPos + 1) < 4) {
           //Rcpp::Rcout << "Caught at this filter because I think that " << stopPos << " is this and " << startPos << " is this!\n";
           
           isValid = false;
@@ -518,7 +611,7 @@ void filter_sigstring(std::vector<std::string>& sigstrings) {
 }
 
 //using PositionFuncMap = std::unordered_map<std::string, PositionCalcFunc>;
-using PositionFuncMap = std::unordered_map<std::string, PositionCalcFunc>;
+//using positionFuncMap = std::unordered_map<std::string, PositionCalcFunc>;
 PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool verbose) {
     PositionFuncMap funcMap;
     for (const auto& element : readLayout) {
@@ -561,12 +654,12 @@ PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool ver
                     }
                     if (it != id_index.end() && 
                         ((refClass->type == "static" && refClass->element_pass && *refClass->element_pass) || 
-                        (refClass->type == "variable") || (refClass->global_class == "poly_tail"))) {
+                        (refClass->type == "variable") || (refClass->global_class == "poly_tail")) ||
+                        (refClass->global_class == "start") || (refClass->global_class == "stop")) {
                       
                         if (verbose) {
                             Rcpp::Rcout << "Made it into the loop and past the if statements!\n";
                         }
-                        
                         int startPos = it->position.first;
                         int stopPos = it->position.second;
                         int basePos = (operation.find("start") != std::string::npos) ? it->position.first : it->position.second;
@@ -577,10 +670,15 @@ PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool ver
                             Rcpp::Rcout << "  Positional Information from start to stop: " << startPos << " and " << stopPos << "\n";
                             Rcpp::Rcout << "  Calculated Position: " << calculatedPos << "\n";
                         }
-                        
-                        return calculatedPos;
-                        
-                    }else if (!isPrimary && !additionalInfo.empty()) {
+                        if(startPos < 0 && stopPos < 0){
+                          if(verbose){
+                            Rcpp::Rcout << "Returning because it's a primary run dependent on an unannotated element!\n";
+                          }
+                          return -1;
+                        } else {
+                          return calculatedPos;
+                        }
+                    } else if (!isPrimary && !additionalInfo.empty()) {
                       std::string readType = readData.string_info.at("type").str_type;
                       auto varClass = id_index.find(varElemClassId);
                       if(verbose){
@@ -1252,340 +1350,123 @@ void clearMap(df_map& map, bool verbose) {
   }
 }
 
-Rcpp::List sig_extraction(const ReadLayout& readLayout, const std::vector<std::string>& sigstrings, 
-  Rcpp::DataFrame df, bool verbose) {
-  df_map idMap;
-  df_to_unordered_map(df, idMap, verbose);
-  
-  std::vector<std::string> ids;
-  std::map<std::string, std::vector<std::string>> columns;
-  
-  for (int i = 0; i < sigstrings.size(); ++i) {
-    ReadData readData;
-    std::string signature = sigstrings[i];
-    ids.push_back(signature);
-  auto read_info_pos = signature.find_last_of('<');
-  std::string lengthTypeStr = signature.substr(read_info_pos + 1, signature.length() - read_info_pos - 2);
-  std::stringstream lengthTypeStream(lengthTypeStr);
-  std::string lengthStr, read_id, type;
-  std::getline(lengthTypeStream, lengthStr, ':');
-  std::getline(lengthTypeStream, read_id, ':');
-  std::getline(lengthTypeStream, type);
-  int length = std::stoi(lengthStr);
-  size_t plusPos = read_id.find("+FR_RF");
-  if (plusPos != std::string::npos) {
-    read_id = read_id.substr(0, plusPos);
-  }
-  readData.addStringInfo("type", length, read_id, type);
-  SigString* targetSigString = &readData.sigstring;
-  std::stringstream ss(signature);
-  std::string token;
-  // Process each token (element) in signature
-  while (std::getline(ss, token, '|')) {
-    std::string id;
-    int editDistance, startPos, endPos;
-    std::stringstream tokenStream(token);
-    
-    std::getline(tokenStream, id, ':');
-    tokenStream >> editDistance;
-    tokenStream.ignore(1); // Ignore the colon
-    tokenStream >> startPos;
-    tokenStream.ignore(1); // Ignore the colon
-    tokenStream >> endPos;
-
-    // Check if element_id is of type "variable" in readLayout
-    auto& class_id_index = readLayout.get<id_tag>();
-    auto it = class_id_index.find(id);
-    if(it->type == "variable") {
-      // Found a variable type element
-      boost::optional<std::string> final_seq;
-      std::string extracted_seq;
-      if (idMap.find(read_id) != idMap.end()) {
-        const auto& qualSeq = idMap[read_id];
-        if (startPos > 0 && endPos >= startPos && (qualSeq.seq.length() > endPos)) {
-          extracted_seq = qualSeq.seq.substr(startPos - 1, endPos - startPos + 1); // Corrected substring extraction
-          if (it->direction != "forward"){
-            extracted_seq = revcomp_cpp(extracted_seq);
-          }
-        }
-        final_seq = extracted_seq;
-      }
-      SigElement element(
-          id,
-          it->global_class,
-          editDistance,
-          std::make_pair(startPos, endPos),
-          it->type,
-          it->order,
-          it->direction,
-          boost::none,
-          final_seq
-      );
-      targetSigString->insert(std::move(element));
-      // Verbose output
-    }
-  }
-  for (const auto& element : readData.sigstring) {
-    if (element.type == "variable" && element.seq) {
-      columns[element.global_class].push_back(*element.seq); // this is pretty weird
+// [[Rcpp::export]]
+Rcpp::DataFrame sig_extraction(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold,
+  Rcpp::DataFrame& df, const Rcpp::CharacterVector& processed_sigstrings, bool verbose) {
+  // Convert R DataFrame to C++ ReadLayout structure
+  ReadLayout readLayout = prep_read_layout_cpp(read_layout, misalignment_threshold, verbose);
+  // Process variable scanning and create position function map
+  VarScan(readLayout, verbose);
+  positionFuncMap = createPositionFunctionMap(readLayout, verbose);
+  // Convert processed_sigstrings to std::vector<std::string>
+  std::vector<std::string> sigstrings = Rcpp::as<std::vector<std::string>>(processed_sigstrings);
+  // Extract all unique class IDs, including both forward and reverse complements
+  std::set<std::string> uniqueClassIds;
+  auto& class_id_index = readLayout.get<id_tag>();
+  for (const auto& elem : class_id_index) {
+    if (elem.type == "variable") {
+      if (elem.class_id.substr(0, 3) == "rc_") {
+        uniqueClassIds.insert(elem.class_id.substr(3));
+      } else {
+        uniqueClassIds.insert(elem.class_id);
       }
     }
   }
-  Rcpp::List data(columns.size() + 1); // +1 for the ID column
-  CharacterVector colNames(columns.size() + 1);
-  colNames[0] = "sig_id";
-  data[0] = wrap(ids);
-  if(verbose){
-    Rcpp::Rcout << "Making it to after wrapping the ids!\n";
-  }
-  int colIndex = 1;
-  for (const auto& col : columns) {
-    colNames[colIndex] = col.first; // global_class as column name
-    data[colIndex] = wrap(col.second); // Associated sequences
-    ++colIndex;
-  }
-  data.attr("names") = colNames;
-  clearMap(idMap, verbose);
-  return data;
-}
-
-Rcpp::List sig_extraction_v2(const ReadLayout& readLayout, const std::vector<std::string>& sigstrings, 
-  Rcpp::DataFrame df, bool verbose) {
-  df_map_v2 idMap;
-  df_to_unordered_map_refs(df, idMap, verbose);
-  
-  std::vector<std::string> ids;
-  std::map<std::string, std::vector<std::string>> columns;
-  
-  Rcpp::StringVector quals = df["qual"];
-  Rcpp::StringVector seqs = df["seq"];
-  
-  for (int i = 0; i < sigstrings.size(); ++i) {
-    ReadData readData;
-    std::string signature = sigstrings[i];
-    ids.push_back(signature);
-    auto read_info_pos = signature.find_last_of('<');
-    std::string lengthTypeStr = signature.substr(read_info_pos + 1, signature.length() - read_info_pos - 2);
-    std::stringstream lengthTypeStream(lengthTypeStr);
-    std::string lengthStr, read_id, type;
-    std::getline(lengthTypeStream, lengthStr, ':');
-    std::getline(lengthTypeStream, read_id, ':');
-    std::getline(lengthTypeStream, type);
-    int length = std::stoi(lengthStr);
-    size_t plusPos = read_id.find("+FR_RF");
-    if (plusPos != std::string::npos) {
-      read_id = read_id.substr(0, plusPos);
-    }
-    readData.addStringInfo("type", length, read_id, type);
-    SigString* targetSigString = &readData.sigstring;
-    std::stringstream ss(signature);
-    std::string token;
-    // Process each token (element) in signature
-    while (std::getline(ss, token, '|')) {
-      std::string id;
-      int editDistance, startPos, endPos;
-      std::stringstream tokenStream(token);
-      
-      std::getline(tokenStream, id, ':');
-      tokenStream >> editDistance;
-      tokenStream.ignore(1); // Ignore the colon
-      tokenStream >> startPos;
-      tokenStream.ignore(1); // Ignore the colon
-      tokenStream >> endPos;
-      
-      // Check if element_id is of type "variable" in readLayout
-      auto& class_id_index = readLayout.get<id_tag>();
-      auto it = class_id_index.find(id);
-      if(it->type == "variable") {
-        boost::optional<std::string> final_seq;
-        std::string extracted_seq;
-        if (idMap.find(read_id) != idMap.end()) {
-          auto& ref = idMap[read_id];
-
-          std::string seq = Rcpp::as<std::string>(seqs[ref.seq]);
-          
-          if (startPos > 0 && endPos >= startPos && (seq.length() > endPos)) {
-            extracted_seq = seq.substr(startPos - 1, endPos - startPos + 1); // Corrected substring extraction
-            if (it->direction != "forward"){
-              extracted_seq = revcomp_cpp(extracted_seq);
-            }
-          }
-          final_seq = extracted_seq;
-        }
-        SigElement element(
-            id,
-            it->global_class,
-            editDistance,
-            std::make_pair(startPos, endPos),
-            it->type,
-            it->order,
-            it->direction,
-            boost::none,
-            final_seq
-        );
-        targetSigString->insert(std::move(element));
-      }
-    }
-    for (const auto& element : readData.sigstring) {
-      if (element.type == "variable" && element.seq) {
-        columns[element.global_class].push_back(*element.seq);
-      }
-    }
-  }
-  Rcpp::List data(columns.size() + 1); // +1 for the ID column
-  CharacterVector colNames(columns.size() + 1);
-  colNames[0] = "sig_id";
-  data[0] = wrap(ids);
-  if(verbose){
-    Rcpp::Rcout << "Making it to after wrapping the ids!\n";
-  }
-  int colIndex = 1;
-  for (const auto& col : columns) {
-    colNames[colIndex] = col.first; // global_class as column name
-    data[colIndex] = wrap(col.second); // Associated sequences
-    ++colIndex;
-  }
-  data.attr("names") = colNames;
-  return data;
-}
-
-Rcpp::List sig_extraction_v3(const ReadLayout& readLayout, const std::vector<std::string>& sigstrings, 
-  Rcpp::DataFrame df, bool verbose) {
-  df_map_v2 idMap;
-  df_to_unordered_map_refs(df, idMap, verbose);
-  std::vector<std::string> ids;
-  std::map<std::string, std::vector<std::string>> columns;
-  std::map<std::string, int> columnCount; // To track the occurrence of global_class names
-  Rcpp::StringVector seqs = df["seq"];
-  for (int i = 0; i < sigstrings.size(); ++i) {
-    ReadData readData;
-    std::string signature = sigstrings[i];
-    ids.push_back(signature);
-    auto read_info_pos = signature.find_last_of('<');
-    std::string lengthTypeStr = signature.substr(read_info_pos + 1, signature.length() - read_info_pos - 2);
-    std::stringstream lengthTypeStream(lengthTypeStr);
-    std::string lengthStr, read_id, type;
-    std::getline(lengthTypeStream, lengthStr, ':');
-    std::getline(lengthTypeStream, read_id, ':');
-    std::getline(lengthTypeStream, type);
-    int length = std::stoi(lengthStr);
-    size_t plusPos = read_id.find("+FR_RF");
-    if (plusPos != std::string::npos) {
-      read_id = read_id.substr(0, plusPos);
-    }
-    readData.addStringInfo("type", length, read_id, type);
-    SigString* targetSigString = &readData.sigstring;
-    std::stringstream ss(signature);
-    std::string token;
-    // Process each token (element) in signature
-    while (std::getline(ss, token, '|')) {
-      std::string id;
-      int editDistance, startPos, endPos;
-      std::stringstream tokenStream(token);
-      
-      std::getline(tokenStream, id, ':');
-      tokenStream >> editDistance;
-      tokenStream.ignore(1); // Ignore the colon
-      tokenStream >> startPos;
-      tokenStream.ignore(1); // Ignore the colon
-      tokenStream >> endPos;
-      
-      auto& class_id_index = readLayout.get<id_tag>();
-      auto it = class_id_index.find(id);
-      if(it->type == "variable") {
-        std::string extracted_seq;
-        if (idMap.find(read_id) != idMap.end()) {
-          auto& ref = idMap[read_id];
-          std::string seq = Rcpp::as<std::string>(seqs[ref.seq]);
-          
-          if (startPos > 0 && endPos >= startPos && (seq.length() > endPos)) {
-            extracted_seq = seq.substr(startPos - 1, endPos - startPos + 1); // Corrected substring extraction
-            if (it->direction != "forward") {
-              extracted_seq = revcomp_cpp(extracted_seq);
-            }
-          }
-        }
-        std::string column_name = it->global_class;
-        if (columnCount.find(column_name) != columnCount.end()) {
-          column_name += "_" + std::to_string(++columnCount[column_name]);
-        } else {
-          columnCount[column_name] = 1; // Initialize count
-        }
-        columns[column_name].push_back(extracted_seq);
-      }
-    }
-  }
-  Rcpp::List data(columns.size() + 1); // +1 for the ID column
-  CharacterVector colNames(columns.size() + 1);
-  colNames[0] = "sig_id";
-  data[0] = wrap(ids);
-  if(verbose){
-    Rcpp::Rcout << "Making it to after wrapping the ids!\n";
-  }
-  int colIndex = 1;
-  for (const auto& col : columns) {
-    colNames[colIndex] = col.first; // Ensuring global_class names are unique
-    data[colIndex] = wrap(col.second); // Associated sequences
-    ++colIndex;
-  }
-  data.attr("names") = colNames;
-  return data;
-}
-
-Rcpp::DataFrame sig_extraction_v4(const ReadLayout& readLayout, const std::vector<std::string>& sigstrings, 
-  Rcpp::DataFrame df, bool verbose, int version = 1) {
-  std::unordered_map<std::string, std::vector<std::string>> extractedData;
-  std::unordered_map<std::string, std::vector<int>> columnCount;
-  
+  // Create a map for fast lookup of sequences by ID
+  std::unordered_map<std::string, std::string> seq_map;
   Rcpp::StringVector ids = df["id"];
-  Rcpp::StringVector quals = df["qual"];
   Rcpp::StringVector seqs = df["seq"];
-  
+  for (int i = 0; i < ids.size(); ++i) {
+    seq_map[Rcpp::as<std::string>(ids[i])] = Rcpp::as<std::string>(seqs[i]);
+  }
+  // Prepare the result list
+  Rcpp::List result(sigstrings.size());
+  std::vector<std::string> column_names(uniqueClassIds.begin(), uniqueClassIds.end());
   for (int i = 0; i < sigstrings.size(); ++i) {
+    Rcpp::List read_result;
     ReadData readData;
     std::string signature = sigstrings[i];
-    parse_signature(signature, readData, readLayout);
+    // Parse the signature
+    auto read_info_pos = signature.find_last_of('<');
+    std::string lengthTypeStr = signature.substr(read_info_pos + 1, signature.length() - read_info_pos - 2);
+    std::stringstream lengthTypeStream(lengthTypeStr);
+    std::string lengthStr, read_id, type;
+    std::getline(lengthTypeStream, lengthStr, ':');
+    std::getline(lengthTypeStream, read_id, ':');
+    std::getline(lengthTypeStream, type);
+    // Debugging statements
+    if(verbose){
+      Rcpp::Rcout << "Signature: " << signature << std::endl;
+      Rcpp::Rcout << "Length: " << lengthStr << ", Read ID: " << read_id << ", Type: " << type << std::endl;
+    }
+    auto plus_pos = read_id.find('+');
+    if (plus_pos != std::string::npos) {
+      read_id = read_id.substr(0, plus_pos);
+    }
+    if(type == "undecided"){
+      continue;
+    }
+    int length = std::stoi(lengthStr);
+    readData.addStringInfo("type", length, read_id, type);
+    SigString* targetSigString = &readData.sigstring;
+    std::stringstream ss(signature.substr(0, read_info_pos));
+    std::string token;
     
-    std::string read_id = readData.string_info.at("type").str_id;
-    extractedData["id"].push_back(read_id);
-    
-    for (const auto& element : readData.sigstring) {
-      if (element.type == "variable" && idMap.find(read_id) != idMap.end()) {
-        auto& ref = idMap[read_id];
-        std::string seq = Rcpp::as<std::string>(seqs[ref.seq]);
+    while (std::getline(ss, token, '|')) {
+      std::string id;
+      int editDistance, startPos, endPos;
+      std::stringstream tokenStream(token);
+      
+      std::getline(tokenStream, id, ':');
+      tokenStream >> editDistance;
+      tokenStream.ignore(1); // Ignore the colon
+      tokenStream >> startPos;
+      tokenStream.ignore(1); // Ignore the colon
+      tokenStream >> endPos;
+      
+      auto it = class_id_index.find(id);
+      if (it != class_id_index.end() && it->type == "variable") {
+        auto seq_it = seq_map.find(read_id);
+        if (seq_it == seq_map.end()) {
+          continue;
+        }
+        std::string seq = seq_it->second;
         std::string extracted_seq;
-        
-        if (element.position.first > 0 && element.position.second >= element.position.first && (seq.length() > element.position.second)) {
-          extracted_seq = seq.substr(element.position.first - 1, element.position.second - element.position.first + 1);
-          if (element.direction != "forward") {
+        if (startPos > 0 && endPos >= startPos && (seq.length() >= endPos)) {
+          extracted_seq = seq.substr(startPos - 1, endPos - startPos + 1); // Corrected substring extraction
+          if (it->direction != "forward") {
             extracted_seq = revcomp_cpp(extracted_seq);
           }
+        } else {
+          continue;
+        }
+        std::string classId = id;
+        if (classId.substr(0, 3) == "rc_") {
+          classId = classId.substr(3);
         }
         
-        std::string column_name = element.global_class;
-        if (columnCount[column_name].size() > 0) {
-          column_name += "_" + std::to_string(++columnCount[column_name].back());
-        } else {
-          columnCount[column_name].push_back(1);
-        }
-        extractedData[column_name].push_back(extracted_seq);
+        read_result[classId] = extracted_seq;
       }
     }
+    result[i] = read_result;
   }
-  
-  // Create the resulting data frame
-  Rcpp::List result(extractedData.size());
-  Rcpp::CharacterVector colNames(extractedData.size());
-  
-  int colIndex = 0;
-  for (const auto& col : extractedData) {
-    colNames[colIndex] = col.first;
-    result[colIndex] = wrap(col.second);
-    ++colIndex;
+  // Convert the list to a data.table
+  Rcpp::List data_table_list;
+  data_table_list["id"] = processed_sigstrings;
+  for (const auto& classId : uniqueClassIds) {
+    Rcpp::CharacterVector column(sigstrings.size(), NA_STRING);
+    for (int i = 0; i < sigstrings.size(); ++i) {
+      Rcpp::List read_result = result[i];
+      if (read_result.containsElementNamed(classId.c_str())) {
+        column[i] = Rcpp::as<std::string>(read_result[classId]);
+      }
+    }
+    data_table_list[classId] = column;
   }
-  
-  result.attr("names") = colNames;
-  return Rcpp::DataFrame(result);
+  // Create the data.table
+  data_table_list.attr("class") = "data.table";
+  data_table_list.attr("row.names") = Rcpp::seq(1, sigstrings.size());
+  return data_table_list;
 }
 
 //displaying a sigstring
@@ -1768,47 +1649,6 @@ void pos_scan(ReadData& readData, const PositionFuncMap& positionFuncMap, const 
   }
 }
 
-// [[Rcpp::export]]
-Rcpp::List sig_extractor(const DataFrame& read_layout, const DataFrame& misalignment_threshold,
-  const DataFrame& df, const CharacterVector& processed_sigstrings, bool verbose) {
-  ReadLayout container = prep_read_layout_cpp(read_layout, misalignment_threshold);
-  VarScan(container, verbose);
-  positionFuncMap = createPositionFunctionMap(container, verbose);
-  std::vector<std::string> sigs = Rcpp::as<std::vector<std::string>>(processed_sigstrings);
-  return sig_extraction(container, sigs, df, verbose);
-}
-
-// [[Rcpp::export]]
-Rcpp::DataFrame sig_extractor_v2(const DataFrame& read_layout, const DataFrame& misalignment_threshold,
-  DataFrame& df, const CharacterVector& processed_sigstrings, bool verbose) {
-  ReadLayout container = prep_read_layout_cpp(read_layout, misalignment_threshold);
-  VarScan(container, verbose);
-  positionFuncMap = createPositionFunctionMap(container, verbose);
-  std::vector<std::string> sigs = Rcpp::as<std::vector<std::string>>(processed_sigstrings);
-  return sig_extraction_v2(container, sigs, df, verbose);
-}
-
-// [[Rcpp::export]]
-Rcpp::DataFrame sig_extractor_v3(const DataFrame& read_layout, const DataFrame& misalignment_threshold,
-  DataFrame& df, const CharacterVector& processed_sigstrings, bool verbose) {
-  ReadLayout container = prep_read_layout_cpp(read_layout, misalignment_threshold);
-  VarScan(container, verbose);
-  positionFuncMap = createPositionFunctionMap(container, verbose);
-  std::vector<std::string> sigs = Rcpp::as<std::vector<std::string>>(processed_sigstrings);
-  return sig_extraction_v3(container, sigs, df, verbose);
-}
-
-// [[Rcpp::export]]
-Rcpp::DataFrame sig_extractor_v4(const DataFrame& read_layout, const DataFrame& misalignment_threshold,
-  DataFrame& df, const CharacterVector& processed_sigstrings, bool verbose) {
-  ReadLayout container = prep_read_layout_cpp(read_layout, misalignment_threshold);
-  VarScan(container, verbose);
-  positionFuncMap = createPositionFunctionMap(container, verbose);
-  std::vector<std::string> sigs = Rcpp::as<std::vector<std::string>>(processed_sigstrings);
-  return sig_extraction(container, sigs, df, verbose);
-}
-
-
 Rcpp::CharacterVector process_sigstrings(const ReadLayout& readLayout, 
   const std::vector<std::string>& sigs, const PositionFuncMap& positionFuncMap, bool verbose, int nthreads = 1) {
   omp_set_num_threads(nthreads);
@@ -1835,10 +1675,36 @@ Rcpp::CharacterVector process_sigstrings(const ReadLayout& readLayout,
   return wrap(processed_sigstrings);
 }
 
+std::vector<std::string> process_sigstrings_cpp(const ReadLayout& readLayout, 
+  const std::vector<std::string>& sigs, const PositionFuncMap& positionFuncMap, bool verbose, int nthreads = 1) {
+  omp_set_num_threads(nthreads);
+  std::vector<std::string> processed_sigstrings;
+#pragma omp parallel
+{
+  std::vector<std::string> local_processed_sigstrings;
+#pragma omp for nowait
+  for (int i = 0; i < sigs.size(); ++i) {
+    const auto& sigstring = sigs[i];
+    ReadData readData;
+    fillSigString(readData, readLayout, sigstring, positionFuncMap, verbose);
+    concat_scan(readData, verbose);
+    pos_scan(readData, positionFuncMap, readLayout, verbose);
+    std::vector<std::string> generated_sigstrings = generateSigString(readData);
+    filter_sigstring(generated_sigstrings);
+    local_processed_sigstrings.insert(local_processed_sigstrings.end(), 
+      generated_sigstrings.begin(), 
+      generated_sigstrings.end());
+  }
+#pragma omp critical
+  processed_sigstrings.insert(processed_sigstrings.end(), local_processed_sigstrings.begin(), local_processed_sigstrings.end());
+}
+return processed_sigstrings;
+}
+
 // [[Rcpp::export]]
 Rcpp::CharacterVector sigrun(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, 
   const Rcpp::StringVector& sigstrings, int nthreads = 1, bool verbose = false) {
-  container = prep_read_layout_cpp(read_layout, misalignment_threshold);
+  container = prep_read_layout_cpp(read_layout, misalignment_threshold, verbose);
   VarScan(container, verbose);
   positionFuncMap = createPositionFunctionMap(container, verbose);
   std::vector<std::string> sigs = Rcpp::as<std::vector<std::string>>(sigstrings);

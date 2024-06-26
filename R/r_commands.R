@@ -116,7 +116,6 @@ read_fastqas<-function(fn, type, full_id = FALSE, ...){
     return(rfq_single(fn = fn, type = type, full_id = full_id, ...))
   }
 }
-
 prep_seq<-function(read_layout_form, external_path_form, create_output_dir = TRUE, data_table_nthreads = 1, ...){
   {
     print("Importing read layout and figuring out its order!")
@@ -192,30 +191,44 @@ prep_seq<-function(read_layout_form, external_path_form, create_output_dir = TRU
       adapters = adapters,
       whitelist = whitelist), envir = .GlobalEnv))
 }
-prep_read_layout<-function(read_layout_form){
+prep_read_layout<-function(read_layout_form) {
   print("Importing read layout and figuring out its order!")
   tidytable::setDTthreads(threads = 1)
-  read_layout<-data.table::fread(file = read_layout_form, header = TRUE, fill = TRUE, na.strings = "", skip = 1)
-  
-  if(any(read_layout$class != "forw_primer") | any(read_layout$class != "rev_primer")){
-    which(read_layout$type == "static") %>% {read_layout[min(.),class := "forw_primer"]}
-    which(read_layout$type == "static") %>% {read_layout[max(.),class := "rev_primer"]}
-  }
-  
+  read_layout <- data.table::fread(file = read_layout_form, header = TRUE, fill = TRUE, na.strings = "", skip = 1)
   read_layout$expected_length[which(!is.na(read_layout$seq))]<-stringr::str_length(read_layout$seq[which(!is.na(read_layout$seq))])
   
-  read_layout[(class %in% c("poly_a", "poly_t")) & is.na(expected_length),
-    expected_length := 12]
+  read_layout[(class %in% c("poly_a", "poly_t")) & is.na(expected_length), expected_length := 12]
   read_layout[class == "poly_a", seq := paste0("A{", expected_length, ",}+")]
   read_layout[class == "poly_t", seq := paste0("T{", expected_length, ",}+")]
   
-  if(any(duplicated(read_layout$id))){
-    read_layout$id[which(duplicated(read_layout$id)|duplicated(read_layout$id, fromLast = TRUE))]<-which(duplicated(read_layout$id)|duplicated(read_layout$id,
-      fromLast = TRUE)) %>%
+  new_row_top<-data.table::data.table(id = "seq_start", seq = NA, expected_length = 0,
+    type = "static", class = "start", direction = "forward", class_id = "seq_start")
+  new_row_bottom<-data.table::data.table(id = "seq_stop", seq = NA, expected_length = 0, 
+    type = "static", class = "stop", direction = "forward", class_id = "seq_stop")
+  
+  read_layout<-data.table::rbindlist(list(new_row_top, read_layout, new_row_bottom), fill = TRUE)
+  
+  if(any(read_layout$class != "forw_primer")){
+    start_index<-which(read_layout$class == "start")
+    if(read_layout$type[start_index+1] == "static"|is.na(read_layout$class[start_index+1])){
+      read_layout[start_index+1, class := "forw_primer"]
+    }
+  }
+  
+  if(any(read_layout$class != "rev_primer")){
+    stop_index<-which(read_layout$class == "stop")
+    if(read_layout$type[stop_index-1] == "static"|is.na(read_layout$class[stop_index-1])){
+      read_layout[stop_index-1, class := "rev_primer"]
+    }
+  }
+  
+  if (any(duplicated(read_layout$id))) {
+    read_layout$id[which(duplicated(read_layout$id) | duplicated(read_layout$id, fromLast = TRUE))]<-
+      which(duplicated(read_layout$id) | duplicated(read_layout$id, fromLast = TRUE)) %>%
       read_layout$id[.] %>% paste0(., "_", seq(length(.)))
   }
-  if(any(duplicated(read_layout$class))){
-    read_layout$class[which(duplicated(read_layout$class)|duplicated(read_layout$class, fromLast = TRUE))] %>% unique %>%
+  if (any(duplicated(read_layout$class))) {
+    read_layout$class[which(duplicated(read_layout$class) | duplicated(read_layout$class, fromLast = TRUE))] %>% unique %>%
       sapply(., FUN = function(x){
         out<-which(read_layout$class == x) %>%
           read_layout[., class_id := paste0(class, "_", seq(.))]
@@ -225,33 +238,38 @@ prep_read_layout<-function(read_layout_form){
   } else {
     read_layout$class_id<-read_layout$class
   }
+  
   read_layout<-read_layout %>%
-    .[,direction := "forward"] %>%
+    .[, direction := "forward"] %>%
     data.table::copy(.) %>%
+    .[!class %in% c("start", "stop")] %>%
     .[, seq := ifelse(class == "poly_t", "A{12,}+", ifelse(class == "poly_a", "T{12,}+", sapply(seq, revcomp)))] %>%
-    .[, id := ifelse(class %in% c("poly_a", "poly_t"), ifelse(class == "poly_a", "poly_t", "poly_a"),paste0("rc_", id))] %>%
+    .[, id := ifelse(class %in% c("poly_a", "poly_t"), ifelse(class == "poly_a", "poly_t", "poly_a"), paste0("rc_", id))] %>%
     .[, class_id := ifelse(class_id == "poly_a", "poly_t", ifelse(class_id == "poly_t", "poly_a", class_id))] %>%
     .[, class := ifelse(class == "poly_a", "poly_t", ifelse(class == "poly_t", "poly_a", class))] %>%
     .[, direction := "reverse"] %>%
-    .[order(seq(nrow(.)), decreasing = TRUE),] %>%
-    #This part does the reversing
+    .[order(seq(nrow(.)), decreasing = TRUE), ] %>%
+    {data.table::rbindlist(list(data.table::data.table(id = "seq_start", seq = NA, expected_length = 0, type = "static",
+      class = "start", direction = "reverse", class_id = "seq_start"),
+      ., data.table::data.table(id = "seq_stop", seq = NA, expected_length = 0, type = "static",
+        class = "stop", direction = "reverse", class_id = "seq_stop")),
+      fill = TRUE)} %>%
     {rbind(read_layout, .)} %>%
-    # This code annotates the reverse variable elements with the "rc" in the type column.
-    {.[,class_id := ifelse(test = {.$direction == "reverse" &! (.$class_id == "poly_a" | .$class_id == "poly_t")},
+    
+    {.[, class_id := ifelse(test = {.$direction == "reverse" &!
+        (.$class_id == "poly_a" | .$class_id == "poly_t")},# | .$class_id == "seq_start" | .$class_id == "seq_stop")},
       yes = paste0("rc_", .$class_id),
       no = .$class_id)]} %>%
-    {.[,"order" := seq(1:nrow(.))]} %>%
-    #{.[,"direction" := NULL]} %>%
+    {.[, "order" := seq(1:nrow(.))]} %>%
     {.[, class := ifelse(test = {.$class == "poly_a" | .$class == "poly_t"},
       yes = "poly_tail",
       no = .$class)]}
-  #adapters<-read_layout$seq[grep(pattern = "adapter", x = read_layout$type)]
-  #names(adapters)<-read_layout$id[grep(pattern = "adapter", x = read_layout$type)] #list2env this one
-  adapters<-read_layout$seq[-which(is.na(read_layout$seq))]
-  names(adapters)<-read_layout$class_id[-which(is.na(read_layout$seq))]
-  #super quick fix to make the alignment adapter stuff work bc of hardcoded adapter name assumptions downstream, fix
+  
+  adapters <- read_layout$seq[-which(is.na(read_layout$seq))]
+  names(adapters) <- read_layout$class_id[-which(is.na(read_layout$seq))]
   return(list2env(x = list(read_layout = read_layout, adapters = adapters), envir = .GlobalEnv))
 }
+
 prep_external_path<-function(external_path_form){
   print("Checking executable paths!")
   path_layout<-data.table::fread(file = external_path_form, header = TRUE, fill = TRUE, na.strings = "", skip = 1,
@@ -263,9 +281,11 @@ prep_external_path<-function(external_path_form){
   return(list2env(x = list(path_layout = path_layout, whitelist = whitelist), envir = .GlobalEnv))
 }
 stat_collector<-function(df, read_layout, mode = "stats"){
-  forward_adapters<-read_layout[type %in% c("static") & direction == "forward" & class != "poly_tail", class_id]
-  reverse_adapters<-read_layout[type %in% c("static") & direction == "reverse" & class != "poly_tail", class_id]
+  #the issue here is...what if none of your data actually has 0 edit distance, as if it's too messy to even do that?
+  forward_adapters<-read_layout[type %in% c("static") & direction == "forward" & class != "poly_tail" & class != "start" & class != "stop", class_id]
+  reverse_adapters<-read_layout[type %in% c("static") & direction == "reverse" & class != "poly_tail" & class != "start" & class != "stop", class_id]
   df<-tidytable::as_tidytable(df)
+  
   forward_zero_ids<-df %>%
     tidytable::filter(query_id %in% forward_adapters) %>%
     tidytable::group_by(id) %>%
@@ -449,13 +469,39 @@ synth_data_processor<-function(fn, type, df_out){
   return(df_new)
 }
 
-whitelist_generator<-function(df, original_whitelist = NULL, prefiltered_whitelist = NULL, 
+whitelist_filterer<-function(generated_whitelist, stringency_params, verbose = FALSE){
+  if(verbose){
+    print(stringency_params)
+  }
+  df<-generated_whitelist
+  fpoisson<-table(df$pois_dist) %>% data.table::as.data.table(.)
+  if(verbose){
+    print(head(fpoisson))
+  }
+  fpoisson<-fpoisson[order(as.numeric(fpoisson$V1), decreasing = FALSE),]
+  min_idx<-diff(fpoisson$N, differences = stringency_params[1], lag = stringency_params[2]) %>% 
+    sign %>% {diff(.,differences = stringency_params[3], lag = stringency_params[4]) != 0} %>% #toggle lag for param sensitivity?
+    which(. == TRUE) %>% 
+    min(.)
+  df<-fpoisson$V1[min_idx] %>% 
+    as.numeric %>% 
+    {df[which(df$pois_dist >= .),]}
+  if(verbose){
+    print(head(df))
+  }
+  return(df)
+}
+
+generate_whitelist<-function(barcode_column, original_whitelist = NULL, prefiltered_whitelist = NULL, 
   output_dir = NULL, verbose = FALSE, stringency = "LOW"){
   if(!is.null(original_whitelist)||!is.null(prefiltered_whitelist)){
-    barcodes<-table(df$barcode) %>% data.table::as.data.table(.)
+    barcodes<-table(barcode_column, useNA = "no") %>% data.table::as.data.table(.)
   } else {
+    barcodes<-table(barcode_column, useNA = "no") %>% data.table::as.data.table(.)
+    #placeholder--figure this out 
   }
-  ratio<-nrow(barcodes)/nrow(df)
+  colnames(barcodes)<-c("V1","N")
+  ratio<-nrow(barcodes)/length(barcode_column)
   if(verbose){
     print(paste0("Number of total barcodes: ", nrow(barcodes)))
     print(whitelist_size())
@@ -467,18 +513,29 @@ whitelist_generator<-function(df, original_whitelist = NULL, prefiltered_whiteli
     return(list2env(troubleshooting_output))
   }
   if(ratio > 0.5){
-    rescue_repeats<-6
+    rescue_repeats<-ceiling(mean(stringr::str_length(barcode_column))*0.3)
   } else {
-    rescue_repeats<-8
+    rescue_repeats<-ceiling(mean(stringr::str_length(barcode_column))*0.5)
   }
   filter_runs<-sapply(X = c("A","C","T","G"), FUN = function(X){
-    paste0(replicate(X, n = rescue_repeats), collapse = "") %>% {which(grepl(pattern = .,  x = barcodes$V1) == TRUE)}
-  }) %>% unlist %>% unique
-  barcodes<-barcodes[-filter_runs,]
+    paste0(replicate(X, n = rescue_repeats), collapse = "")}, 
+    USE.NAMES = FALSE)
+  
+  if(verbose){
+    print(paste0("After filtering repeated runs of length ", rescue_repeats,"..."))
+    print(head(filter_runs))
+    print(colnames(barcodes))
+    print(head(barcodes))
+  }
   barcodes$pois_dist<-stats::ppois(q = barcodes$N, lambda = mean(barcodes$N))
+  if(verbose){
+    print("Pre-conversion to bits...")
+    print(head(barcodes))
+  }
   barcodes$V1<-sequence_to_bits(barcodes$V1)
   if(verbose){
     print(head(barcodes))
+    print("Post-conversion to bits!")
   }
   if(!is.null(original_whitelist)){
     if(verbose){
@@ -551,47 +608,39 @@ whitelist_generator<-function(df, original_whitelist = NULL, prefiltered_whiteli
       
     }
   }#stats module
+  calling_env<-parent.frame()
+  
   if(verbose){
+    print(calling_env)
     print(head(chunk_whitelist))
     print(nrow(chunk_whitelist))
   }
   output<-list(generated_whitelist = chunk_whitelist, original_whitelist = original_whitelist)
-  return(list2env(output, .GlobalEnv))
+  return(list2env(output, calling_env))
 }
-barcode_corrector<-function(df, gen_whitelist, breadth = 1, depth = 2, high_speed = TRUE, nthreads = 1,
-   maxDistance = 2, verbose = FALSE){
-  populate_whitelist(barcodes = gen_whitelist$V1, poisson_data = gen_whitelist$pois_dist, counts = gen_whitelist$N)
+
+barcode_corrector<-function(barcode_column, gen_whitelist = NULL, breadth = 1, depth = 2, high_speed = TRUE, nthreads = 1,
+   maxDistance = 2, verbose = FALSE, stringency = "LOW"){
+    if(is.null(gen_whitelist)){
+      generate_whitelist(barcode_column = barcode_column, original_whitelist = NULL, 
+        prefiltered_whitelist = NULL, output_dir = NULL, verbose = verbose, stringency = stringency)
+      gen_whitelist<-generated_whitelist
+    }
+    populate_whitelist(barcodes = gen_whitelist$V1, poisson_data = gen_whitelist$pois_dist, counts = gen_whitelist$N)
     gen_whitelist<-wl_to_df()
+    #semantically this is shit
+  if(verbose){
+    print(head(gen_whitelist))
+    print("This is the generated whitelist!")
+  }
     if(whitelist_size() < 10){
-      stop()
+      stop("Empty whitelist!")
     }
-    if(!is.null(original_whitelist)){
-      barcodes<-table(df$barcode) %>% data.table::as.data.table(.)
-    } else {
-      barcodes<-table(df$barcode[grep(pattern = "FR_RF", x = df$sig_id, invert = TRUE)]) %>% data.table::as.data.table(.)
-    }
-    if(verbose){
-      print(paste0("Number of total barcodes: ", nrow(barcodes)))
-      print(whitelist_size())
-    }
-    ratio<-nrow(barcodes)/nrow(df)
-    if(verbose){
-      print(paste0("Ratio of unique barcodes to unique reads: ", ratio))
-    }
-    if(ratio > 0.5){
-      rescue_repeats<-6
-      maxDist<-2
-    } else {
-      rescue_repeats<-8
-    }
-    filter_runs<-sapply(X = c("A","C","T","G"), FUN = function(X){
-      paste0(replicate(X, n = rescue_repeats), collapse = "") %>% {which(grepl(pattern = .,  x = barcodes$V1) == TRUE)}
-    }) %>% unlist %>% unique
-    barcodes<-barcodes[-filter_runs,]
-    if(verbose){
-      print(head(gen_whitelist))
-    }
+  
     gen_whitelist$sequence<-bit64::as.integer64(gen_whitelist$sequence)
+    
+    barcodes<-table(barcode_column, useNA = "no") %>% data.table::as.data.table(.)
+    colnames(barcodes)<-c("V1","N")
     barcodes$V1<-sequence_to_bits(barcodes$V1)
     query_list<-barcodes[!barcodes$V1 %in% gen_whitelist$sequence,]
     query_list<-query_list[order(query_list$N, decreasing = TRUE),]
@@ -609,18 +658,19 @@ barcode_corrector<-function(df, gen_whitelist, breadth = 1, depth = 2, high_spee
     query_list$corrected<-correct_barcodes(
       barcodes = query_list$V1, 
       breadth = breadth, depth = depth,
-      high_speed = high_speed, nthreads = nthreads, maxDistance = 4)
+      high_speed = high_speed, nthreads = nthreads, maxDistance = maxDistance)
     
-    df$barcode<-sequence_to_bits(df$barcode)
-    df[query_list, barcode := bit64::as.integer64(i.corrected), on = .(barcode = V1)]
-    query_list<-query_list[which(!is.na(query_list$corrected)),]
+    #df$barcode<-sequence_to_bits(df$barcode)
+    #df[query_list, barcode := bit64::as.integer64(i.corrected), on = .(barcode = V1)]
+    #query_list<-query_list[which(!is.na(query_list$corrected)),]
     
     #df<-df[which(df$barcode %in% chunk_whitelist$V1),]
     
-    df$pass_fail<-df$barcode %in% gen_whitelist$sequence
-    output<-list(df_filtered = df)
-    return(list2env(output, .GlobalEnv))
+    #df$pass_fail<-df$barcode %in% gen_whitelist$sequence
+    #output<-list(df_filtered = df)
+    return(list2env(list(query_list = query_list), .GlobalEnv))
 }
+
 post_processor<-function(df){
   df$sig_id<-stringr::str_extract(string = df$sig_id, pattern = "<.+.(?=:)") 
   df$barcode<-df$barcode %>% bit64::as.integer64(.) %>% bits_to_sequence(.)
@@ -628,6 +678,7 @@ post_processor<-function(df){
     .[,c("id","read")] %>% data.table::setnames("read","seq")
  return(df)
 }
+
 single_processor<-function(fastqas, nthreads, output_dir){
   df<-read_fastqas(fn = fastqas, type = "fq")
   df<-rad_chunk(df, read_layout, misalignment_threshold, nthreads = nthreads, output_dir = output_dir, verbose = FALSE)
@@ -643,27 +694,6 @@ single_processor<-function(fastqas, nthreads, output_dir){
   append_fasta<-file.exists(paste0(output_dir, "/output/filtered_reads.fasta.gz"))
   write_fastqas(df = df_filtered, fn = paste0(output_dir, "/output/filtered_reads.fasta.gz"), 
     type = "fa", append = append_fasta, nthreads = nthreads)
-}
-whitelist_filterer<-function(df, stringency_params, verbose = FALSE){
-  if(verbose){
-    print(stringency_params)
-  }
-  fpoisson<-table(df$pois_dist) %>% data.table::as.data.table(.)
-  if(verbose){
-    print(head(fpoisson))
-  }
-  fpoisson<-fpoisson[order(as.numeric(fpoisson$V1), decreasing = FALSE),]
-  min_idx<-diff(fpoisson$N, differences = stringency_params[1], lag = stringency_params[2]) %>% 
-    sign %>% {diff(.,differences = stringency_params[3], lag = stringency_params[4]) != 0} %>% #toggle lag for param sensitivity?
-    which(. == TRUE) %>% 
-    min(.)
-  df<-fpoisson$V1[min_idx] %>% 
-    as.numeric %>% 
-    {df[which(df$pois_dist >= .),]}
-  if(verbose){
-    print(head(df))
-  }
-    return(df)
 }
 aggc<-function(){
   gc()

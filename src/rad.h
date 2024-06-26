@@ -9,7 +9,6 @@
 #include <boost/multi_index/ordered_index.hpp>
 #include <boost/multi_index/member.hpp>
 #include <boost/multi_index/sequenced_index.hpp>
-#include <boost/optional.hpp>
 #include <boost/optional/optional_io.hpp>
 #include <boost/bimap.hpp>
 #include <boost/optional.hpp>
@@ -17,12 +16,12 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <random>
 #include <map>
 #include <unordered_map>
 #include <algorithm>
 #include <utility>
 #include <functional>
-#include <unordered_map>
 #include "edlib.h"
 #include "RcppInt64.h"
 #include <omp.h>
@@ -239,16 +238,24 @@ struct dictionary{
 
 std::string findPolyTail(const std::string& sequence, char poly_base, int window_size, int min_count);
 
-ReadLayout prep_read_layout_cpp(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold);
+ReadLayout prep_read_layout_cpp(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, bool verbose);
 
 void displayOrderedSigString(const ReadData& readData);
 
 void pos_scan(ReadData& readData, const PositionFuncMap& positionFuncMap, const ReadLayout& readLayout, bool verbose);
 
+void VarScan(ReadLayout& readLayout, bool verbose);
+
 PositionFuncMap createPositionFunctionMap(const ReadLayout& readLayout, bool verbose);
 
 void fillSigString(ReadData& readData, const ReadLayout& readLayout, 
   const std::string& signature, const PositionFuncMap& positionFuncMap, bool verbose);
+
+Rcpp::CharacterVector process_sigstrings(const ReadLayout& readLayout, 
+  const std::vector<std::string>& sigs, const PositionFuncMap& positionFuncMap, bool verbose, int nthreads);
+
+std::vector<std::string> process_sigstrings_cpp(const ReadLayout& readLayout, 
+  const std::vector<std::string>& sigs, const PositionFuncMap& positionFuncMap, bool verbose, int nthreads);
 
 std::vector<std::string> generateSigString(ReadData& readData);
 
@@ -274,7 +281,7 @@ int hamming_bits_cpp(int64_t a, int64_t b, int sequence_length);
 
 std::vector<int64_t> generate_bit_mutations_cpp(int64_t sequence, int sequence_length);
 
-std::vector<int64_t> generate_recursive_mutations_cpp(int64_t sequence, int mutation_rounds);
+std::vector<int64_t> generate_recursive_mutations_cpp(int64_t sequence, int mutation_rounds, int sequence_length);
 
 std::vector<int64_t> extract_subsequence_cpp(const std::vector<int64_t>& input, int start_pos, int stop_pos);
 

@@ -1,8 +1,15 @@
-#PKG_CPPFLAGS = -I../inst/include
+CXX_STD = CXX17 
+
+#I don't even know if this works...let's see. 
+#Package works with C++14, but I want to try to include rapidgzip, which looks like it needs C++17. 
+#So we'll see!
+
+PKG_CPPFLAGS = -I../inst/include
+
 ifeq ($(OS_TYPE),apple)
 	SHLIB_OPENMP_CFLAGS=-Xpreprocessor -fopenmp
-	SHLIB_OPENMP_CXXFLAGS=-Xpreprocessor -fopenmp
+	SHLIB_OPENMP_CXXFLAGS=-Xpreprocessor -fopenmp #-fdiagnostics-color=never
 else
-	PKG_CXXFLAGS = $(SHLIB_OPENMP_CXXFLAGS)
-	PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS)
+	PKG_CXXFLAGS = $(SHLIB_OPENMP_CXXFLAGS) #-fdiagnostics-color=never
+	PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS) #-fdiagnostics-color=never
 endif

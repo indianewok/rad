@@ -316,12 +316,12 @@ Rcpp::NumericVector generate_bit_mutations(Rcpp::NumericVector sequences, Intege
   return Rcpp::toInteger64(results);
 }
 
-std::vector<int64_t> generate_recursive_mutations_cpp(int64_t sequence, int mutation_rounds) {
+std::vector<int64_t> generate_recursive_mutations_cpp(int64_t sequence, int mutation_rounds, int sequence_length = 16) {
   std::unordered_set<int64_t> mutations{sequence};
   std::unordered_set<int64_t> new_mutations;
   for (int round = 0; round < mutation_rounds; ++round) {
     for (const auto& seq : mutations) {
-      std::vector<int64_t> current_mutations = generate_bit_mutations_cpp(seq, 16);
+      std::vector<int64_t> current_mutations = generate_bit_mutations_cpp(seq, sequence_length);
       new_mutations.insert(current_mutations.begin(), current_mutations.end());
     }
     mutations.insert(new_mutations.begin(), new_mutations.end());
@@ -330,11 +330,11 @@ std::vector<int64_t> generate_recursive_mutations_cpp(int64_t sequence, int muta
   return std::vector<int64_t>(mutations.begin(), mutations.end());
 }
 // [[Rcpp::export]]
-Rcpp::NumericVector generate_recursive_mutations(Rcpp::NumericVector sequences, int mutation_rounds = 2) {
+Rcpp::NumericVector generate_recursive_mutations(Rcpp::NumericVector sequences, int mutation_rounds = 2, int sequence_length = 16) {
   std::vector<int64_t> cpp_input_list = Rcpp::as<std::vector<int64_t>>(sequences);
   std::vector<int64_t> results;
   for (int64_t bits_input : cpp_input_list) {
-    std::vector<int64_t> subresult = generate_recursive_mutations_cpp(bits_input, mutation_rounds); 
+    std::vector<int64_t> subresult = generate_recursive_mutations_cpp(bits_input, mutation_rounds, sequence_length); 
     results.insert(results.end(), subresult.begin(), subresult.end());
   }
   return Rcpp::wrap(results);
