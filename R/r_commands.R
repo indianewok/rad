@@ -599,13 +599,13 @@ generate_whitelist<-function(barcode_column, original_whitelist = NULL, prefilte
       stringency_params<-c(2,2,1,1)
       chunk_whitelist<-whitelist_filterer(generated_whitelist = chunk_whitelist, 
         stringency_params = stringency_params, verbose= TRUE) %>% 
-        {whitelist_filterer(df = ., 
+        {whitelist_filterer(generated_whitelist = ., 
         stringency_params = c(2,1,1,1), verbose= TRUE)}
       quant_cutoff<-quantile(chunk_whitelist$pois_dist)[4]
       chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
     }
     if(stringency == "NEUROTIC"){
-      
+      return(print("Doesn't work yet!"))
     }
   }#stats module
   calling_env<-parent.frame()
