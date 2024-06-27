@@ -25,9 +25,10 @@ std::vector<std::string> sigrun_cpp(
 
 std::vector<SearchResult> readFastqChunk(
     kseq_t* seq, gzFile fp, size_t chunkSize, 
-    bool& is_fastq) {
+    bool& is_fastq, int& read_count, int max_sequences) {
   std::vector<SearchResult> records;
   for (size_t i = 0; i < chunkSize && kseq_read(seq) >= 0; ++i) {
+    if (max_sequences != -1 && read_count >= max_sequences) break;
     SearchResult sr;
     sr.read_id = seq->name.s;
     sr.line = seq->seq.s;
@@ -38,6 +39,7 @@ std::vector<SearchResult> readFastqChunk(
       is_fastq = false;
     }
     records.push_back(sr);
+    ++read_count;
   }
   return records;
 }
@@ -179,7 +181,8 @@ void processChunk(
     const Rcpp::DataFrame& read_layout,
     const Rcpp::DataFrame& misalignment_threshold,
     int nthreads,
-    std::vector<std::string>& processed_signatures) {
+    std::vector<std::string>& processed_signatures,
+    std::vector<int>& original_indices) {
   
   std::vector<std::string> sequences;
   std::vector<std::string> ids;
@@ -194,8 +197,9 @@ void processChunk(
   
   std::vector<std::string> sigrun_results = sigrun_cpp(sigalign_vector, container, misalignment_threshold, nthreads, false);
   
-  for (const auto& result : sigrun_results) {
-    processed_signatures.push_back(result);
+  for (size_t i = 0; i < sigrun_results.size(); ++i) {
+    processed_signatures.push_back(sigrun_results[i]);
+    original_indices.push_back(i);
   }
 }
 
@@ -205,15 +209,31 @@ void writeFasta(const std::string& fileName, const std::vector<std::string>& ids
     Rcpp::stop("Failed to open output file.");
   }
   for (size_t i = 0; i < ids.size(); ++i) {
-    Rcpp::Rcout << "Writing ID: " << ids[i] << " with sequence length: " << sequences[i].size() << std::endl;
-    outputFile << ">" << ids[i] << "\n" << sequences[i] << "\n";
+    if(sequences[i].size() > 0){
+      outputFile << ">" << ids[i] << "\n" << sequences[i] << "\n";
+    } else {
+      continue;
+    }
+    //Rcpp::Rcout << "Writing ID: " << ids[i] << " with sequence length: " << sequences[i].size() << std::endl;
   }
   outputFile.close();
 }
 
+void writeSigstrings(const std::string& sigstringsFilePath, const std::vector<std::string>& sigstrings) {
+  std::ofstream sigstringsFile(sigstringsFilePath);
+  if (!sigstringsFile.is_open()) {
+    Rcpp::stop("Failed to open sigstrings file.");
+  }
+  for (const auto& sig : sigstrings) {
+    sigstringsFile << sig << "\n";
+  }
+  sigstringsFile.close();
+}
+
 void sig_extraction_to_fasta(const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold,
   const std::vector<std::string>& chunk_ids, const std::vector<std::string>& chunk_sequences,
-  const Rcpp::CharacterVector& processed_sigstrings, const std::string& outputFilePath, bool verbose = false) {
+  const Rcpp::CharacterVector& processed_sigstrings, const std::string& outputFilePath, bool verbose,
+  const std::vector<int>& original_indices) {
   // Convert R DataFrame to C++ ReadLayout structure
   ReadLayout readLayout = prep_read_layout_cpp(read_layout, misalignment_threshold, verbose);
   // Process variable scanning and create position function map
@@ -229,11 +249,17 @@ void sig_extraction_to_fasta(const Rcpp::DataFrame& read_layout, const Rcpp::Dat
 #pragma omp parallel for schedule(dynamic)
   for (size_t i = 0; i < sigstrings.size(); ++i) {
     const std::string& signature = sigstrings[i];
-    const std::string& sequence = chunk_sequences[i];
-    const std::string& id = chunk_ids[i];
+    int original_index = original_indices[i];
+    const std::string& sequence = chunk_sequences[original_index];
+    const std::string& id = chunk_ids[original_index];
     
     // Parse the signature
     auto read_info_pos = signature.find_last_of('<');
+    if (read_info_pos == std::string::npos) {
+      Rcpp::Rcout << "Invalid signature format: " << signature << std::endl;
+      continue;
+    }
+    
     std::string lengthTypeStr = signature.substr(read_info_pos + 1, signature.length() - read_info_pos - 2);
     std::stringstream lengthTypeStream(lengthTypeStr);
     std::string lengthStr, read_id, type;
@@ -300,13 +326,121 @@ void sig_extraction_to_fasta(const Rcpp::DataFrame& read_layout, const Rcpp::Dat
     }
 #pragma omp critical
 {
-  Rcpp::Rcout << "Appending ID: " << new_id << " with sequence length: " << extracted_sequence.size() << std::endl;
+  //Rcpp::Rcout << "Appending ID: " << new_id << " with sequence length: " << extracted_sequence.size() << std::endl;
   result_ids.push_back(new_id);
   result_sequences.push_back(extracted_sequence);
 }
   }
   // Write the results to a FASTA file
   writeFasta(outputFilePath, result_ids, result_sequences);
+}
+
+// [[Rcpp::export]]
+void sigstream(const std::vector<std::string>& inputFilePaths,
+  const std::string& sigstringsFilePath, Rcpp::CharacterVector adapters, 
+  const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, 
+  int chunkSize, int nthreads, const std::string& fastaOutputPath, 
+  int max_sequences = -1, bool verbose = false) {
+  
+  auto parsed_adapters = parseAdapters(adapters);
+  std::vector<std::string> queries = parsed_adapters.first;
+  std::vector<std::string> query_names = parsed_adapters.second;
+  std::map<std::string, std::pair<double, double>> null_dist_map = parseThresholds(misalignment_threshold);
+  
+  if (inputFilePaths.size() == 1) {
+    std::string inputFilePath = inputFilePaths[0];
+    
+    gzFile fp = gzopen(inputFilePath.c_str(), "r");
+    if (!fp) {
+      Rcpp::stop("Failed to open input file.");
+    }
+    
+    kseq_t* seq = kseq_init(fp);
+    
+    std::ofstream outputFile(sigstringsFilePath);
+    if (!outputFile.is_open()) {
+      Rcpp::stop("Failed to open output file.");
+    }
+    
+    container = prep_read_layout_cpp(read_layout, misalignment_threshold, false);
+    
+    std::vector<std::string> chunk_ids;
+    std::vector<std::string> chunk_sequences;
+    std::vector<std::string> processed_signatures;
+    std::vector<int> original_indices;
+    
+    bool is_fastq = false;
+    int read_count = 0;
+    while (true) {
+      std::vector<SearchResult> chunk = readFastqChunk(seq, fp, chunkSize, is_fastq, read_count, max_sequences);
+      if (chunk.empty()) break;
+      processChunk(chunk, queries, query_names, null_dist_map, 
+        read_layout, misalignment_threshold, nthreads, processed_signatures, original_indices);
+      for (const auto& sr : chunk) {
+        chunk_ids.push_back(sr.read_id);
+        chunk_sequences.push_back(sr.line);
+      }
+      if (max_sequences != -1 && read_count >= max_sequences) break;
+    }
+    
+    kseq_destroy(seq);
+    gzclose(fp);
+    outputFile.close();
+    
+    // Write all signatures to a file
+    writeSigstrings(sigstringsFilePath, processed_signatures);
+    
+    // Call the sig_extraction_to_fasta function
+    sig_extraction_to_fasta(read_layout, misalignment_threshold, chunk_ids, chunk_sequences, 
+      Rcpp::wrap(processed_signatures), fastaOutputPath, verbose, original_indices);
+    
+  } else {
+    for (const auto& inputFilePath : inputFilePaths) {
+      gzFile fp = gzopen(inputFilePath.c_str(), "r");
+      if (!fp) {
+        Rcpp::stop("Failed to open input file: " + inputFilePath);
+      }
+      
+      kseq_t* seq = kseq_init(fp);
+      
+      std::ofstream outputFile(sigstringsFilePath, std::ios::app);
+      if (!outputFile.is_open()) {
+        Rcpp::stop("Failed to open output file.");
+      }
+      
+      container = prep_read_layout_cpp(read_layout, misalignment_threshold, false);
+      
+      std::vector<std::string> chunk_ids;
+      std::vector<std::string> chunk_sequences;
+      std::vector<std::string> processed_signatures;
+      std::vector<int> original_indices;
+      
+      bool is_fastq = false;
+      int read_count = 0;
+      while (true) {
+        std::vector<SearchResult> chunk = readFastqChunk(seq, fp, chunkSize, is_fastq, read_count, max_sequences);
+        if (chunk.empty()) break;
+        processChunk(chunk, queries, query_names, null_dist_map, 
+          read_layout, misalignment_threshold, nthreads, processed_signatures, original_indices);
+        for (const auto& sr : chunk) {
+          chunk_ids.push_back(sr.read_id);
+          chunk_sequences.push_back(sr.line);
+        }
+        if (max_sequences != -1 && read_count >= max_sequences) break;
+      }
+      
+      kseq_destroy(seq);
+      gzclose(fp);
+      outputFile.close();
+      
+      // Write all signatures to a file
+      writeSigstrings(sigstringsFilePath, processed_signatures);
+      
+      // Call the sig_extraction_to_fasta function
+      sig_extraction_to_fasta(read_layout, misalignment_threshold, chunk_ids, chunk_sequences, 
+        Rcpp::wrap(processed_signatures), fastaOutputPath, verbose, original_indices);
+    }
+  }
 }
 
 // [[Rcpp::export]]
@@ -460,51 +594,4 @@ Rcpp::DataFrame misalignment_stream(const std::string& fastq_path, Rcpp::Charact
     Rcpp::Named("second_edit_distance") = second_edit_distances
   );
   return result;
-}
-
-// [[Rcpp::export]]
-void sigalign_stream(const std::string& inputFilePath, const std::string& outputFilePath,
-  Rcpp::CharacterVector adapters, const Rcpp::DataFrame& read_layout, 
-  const Rcpp::DataFrame& misalignment_threshold, int chunkSize, int nthreads,
-  const std::string& fastaOutputPath) {
-  auto parsed_adapters = parseAdapters(adapters);
-  std::vector<std::string> queries = parsed_adapters.first;
-  std::vector<std::string> query_names = parsed_adapters.second;
-  std::map<std::string, std::pair<double, double>> null_dist_map = parseThresholds(misalignment_threshold);
-  
-  gzFile fp = gzopen(inputFilePath.c_str(), "r");
-  if (!fp) {
-    Rcpp::stop("Failed to open input file.");
-  }
-  
-  kseq_t* seq = kseq_init(fp);
-  
-  std::ofstream outputFile(outputFilePath);
-  if (!outputFile.is_open()) {
-    Rcpp::stop("Failed to open output file.");
-  }
-  
-  container = prep_read_layout_cpp(read_layout, misalignment_threshold, false);
-  
-  std::vector<std::string> chunk_ids;
-  std::vector<std::string> chunk_sequences;
-  std::vector<std::string> processed_signatures;
-  
-  bool is_fastq = false;
-  while (true) {
-    std::vector<SearchResult> chunk = readFastqChunk(seq, fp, chunkSize, is_fastq);
-    if (chunk.empty()) break;
-    processChunk(chunk, queries, query_names, null_dist_map, read_layout, misalignment_threshold, nthreads, processed_signatures);
-    for (const auto& sr : chunk) {
-      chunk_ids.push_back(sr.read_id);
-      chunk_sequences.push_back(sr.line);
-    }
-  }
-  
-  kseq_destroy(seq);
-  gzclose(fp);
-  outputFile.close();
-  
-  // Call the sig_extraction_to_fasta function
-  sig_extraction_to_fasta(read_layout, misalignment_threshold, chunk_ids, chunk_sequences, Rcpp::wrap(processed_signatures), fastaOutputPath, true);
 }

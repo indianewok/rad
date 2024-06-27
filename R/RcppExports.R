@@ -105,11 +105,11 @@ kmer_circ <- function(sequence, base_length = 16L, kmerLength = 16L, verbose = F
     .Call(`_rad_kmer_circ`, sequence, base_length, kmerLength, verbose)
 }
 
-misalignment_stream <- function(fastq_path, adapters, nthreads = 1L, max_sequences = -1L) {
-    .Call(`_rad_misalignment_stream`, fastq_path, adapters, nthreads, max_sequences)
+sigstream <- function(inputFilePaths, sigstringsFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, fastaOutputPath, max_sequences = -1L, verbose = FALSE) {
+    invisible(.Call(`_rad_sigstream`, inputFilePaths, sigstringsFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, fastaOutputPath, max_sequences, verbose))
 }
 
-sigalign_stream <- function(inputFilePath, outputFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, fastaOutputPath) {
-    invisible(.Call(`_rad_sigalign_stream`, inputFilePath, outputFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, fastaOutputPath))
+misalignment_stream <- function(fastq_path, adapters, nthreads = 1L, max_sequences = -1L) {
+    .Call(`_rad_misalignment_stream`, fastq_path, adapters, nthreads, max_sequences)
 }
 

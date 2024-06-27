@@ -575,21 +575,21 @@ generate_whitelist<-function(barcode_column, original_whitelist = NULL, prefilte
     if(stringency != "EXTRA"){
       if(stringency == "LOW"){
         stringency_params<-c(2,2,2,2)
-        chunk_whitelist<-whitelist_filterer(df = chunk_whitelist, 
+        chunk_whitelist<-whitelist_filterer(generated_whitelist = chunk_whitelist, 
           stringency_params = stringency_params, verbose= TRUE)
         quant_cutoff<-quantile(chunk_whitelist$pois_dist)[1]
         chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
       } else
         if(stringency == "DEFAULT"){
           stringency_params<-c(2,2,2,1)
-          chunk_whitelist<-whitelist_filterer(df = chunk_whitelist, 
+          chunk_whitelist<-whitelist_filterer(generated_whitelist = chunk_whitelist, 
             stringency_params = stringency_params, verbose= TRUE)
           quant_cutoff<-quantile(chunk_whitelist$pois_dist)[2]
           chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
         } else 
           if(stringency == "HIGH"){
             stringency_params<-c(2,2,1,1)
-            chunk_whitelist<-whitelist_filterer(df = chunk_whitelist, 
+            chunk_whitelist<-whitelist_filterer(generated_whitelist = chunk_whitelist, 
               stringency_params = stringency_params, verbose= TRUE)
             quant_cutoff<-quantile(chunk_whitelist$pois_dist)[3]
             chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
@@ -597,7 +597,7 @@ generate_whitelist<-function(barcode_column, original_whitelist = NULL, prefilte
     }
     if(stringency == "EXTRA"){
       stringency_params<-c(2,2,1,1)
-      chunk_whitelist<-whitelist_filterer(df = chunk_whitelist, 
+      chunk_whitelist<-whitelist_filterer(generated_whitelist = chunk_whitelist, 
         stringency_params = stringency_params, verbose= TRUE) %>% 
         {whitelist_filterer(df = ., 
         stringency_params = c(2,1,1,1), verbose= TRUE)}

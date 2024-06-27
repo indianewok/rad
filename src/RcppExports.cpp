@@ -334,6 +334,25 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// sigstream
+void sigstream(const std::vector<std::string>& inputFilePaths, const std::string& sigstringsFilePath, Rcpp::CharacterVector adapters, const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, int chunkSize, int nthreads, const std::string& fastaOutputPath, int max_sequences, bool verbose);
+RcppExport SEXP _rad_sigstream(SEXP inputFilePathsSEXP, SEXP sigstringsFilePathSEXP, SEXP adaptersSEXP, SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP chunkSizeSEXP, SEXP nthreadsSEXP, SEXP fastaOutputPathSEXP, SEXP max_sequencesSEXP, SEXP verboseSEXP) {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::vector<std::string>& >::type inputFilePaths(inputFilePathsSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type sigstringsFilePath(sigstringsFilePathSEXP);
+    Rcpp::traits::input_parameter< Rcpp::CharacterVector >::type adapters(adaptersSEXP);
+    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
+    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
+    Rcpp::traits::input_parameter< int >::type chunkSize(chunkSizeSEXP);
+    Rcpp::traits::input_parameter< int >::type nthreads(nthreadsSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type fastaOutputPath(fastaOutputPathSEXP);
+    Rcpp::traits::input_parameter< int >::type max_sequences(max_sequencesSEXP);
+    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
+    sigstream(inputFilePaths, sigstringsFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, fastaOutputPath, max_sequences, verbose);
+    return R_NilValue;
+END_RCPP
+}
 // misalignment_stream
 Rcpp::DataFrame misalignment_stream(const std::string& fastq_path, Rcpp::CharacterVector adapters, int nthreads, int max_sequences);
 RcppExport SEXP _rad_misalignment_stream(SEXP fastq_pathSEXP, SEXP adaptersSEXP, SEXP nthreadsSEXP, SEXP max_sequencesSEXP) {
@@ -346,23 +365,6 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< int >::type max_sequences(max_sequencesSEXP);
     rcpp_result_gen = Rcpp::wrap(misalignment_stream(fastq_path, adapters, nthreads, max_sequences));
     return rcpp_result_gen;
-END_RCPP
-}
-// sigalign_stream
-void sigalign_stream(const std::string& inputFilePath, const std::string& outputFilePath, Rcpp::CharacterVector adapters, const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, int chunkSize, int nthreads, const std::string& fastaOutputPath);
-RcppExport SEXP _rad_sigalign_stream(SEXP inputFilePathSEXP, SEXP outputFilePathSEXP, SEXP adaptersSEXP, SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP chunkSizeSEXP, SEXP nthreadsSEXP, SEXP fastaOutputPathSEXP) {
-BEGIN_RCPP
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const std::string& >::type inputFilePath(inputFilePathSEXP);
-    Rcpp::traits::input_parameter< const std::string& >::type outputFilePath(outputFilePathSEXP);
-    Rcpp::traits::input_parameter< Rcpp::CharacterVector >::type adapters(adaptersSEXP);
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type read_layout(read_layoutSEXP);
-    Rcpp::traits::input_parameter< const Rcpp::DataFrame& >::type misalignment_threshold(misalignment_thresholdSEXP);
-    Rcpp::traits::input_parameter< int >::type chunkSize(chunkSizeSEXP);
-    Rcpp::traits::input_parameter< int >::type nthreads(nthreadsSEXP);
-    Rcpp::traits::input_parameter< const std::string& >::type fastaOutputPath(fastaOutputPathSEXP);
-    sigalign_stream(inputFilePath, outputFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, fastaOutputPath);
-    return R_NilValue;
 END_RCPP
 }
 
@@ -393,8 +395,8 @@ static const R_CallMethodDef CallEntries[] = {
     {"_rad_generate_recursive_mutations", (DL_FUNC) &_rad_generate_recursive_mutations, 3},
     {"_rad_bit_substring", (DL_FUNC) &_rad_bit_substring, 3},
     {"_rad_kmer_circ", (DL_FUNC) &_rad_kmer_circ, 4},
+    {"_rad_sigstream", (DL_FUNC) &_rad_sigstream, 10},
     {"_rad_misalignment_stream", (DL_FUNC) &_rad_misalignment_stream, 4},
-    {"_rad_sigalign_stream", (DL_FUNC) &_rad_sigalign_stream, 8},
     {NULL, NULL, 0}
 };
 
