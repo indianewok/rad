@@ -8,6 +8,8 @@
 #include "edlib.h"
 #include "RcppInt64.h"
 #include "kseq.h"
+#include <chrono>
+#include <iomanip>
 
 #include <boost/algorithm/string.hpp>
 #include <mutex>

@@ -113,3 +113,7 @@ misalignment_stream <- function(input_path, adapters, nthreads = 1L, max_sequenc
     .Call(`_rad_misalignment_stream`, input_path, adapters, nthreads, max_sequences, chunk_size)
 }
 
+tabulate_barcodes <- function(input_files, output_prefix, compress = TRUE) {
+    invisible(.Call(`_rad_tabulate_barcodes`, input_files, output_prefix, compress))
+}
+

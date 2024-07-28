@@ -371,6 +371,18 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// tabulate_barcodes
+void tabulate_barcodes(const std::vector<std::string>& input_files, const std::string& output_prefix, bool compress);
+RcppExport SEXP _rad_tabulate_barcodes(SEXP input_filesSEXP, SEXP output_prefixSEXP, SEXP compressSEXP) {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::vector<std::string>& >::type input_files(input_filesSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type output_prefix(output_prefixSEXP);
+    Rcpp::traits::input_parameter< bool >::type compress(compressSEXP);
+    tabulate_barcodes(input_files, output_prefix, compress);
+    return R_NilValue;
+END_RCPP
+}
 
 static const R_CallMethodDef CallEntries[] = {
     {"_rad_sigalign", (DL_FUNC) &_rad_sigalign, 5},
@@ -401,6 +413,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_rad_kmer_circ", (DL_FUNC) &_rad_kmer_circ, 4},
     {"_rad_sigstream", (DL_FUNC) &_rad_sigstream, 13},
     {"_rad_misalignment_stream", (DL_FUNC) &_rad_misalignment_stream, 5},
+    {"_rad_tabulate_barcodes", (DL_FUNC) &_rad_tabulate_barcodes, 3},
     {NULL, NULL, 0}
 };
 

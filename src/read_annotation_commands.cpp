@@ -581,7 +581,7 @@ void filter_sigstring(std::vector<std::string>& sigstrings) {
       if (std::regex_search(element, matches, readPattern)) {
         int startPos = std::stoi(matches.str(3));
         int stopPos = std::stoi(matches.str(4));
-        if ((stopPos - startPos) <= 0 || (stopPos - startPos) < 25) {
+        if ((stopPos - startPos + 1) < 4) {
           isValid = false;
           reason = "invalid_read_length";
           break;
@@ -590,7 +590,7 @@ void filter_sigstring(std::vector<std::string>& sigstrings) {
       } else if (std::regex_search(element, matches, barcodePattern)) {
         int startPos = std::stoi(matches.str(3));
         int stopPos = std::stoi(matches.str(4));
-        if ((stopPos - startPos + 1) < 4) {
+        if (((stopPos - startPos + 1) < 4)||((stopPos - startPos + 1) > 33)) {
           isValid = false;
           reason = "invalid_barcode_length";
           break;
