@@ -33,7 +33,7 @@ rad_test<-function(
                          ifelse(test = compress, yes = ".gz", no = "")), 
     output_prefix = paste0(output_directory_path,"barcodes/"), 
     compress = FALSE)
-  barcode_files<-list.files(path = paste0(output_directory_path,"/barcodes/"), full.names = TRUE)
+  barcode_files<-list.files(path = paste0(output_directory_path,"/barcodes/"), full.names = TRUE, pattern = "barcode")
   pbapply::pblapply(X = barcode_files, FUN = function(X){
     process_barcode(barcode_path = X, read_layout = read_layout)
   })

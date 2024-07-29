@@ -903,8 +903,8 @@ void tabulate_barcodes(
       std::istringstream iss(header);
       std::string token;
       std::string id;
-      std::getline(iss, id, '|');  // Extract the ID
-      id = id.substr(1);  // Remove the '@' character
+      std::getline(iss, id, '|'); 
+      id = id.substr(1);
       while (std::getline(iss, token, '|')) {
         std::smatch matches;
         if (std::regex_search(token, matches, barcode_regex)) {

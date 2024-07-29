@@ -661,10 +661,13 @@ process_barcode<-function(barcode_path, read_layout) {
     barcodes[, pois_dist := stats::ppois(q = count, lambda = mean(count))]
     #we calculate the zero-truncated poisson distribution of the barcode
   }
-  barcodes[is.na(filtered), int64_seq := sequence_to_bits(seq)]
+  barcodes[is.na(filtered), ':='(
+    int64_seq = sequence_to_bits(seq),
+    int64_rcseq = sequence_to_bits(revcomp(seq))
+  )]
   if (!is.null(whitelist)){
     barcodes[(is.na(filtered) & stringr::str_length(seq) == expected_length), filtered := ifelse(
-      int64_seq %in% whitelist$whitelist_bcs,
+      int64_seq %in% whitelist$whitelist_bcs | int64_rcseq %in% whitelist$whitelist_bcs,
       "valid_barcode", "barcode_to_correct"
     )]
   }
