@@ -658,7 +658,6 @@ process_barcode<-function(barcode_path, read_layout) {
   }
   if (is.null(whitelist)){
     barcodes[, pois_dist := stats::ppois(q = count, lambda = mean(count))]
-    #we calculate the zero-truncated poisson distribution of the barcode
   }
   barcodes[is.na(filtered), ':='(
     int64_seq = sequence_to_bits(seq),
