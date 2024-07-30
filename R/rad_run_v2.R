@@ -35,6 +35,7 @@ rad_test<-function(
     compress = FALSE)
   barcode_files<-list.files(path = paste0(output_directory_path,"/barcodes/"), full.names = TRUE, pattern = "barcode")
   print("Testing barcode whitelist functionality...")
+  
   data.table::setkey(read_layout, "class_id")
   barcode_path<-barcode_files[[1]]
   dir_path<-paste0(dirname(barcode_path),"/")
@@ -46,12 +47,12 @@ rad_test<-function(
   whitelist_path<-ifelse(whitelist_path == "10x_3v3", 
                          system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz"), 
                          ifelse(whitelist_path == "10x_3v1", 
-                                system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"), 
-                                whitelist_path))
+                         system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"), 
+                         whitelist_path))
   print(paste0("The whitelist path is ", whitelist_path))
-  whitelist_path<-read_layout[barcode_id, whitelist]
   
   pbapply::pblapply(X = barcode_files, FUN = function(X){
     process_barcode(barcode_path = X, read_layout = read_layout)
+    return(print(paste0("Processed this barcode file: ", X,"!")))
   })
 }
