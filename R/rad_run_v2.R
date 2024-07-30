@@ -36,6 +36,10 @@ rad_test<-function(
   barcode_files<-list.files(path = paste0(output_directory_path,"/barcodes/"), full.names = TRUE, pattern = "barcode")
   print("Testing barcode whitelist functionality...")
   data.table::setkey(read_layout, "class_id")
+  barcode_path<-barcode_files[[1]]
+  dir_path<-paste0(dirname(barcode_path),"/")
+  barcode_id<-basename(tools::file_path_sans_ext(barcode_path))
+  
   whitelist_path<-read_layout[barcode_id, whitelist]
   print(paste0("The whitelist path is ", whitelist_path))
   whitelist<-NULL
