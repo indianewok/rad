@@ -18,5 +18,4 @@ Imports:
     tidytable,
     BH (>= 1.75.0-0)
 LinkingTo: Rcpp, BH
-LazyData: true
 RoxygenNote: 7.2.2

@@ -313,7 +313,6 @@ synth_data_processor<-function(fn, type, df_out){
   df_new$original_umi<-gsub(pattern = "seq", replacement = NA, x = df_new$original_barcode)
   if(length(grep(pattern = "junk", x = df_new$original_barcode)) > 1){
     df_new<-df_new[-grep(pattern = "junk", x = df_new$original_barcode),]
-    #the adapter sequences and original read structure mess up jr here
   }
   return(df_new)
 }
@@ -344,7 +343,7 @@ whitelist_filterer<-function(generated_whitelist, stringency_params, verbose = F
 generate_whitelist<-function(barcode_df, original_whitelist = NULL, prefiltered_whitelist = NULL, 
   output_dir = NULL, verbose = FALSE, stringency = "LOW", expected_length = 16){
   if(!is.null(original_whitelist)||!is.null(prefiltered_whitelist)){
-    barcodes<-table(barcode_column, useNA = "no") %>% data.table::as.data.table(.)
+    barcodes<-table(barcode_df, useNA = "no") %>% data.table::as.data.table(.)
   } else {
     barcodes<-barcode_df
   }
@@ -644,14 +643,14 @@ process_barcode<-function(barcode_path, read_layout) {
   static_qgrams<-colnames(stringdist::qgrams(static_seqs, q = expected_length, useNames = TRUE))
   barcodes[is.na(filtered) & seq %in% static_qgrams, filtered := "adapter_segment_filtered"]
   whitelist_path<-read_layout[barcode_id, whitelist]
+  print(paste0("The whitelist path is ", whitelist_path))
   whitelist<-NULL
   whitelist_path<-ifelse(whitelist_path == "10x_3v3", 
-                           here::here("whitelists", 
-                                      "3M-february-2018-3v3.txt_bitlist.csv.gz"), 
+                           system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz"), 
                            ifelse(whitelist_path == "10x_3v1", 
-                                  here::here("whitelists", 
-                                             "737K-august-2016_bitlist.csv.gz"), 
+                                  system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"), 
                                   whitelist_path))
+  print(paste0("The whitelist path is ", whitelist_path))
   if(!is.na(whitelist_path) && file.exists(whitelist_path)){
     ext <- tools::file_ext(whitelist_path)
     convert <- ext == "csv" || ext == "txt"
