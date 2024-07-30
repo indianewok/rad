@@ -1,11 +1,11 @@
 Package: rad
 Type: Package
-Title: What the Package Does in One 'Title Case' Line
+Title: read-agnostic demultiplexer
 Version: 1.0
-Date: 2024-02-02
-Author: Your Name
-Maintainer: Your Name <your@email.com>
-Description: One paragraph description of what the package does as one or more full sentences.
+Date: 2024-07-30
+Author: Chinmay Vaidya
+Maintainer: Chinmay Vaidya <chinmay.m.vaidya.GR@dartmouth.edu>
+Description: This package contains a read-agnostic demultiplexer, implemented in R, along with a suite of demultiplexing/sequence manipulation tools for the interested user.
 License: GPL (>= 2)
 Imports: 
     data.table,
@@ -18,4 +18,5 @@ Imports:
     tidytable,
     BH (>= 1.75.0-0)
 LinkingTo: Rcpp, BH
+LazyData: true
 RoxygenNote: 7.2.2

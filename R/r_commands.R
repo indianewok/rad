@@ -588,8 +588,8 @@ tabulate_sigs<-function(file_path, output_prefix = NULL, chunk_size = 10000) {
   
   summary_plot<-ggpubr::ggbarplot(data = summary_results, 
                           x = "direction", 
-                          y = "unique_id_count", 
-                          color = "concatenate", 
+                          y = "unique_id_count",
+                          color = "concatenate",
                           fill = "concatenate", 
                           title = "SigString Summary", 
                           legend = "right", 
