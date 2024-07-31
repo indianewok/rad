@@ -1,7 +1,6 @@
 #!/usr/bin/env Rscript
 
-if (interactive() == FALSE) {
-  libraries <- c("docopt", "data.table", "magrittr", "stringr", "stringdist")
+  libraries <- c("docopt", "data.table", "magrittr", "stringr", "stringdist", "rad")
   invisible(lapply(libraries, function(lib) {
     if (!require(lib, character.only = TRUE)) {
       install.packages(lib)
@@ -53,8 +52,6 @@ Options:
   cat("chunk_size:", arguments$`--chunk_size`, "\n")
   cat("nthreads:", arguments$`--nthreads`, "\n")
   
-  print(arguments)
-  
   rad_run(fastq_file_or_directory_path = arguments$fastq_file_or_directory_path,
     read_layout_path = arguments$`--read_layout_path`,
     output_directory_path = arguments$`--output_directory_path`,
@@ -66,4 +63,3 @@ Options:
     chunk_size = arguments$`--chunk_size`,
     nthreads = arguments$`--nthreads`
   )
-}

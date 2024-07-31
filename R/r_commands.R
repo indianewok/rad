@@ -596,7 +596,7 @@ process_sig<-function(file_path,
                 compress = compress, 
                 nthreads = nthreads,
                 output_type = output_type)
-  summary_results<-data.table::fread(file = paste0(output_prefix,"summary_table.csv",  ifelse(test = compress, yes = ".gz", no = "")),
+  summary_results<-data.table::fread(file = paste0(output_prefix,"/summary_table.csv",  ifelse(test = compress, yes = ".gz", no = "")),
                                      header = TRUE)
   valid_reads<-sum(summary_results$unique_id_count[which(summary_results$direction == "F"|summary_results$direction == "R")])
   total_reads<-sum(summary_results$unique_id_count)
