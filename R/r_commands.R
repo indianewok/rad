@@ -632,7 +632,6 @@ process_sig<-function(file_path,
   data.table::fwrite(summary_results, paste0(output_prefix,"/summary_table.csv", ifelse(test = compress, yes = ".gz", no = "")))
 }
 
-#' @export
 rad_run<-function(
     fastq_file_or_directory_path, 
     read_layout_path, 
