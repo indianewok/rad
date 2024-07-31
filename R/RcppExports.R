@@ -117,3 +117,7 @@ tabulate_barcodes <- function(input_files, output_prefix, compress = TRUE) {
     invisible(.Call(`_rad_tabulate_barcodes`, input_files, output_prefix, compress))
 }
 
+tabulate_sigs <- function(file_path, output_prefix, chunk_size = 50000L, max_sequences = -1L, nthreads = 1L, compress = TRUE, output_type = "summary") {
+    invisible(.Call(`_rad_tabulate_sigs`, file_path, output_prefix, chunk_size, max_sequences, nthreads, compress, output_type))
+}
+

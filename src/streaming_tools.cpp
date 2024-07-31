@@ -5,6 +5,7 @@ using namespace Rcpp;
 namespace fs = std::filesystem;
 
 KSEQ_INIT(gzFile, gzread)
+  
   std::mutex fasta_mutex;
   std::mutex sig_map_mutex;
 
@@ -441,7 +442,7 @@ void sig_extraction(
       if (parts.size() < 4) continue;
       
       std::string element_id = parts[0];
-      int edit_distance = std::stoi(parts[1]);
+      //int edit_distance = std::stoi(parts[1]);
       int start_pos = std::stoi(parts[2]);
       int end_pos = std::stoi(parts[3]);
       
@@ -743,7 +744,7 @@ if (max_sequences != -1 && total_sequences >= max_sequences) {
   
 #pragma omp critical
 {
-  Rcpp::Rcout << "sigstream processing completed. Total sequences processed: " << total_sequences << std::endl;
+  Rcpp::Rcout << "Read extraction & demultiplexing completed. Total sequences processed: " << total_sequences << std::endl;
   Rcpp::Rcout << "Total runtime: " << format_duration(total_duration) << std::endl;
 }
 }
@@ -779,6 +780,8 @@ Rcpp::DataFrame misalignment_stream(
   std::vector<int> best_start_positions;
   std::vector<int> best_stop_positions;
   std::vector<int> second_edit_distances;
+  
+  Rcpp::Rcout << "Generating misalignment threshold data!\n";
   
   omp_set_num_threads(nthreads);
   
@@ -974,4 +977,121 @@ void tabulate_barcodes(
   }
   write_output(master_file, master_ss.str());
   Rcpp::Rcout << "Saved master variable sequence data to " << master_file << std::endl;
+}
+
+// [[Rcpp::export]]
+void tabulate_sigs(const std::string& file_path,
+                   const std::string& output_prefix,
+                   int chunk_size = 50000,
+                   int max_sequences = -1,
+                   int nthreads = 1,
+                   bool compress = true,
+                   const std::string& output_type = "summary") {
+  omp_set_num_threads(nthreads);
+  auto write_output = [compress](const std::string& filename, const std::string& content) {
+    if (compress) {
+      gzFile file = gzopen(filename.c_str(), "wb");
+      if (!file) {
+        Rcpp::stop("Error opening output file: " + filename);
+      }
+      gzwrite(file, content.c_str(), content.length());
+      gzclose(file);
+    } else {
+      std::ofstream file(filename);
+      if (!file.is_open()) {
+        Rcpp::stop("Error opening output file: " + filename);
+      }
+      file << content;
+      file.close();
+    }
+  };
+  auto extract_id = [](const std::string& sigstring) {
+    std::regex id_regex("<\\d+:(.*?):");
+    std::smatch match;
+    if (std::regex_search(sigstring, match, id_regex)) {
+      return match[1].str();
+    }
+    return std::string("");
+  };
+  auto extract_direction = [](const std::string& sigstring) {
+    std::regex direction_regex(":([^:]*?)>");
+    std::smatch match;
+    if (std::regex_search(sigstring, match, direction_regex)) {
+      return match[1].str();
+    }
+    return std::string("");
+  };
+  std::string data_output_file = output_prefix + "/sigparsed_info.csv" + (compress ? ".gz" : "");
+  std::string summary_output_file = output_prefix + "/summary_table.csv" + (compress ? ".gz" : "");
+  std::stringstream data_ss;
+  data_ss << "id,element,edit_distance,start_pos,stop_pos,concatenate,direction\n";
+  std::unordered_map<std::string, int> summary_map;
+  int sequence_count = 0;
+  gzFile file = gzopen(file_path.c_str(), "r");
+  if (!file) {
+    Rcpp::stop("Failed to open file: " + file_path);
+  }
+  kstream_t* ks = ks_init(file);
+  kstring_t str = {0, 0, 0};
+  std::regex element_regex(R"(([^:]+):(\d+):(\d+):(\d+))");
+  while ((max_sequences == -1 || sequence_count < max_sequences) && ks_getuntil(ks, '\n', &str, 0) >= 0) {
+    std::vector<std::string> sigstrings;
+    sigstrings.push_back(str.s);
+    for (int i = 1; i < chunk_size && (max_sequences == -1 || sequence_count + i < max_sequences) && ks_getuntil(ks, '\n', &str, 0) >= 0; ++i) {
+      sigstrings.push_back(str.s);
+    }
+#pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < sigstrings.size(); ++i) {
+      std::string sigstring = sigstrings[i];
+      std::string id = extract_id(sigstring);
+      std::string direction = extract_direction(sigstring);
+      std::string concatenate = (sigstring.find("+FR_RF") != std::string::npos) ? "TRUE" : "FALSE";
+      std::smatch match;
+      auto start = std::sregex_iterator(sigstring.begin(), sigstring.end(), element_regex);
+      auto end = std::sregex_iterator();
+      std::stringstream local_data_ss;
+      for (std::sregex_iterator it = start; it != end; ++it) {
+        std::smatch match = *it;
+        std::string element = "|" + match[1].str();
+        int edit_distance = std::stoi(match[2].str());
+        int start_pos = std::stoi(match[3].str());
+        int stop_pos = std::stoi(match[4].str());
+        local_data_ss << id << "," << element << "," << edit_distance << "," << start_pos << 
+          "," << stop_pos << "," << concatenate << "," << direction << "\n";
+      }
+#pragma omp critical
+{
+  if (output_type == "diagnostic") {
+    data_ss << local_data_ss.str();
+  }
+  summary_map[concatenate + ":" + direction]++;
+}
+    }
+    
+    sequence_count += sigstrings.size();
+    if (sequence_count % chunk_size == 0) {
+      Rcpp::checkUserInterrupt();
+#pragma omp critical
+{
+  Rcpp::Rcout << "Processed " << sequence_count << " sequences" << std::endl;
+}
+    }
+  }
+  ks_destroy(ks);
+  gzclose(file);
+  free(str.s);
+  if (output_type == "diagnostic") {
+    write_output(data_output_file, data_ss.str());
+  }
+  std::stringstream summary_ss;
+  summary_ss << "concatenate,direction,unique_id_count\n";
+  for (const auto& entry : summary_map) {
+    std::stringstream ss(entry.first);
+    std::string concatenate_str, direction_str;
+    std::getline(ss, concatenate_str, ':');
+    std::getline(ss, direction_str, ':');
+    summary_ss << concatenate_str << "," << direction_str << "," << entry.second << "\n";
+  }
+  write_output(summary_output_file, summary_ss.str());
+  Rcpp::Rcout << "Completed processing " << sequence_count << " sequences" << std::endl;
 }

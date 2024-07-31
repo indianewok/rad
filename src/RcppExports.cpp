@@ -383,6 +383,22 @@ BEGIN_RCPP
     return R_NilValue;
 END_RCPP
 }
+// tabulate_sigs
+void tabulate_sigs(const std::string& file_path, const std::string& output_prefix, int chunk_size, int max_sequences, int nthreads, bool compress, const std::string& output_type);
+RcppExport SEXP _rad_tabulate_sigs(SEXP file_pathSEXP, SEXP output_prefixSEXP, SEXP chunk_sizeSEXP, SEXP max_sequencesSEXP, SEXP nthreadsSEXP, SEXP compressSEXP, SEXP output_typeSEXP) {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type file_path(file_pathSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type output_prefix(output_prefixSEXP);
+    Rcpp::traits::input_parameter< int >::type chunk_size(chunk_sizeSEXP);
+    Rcpp::traits::input_parameter< int >::type max_sequences(max_sequencesSEXP);
+    Rcpp::traits::input_parameter< int >::type nthreads(nthreadsSEXP);
+    Rcpp::traits::input_parameter< bool >::type compress(compressSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type output_type(output_typeSEXP);
+    tabulate_sigs(file_path, output_prefix, chunk_size, max_sequences, nthreads, compress, output_type);
+    return R_NilValue;
+END_RCPP
+}
 
 static const R_CallMethodDef CallEntries[] = {
     {"_rad_sigalign", (DL_FUNC) &_rad_sigalign, 5},
@@ -414,6 +430,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_rad_sigstream", (DL_FUNC) &_rad_sigstream, 13},
     {"_rad_misalignment_stream", (DL_FUNC) &_rad_misalignment_stream, 5},
     {"_rad_tabulate_barcodes", (DL_FUNC) &_rad_tabulate_barcodes, 3},
+    {"_rad_tabulate_sigs", (DL_FUNC) &_rad_tabulate_sigs, 7},
     {NULL, NULL, 0}
 };
 

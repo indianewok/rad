@@ -1,16 +1,16 @@
 .datatable.aware = TRUE
 
 whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
-  print("Importing a little bit of your whitelist to figure out its type...")
+  cat("Importing a little bit of your whitelist to figure out its type...\n")
   whitelist<-data.table::fread(input = whitelist_path, header = FALSE, data.table = TRUE, nrows = 10, nThread = 1)
   if(ncol(whitelist) == 1){
     colnames(whitelist)<-"whitelist_bcs"
   }
   if(class(whitelist$whitelist_bcs) == "character"){
-    print("Character type detected! Importing the whitelist.")
+    cat("Character type detected! Importing the whitelist.\n")
     whitelist<-data.table::fread(input = whitelist_path, header = FALSE, data.table = TRUE, nThread = 1, col.names = "whitelist_bcs")
     if(convert != FALSE){
-      print("Converting the whitelist into a more efficient format!")
+      cat("Converting the whitelist into a more efficient format!\n")
       whitelist$whitelist_bcs<-sequence_to_bits(whitelist$whitelist_bcs)
     }
     whitelist<-data.table::setkey(whitelist, "whitelist_bcs")
@@ -20,7 +20,7 @@ whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
         new_path<-paste0(dirname(whitelist_path),"/",file_path_sans_ext(whitelist_path)
           %>% basename(.),
           "_bitlist.csv.gz")
-        print(paste0("Now saving the integer whitelist to ",new_path,"!"))
+        cat(paste0("Now saving the integer whitelist to ",new_path,"!\n"))
         data.table::fwrite(x = whitelist, file = new_path, compress = "auto", nThread = 1, showProgress = TRUE, col.names = FALSE)
         gc()
       }
@@ -29,11 +29,11 @@ whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
   }
   else{
     if(class(whitelist$whitelist_bcs) == "integer"){
-      print("Integer64-type whitelist detected! Now importing...")
+      cat("Integer64-type whitelist detected! Now importing...\n")
       whitelist<-data.table::fread(input = whitelist_path, header = FALSE, data.table = TRUE, nThread = 1,
         col.names = "whitelist_bcs", key = "whitelist_bcs", integer64 = "integer64")
       gc()
-      print(paste0("Your whitelist is ", nrow(whitelist), " barcodes long!"))
+      cat(paste0("Your whitelist is ", nrow(whitelist), " barcodes long!\n"))
       print(head(whitelist))
       return(whitelist)
     }
@@ -122,7 +122,7 @@ read_fastqas<-function(fn, type = "fq", full_id = FALSE, ...){
 }
 
 prep_read_layout<-function(read_layout_form) {
-  print("Importing read layout and figuring out its order!")
+  cat("Importing read layout and figuring out its order!\n")
   tidytable::setDTthreads(threads = 1)
   read_layout<-data.table::fread(file = read_layout_form, header = TRUE, fill = TRUE, na.strings = "", skip = 1)
   read_layout$expected_length[which(!is.na(read_layout$seq))]<-stringr::str_length(read_layout$seq[which(!is.na(read_layout$seq))])
@@ -287,6 +287,7 @@ read_paf<-function(path, ...){
   }
   return(df)
 }
+
 synth_data_processor<-function(fn, type, df_out){
   if(type == "gz"){
     cat_cmd<-"zcat"
@@ -528,98 +529,7 @@ aggc<-function(){
   }
 }
 
-sigstractor<-function(sigstring){
-  id <- sub(".*<\\d+:(.*?):.*", "\\1", sigstring)
-  direction<-sub(".*<\\d+:.*:(.*)>", "\\1", sigstring)
-  elements<-strsplit(sub("<.*", "", sigstring), "\\|")[[1]]
-  dt<-data.table::data.table(
-    id = rep(id, length(elements)),
-    element = sapply(elements, function(x) strsplit(x, ":")[[1]][1]),
-    edit_distance = sapply(elements, function(x) as.integer(strsplit(x, ":")[[1]][2])),
-    start_pos = sapply(elements, function(x) as.integer(strsplit(x, ":")[[1]][3])),
-    stop_pos = sapply(elements, function(x) as.integer(strsplit(x, ":")[[1]][4])),
-    concatenate = grepl(pattern = "+FR_RF", x = id, fixed = TRUE),
-    direction = rep(direction, length(elements))
-  )
-  dt$id<-gsub(pattern = "+FR_RF", replacement = "", x = dt$id, fixed = TRUE)
-  return(dt)
-}
-
-tabulate_sigs<-function(file_path, output_prefix = NULL, chunk_size = 10000) {
-  data_output_file<-paste0(output_prefix, "/compiled_summary_data.csv")
-  summary_output_file<-paste0(output_prefix, "/summary_table.csv")
-  summary_output_graph<-paste0(output_prefix, "/summary_data.pdf")
-  data.table::fwrite(data.table::data.table(
-    id = character(),
-    element = character(),
-    edit_distance = integer(),
-    start_pos = integer(),
-    stop_pos = integer(),
-    concatenate = logical(),
-    direction = character()
-  ), data_output_file, col.names = TRUE)
-  summary_map<-list()
-  con<-gzcon(file(file_path, "rb"))
-  on.exit(close(con))
-  while (length(lines<-readLines(con, n = chunk_size)) > 0) {
-    sigstrings<-data.table::data.table(sigstring = lines)
-    dt<-data.table::rbindlist(pbapply::pblapply(sigstrings$sigstring, sigstractor))
-    if (nrow(dt) > 0) {
-      data.table::fwrite(dt, data_output_file, append = TRUE)
-      summary_dt<-dt[, .(unique_id_count = data.table::uniqueN(id)), by = .(concatenate, direction)]
-      for (i in 1:nrow(summary_dt)) {
-        key<-paste0(summary_dt$concatenate[i], ":", summary_dt$direction[i])
-        if (!is.null(summary_map[[key]])) {
-          summary_map[[key]]<-summary_map[[key]] + summary_dt$unique_id_count[i]
-        } else {
-          summary_map[[key]]<-summary_dt$unique_id_count[i]
-        }
-      }
-    }
-  }
-  summary_results<-data.table::rbindlist(lapply(names(summary_map),function(key){
-    concatenate<-as.logical(strsplit(key, ":")[[1]][1])
-    direction<-strsplit(key, ":")[[1]][2]
-    data.table::data.table(concatenate = concatenate, direction = direction, unique_id_count = summary_map[[key]])
-  }))
-  valid_reads<-sum(summary_results$unique_id_count[which(summary_results$direction == "F"|summary_results$direction == "R")])
-  total_reads<-sum(summary_results$unique_id_count)
-  
-  summary_plot<-ggpubr::ggbarplot(data = summary_results, 
-                          x = "direction", 
-                          y = "unique_id_count",
-                          color = "concatenate",
-                          fill = "concatenate", 
-                          title = "SigString Summary", 
-                          legend = "right", 
-                          legend.title = "Concatenate Status", 
-                          xlab = "Read (or Filter) Type",
-                          ylab = "Number of Reads", 
-                          order = c("F", 
-                                    "R", 
-                                    "missing_read_or_barcode_undecided", 
-                                    "invalid_barcode_length_undecided",
-                                    "invalid_read_length_undecided"), 
-                          subtitle = paste0(
-                            valid_reads, 
-                            " valid reads out of a total ", 
-                            total_reads), 
-                          x.text.angle = 45)
-  ggplot2::ggsave(filename = summary_output_graph, 
-                  plot = summary_plot, 
-                  device = "pdf", 
-                  width = 8, 
-                  height = 11, 
-                  units = "in", 
-                  dpi = "retina")
-  
-  results<-data.table::data.table(unique_id_count = paste0(valid_reads, " valid reads captured from ", total_reads, " total reads."))
-  summary_results<-data.table::rbindlist(l = list(summary_results, results), fill = TRUE)
-  
-  data.table::fwrite(summary_results, summary_output_file)
-}
-
-process_barcode<-function(barcode_path, read_layout) {
+process_barcodes<-function(barcode_path, read_layout) {
   barcodes<-data.table::fread(barcode_path, col.names = c("seq", "count"))
   data.table::setkey(read_layout, "class_id")
   
@@ -628,46 +538,168 @@ process_barcode<-function(barcode_path, read_layout) {
   
   expected_length<-read_layout[barcode_id, expected_length]
   barcodes[, filtered := NA_character_]
-  barcodes[stringr::str_length(seq) >= (expected_length + 2) | 
-             stringr::str_length(seq) < (expected_length - 2), 
-           filtered := "length_filter"]
+  bad_barcodes[(stringr::str_length(seq) != expected_length), filtered := "length_filter"]
   rescue_filter<-ceiling(expected_length * 0.5)
   patterns<-sprintf("%s{%d,}", c("A", "C", "T", "G"), rescue_filter + 1)
   poly_runs<-data.table::rbindlist(lapply(patterns, function(pattern) {
     barcodes[is.na(filtered) & grepl(pattern, seq), .(seq, count, filtered = "poly_run_filtered")]
   }))
-  if (nrow(poly_runs) > 0) {
+  if (nrow(poly_runs) > 0){
     barcodes[poly_runs, on = .(seq), filtered := i.filtered]
   }
   static_seqs<-read_layout[type == "static" & !is.na(expected_length) & expected_length > 0, seq]
   static_qgrams<-colnames(stringdist::qgrams(static_seqs, q = expected_length, useNames = TRUE))
   barcodes[is.na(filtered) & seq %in% static_qgrams, filtered := "adapter_segment_filtered"]
   whitelist_path<-read_layout[barcode_id, whitelist]
-  print(paste0("The whitelist path is ", whitelist_path))
+  cat(paste0("The whitelist path is ", whitelist_path,"\n"))
   whitelist<-NULL
   whitelist_path<-ifelse(whitelist_path == "10x_3v3", 
                            system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz"), 
                            ifelse(whitelist_path == "10x_3v1", 
                                   system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"), 
                                   whitelist_path))
-  print(paste0("The whitelist path is ", whitelist_path))
+  cat(paste0("The whitelist path is ", whitelist_path, "\n"))
+  
   if(!is.na(whitelist_path) && file.exists(whitelist_path)){
-    ext <- tools::file_ext(whitelist_path)
-    convert <- ext == "csv" || ext == "txt"
+    ext<-tools::file_ext(whitelist_path)
+    convert<-ext == "csv" || ext == "txt"
     whitelist<-whitelist_importer(whitelist_path, convert = convert)
   }
-  if (is.null(whitelist)){
-    barcodes[, pois_dist := stats::ppois(q = count, lambda = mean(count))]
-  }
+  
+  barcodes[, pois_dist := stats::ppois(q = count, lambda = mean(count))]
   barcodes[is.na(filtered), ':='(
     int64_seq = sequence_to_bits(seq),
     int64_rcseq = sequence_to_bits(revcomp(seq))
   )]
+  
   if (!is.null(whitelist)){
     barcodes[(is.na(filtered) & stringr::str_length(seq) == expected_length), filtered := ifelse(
       int64_seq %in% whitelist$whitelist_bcs | int64_rcseq %in% whitelist$whitelist_bcs,
-      "valid_barcode", "barcode_to_correct"
+      "whitelisted_barcode", "barcode_to_correct"
     )]
+    barcodes[(filtered == "whitelisted_barcode" & pois_dist >= 0.95), filtered := "valid_barcode"]
   }
   data.table::fwrite(x = barcodes, file = barcode_path)
+}
+
+process_sig<-function(file_path,
+                      output_prefix,
+                      chunk_size = 50000,
+                      max_sequences = -1,
+                      compress = TRUE,
+                      output_type = "summary",
+                      nthreads = 1){
+  tabulate_sigs(file_path = file_path, 
+                output_prefix = output_prefix, 
+                chunk_size = chunk_size,
+                max_sequences = max_sequences, 
+                compress = compress, 
+                nthreads = nthreads,
+                output_type = output_type)
+  summary_results<-data.table::fread(file = paste0(output_prefix,"summary_table.csv",  ifelse(test = compress, yes = ".gz", no = "")),
+                                     header = TRUE)
+  valid_reads<-sum(summary_results$unique_id_count[which(summary_results$direction == "F"|summary_results$direction == "R")])
+  total_reads<-sum(summary_results$unique_id_count)
+  summary_plot<-ggpubr::ggbarplot(data = summary_results, 
+                                  x = "direction", 
+                                  y = "unique_id_count",
+                                  color = "concatenate",
+                                  fill = "concatenate", 
+                                  title = "SigString Summary", 
+                                  legend = "right", 
+                                  legend.title = "Concatenate Status", 
+                                  xlab = "Read (or Filter) Type",
+                                  ylab = "Number of Reads", 
+                                  order = c("F", 
+                                            "R", 
+                                            "missing_read_or_barcode_undecided", 
+                                            "invalid_barcode_length_undecided",
+                                            "invalid_read_length_undecided"), 
+                                  subtitle = paste0(
+                                    valid_reads, 
+                                    " valid reads out of a total ", 
+                                    total_reads, " total reads."), 
+                                  x.text.angle = 45, palette = "npj")
+  ggplot2::ggsave(filename = paste0(output_prefix,"summary_barplot.pdf"), 
+                  plot = summary_plot, 
+                  device = "pdf", 
+                  width = 8, 
+                  height = 11, 
+                  units = "in", 
+                  dpi = "retina")
+  results<-data.table::data.table(unique_id_count = paste0(valid_reads, " valid reads captured from ", total_reads, " total reads."))
+  summary_results<-data.table::rbindlist(l = list(summary_results, results), fill = TRUE)
+  data.table::fwrite(summary_results, paste0(output_prefix,"/summary_table.csv", ifelse(test = compress, yes = ".gz", no = "")))
+}
+
+radrun<-function(
+    fastq_file_or_directory_path, 
+    read_layout_path, 
+    output_directory_path, 
+    compress = TRUE,
+    generate_sigstring_diagnostics = FALSE,
+    sigstring_diagnostic_verbose = FALSE,
+    misalignment_threshold_path = NULL,
+    tabulated_sigstring_count = -1,
+    chunk_size = 50000,
+    nthreads = 1){
+  if(!dir.exists(output_directory_path)){
+    dir.create(output_directory_path)
+  }
+  prep_read_layout(read_layout_form = read_layout_path)
+  if(!is.null(misalignment_threshold_path)){
+    misalignment_threshold<-data.table::fread(misalignment_threshold_path, header = FALSE)
+  } else {
+    misalignment_threshold<-misalignment_stream(
+      input_path = fastq_file_or_directory_path,
+      adapters = adapters,
+      nthreads = nthreads)
+    misalignment_threshold<-stat_collector(misalignment_threshold, read_layout)
+    data.table::fwrite(misalignment_threshold, file = paste0(output_directory_path,"/misalignment_threshold.csv"))
+  }
+  
+  sigstream(input_path = fastq_file_or_directory_path, 
+            nthreads = nthreads, 
+            compress = compress, 
+            write_fastq = TRUE, 
+            min_length = 100,
+            chunkSize = chunk_size,
+            outputPath = paste0(output_directory_path, "/demuxed_reads.fastq"),
+            adapters = adapters,
+            misalignment_threshold = misalignment_threshold,
+            read_layout = read_layout,
+            sigstringsFilePath = paste0(output_directory_path, "/sigstrings.txt")
+  )
+  gc()
+  if(generate_sigstring_diagnostics){
+    if(sigstring_diagnostic_verbose){
+      output_type<-"diagnostic"
+    } else {
+      output_type<-"summary"
+    }
+    process_sig(
+      file_path = paste0(output_directory_path, "/sigstrings.txt", ifelse(test = compress, yes = ".gz", no = "")),
+      output_prefix = output_directory_path,
+      max_sequences = tabulated_sigstring_count,
+      chunk_size = chunk_size,
+      compress = compress,
+      nthreads = nthreads,
+      output_type = output_type
+    )
+    gc()
+  } else {
+    cat("Generate sigstring diagnostics set to FALSE--skipping sigstring tabulation.\n")
+  }
+  
+  dir.create(path = paste0(output_directory_path,"/variable_seqs/"))
+  cat("Tabulating barcodes...\n")
+  tabulate_barcodes(
+    input_files = paste0(output_directory_path, "/demuxed_reads.fastq", 
+                         ifelse(test = compress, yes = ".gz", no = "")), 
+    output_prefix = paste0(output_directory_path,"variable_seqs/"), 
+    compress = FALSE)
+  barcode_files<-list.files(path = paste0(output_directory_path,"/variable_seqs/"), full.names = TRUE, pattern = "barcode")
+  out<-lapply(X = barcode_files, FUN = function(X){
+    return(process_barcodes(barcode_path = X, read_layout = read_layout))
+  })
 }

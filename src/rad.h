@@ -308,4 +308,6 @@ std::vector<int64_t> kmer_circ_cpp(int64_t sequence, int base_length, int kmerLe
 
 std::vector<unsigned int> bits_to_uint_cpp(const std::vector<int64_t>& input, int sequence_length);
 
+std::vector<std::string> split(const std::string &s, char delimiter);
+
 #endif
