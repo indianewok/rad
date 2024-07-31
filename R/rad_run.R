@@ -1,18 +1,15 @@
 #!/usr/bin/env Rscript
 
 if (interactive() == FALSE) {
-  
-  libraries <- c("docopt", "data.table", "magrittr", "stringr", "stringdist", "rad")
-  
+  libraries <- c("docopt", "data.table", "magrittr", "stringr", "stringdist")
   invisible(lapply(libraries, function(lib) {
     if (!require(lib, character.only = TRUE)) {
       install.packages(lib)
       library(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
     }
   }))
-  
   doc <- "
-Usage: radrun.R [--fastq_file_or_directory_path=<path>] [--read_layout_path=<path>] [--output_directory_path=<path>] [--compress] [--generate_sigstring_diagnostics] [--sigstring_diagnostic_verbose] [--misalignment_threshold_path=<path>] [--tabulated_sigstring_count=<count>] [--chunk_size=<size>] [--nthreads=<threads>]
+Usage: rad_run.R [--fastq_file_or_directory_path=<path>] [--read_layout_path=<path>] [--output_directory_path=<path>] [--compress] [--generate_sigstring_diagnostics] [--sigstring_diagnostic_verbose] [--misalignment_threshold_path=<path>] [--tabulated_sigstring_count=<count>] [--chunk_size=<size>] [--nthreads=<threads>]
 
 Options:
   -h --help                                Show this screen.
@@ -40,7 +37,7 @@ Options:
   
   # Ensure the function is defined
   if (!exists("rad_run", where = "package:rad", mode = "function")) {
-    stop("rad_run function is not available in the rad package")
+    stop("rad_run function is not available in the rad package.")
   }
   
   # Print the values to ensure they are correctly parsed
@@ -58,7 +55,7 @@ Options:
   
   print(arguments)
   
-  rad::radrun(fastq_file_or_directory_path = arguments$fastq_file_or_directory_path,
+  rad::rad_run(fastq_file_or_directory_path = arguments$fastq_file_or_directory_path,
     read_layout_path = arguments$`--read_layout_path`,
     output_directory_path = arguments$`--output_directory_path`,
     compress = arguments$`--compress`,
