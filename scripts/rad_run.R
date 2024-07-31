@@ -8,7 +8,6 @@ if (interactive() == FALSE) {
       library(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
     }
   }))
-  library(rad)
   doc <- "
 Usage: rad_run.R [--fastq_file_or_directory_path=<path>] [--read_layout_path=<path>] [--output_directory_path=<path>] [--compress] [--generate_sigstring_diagnostics] [--sigstring_diagnostic_verbose] [--misalignment_threshold_path=<path>] [--tabulated_sigstring_count=<count>] [--chunk_size=<size>] [--nthreads=<threads>]
 
