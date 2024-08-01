@@ -903,6 +903,9 @@ void tabulate_barcodes(
     int l;
     while ((l = kseq_read(seq)) >= 0) {
       std::string header(seq->name.s);
+      if (header.find("+FR_RF") != std::string::npos) {
+        continue;
+      }
       std::istringstream iss(header);
       std::string token;
       std::string id;

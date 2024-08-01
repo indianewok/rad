@@ -704,5 +704,5 @@ rad_run<-function(
     return(process_barcodes(barcode_path = X, read_layout = read_layout))
   })
   end_time = Sys.time()
-  cat(paste0("Finished running! Total run time: ", (end_time-start_time), "\n"))
+  cat(paste0("Finished running! Total run time: ", difftime(timeEnd, timeStart, units='mins'), "\n"))
 }
