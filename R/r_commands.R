@@ -633,7 +633,6 @@ process_sig<-function(file_path,
 }
 
 rad_run<-function(
-    start_time = Sys.time()
     fastq_file_or_directory_path, 
     read_layout_path, 
     output_directory_path, 
@@ -644,6 +643,7 @@ rad_run<-function(
     tabulated_sigstring_count = -1,
     chunk_size = 50000,
     nthreads = 1){
+  start_time = Sys.time()
   if(!dir.exists(output_directory_path)){
     dir.create(output_directory_path)
   }
