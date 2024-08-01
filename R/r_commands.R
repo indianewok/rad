@@ -538,7 +538,7 @@ process_barcodes<-function(barcode_path, read_layout) {
   
   expected_length<-read_layout[barcode_id, expected_length]
   barcodes[, filtered := NA_character_]
-  bad_barcodes[(stringr::str_length(seq) != expected_length), filtered := "length_filter"]
+  barcodes[(stringr::str_length(seq) != expected_length), filtered := "length_filter"]
   rescue_filter<-ceiling(expected_length * 0.5)
   patterns<-sprintf("%s{%d,}", c("A", "C", "T", "G"), rescue_filter + 1)
   poly_runs<-data.table::rbindlist(lapply(patterns, function(pattern) {

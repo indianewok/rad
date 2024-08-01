@@ -2,7 +2,7 @@
 
   libraries<-c("docopt", "data.table", "magrittr", "stringr", "stringdist", "rad")
   invisible(lapply(libraries, function(lib) {
-    if (!require(lib, character.only = TRUE)) {
+    if (!require(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)) {
       install.packages(lib)
       invisible(library(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE))
     }
