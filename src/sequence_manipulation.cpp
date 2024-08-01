@@ -455,3 +455,248 @@ Rcpp::NumericVector kmer_circ(SEXP sequence, int base_length = 16, int kmerLengt
   std::vector<int64_t> kmers = kmer_circ_cpp_v2(sequenceVec[0], base_length, kmerLength, verbose);
   return Rcpp::wrap(kmers);
 }
+
+int hamming_distance(int64_t a, int64_t b) {
+  return std::bitset<64>(a ^ b).count();
+}
+// Helper function to convert a DNA sequence to int64
+int64_t seq_to_int64(const std::string& seq) {
+  int64_t result = 0;
+  for (char nucleotide : seq) {
+    result <<= 2;
+    switch (nucleotide) {
+    case 'A':
+      result |= 0;
+      break;
+    case 'C':
+      result |= 1;
+      break;
+    case 'G':
+      result |= 2;
+      break;
+    case 'T':
+      result |= 3;
+      break;
+    default:
+      Rcpp::stop("Invalid nucleotide in sequence");
+    }
+  }
+  return result;
+}
+
+// [[Rcpp::export]]
+void bc_correct_module(std::string input_file,
+                            std::string output_file,
+                            bool verbose = false,
+                            int nthreads = 1,
+                            int maxDistance = 2,
+                            int sequence_length = 16,
+                            int depth = 2,
+                            int breadth = 1,
+                            bool high_speed = true) {
+  // Read input CSV file
+  std::ifstream infile(input_file);
+  if (!infile.is_open()) {
+    Rcpp::stop("Could not open input file.");
+  }
+  
+  std::vector<std::string> seq;
+  std::vector<int> count;
+  std::vector<std::string> filtered;
+  std::vector<int64_t> int64_seq;
+  std::vector<int64_t> rc_int64seq;
+  
+  std::string line;
+  
+  // Skip the header row
+  if (!std::getline(infile, line)) {
+    Rcpp::stop("Input file is empty.");
+  }
+  
+  while (std::getline(infile, line)) {
+    std::istringstream ss(line);
+    std::string tmp;
+    
+    std::getline(ss, tmp, ',');
+    seq.push_back(tmp.empty() ? "N" : tmp);  // Fill empty entries with "N"
+    
+    std::getline(ss, tmp, ',');
+    try {
+      count.push_back(tmp.empty() ? 0 : std::stoi(tmp));  // Fill empty entries with 0
+    } catch (const std::invalid_argument& e) {
+      Rcpp::stop("Error parsing count: " + tmp);
+    }
+    
+    std::getline(ss, tmp, ',');
+    filtered.push_back(tmp.empty() ? "unknown" : tmp);  // Fill empty entries with "unknown"
+    
+    // Skip pois_dist column
+    std::getline(ss, tmp, ',');
+    
+    std::getline(ss, tmp, ',');
+    try {
+      int64_seq.push_back(tmp.empty() ? 0 : std::stoll(tmp));  // Fill empty entries with 0
+    } catch (const std::invalid_argument& e) {
+      Rcpp::stop("Error parsing int64_seq: " + tmp);
+    }
+    
+    std::getline(ss, tmp, ',');
+    try {
+      rc_int64seq.push_back(tmp.empty() ? 0 : std::stoll(tmp));  // Fill empty entries with 0
+    } catch (const std::invalid_argument& e) {
+      Rcpp::stop("Error parsing rc_int64seq: " + tmp);
+    }
+  }
+  infile.close();
+  
+  // Debugging: Print the parsed input
+  Rcpp::Rcout << "Parsed " << seq.size() << " entries from the input file.\n";
+  
+  // Generate the whitelist from the pois_validated_barcode
+  std::unordered_map<int64_t, std::pair<std::string, double>> wl;
+  
+  for (size_t i = 0; i < seq.size(); ++i) {
+    if (filtered[i] == "pois_validated_barcode") {
+      wl[int64_seq[i]] = std::make_pair(seq[i], double(count[i]));
+    }
+  }
+  
+  // Collapse false positives in the whitelist
+  for (size_t i = 0; i < seq.size(); ++i) {
+    if (filtered[i] == "whitelist_barcode") {
+      int64_t wl_barcode = int64_seq[i];
+      for (const auto& validated : wl) {
+        if (hamming_distance(wl_barcode, validated.first) <= maxDistance) {
+          wl[validated.first].second = std::max(wl[validated.first].second, double(count[i]));
+          break;
+        }
+      }
+    }
+  }
+  
+  std::vector<std::string> corrected_seq(seq.size(), "");
+  std::vector<int> best_distances(seq.size(), -1);
+  int corrected_count = 0; // Variable to count the number of corrections
+  int scanned_count = 0;   // Variable to count the number of scanned barcodes
+  
+  omp_set_num_threads(nthreads);
+  
+#pragma omp parallel for schedule(dynamic)
+  for (size_t i = 0; i < seq.size(); ++i) {
+    if (filtered[i] == "barcode_to_correct") {
+      int64_t barcode = int64_seq[i];
+      double highest_poisson_score = -1.0;
+      int best_distance = std::numeric_limits<int>::max();
+      int64_t best_match = 0;
+      
+      // First check against pois_validated_barcodes
+      for (const auto& validated : wl) {
+        int distance = hamming_distance(barcode, validated.first);
+        if (distance <= 2) {
+          double poisson_score = validated.second.second;
+          if (poisson_score > highest_poisson_score || 
+              (poisson_score == highest_poisson_score && distance < best_distance)) {
+            best_match = validated.first;
+            highest_poisson_score = poisson_score;
+            best_distance = distance;
+          }
+        }
+      }
+      
+      // If no match found, check against whitelist_barcodes
+      if (best_match == 0) {
+        for (size_t j = 0; j < seq.size(); ++j) {
+          if (filtered[j] == "whitelist_barcode") {
+            int64_t wl_barcode = int64_seq[j];
+            int distance = hamming_distance(barcode, wl_barcode);
+            if (distance <= 2) {
+              double poisson_score = double(count[j]);
+              if (poisson_score > highest_poisson_score || 
+                  (poisson_score == highest_poisson_score && distance < best_distance)) {
+                best_match = wl_barcode;
+                highest_poisson_score = poisson_score;
+                best_distance = distance;
+              }
+            }
+          }
+        }
+      }
+      // If no match found, generate mutations and circular sequences
+      if (best_match == 0) {
+        auto mutations = generate_recursive_mutations_cpp(barcode, depth, sequence_length);
+        for (auto& mutation : mutations) {
+          if (wl.find(mutation) != wl.end()) {
+            int dl_distance = dl_dist_cpp({barcode}, {mutation}, maxDistance)[0];
+            if (dl_distance <= maxDistance) {
+              double poisson_score = wl[mutation].second;
+              if (poisson_score > highest_poisson_score || 
+                  (poisson_score == highest_poisson_score && dl_distance < best_distance)) {
+                best_match = mutation;
+                highest_poisson_score = poisson_score;
+                best_distance = dl_distance;
+              }
+            }
+          }
+        }
+        if (best_match == 0) {
+          auto circularizedSequences = kmer_circ_cpp(barcode, sequence_length, sequence_length, false);
+          for (auto& circSeq : circularizedSequences) {
+            auto circMutations = generate_recursive_mutations_cpp(circSeq, breadth, sequence_length);
+            for (auto& mutation : circMutations) {
+              if (wl.find(mutation) != wl.end()) {
+                int dl_distance = dl_dist_cpp({barcode}, {mutation}, maxDistance)[0];
+                if (dl_distance <= maxDistance) {
+                  double poisson_score = wl[mutation].second;
+                  if (poisson_score > highest_poisson_score || 
+                      (poisson_score == highest_poisson_score && dl_distance < best_distance)) {
+                    best_match = mutation;
+                    highest_poisson_score = poisson_score;
+                    best_distance = dl_distance;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      // Updating shared variables within the critical section
+#pragma omp critical
+{
+  if (best_match != 0) {
+  wl[best_match].second++;
+  filtered[i] = "corrected_barcode";
+  corrected_seq[i] = wl[best_match].first;
+  best_distances[i] = best_distance;
+  corrected_count++;
+
+      } else {
+        corrected_seq[i] = "";
+        best_distances[i] = -1;
+      }
+}      
+#pragma omp atomic
+      scanned_count++;
+      
+      if (scanned_count % 10000 == 0) {
+#pragma omp critical
+{
+  Rcpp::Rcout << scanned_count << " barcodes scanned, " << corrected_count << " barcodes corrected.\n";
+}
+      }
+    }
+  }
+  
+  Rcpp::Rcout << "Total barcodes corrected: " << corrected_count << "\n";
+  
+  // Write output to CSV
+  std::ofstream outfile(output_file);
+  if (!outfile.is_open()) {
+    Rcpp::stop("Could not open output file.");
+  }
+  
+  outfile << "seq,count,filtered,corrected_seq\n";
+  for (size_t i = 0; i < seq.size(); ++i) {
+    outfile << seq[i] << ',' << count[i] << ',' << filtered[i] << ',' << corrected_seq[i]  << '\n';
+  }
+  outfile.close();
+}

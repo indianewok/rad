@@ -29,8 +29,8 @@ whitelist_size <- function() {
     .Call(`_rad_whitelist_size`)
 }
 
-correct_barcodes <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 1L, high_speed = TRUE, maxDistance = 2L, sequence_length = 16L) {
-    .Call(`_rad_correct_barcodes`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance, sequence_length)
+correct_barcodes_rcpp <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 1L, high_speed = TRUE, maxDistance = 2L, sequence_length = 16L) {
+    .Call(`_rad_correct_barcodes_rcpp`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance, sequence_length)
 }
 
 generate_recursive_mutations_gw <- function(barcodes, alpha, error_rate, num_cycles = 10L) {
@@ -103,6 +103,10 @@ bit_substring <- function(bit_sequences, start_pos, stop_pos) {
 
 kmer_circ <- function(sequence, base_length = 16L, kmerLength = 16L, verbose = FALSE) {
     .Call(`_rad_kmer_circ`, sequence, base_length, kmerLength, verbose)
+}
+
+bc_correct_module <- function(input_file, output_file, verbose = FALSE, nthreads = 1L, maxDistance = 2L, sequence_length = 16L, depth = 2L, breadth = 1L, high_speed = TRUE) {
+    invisible(.Call(`_rad_bc_correct_module`, input_file, output_file, verbose, nthreads, maxDistance, sequence_length, depth, breadth, high_speed))
 }
 
 sigstream <- function(input_path, sigstringsFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, outputPath, write_fastq = TRUE, compress = TRUE, max_sequences = -1L, min_length = 100L, verbose = FALSE) {

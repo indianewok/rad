@@ -288,239 +288,6 @@ read_paf<-function(path, ...){
   return(df)
 }
 
-synth_data_processor<-function(fn, type, df_out){
-  if(type == "gz"){
-    cat_cmd<-"zcat"
-  } else {
-    cat_cmd<-"cat"
-  }
-  cmd<-glue::glue("{cat_cmd} {fn} | paste - - - - | awk -F'\t' '{{ split($1, a,
-     \" \"); print a[1]\",\"a[2] }}' | cut -d',' -f1,2,3,4,5,6,7")
-  res<-data.table::fread(cmd = cmd, sep = ",", header = FALSE, quote = "", fill = TRUE)
-  df_out$id<-stringr::str_extract(string = df_out$sig_id, pattern = "<.+?>") %>% 
-  DescTools::StrExtractBetween(x = ., left = ":", right = ":")
-  df_out$concatenate_state<-ifelse(test = grepl(pattern = "+FR_RF",
-     x = df_out$sig_id, fixed = TRUE),
-    yes = {
-      "TRUE"
-    },
-    no = {
-      "FALSE"
-    })
-  df_out$id<-gsub(pattern = "\\+FR_RF", replacement = "", x =df_out$id)
-  df_new<-dplyr::left_join(df_out, res, by = c("id" = "V1"))
-  df_new[, c("original_barcode", "original_umi", "original_read") := data.table::tstrsplit(V2, "_", type.convert = TRUE)]
-  df_new$original_barcode<-gsub(pattern = "random", replacement = NA, x = df_new$original_barcode)
-  df_new$original_umi<-gsub(pattern = "seq", replacement = NA, x = df_new$original_barcode)
-  if(length(grep(pattern = "junk", x = df_new$original_barcode)) > 1){
-    df_new<-df_new[-grep(pattern = "junk", x = df_new$original_barcode),]
-  }
-  return(df_new)
-}
-
-whitelist_filterer<-function(generated_whitelist, stringency_params, verbose = FALSE){
-  if(verbose){
-    print(stringency_params)
-  }
-  df<-generated_whitelist
-  fpoisson<-table(df$pois_dist) %>% data.table::as.data.table(.)
-  if(verbose){
-    print(head(fpoisson))
-  }
-  fpoisson<-fpoisson[order(as.numeric(fpoisson$V1), decreasing = FALSE),]
-  min_idx<-diff(fpoisson$N, differences = stringency_params[1], lag = stringency_params[2]) %>% 
-    sign %>% {diff(.,differences = stringency_params[3], lag = stringency_params[4]) != 0} %>%
-    which(. == TRUE) %>%
-    min(.)
-  df<-fpoisson$V1[min_idx] %>% 
-    as.numeric %>% 
-    {df[which(df$pois_dist >= .),]}
-  if(verbose){
-    print(head(df))
-  }
-  return(df)
-}
-
-generate_whitelist<-function(barcode_df, original_whitelist = NULL, prefiltered_whitelist = NULL, 
-  output_dir = NULL, verbose = FALSE, stringency = "LOW", expected_length = 16){
-  if(!is.null(original_whitelist)||!is.null(prefiltered_whitelist)){
-    barcodes<-table(barcode_df, useNA = "no") %>% data.table::as.data.table(.)
-  } else {
-    barcodes<-barcode_df
-  }
-  colnames(barcodes)<-c("V1","N")
-  ratio<-nrow(barcodes)/sum(barcodes$N)
-  if(verbose){
-    print(paste0("Number of total barcodes: ", nrow(barcodes)))
-    print(paste0("Ratio of unique barcodes to unique reads: ", ratio))
-  }
-  if(nrow(barcodes) == 0){
-    print("Something's a little funky, returning all of the material on hand and stopping execution!")
-    troubleshooting_output<-list(df = df, fail = TRUE)
-    return(list2env(troubleshooting_output))
-  }
-  if(ratio > 0.5){
-    rescue_repeats<-ceiling(mean(stringr::str_length(barcodes$V1))*0.3)
-  } else {
-    rescue_repeats<-ceiling(mean(stringr::str_length(barcodes$V1))*0.5)
-    if(verbose){
-      print(paste0("Number of rescue repeats: ",rescue_repeats))
-    }
-  }
-  filter_runs<-sapply(X = c("A","C","T","G"), FUN = function(X){
-    paste0(replicate(X, n = rescue_repeats), collapse = "")}, 
-    USE.NAMES = FALSE)
-  
-  if(verbose){
-    print(paste0("After filtering repeated runs of length ", rescue_repeats,"..."))
-    print(head(filter_runs))
-    print(colnames(barcodes))
-    print(head(barcodes))
-  }
-  barcodes$pois_dist<-stats::ppois(q = barcodes$N, lambda = mean(barcodes$N))
-  if(verbose){
-    print("Pre-conversion to bits...")
-    print(head(barcodes))
-  }
-  barcodes$V1<-sequence_to_bits(barcodes$V1)
-  if(verbose){
-    print(head(barcodes))
-    print("Post-conversion to bits!")
-  }
-  if(!is.null(original_whitelist)){
-    if(verbose){
-      print(table(barcodes$V1 %in% original_whitelist$whitelist_bcs))
-    }
-    chunk_whitelist<-barcodes[barcodes$V1 %in% original_whitelist$whitelist_bcs,]
-    if(verbose){
-      print(nrow(chunk_whitelist))
-    }
-  } else if(!is.null(prefiltered_whitelist)){
-    if(verbose){
-      print(table(barcodes$V1 %in% prefiltered_whitelist$whitelist_bcs))
-    }
-    chunk_whitelist<-barcodes[barcodes$V1 %in% prefiltered_whitelist$whitelist_bcs,]
-  } else
-  if(is.null(prefiltered_whitelist) && is.null(original_whitelist)){
-    chunk_whitelist<-barcodes[which(barcodes$pois > 0.9),] #first pass
-  }
-  {
-    if(verbose){
-      print(head(chunk_whitelist))
-    }
-    chunk_whitelist<-chunk_whitelist[order(chunk_whitelist$N, decreasing = TRUE),]
-    chunk_whitelist$pois_dist<-stats::ppois(q = chunk_whitelist$N, lambda = mean(chunk_whitelist$N))*100
-    suppressWarnings(fitcheck<-MASS::fitdistr(chunk_whitelist$N, "negative binomial"))
-    chunk_whitelist$ncsum<-pnbinom(size = fitcheck$estimate[1], mu = fitcheck$estimate[2], chunk_whitelist$N)*100
-    chunk_whitelist$csum<-(cumsum(chunk_whitelist$N)/sum(chunk_whitelist$N))*100
-    if(verbose){
-      print(head(chunk_whitelist))
-    }
-    #hardcoded for the back-two vars
-    if(!is.null(output_dir)){
-      output<-ggpubr::ggdensity(chunk_whitelist, x = "pois_dist", weight = "N")
-      filename<-paste0(output_dir,"/weighted_poisson_distribution_density.png")
-      ggplot2::ggsave(filename, output)
-    }
-    if(stringency != "EXTRA"){
-      if(stringency == "LOW"){
-        stringency_params<-c(2,2,2,2)
-        chunk_whitelist<-whitelist_filterer(generated_whitelist = chunk_whitelist, 
-          stringency_params = stringency_params, verbose= TRUE)
-        quant_cutoff<-quantile(chunk_whitelist$pois_dist)[1]
-        chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
-      } else
-        if(stringency == "DEFAULT"){
-          stringency_params<-c(2,2,2,1)
-          chunk_whitelist<-whitelist_filterer(generated_whitelist = chunk_whitelist, 
-            stringency_params = stringency_params, verbose= TRUE)
-          quant_cutoff<-quantile(chunk_whitelist$pois_dist)[2]
-          chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
-        } else 
-          if(stringency == "HIGH"){
-            stringency_params<-c(2,2,1,1)
-            chunk_whitelist<-whitelist_filterer(generated_whitelist = chunk_whitelist, 
-              stringency_params = stringency_params, verbose= TRUE)
-            quant_cutoff<-quantile(chunk_whitelist$pois_dist)[3]
-            chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
-        }
-    }
-    if(stringency == "EXTRA"){
-      stringency_params<-c(2,2,1,1)
-      chunk_whitelist<-whitelist_filterer(generated_whitelist = chunk_whitelist, 
-        stringency_params = stringency_params, verbose= TRUE) %>% 
-        {whitelist_filterer(generated_whitelist = ., 
-        stringency_params = c(2,1,1,1), verbose= TRUE)}
-      quant_cutoff<-quantile(chunk_whitelist$pois_dist)[4]
-      chunk_whitelist<-chunk_whitelist[which(chunk_whitelist$pois_dist >= quant_cutoff),]
-    }
-    if(stringency == "NEUROTIC"){
-      return(print("Doesn't work yet!"))
-    }
-  }#stats module
-  calling_env<-parent.frame()
-  
-  if(verbose){
-    print(calling_env)
-    print(head(chunk_whitelist))
-    print(nrow(chunk_whitelist))
-  }
-  output<-list(generated_whitelist = chunk_whitelist, original_whitelist = original_whitelist)
-  return(list2env(output, calling_env))
-}
-
-barcode_corrector<-function(barcode_column, gen_whitelist = NULL, breadth = 1, depth = 2, high_speed = TRUE, nthreads = 1,
-   maxDistance = 2, verbose = FALSE, stringency = "LOW"){
-    if(is.null(gen_whitelist)){
-      generate_whitelist(barcode_column = barcode_column, original_whitelist = NULL, 
-        prefiltered_whitelist = NULL, output_dir = NULL, verbose = verbose, stringency = stringency)
-      gen_whitelist<-generated_whitelist
-    }
-    populate_whitelist(barcodes = gen_whitelist$V1, poisson_data = gen_whitelist$pois_dist, counts = gen_whitelist$N)
-    gen_whitelist<-wl_to_df()
-    #semantically this is shit
-  if(verbose){
-    print(head(gen_whitelist))
-    print("This is the generated whitelist!")
-  }
-    if(whitelist_size() < 10){
-      stop("Empty whitelist!")
-    }
-  
-    gen_whitelist$sequence<-bit64::as.integer64(gen_whitelist$sequence)
-    
-    barcodes<-table(barcode_column, useNA = "no") %>% data.table::as.data.table(.)
-    colnames(barcodes)<-c("V1","N")
-    barcodes$V1<-sequence_to_bits(barcodes$V1)
-    query_list<-barcodes[!barcodes$V1 %in% gen_whitelist$sequence,]
-    query_list<-query_list[order(query_list$N, decreasing = TRUE),]
-    query_list$corrected<-NA
-    
-    if(verbose){
-      print(paste0("The length of the barcodes are: ", nrow(barcodes)))
-      print(head(barcodes))
-      print(paste0("The length of the gen_whitelist is ", nrow(gen_whitelist)))
-      print(head(gen_whitelist))
-      print(paste0("the length of the query list is ", nrow(query_list)))
-      print(head(query_list))
-      print(class(query_list$V1))
-    }
-    query_list$corrected<-correct_barcodes(
-      barcodes = query_list$V1, 
-      breadth = breadth, depth = depth,
-      high_speed = high_speed, nthreads = nthreads, maxDistance = maxDistance)
-    
-    #df$barcode<-sequence_to_bits(df$barcode)
-    #df[query_list, barcode := bit64::as.integer64(i.corrected), on = .(barcode = V1)]
-    #query_list<-query_list[which(!is.na(query_list$corrected)),]
-    
-    #df<-df[which(df$barcode %in% chunk_whitelist$V1),]
-    
-    #df$pass_fail<-df$barcode %in% gen_whitelist$sequence
-    #output<-list(df_filtered = df)
-    return(list2env(list(query_list = query_list), .GlobalEnv))
-}
-
 aggc<-function(){
   gc()
   sysname<-Sys.info()[["sysname"]]
@@ -581,6 +348,25 @@ process_barcodes<-function(barcode_path, read_layout) {
   data.table::fwrite(x = barcodes, file = barcode_path)
 }
 
+correct_barcodes<-function(input_file,
+                           output_file,
+                           verbose = FALSE,
+                           nthreads = 1,
+                           maxDistance = 2,
+                           sequence_length = 16,
+                           depth = 2,
+                           breadth = 1,
+                           read_layout){
+  barcodes<-data.table::fread(input_file, col.names = c("seq","count","filtered","pois_dist","int64_seq","int64_rcseq"))
+  data.table::setkey(read_layout, "class_id")
+  
+  dir_path<-paste0(dirname(input_file),"/")
+  barcode_id<-basename(tools::file_path_sans_ext(input_file))
+  
+  expected_length<-read_layout[barcode_id, expected_length]
+  bc_correct_module(input_file, output_file, verbose, nthreads, maxDistance, sequence_length, depth, breadth)
+}
+
 process_sig<-function(file_path,
                       output_prefix,
                       chunk_size = 50000,
@@ -632,6 +418,7 @@ process_sig<-function(file_path,
   data.table::fwrite(summary_results, paste0(output_prefix,"/summary_table.csv", ifelse(test = compress, yes = ".gz", no = "")))
 }
 
+
 rad_run<-function(
     fastq_file_or_directory_path, 
     read_layout_path, 
@@ -642,6 +429,7 @@ rad_run<-function(
     misalignment_threshold_path = NULL,
     tabulated_sigstring_count = -1,
     chunk_size = 50000,
+    maxDistance = 3,
     nthreads = 1){
   start_time = Sys.time()
   if(!dir.exists(output_directory_path)){
@@ -701,8 +489,9 @@ rad_run<-function(
     compress = FALSE)
   barcode_files<-list.files(path = paste0(output_directory_path,"/variable_seqs/"), full.names = TRUE, pattern = "barcode")
   out<-lapply(X = barcode_files, FUN = function(X){
-    return(process_barcodes(barcode_path = X, read_layout = read_layout))
+    process_barcodes(barcode_path = X, read_layout = read_layout)
+    correct_barcodes(input_file = X, output_file = X, verbose = FALSE, nthreads = nthreads, maxDistance = maxDistance, read_layout = read_layout)
   })
   end_time = Sys.time()
-  cat(paste0("Finished running! Total run time: ", difftime(timeEnd, timeStart, units='mins'), "\n"))
+  cat(paste0("Finished running! Total run time: ", difftime(end_time, start_time, units='mins'), "\n"))
 }

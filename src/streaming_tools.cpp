@@ -904,7 +904,6 @@ void tabulate_barcodes(
     while ((l = kseq_read(seq)) >= 0) {
       std::string header(seq->name.s);
       bool skip_counting = (header.find("+FR_RF") != std::string::npos);
-      
       std::istringstream iss(header);
       std::string token;
       std::string id;
@@ -916,7 +915,7 @@ void tabulate_barcodes(
           std::string barcode_type = matches[1].str();
           std::string barcode_seq = matches[2].str();
           std::string revcomp_seq = revcomp_cpp(barcode_seq);
-          
+        
           // Check if barcode or its reverse complement already exists
           if (!skip_counting) {
             if (barcode_counts[barcode_type].find(barcode_seq) == barcode_counts[barcode_type].end() &&
@@ -929,9 +928,7 @@ void tabulate_barcodes(
               barcode_counts[barcode_type][barcode_seq]++;
             }
           }
-          
           master_sequences[id][barcode_type] = barcode_seq;
-          
           // Add to column order if not already present
           if (std::find(column_order.begin(), column_order.end(), barcode_type) == column_order.end()) {
             column_order.push_back(barcode_type);

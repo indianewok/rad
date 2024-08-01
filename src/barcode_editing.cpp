@@ -223,7 +223,7 @@ int whitelist_size() {
 }
 
 // [[Rcpp::export]]
-Rcpp::NumericVector correct_barcodes(Rcpp::NumericVector barcodes, bool verbose = false, 
+Rcpp::NumericVector correct_barcodes_rcpp(Rcpp::NumericVector barcodes, bool verbose = false, 
   int nthreads = 1, int depth = 2, int breadth = 1, bool high_speed = true, int maxDistance = 2, int sequence_length = 16) {
   int n = barcodes.size();
   Rcpp::NumericVector results(n, NA_REAL); // Initialize results with NA_REAL

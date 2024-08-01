@@ -310,4 +310,8 @@ std::vector<unsigned int> bits_to_uint_cpp(const std::vector<int64_t>& input, in
 
 std::vector<std::string> split(const std::string &s, char delimiter);
 
+std::vector<int> dl_dist_cpp(const std::vector<int64_t>& src_input_vec, 
+                             const std::vector<int64_t>& tgt_input_vec, 
+                             unsigned int maxDistance);
+
 #endif

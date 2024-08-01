@@ -93,9 +93,9 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
-// correct_barcodes
-Rcpp::NumericVector correct_barcodes(Rcpp::NumericVector barcodes, bool verbose, int nthreads, int depth, int breadth, bool high_speed, int maxDistance, int sequence_length);
-RcppExport SEXP _rad_correct_barcodes(SEXP barcodesSEXP, SEXP verboseSEXP, SEXP nthreadsSEXP, SEXP depthSEXP, SEXP breadthSEXP, SEXP high_speedSEXP, SEXP maxDistanceSEXP, SEXP sequence_lengthSEXP) {
+// correct_barcodes_rcpp
+Rcpp::NumericVector correct_barcodes_rcpp(Rcpp::NumericVector barcodes, bool verbose, int nthreads, int depth, int breadth, bool high_speed, int maxDistance, int sequence_length);
+RcppExport SEXP _rad_correct_barcodes_rcpp(SEXP barcodesSEXP, SEXP verboseSEXP, SEXP nthreadsSEXP, SEXP depthSEXP, SEXP breadthSEXP, SEXP high_speedSEXP, SEXP maxDistanceSEXP, SEXP sequence_lengthSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -107,7 +107,7 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< bool >::type high_speed(high_speedSEXP);
     Rcpp::traits::input_parameter< int >::type maxDistance(maxDistanceSEXP);
     Rcpp::traits::input_parameter< int >::type sequence_length(sequence_lengthSEXP);
-    rcpp_result_gen = Rcpp::wrap(correct_barcodes(barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance, sequence_length));
+    rcpp_result_gen = Rcpp::wrap(correct_barcodes_rcpp(barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance, sequence_length));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -334,6 +334,24 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// bc_correct_module
+void bc_correct_module(std::string input_file, std::string output_file, bool verbose, int nthreads, int maxDistance, int sequence_length, int depth, int breadth, bool high_speed);
+RcppExport SEXP _rad_bc_correct_module(SEXP input_fileSEXP, SEXP output_fileSEXP, SEXP verboseSEXP, SEXP nthreadsSEXP, SEXP maxDistanceSEXP, SEXP sequence_lengthSEXP, SEXP depthSEXP, SEXP breadthSEXP, SEXP high_speedSEXP) {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< std::string >::type input_file(input_fileSEXP);
+    Rcpp::traits::input_parameter< std::string >::type output_file(output_fileSEXP);
+    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
+    Rcpp::traits::input_parameter< int >::type nthreads(nthreadsSEXP);
+    Rcpp::traits::input_parameter< int >::type maxDistance(maxDistanceSEXP);
+    Rcpp::traits::input_parameter< int >::type sequence_length(sequence_lengthSEXP);
+    Rcpp::traits::input_parameter< int >::type depth(depthSEXP);
+    Rcpp::traits::input_parameter< int >::type breadth(breadthSEXP);
+    Rcpp::traits::input_parameter< bool >::type high_speed(high_speedSEXP);
+    bc_correct_module(input_file, output_file, verbose, nthreads, maxDistance, sequence_length, depth, breadth, high_speed);
+    return R_NilValue;
+END_RCPP
+}
 // sigstream
 void sigstream(const std::string& input_path, const std::string& sigstringsFilePath, Rcpp::CharacterVector adapters, const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, int chunkSize, int nthreads, const std::string& outputPath, bool write_fastq, bool compress, int max_sequences, int min_length, bool verbose);
 RcppExport SEXP _rad_sigstream(SEXP input_pathSEXP, SEXP sigstringsFilePathSEXP, SEXP adaptersSEXP, SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP chunkSizeSEXP, SEXP nthreadsSEXP, SEXP outputPathSEXP, SEXP write_fastqSEXP, SEXP compressSEXP, SEXP max_sequencesSEXP, SEXP min_lengthSEXP, SEXP verboseSEXP) {
@@ -408,7 +426,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_rad_wl_to_df", (DL_FUNC) &_rad_wl_to_df, 0},
     {"_rad_clear_whitelist", (DL_FUNC) &_rad_clear_whitelist, 0},
     {"_rad_whitelist_size", (DL_FUNC) &_rad_whitelist_size, 0},
-    {"_rad_correct_barcodes", (DL_FUNC) &_rad_correct_barcodes, 8},
+    {"_rad_correct_barcodes_rcpp", (DL_FUNC) &_rad_correct_barcodes_rcpp, 8},
     {"_rad_generate_recursive_mutations_gw", (DL_FUNC) &_rad_generate_recursive_mutations_gw, 4},
     {"_rad_prep_read_layout_rcpp", (DL_FUNC) &_rad_prep_read_layout_rcpp, 3},
     {"_rad_generate_position_setup_test", (DL_FUNC) &_rad_generate_position_setup_test, 2},
@@ -427,6 +445,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_rad_generate_recursive_mutations", (DL_FUNC) &_rad_generate_recursive_mutations, 3},
     {"_rad_bit_substring", (DL_FUNC) &_rad_bit_substring, 3},
     {"_rad_kmer_circ", (DL_FUNC) &_rad_kmer_circ, 4},
+    {"_rad_bc_correct_module", (DL_FUNC) &_rad_bc_correct_module, 9},
     {"_rad_sigstream", (DL_FUNC) &_rad_sigstream, 13},
     {"_rad_misalignment_stream", (DL_FUNC) &_rad_misalignment_stream, 5},
     {"_rad_tabulate_barcodes", (DL_FUNC) &_rad_tabulate_barcodes, 3},
