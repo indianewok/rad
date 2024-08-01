@@ -1,10 +1,10 @@
 #!/usr/bin/env Rscript
 
-  libraries <- c("docopt", "data.table", "magrittr", "stringr", "stringdist", "rad")
+  libraries<-c("docopt", "data.table", "magrittr", "stringr", "stringdist", "rad")
   invisible(lapply(libraries, function(lib) {
     if (!require(lib, character.only = TRUE)) {
       install.packages(lib)
-      library(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
+      invisible(library(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE))
     }
   }))
   doc <- "
