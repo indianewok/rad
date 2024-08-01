@@ -571,13 +571,12 @@ process_barcodes<-function(barcode_path, read_layout) {
     int64_seq = sequence_to_bits(seq),
     int64_rcseq = sequence_to_bits(revcomp(seq))
   )]
-  
   if (!is.null(whitelist)){
     barcodes[(is.na(filtered) & stringr::str_length(seq) == expected_length), filtered := ifelse(
       int64_seq %in% whitelist$whitelist_bcs | int64_rcseq %in% whitelist$whitelist_bcs,
-      "whitelisted_barcode", "barcode_to_correct"
+      "whitelist_barcode", "barcode_to_correct"
     )]
-    barcodes[(filtered == "whitelisted_barcode" & pois_dist >= 0.95), filtered := "valid_barcode"]
+    barcodes[(filtered == "whitelist_barcode" & pois_dist >= 0.95), filtered := "pois_validated_barcode"]
   }
   data.table::fwrite(x = barcodes, file = barcode_path)
 }
@@ -634,6 +633,7 @@ process_sig<-function(file_path,
 }
 
 rad_run<-function(
+    start_time = Sys.time()
     fastq_file_or_directory_path, 
     read_layout_path, 
     output_directory_path, 
@@ -703,4 +703,6 @@ rad_run<-function(
   out<-lapply(X = barcode_files, FUN = function(X){
     return(process_barcodes(barcode_path = X, read_layout = read_layout))
   })
+  end_time = Sys.time()
+  cat(paste0("Finished running! Total run time: ", (end_time-start_time), "\n"))
 }

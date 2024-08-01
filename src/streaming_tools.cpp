@@ -1073,7 +1073,7 @@ void tabulate_sigs(const std::string& file_path,
       Rcpp::checkUserInterrupt();
 #pragma omp critical
 {
-  Rcpp::Rcout << "Processed " << sequence_count << " sequences" << std::endl;
+  Rcpp::Rcout << "Processed " << sequence_count << " sigstrings." << std::endl;
 }
     }
   }
@@ -1093,5 +1093,5 @@ void tabulate_sigs(const std::string& file_path,
     summary_ss << concatenate_str << "," << direction_str << "," << entry.second << "\n";
   }
   write_output(summary_output_file, summary_ss.str());
-  Rcpp::Rcout << "Completed processing " << sequence_count << " sequences" << std::endl;
+  Rcpp::Rcout << "Completed processing " << sequence_count << " sigstrings." << std::endl;
 }
