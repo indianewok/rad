@@ -1,13 +1,25 @@
 #!/usr/bin/env Rscript
 
-  libraries<-c("docopt", "data.table", "magrittr", "stringr", "stringdist", "rad")
-  invisible(lapply(libraries, function(lib) {
-    if (!require(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)) {
-      install.packages(lib)
-      invisible(library(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE))
+libraries <- c("docopt", "data.table", "magrittr", "stringr", "stringdist")
+github_libraries <- c("rad" = "indianewok/rad@dev")
+
+install_and_load<-function(lib, repo = NULL) {
+  if (!require(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)) {
+    if (is.null(repo)) {
+      install.packages(lib, repos = "http://cran.us.r-project.org", dependencies = TRUE, quiet = TRUE)
+    } else {
+      if (!require(remotes, quietly = TRUE, warn.conflicts = FALSE)) {
+        install.packages("remotes", repos = "http://cran.us.r-project.org", quiet = TRUE)
+      }
+      remotes::install_github(repo, quiet = TRUE)
     }
-  }))
-  doc <- "
+    invisible(library(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE))
+  }
+}
+
+invisible(lapply(libraries, install_and_load))
+
+doc <- "
 Usage: rad_run.R [--fastq_file_or_directory_path=<path>] [--read_layout_path=<path>] [--output_directory_path=<path>] [--compress] [--generate_sigstring_diagnostics] [--sigstring_diagnostic_verbose] [--misalignment_threshold_path=<path>] [--tabulated_sigstring_count=<count>] [--chunk_size=<size>] [--nthreads=<threads>]
 
 Options:
