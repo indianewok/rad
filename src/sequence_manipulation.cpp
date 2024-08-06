@@ -504,7 +504,6 @@ void bc_correct_module(std::string input_file,
   if (!outfile.is_open()) {
     Rcpp::stop("Could not open output file.");
   }
-  
   // Write the header to the output file
   outfile << "seq,count,filtered,corrected_seq\n";
   
@@ -556,21 +555,15 @@ void bc_correct_module(std::string input_file,
     }
   }
   infile.close();
-  
   // Debugging: Print the parsed input
-  if (verbose) {
-    Rcpp::Rcout << "Parsed " << seq.size() << " entries from the input file.\n";
-  }
-  
+  Rcpp::Rcout << "Parsed " << seq.size() << " entries from the input file.\n";
   // Generate the whitelist from the pois_validated_barcode
   std::unordered_map<int64_t, std::pair<std::string, double>> wl;
-  
   for (size_t i = 0; i < seq.size(); ++i) {
     if (filtered[i] == "pois_validated_barcode") {
       wl[int64_seq[i]] = std::make_pair(seq[i], double(count[i]));
     }
   }
-  
   // Collapse false positives in the whitelist
   for (size_t i = 0; i < seq.size(); ++i) {
     if (filtered[i] == "whitelist_barcode") {
@@ -583,10 +576,9 @@ void bc_correct_module(std::string input_file,
       }
     }
   }
-  
   int corrected_count = 0; // Variable to count the number of corrections
   int scanned_count = 0;   // Variable to count the number of scanned barcodes
-  
+
   omp_set_num_threads(nthreads);
   
 #pragma omp parallel for schedule(dynamic)
@@ -596,11 +588,11 @@ void bc_correct_module(std::string input_file,
       double highest_poisson_score = -1.0;
       int best_distance = std::numeric_limits<int>::max();
       int64_t best_match = 0;
-      
+    
       // First check against pois_validated_barcodes
       for (const auto& validated : wl) {
         int distance = hamming_distance(barcode, validated.first);
-        if (distance <= maxDistance) {
+        if (distance <= 2) {
           double poisson_score = validated.second.second;
           if (poisson_score > highest_poisson_score ||
               (poisson_score == highest_poisson_score && distance < best_distance)) {
@@ -610,14 +602,13 @@ void bc_correct_module(std::string input_file,
           }
         }
       }
-      
       // If no match found, check against whitelist_barcodes
       if (best_match == 0) {
         for (size_t j = 0; j < seq.size(); ++j) {
           if (filtered[j] == "whitelist_barcode") {
             int64_t wl_barcode = int64_seq[j];
             int distance = hamming_distance(barcode, wl_barcode);
-            if (distance <= maxDistance) {
+            if (distance <= 2) {
               double poisson_score = double(count[j]);
               if (poisson_score > highest_poisson_score ||
                   (poisson_score == highest_poisson_score && distance < best_distance)) {
@@ -629,7 +620,7 @@ void bc_correct_module(std::string input_file,
           }
         }
       }
-      
+    
       // If no match found, generate mutations and circular sequences
       if (best_match == 0) {
         auto mutations = generate_recursive_mutations_cpp(barcode, depth, sequence_length);
