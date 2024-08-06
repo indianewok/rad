@@ -486,19 +486,27 @@ int64_t seq_to_int64(const std::string& seq) {
 
 // [[Rcpp::export]]
 void bc_correct_module(std::string input_file,
-                            std::string output_file,
-                            bool verbose = false,
-                            int nthreads = 1,
-                            int maxDistance = 2,
-                            int sequence_length = 16,
-                            int depth = 2,
-                            int breadth = 1,
-                            bool high_speed = true) {
+                       std::string output_file,
+                       bool verbose = false,
+                       int nthreads = 1,
+                       int maxDistance = 2,
+                       int sequence_length = 16,
+                       int depth = 2,
+                       int breadth = 1,
+                       bool high_speed = true) {
   // Read input CSV file
   std::ifstream infile(input_file);
   if (!infile.is_open()) {
     Rcpp::stop("Could not open input file.");
   }
+  
+  std::ofstream outfile(output_file);
+  if (!outfile.is_open()) {
+    Rcpp::stop("Could not open output file.");
+  }
+  
+  // Write the header to the output file
+  outfile << "seq,count,filtered,corrected_seq\n";
   
   std::vector<std::string> seq;
   std::vector<int> count;
@@ -550,7 +558,9 @@ void bc_correct_module(std::string input_file,
   infile.close();
   
   // Debugging: Print the parsed input
-  Rcpp::Rcout << "Parsed " << seq.size() << " entries from the input file.\n";
+  if (verbose) {
+    Rcpp::Rcout << "Parsed " << seq.size() << " entries from the input file.\n";
+  }
   
   // Generate the whitelist from the pois_validated_barcode
   std::unordered_map<int64_t, std::pair<std::string, double>> wl;
@@ -574,8 +584,6 @@ void bc_correct_module(std::string input_file,
     }
   }
   
-  std::vector<std::string> corrected_seq(seq.size(), "");
-  std::vector<int> best_distances(seq.size(), -1);
   int corrected_count = 0; // Variable to count the number of corrections
   int scanned_count = 0;   // Variable to count the number of scanned barcodes
   
@@ -592,9 +600,9 @@ void bc_correct_module(std::string input_file,
       // First check against pois_validated_barcodes
       for (const auto& validated : wl) {
         int distance = hamming_distance(barcode, validated.first);
-        if (distance <= 2) {
+        if (distance <= maxDistance) {
           double poisson_score = validated.second.second;
-          if (poisson_score > highest_poisson_score || 
+          if (poisson_score > highest_poisson_score ||
               (poisson_score == highest_poisson_score && distance < best_distance)) {
             best_match = validated.first;
             highest_poisson_score = poisson_score;
@@ -609,9 +617,9 @@ void bc_correct_module(std::string input_file,
           if (filtered[j] == "whitelist_barcode") {
             int64_t wl_barcode = int64_seq[j];
             int distance = hamming_distance(barcode, wl_barcode);
-            if (distance <= 2) {
+            if (distance <= maxDistance) {
               double poisson_score = double(count[j]);
-              if (poisson_score > highest_poisson_score || 
+              if (poisson_score > highest_poisson_score ||
                   (poisson_score == highest_poisson_score && distance < best_distance)) {
                 best_match = wl_barcode;
                 highest_poisson_score = poisson_score;
@@ -621,6 +629,7 @@ void bc_correct_module(std::string input_file,
           }
         }
       }
+      
       // If no match found, generate mutations and circular sequences
       if (best_match == 0) {
         auto mutations = generate_recursive_mutations_cpp(barcode, depth, sequence_length);
@@ -629,7 +638,7 @@ void bc_correct_module(std::string input_file,
             int dl_distance = dl_dist_cpp({barcode}, {mutation}, maxDistance)[0];
             if (dl_distance <= maxDistance) {
               double poisson_score = wl[mutation].second;
-              if (poisson_score > highest_poisson_score || 
+              if (poisson_score > highest_poisson_score ||
                   (poisson_score == highest_poisson_score && dl_distance < best_distance)) {
                 best_match = mutation;
                 highest_poisson_score = poisson_score;
@@ -647,7 +656,7 @@ void bc_correct_module(std::string input_file,
                 int dl_distance = dl_dist_cpp({barcode}, {mutation}, maxDistance)[0];
                 if (dl_distance <= maxDistance) {
                   double poisson_score = wl[mutation].second;
-                  if (poisson_score > highest_poisson_score || 
+                  if (poisson_score > highest_poisson_score ||
                       (poisson_score == highest_poisson_score && dl_distance < best_distance)) {
                     best_match = mutation;
                     highest_poisson_score = poisson_score;
@@ -659,44 +668,27 @@ void bc_correct_module(std::string input_file,
           }
         }
       }
-      // Updating shared variables within the critical section
+      
+      // Update the output file within the critical section
 #pragma omp critical
 {
   if (best_match != 0) {
-  wl[best_match].second++;
-  filtered[i] = "corrected_barcode";
-  corrected_seq[i] = wl[best_match].first;
-  best_distances[i] = best_distance;
-  corrected_count++;
-
-      } else {
-        corrected_seq[i] = "";
-        best_distances[i] = -1;
-      }
-}      
-#pragma omp atomic
-      scanned_count++;
-      
-      if (scanned_count % 10000 == 0) {
-#pragma omp critical
-{
-  Rcpp::Rcout << scanned_count << " barcodes scanned, " << corrected_count << " barcodes corrected.\n";
+    wl[best_match].second++;
+    filtered[i] = "corrected_barcode";
+    outfile << seq[i] << ',' << count[i] << ",corrected_barcode," << wl[best_match].first << '\n';
+    corrected_count++;
+  } else {
+    outfile << seq[i] << ',' << count[i] << ',' << filtered[i] << ',' << "" << '\n';
+  }
+  
+  scanned_count++;
+  if (scanned_count % 10000 == 0) {
+    Rcpp::Rcout << scanned_count << " barcodes scanned, " << corrected_count << " barcodes corrected.\n";
+  }
 }
-      }
     }
   }
   
   Rcpp::Rcout << "Total barcodes corrected: " << corrected_count << "\n";
-  
-  // Write output to CSV
-  std::ofstream outfile(output_file);
-  if (!outfile.is_open()) {
-    Rcpp::stop("Could not open output file.");
-  }
-  
-  outfile << "seq,count,filtered,corrected_seq\n";
-  for (size_t i = 0; i < seq.size(); ++i) {
-    outfile << seq[i] << ',' << count[i] << ',' << filtered[i] << ',' << corrected_seq[i]  << '\n';
-  }
   outfile.close();
 }

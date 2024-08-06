@@ -1,23 +1,35 @@
 #!/usr/bin/env Rscript
 
-libraries <- c("docopt", "data.table", "magrittr", "stringr", "stringdist")
-github_libraries <- c("rad" = "indianewok/rad@dev")
-
+cat("Welcome to rad! Checking which packages are necessary...\n")
+libraries<-c("docopt", "data.table", "magrittr", "stringr", "stringdist")
+github_libraries<-c("rad" = "indianewok/rad@dev")
 install_and_load<-function(lib, repo = NULL) {
   if (!require(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)) {
     if (is.null(repo)) {
+      cat(paste0("Installing CRAN package: ", lib, "...\n"))
       install.packages(lib, repos = "http://cran.us.r-project.org", dependencies = TRUE, quiet = TRUE)
     } else {
       if (!require(remotes, quietly = TRUE, warn.conflicts = FALSE)) {
+        cat("Installing CRAN package: remotes...\n")
         install.packages("remotes", repos = "http://cran.us.r-project.org", quiet = TRUE)
       }
+      cat(paste0("Installing GitHub package: ", lib, " from ", repo, "...\n"))
       remotes::install_github(repo, quiet = TRUE)
     }
+    cat(paste0("Loading package: ", lib, "...\n"))
     invisible(library(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE))
+  } else {
+    cat(paste0("Package ", lib, " is already installed and loaded.\n"))
   }
 }
-
+cat("Checking CRAN packages...\n")
 invisible(lapply(libraries, install_and_load))
+cat("Checking GitHub packages...\n")
+invisible(lapply(names(github_libraries), function(lib){
+  install_and_load(lib, github_libraries[lib])
+}))
+cat("All necessary R packages are installed and loaded.\n")
+
 
 doc <- "
 Usage: rad_run.R [--fastq_file_or_directory_path=<path>] [--read_layout_path=<path>] [--output_directory_path=<path>] [--compress] [--generate_sigstring_diagnostics] [--sigstring_diagnostic_verbose] [--misalignment_threshold_path=<path>] [--tabulated_sigstring_count=<count>] [--chunk_size=<size>] [--nthreads=<threads>]
@@ -40,11 +52,11 @@ Options:
   
   # Convert arguments to the appropriate types
   arguments$`--tabulated_sigstring_count` <- as.integer(arguments$`--tabulated_sigstring_count`)
-  arguments$`--chunk_size` <- as.integer(arguments$`--chunk_size`)
-  arguments$`--nthreads` <- as.integer(arguments$`--nthreads`)
-  arguments$`--compress` <- !is.null(arguments$`--compress`)
-  arguments$`--generate_sigstring_diagnostics` <- !is.null(arguments$`--generate_sigstring_diagnostics`)
-  arguments$`--sigstring_diagnostic_verbose` <- !is.null(arguments$`--sigstring_diagnostic_verbose`)
+  arguments$`--chunk_size`<-as.integer(arguments$`--chunk_size`)
+  arguments$`--nthreads`<-as.integer(arguments$`--nthreads`)
+  arguments$`--compress`<-!is.null(arguments$`--compress`)
+  arguments$`--generate_sigstring_diagnostics`<-!is.null(arguments$`--generate_sigstring_diagnostics`)
+  arguments$`--sigstring_diagnostic_verbose`<-!is.null(arguments$`--sigstring_diagnostic_verbose`)
   
   # Ensure the function is defined
   if (!exists("rad_run", where = "package:rad", mode = "function")) {
