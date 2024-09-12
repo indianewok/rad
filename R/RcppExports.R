@@ -9,34 +9,6 @@ sigalign_stats <- function(adapters, sequences, nthreads = 1L) {
     .Call(`_rad_sigalign_stats`, adapters, sequences, nthreads)
 }
 
-dl_dist_rcpp <- function(src_input, tgt_input, maxDistance) {
-    .Call(`_rad_dl_dist_rcpp`, src_input, tgt_input, maxDistance)
-}
-
-populate_whitelist <- function(barcodes, poisson_data = numeric(), counts = numeric(), verbose = FALSE) {
-    invisible(.Call(`_rad_populate_whitelist`, barcodes, poisson_data, counts, verbose))
-}
-
-wl_to_df <- function() {
-    .Call(`_rad_wl_to_df`)
-}
-
-clear_whitelist <- function() {
-    invisible(.Call(`_rad_clear_whitelist`))
-}
-
-whitelist_size <- function() {
-    .Call(`_rad_whitelist_size`)
-}
-
-correct_barcodes_rcpp <- function(barcodes, verbose = FALSE, nthreads = 1L, depth = 2L, breadth = 1L, high_speed = TRUE, maxDistance = 2L, sequence_length = 16L) {
-    .Call(`_rad_correct_barcodes_rcpp`, barcodes, verbose, nthreads, depth, breadth, high_speed, maxDistance, sequence_length)
-}
-
-generate_recursive_mutations_gw <- function(barcodes, alpha, error_rate, num_cycles = 10L) {
-    .Call(`_rad_generate_recursive_mutations_gw`, barcodes, alpha, error_rate, num_cycles)
-}
-
 prep_read_layout_rcpp <- function(read_layout, misalignment_threshold, verbose) {
     invisible(.Call(`_rad_prep_read_layout_rcpp`, read_layout, misalignment_threshold, verbose))
 }
@@ -65,14 +37,6 @@ sequence_to_bitlist <- function(sequences) {
     .Call(`_rad_sequence_to_bitlist`, sequences)
 }
 
-qual_to_bits <- function(sequences) {
-    .Call(`_rad_qual_to_bits`, sequences)
-}
-
-qual_to_bitlist <- function(sequences) {
-    .Call(`_rad_qual_to_bitlist`, sequences)
-}
-
 bits_to_sequence <- function(input, sequence_length = 16L) {
     .Call(`_rad_bits_to_sequence`, input, sequence_length)
 }
@@ -85,28 +49,36 @@ revcomp_bits <- function(input, sequence_length = 16L) {
     .Call(`_rad_revcomp_bits`, input, sequence_length)
 }
 
-hamming_bits <- function(int64_a, int64_b, sequence_length = 16L) {
-    .Call(`_rad_hamming_bits`, int64_a, int64_b, sequence_length)
+hamming_distance_rcpp <- function(a, b) {
+    .Call(`_rad_hamming_distance_rcpp`, a, b)
 }
 
-generate_bit_mutations <- function(sequences, sequence_length = 16L) {
-    .Call(`_rad_generate_bit_mutations`, sequences, sequence_length)
+generate_quaternary_mutations <- function(sequences, sequence_length = 32L) {
+    .Call(`_rad_generate_quaternary_mutations`, sequences, sequence_length)
 }
 
-generate_recursive_mutations <- function(sequences, mutation_rounds = 2L, sequence_length = 16L) {
-    .Call(`_rad_generate_recursive_mutations`, sequences, mutation_rounds, sequence_length)
+generate_recursive_quaternary_mutations <- function(sequences, mutation_rounds = 2L, sequence_length = 32L) {
+    .Call(`_rad_generate_recursive_quaternary_mutations`, sequences, mutation_rounds, sequence_length)
 }
 
-bit_substring <- function(bit_sequences, start_pos, stop_pos) {
-    .Call(`_rad_bit_substring`, bit_sequences, start_pos, stop_pos)
+shift_barcodes <- function(sequences, sequence_length, max_shift = 2L, verbose = FALSE) {
+    .Call(`_rad_shift_barcodes`, sequences, sequence_length, max_shift, verbose)
 }
 
-kmer_circ <- function(sequence, base_length = 16L, kmerLength = 16L, verbose = FALSE) {
-    .Call(`_rad_kmer_circ`, sequence, base_length, kmerLength, verbose)
+generate_and_filter_mutations_v3 <- function(true_barcodes, invalid_barcodes, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, input_fastq = "", output_fastq = "", verbose = FALSE, generate_r_output = TRUE, update_fastq = TRUE, barcode_header = "barcode:") {
+    .Call(`_rad_generate_and_filter_mutations_v3`, true_barcodes, invalid_barcodes, mutation_rounds, sequence_length, nthread, max_shift, input_fastq, output_fastq, verbose, generate_r_output, update_fastq, barcode_header)
 }
 
-bc_correct_module <- function(input_file, output_file, verbose = FALSE, nthreads = 1L, maxDistance = 2L, sequence_length = 16L, depth = 2L, breadth = 1L, high_speed = TRUE) {
-    invisible(.Call(`_rad_bc_correct_module`, input_file, output_file, verbose, nthreads, maxDistance, sequence_length, depth, breadth, high_speed))
+generate_and_filter_mutations_v4 <- function(true_barcodes, invalid_barcodes, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, input_fastq = "", output_fastq = "", verbose = FALSE, generate_r_output = TRUE, update_fastq = TRUE, barcode_header = "barcode:", counts_output_csv = "barcode_counts.csv") {
+    .Call(`_rad_generate_and_filter_mutations_v4`, true_barcodes, invalid_barcodes, mutation_rounds, sequence_length, nthread, max_shift, input_fastq, output_fastq, verbose, generate_r_output, update_fastq, barcode_header, counts_output_csv)
+}
+
+generate_and_filter_mutations_v5 <- function(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, input_fastq = "", output_fastq = "", verbose = FALSE, generate_r_output = TRUE, update_fastq = TRUE, barcode_header = "barcode:", counts_output_csv = "barcode_counts.csv") {
+    .Call(`_rad_generate_and_filter_mutations_v5`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, input_fastq, output_fastq, verbose, generate_r_output, update_fastq, barcode_header, counts_output_csv)
+}
+
+generate_and_filter_mutations_v6 <- function(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, input_fastq = "", filtered_fastq = "filtered_fastq.gz", unfiltered_fastq = "unfiltered_fastq.gz", verbose = FALSE, verbose_output = TRUE, barcode_header = "barcode:", detailed_output_csv = "", counts_output_csv = "") {
+    .Call(`_rad_generate_and_filter_mutations_v6`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, input_fastq, filtered_fastq, unfiltered_fastq, verbose, verbose_output, barcode_header, detailed_output_csv, counts_output_csv)
 }
 
 sigstream <- function(input_path, sigstringsFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, outputPath, write_fastq = TRUE, compress = TRUE, max_sequences = -1L, min_length = 100L, verbose = FALSE) {

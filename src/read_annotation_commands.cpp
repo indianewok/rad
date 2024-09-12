@@ -366,15 +366,15 @@ void parse_static_right(const ReadLayout& readLayout, const std::vector<int>& se
           } else {
             if (prePrevElemExists && pre_prevElem->type == "static" && prevElem->global_class != "read") {
               int prevElem_offset = *prevElem->expected_length;
-              secondaryStart = pre_prevElem->class_id + "|stop+" + std::to_string(prevElem_offset);
+              secondaryStart = pre_prevElem->class_id + "|stop+" + std::to_string(prevElem_offset + 1);
               secondaryStop = pre_prevElem->class_id + "|stop+" + std::to_string(prevElem_offset + offset_result);
             } else if (prePrevElemExists && pre_prevElem->type == "variable" && prevElem->global_class != "read") {
-              if (prevElem->global_class == "poly_tail"||*prevElem->expected_length < 13) {
+              if (prevElem->global_class == "poly_tail"||*prevElem->expected_length <= 13) {
                 secondaryStart = pre_prevElem->class_id + "|stop+1|skipped";
                 secondaryStop = pre_prevElem->class_id + "|stop+" + std::to_string(offset_result) + "|skipped";
                 } //added here
               } //else {
-                if(nextNextElemExists && next_nextElem->type == "variable" && nextElem->global_class != "read"){
+                else if(nextNextElemExists && next_nextElem->type == "variable" && nextElem->global_class != "read"){
                   int nextElem_offset = *nextElem->expected_length;
                   secondaryStart = next_nextElem->class_id + "|start-" + std::to_string(offset_result + nextElem_offset) + "|chained_start";
                   secondaryStop = next_nextElem->class_id + "|start-" + std::to_string(nextElem_offset) + "|chained_stop";

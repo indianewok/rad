@@ -1,6 +1,10 @@
 #include "rad.h"
+#include "stringdist_api.h"
+
 using namespace std;
 using namespace Rcpp;
+
+KSEQ_INIT(gzFile, gzread)
 
 std::string revcomp_cpp(const std::string& sequence) {
   std::unordered_map<char, char> complement {
@@ -71,49 +75,6 @@ List sequence_to_bitlist(Rcpp::StringVector sequences) {
   for(int i = 0; i < n; ++i) {
     std::string sequence = as<std::string>(sequences[i]);
     std::vector<int64_t> chunk_results = sequence_to_bits_cpp(sequence);
-    results[i] = wrap(chunk_results);
-  }
-  return results;
-}
-
-std::vector<int64_t> qual_to_bits_cpp(const std::string& qual) {
-  std::vector<int64_t> result;
-  const size_t charsPerInt64 = 8; // Number of characters to pack into an int64_t
-  size_t totalInt64s = (qual.size() + charsPerInt64 - 1) / charsPerInt64;
-  for (size_t i = 0; i < totalInt64s; ++i) {
-    int64_t packedValue = 0;
-    for (size_t j = 0; j < charsPerInt64; ++j) {
-      size_t charIndex = i * charsPerInt64 + j;
-      if (charIndex < qual.size()) {
-        // Shift the packedValue left by 8 bits and add the new character
-        packedValue = (packedValue << 8) | static_cast<unsigned char>(qual[charIndex]);
-      }
-    }
-    result.push_back(packedValue);
-  }
-  
-  return result;
-}
-
-// [[Rcpp::export]]
-Rcpp::NumericVector qual_to_bits(Rcpp::StringVector sequences) {
-  int n = sequences.size();
-  std::vector<int64_t> results;
-  for(int i = 0; i < n; ++i) {
-    std::string sequence = Rcpp::as<std::string>(sequences[i]);
-    std::vector<int64_t> chunk_results = qual_to_bits_cpp(sequence);
-    results.insert(results.end(), chunk_results.begin(), chunk_results.end());
-  }
-  return Rcpp::toInteger64(results);
-}
-
-// [[Rcpp::export]]
-List qual_to_bitlist(StringVector sequences) {
-  int n = sequences.size();
-  List results(n);
-  for(int i = 0; i < n; ++i) {
-    std::string sequence = as<std::string>(sequences[i]);
-    std::vector<int64_t> chunk_results = qual_to_bits_cpp(sequence);
     results[i] = wrap(chunk_results);
   }
   return results;
@@ -205,7 +166,8 @@ std::string bits_to_hex_cpp(const std::vector<int64_t>& input, int sequence_leng
 StringVector bits_to_hex(Rcpp::NumericVector input, int sequence_length = 16) {
   Rcpp::StringVector hex_sequences(input.size());
   std::vector<int64_t> cpp_input = Rcpp::as<std::vector<int64_t>>(input);
-  int slen = sequence_length/2; //for consistency and compression's sake, we convert from a rep of 2 bits->one char to 4 bits->one char
+  int slen = sequence_length/2; 
+  //for consistency and compression's sake, we convert from a rep of 2 bits->one char to 4 bits->one char
   for(size_t i = 0; i < cpp_input.size(); ++i) {
     std::vector<int64_t> single_input = {cpp_input[i]};
     std::string hex_sequence = bits_to_hex_cpp(single_input, slen);
@@ -251,48 +213,55 @@ Rcpp::NumericVector revcomp_bits(Rcpp::NumericVector input, Rcpp::IntegerVector 
   return Rcpp::toInteger64(results);
 }
 
-int hamming_bits_cpp(int64_t a, int64_t b, int sequence_length) {
-  int64_t xor_result = a ^ b; // XOR to find differing bits
-  int count = 0;
-  for (int i = 0; i < sequence_length; i++) {
-    if ((xor_result & 3) != 0) {
-      count++; 
-    }
-    xor_result >>= 2;
-  }
-  return count;
+// Function to calculate the number of differing bits for int64_t sequences
+int hamming_distance(int64_t a, int64_t b) {
+  int bit_diff_count = std::bitset<64>(a ^ b).count();
+  return std::ceil(bit_diff_count / 2.0);  // Base Hamming distance
 }
 
 // [[Rcpp::export]]
-IntegerVector hamming_bits(NumericVector int64_a, NumericVector int64_b, IntegerVector sequence_length = 16) {
-  int n_a = int64_a.size();
-  int n_b = int64_b.size();
-  int n_max = std::max(n_a, n_b); // Determine the maximum length to set as the loop limit
-  IntegerVector distances(n_max);
-  bool use_single_length = sequence_length.size() == 1;
-  int seq_length = use_single_length ? sequence_length[0] : 0; // Use this if only one length is provided
-  std::vector<int64_t> int64_avec = Rcpp::as<std::vector<int64_t>>(int64_a);
-  std::vector<int64_t> int64_bvec = Rcpp::as<std::vector<int64_t>>(int64_b);
-  for (int i = 0; i < n_max; ++i) {
-    // Handle the scenario where one vector has a single value and the other has multiple values
-    int64_t a = (n_a == 1) ? int64_avec[0] : int64_avec[i]; // Use the single value or the current value
-    int64_t b = (n_b == 1) ? int64_bvec[0] : int64_bvec[i]; // Use the single value or the current value
-    int cur_seq = use_single_length ? seq_length : sequence_length[std::min(i, static_cast<int>(sequence_length.size()) - 1)];
-    // Use the single length or individual lengths, ensuring we don't go out of bounds
-    distances[i] = hamming_bits_cpp(a, b, cur_seq);
-  } 
-  return distances;
+int hamming_distance_rcpp(Rcpp::NumericVector a, Rcpp::NumericVector b) {
+  // Convert Rcpp::NumericVector (integer64) to std::vector<int64_t>
+  std::vector<int64_t> a_int = Rcpp::fromInteger64(a);
+  std::vector<int64_t> b_int = Rcpp::fromInteger64(b);
+  
+  if (a_int.size() != 1 || b_int.size() != 1) {
+    Rcpp::stop("Expecting single integer64 values.");
+  }
+  
+  // Return the Hamming distance between the first (and only) elements
+  return hamming_distance(a_int[0], b_int[0]);
 }
 
-std::vector<int64_t> generate_bit_mutations_cpp(int64_t sequence, int sequence_length) {
-  std::vector<int64_t> mutations;
-  for (int position = 0; position < sequence_length; ++position) { // 16 nucleotides in the sequence
-    int64_t original_nucleotide = (sequence >> (2 * position)) & 0b11; // Extract the original nucleotide
+// Function to generate mutations for a single sequence
+std::vector<int64_t> generate_quaternary_mutations_cpp_heap(int64_t sequence, int sequence_length) {
+  // Allocate mutations vector on the heap
+  auto mutations = std::make_unique<std::vector<int64_t>>();
+  for (int position = 0; position < sequence_length; ++position) {
+    int64_t original_nucleotide = (sequence >> (2 * position)) & 0b11;
     for (int64_t new_nucleotide = 0; new_nucleotide < 4; ++new_nucleotide) {
-      if (new_nucleotide != original_nucleotide) { // Ensure we're generating a mutation
-        int64_t mutation_mask = new_nucleotide << (2 * position); // Set the new nucleotide
-        int64_t clear_mask = ~(0b11LL << (2 * position)); // Clear the original nucleotide position
-        int64_t mutated_sequence = (sequence & clear_mask) | mutation_mask; // Apply mutation
+      if (new_nucleotide != original_nucleotide) {
+        int64_t mutation_mask = new_nucleotide << (2 * position);
+        int64_t clear_mask = ~(0b11LL << (2 * position));
+        int64_t mutated_sequence = (sequence & clear_mask) | mutation_mask;
+        mutations->push_back(mutated_sequence);
+      }
+    }
+  }
+  // Return the vector stored on the heap
+  return *mutations;
+}
+
+// Function to generate mutations for a single sequence
+std::vector<int64_t> generate_quaternary_mutations_cpp(int64_t sequence, int sequence_length) {
+  std::vector<int64_t> mutations;
+  for (int position = 0; position < sequence_length; ++position) {
+    int64_t original_nucleotide = (sequence >> (2 * position)) & 0b11;
+    for (int64_t new_nucleotide = 0; new_nucleotide < 4; ++new_nucleotide) {
+      if (new_nucleotide != original_nucleotide) {
+        int64_t mutation_mask = new_nucleotide << (2 * position);
+        int64_t clear_mask = ~(0b11LL << (2 * position));
+        int64_t mutated_sequence = (sequence & clear_mask) | mutation_mask;
         mutations.push_back(mutated_sequence);
       }
     }
@@ -301,385 +270,1345 @@ std::vector<int64_t> generate_bit_mutations_cpp(int64_t sequence, int sequence_l
 }
 
 // [[Rcpp::export]]
-Rcpp::NumericVector generate_bit_mutations(Rcpp::NumericVector sequences, IntegerVector sequence_length = 16) {
+Rcpp::NumericVector generate_quaternary_mutations(Rcpp::NumericVector sequences, Rcpp::IntegerVector sequence_length = 32) {
   std::vector<int64_t> cpp_input_list = Rcpp::as<std::vector<int64_t>>(sequences);
   bool use_sl = sequence_length.size() == 1;
-  int seq_length = use_sl ? sequence_length[0] : 0; // Use this if only one length is provided
-  int n = cpp_input_list.size(); // Number of sequences to process
+  int seq_length = use_sl ? sequence_length[0] : 0;
   std::vector<int64_t> results;
-  for (int i = 0; i < n; ++i) {
-    int64_t bits_input = cpp_input_list[i]; // Directly use the int64_t value
-    int seqlength = use_sl ? seq_length : sequence_length[i]; // Use the single length or individual lengths
-    std::vector<int64_t> subresult = generate_bit_mutations_cpp(bits_input, seqlength); // Corrected call
-    results.insert(results.end(), subresult.begin(), subresult.end());
-  }
-  return Rcpp::toInteger64(results);
-}
-
-std::vector<int64_t> generate_recursive_mutations_cpp(int64_t sequence, int mutation_rounds, int sequence_length = 16) {
-  std::unordered_set<int64_t> mutations{sequence};
-  std::unordered_set<int64_t> new_mutations;
-  for (int round = 0; round < mutation_rounds; ++round) {
-    for (const auto& seq : mutations) {
-      std::vector<int64_t> current_mutations = generate_bit_mutations_cpp(seq, sequence_length);
-      new_mutations.insert(current_mutations.begin(), current_mutations.end());
-    }
-    mutations.insert(new_mutations.begin(), new_mutations.end());
-  }
-  mutations.erase(sequence);
-  return std::vector<int64_t>(mutations.begin(), mutations.end());
-}
-// [[Rcpp::export]]
-Rcpp::NumericVector generate_recursive_mutations(Rcpp::NumericVector sequences, int mutation_rounds = 2, int sequence_length = 16) {
-  std::vector<int64_t> cpp_input_list = Rcpp::as<std::vector<int64_t>>(sequences);
-  std::vector<int64_t> results;
-  for (int64_t bits_input : cpp_input_list) {
-    std::vector<int64_t> subresult = generate_recursive_mutations_cpp(bits_input, mutation_rounds, sequence_length); 
+  for (size_t i = 0; i < cpp_input_list.size(); ++i) {
+    int64_t quaternary_input = cpp_input_list[i];
+    int seqlength = use_sl ? seq_length : sequence_length[i];
+    std::vector<int64_t> subresult = generate_quaternary_mutations_cpp(quaternary_input, seqlength);
     results.insert(results.end(), subresult.begin(), subresult.end());
   }
   return Rcpp::wrap(results);
 }
 
-std::vector<int64_t> extract_subsequence_cpp(const std::vector<int64_t>& input, int start_pos, int stop_pos) {
-  std::vector<int64_t> result;
-  // Calculate start and end elements in the vector
-  int start_element = start_pos / 32;
-  int end_element = stop_pos / 32;
-  int start_bit = (start_pos % 32) * 2;
-  int end_bit = ((stop_pos % 32) + 1) * 2;
-  if (start_element == end_element) {
-    int64_t mask = ((1LL << (end_bit - start_bit)) - 1) << (64 - end_bit);
-    result.push_back((input[start_element] & mask) >> (64 - end_bit));
-    return result;
+// Function to generate recursive mutations
+std::vector<int64_t> generate_recursive_quaternary_mutations_cpp(
+    int64_t sequence, 
+  int mutation_rounds, 
+  int sequence_length = 32) {
+  std::unordered_set<int64_t> all_mutations{sequence};
+  std::vector<int64_t> current_round{sequence};
+  for (int round = 0; round < mutation_rounds; ++round) {
+    std::vector<int64_t> next_round;
+    for (const auto& seq : current_round) {
+      auto mutations = generate_quaternary_mutations_cpp(seq, sequence_length);
+      for (const auto& mutation : mutations) {
+        if (all_mutations.insert(mutation).second) {
+          next_round.push_back(mutation);
+        }
+      }
+    }
+    if (next_round.empty()) break;
+    current_round = std::move(next_round);
   }
-  for (int i = start_element; i <= end_element; ++i) {
-    int64_t mask;
-    if (i == start_element) {
-      mask = (1LL << (64 - start_bit)) - 1;
-      result.push_back((input[i] & mask) >> start_bit);
-    } else if (i == end_element) {
-      mask = ((1LL << end_bit) - 1) << (64 - end_bit);
-      result.push_back((input[i] & mask) >> (64 - end_bit));
-    } else {
-      result.push_back(input[i]);
+  all_mutations.erase(sequence);
+  return std::vector<int64_t>(all_mutations.begin(), all_mutations.end());
+}
+
+std::vector<int64_t> generate_recursive_quaternary_mutations_cpp_v2(
+    int64_t sequence,
+    int mutation_rounds,
+    int sequence_length = 32) {
+  std::unordered_set<int64_t> all_mutations{sequence};
+  std::queue<std::pair<int64_t, int>> sequences_to_mutate;
+  sequences_to_mutate.push({sequence, 0});
+  
+  while (!sequences_to_mutate.empty()) {
+    auto current = sequences_to_mutate.front();
+    int64_t current_seq = current.first;
+    int current_round = current.second;
+    sequences_to_mutate.pop();
+    
+    if (current_round < mutation_rounds) {
+      std::vector<int64_t> new_mutations = generate_quaternary_mutations_cpp(current_seq, sequence_length);
+      for (const auto& mutation : new_mutations) {
+        if (all_mutations.insert(mutation).second) {
+          sequences_to_mutate.push(std::make_pair(mutation, current_round + 1));
+        }
+      }
+    }
+  }
+  return std::vector<int64_t>(all_mutations.begin(), all_mutations.end());
+}
+
+std::vector<int64_t> generate_recursive_quaternary_mutations_cpp_v3(
+    int64_t sequence,
+    int mutation_rounds,
+    int sequence_length = 32) {
+  // Use unique_ptr to allocate containers on the heap
+  auto all_mutations = std::make_unique<std::unordered_set<int64_t>>();
+  all_mutations->insert(sequence);
+  
+  auto sequences_to_mutate = std::make_unique<std::queue<std::pair<int64_t, int>>>();
+  sequences_to_mutate->push({sequence, 0});
+  
+  while (!sequences_to_mutate->empty()) {
+    auto current = sequences_to_mutate->front();
+    int64_t current_seq = current.first;
+    int current_round = current.second;
+    sequences_to_mutate->pop();
+    
+    if (current_round < mutation_rounds) {
+      // Store new mutations on the heap
+      auto new_mutations = std::make_unique<std::vector<int64_t>>(generate_quaternary_mutations_cpp(current_seq, sequence_length));
+      for (const auto& mutation : *new_mutations) {
+        if (all_mutations->insert(mutation).second) {
+          sequences_to_mutate->push(std::make_pair(mutation, current_round + 1));
+        }
+      }
+    }
+  }
+  
+  // Return vector created from the heap-allocated unordered_set
+  return std::vector<int64_t>(all_mutations->begin(), all_mutations->end());
+}
+
+// [[Rcpp::export]]
+Rcpp::NumericVector generate_recursive_quaternary_mutations(
+    Rcpp::NumericVector sequences,
+    int mutation_rounds = 2, 
+  Rcpp::IntegerVector sequence_length = 32) {
+  std::vector<int64_t> cpp_input_list = Rcpp::as<std::vector<int64_t>>(sequences);
+  std::vector<int64_t> results;
+  bool use_sl = sequence_length.size() == 1;
+  int seq_length = use_sl ? sequence_length[0] : 0;
+  
+  for (size_t i = 0; i < cpp_input_list.size(); ++i) {
+    int64_t quaternary_input = cpp_input_list[i];
+    int seqlength = use_sl ? seq_length : sequence_length[i];
+    std::vector<int64_t> subresult = generate_recursive_quaternary_mutations_cpp(quaternary_input, mutation_rounds, seqlength); 
+    results.insert(results.end(), subresult.begin(), subresult.end());
+  }
+  return Rcpp::wrap(results);
+}
+
+// Helper function to print binary representation of int64_t
+std::string int64_to_binary(int64_t value, int length) {
+  std::string binary = std::bitset<64>(value).to_string();
+  return binary.substr(64 - 2*length);
+}
+
+// Helper function to convert int64_t to quaternary string
+std::string int64_to_quaternary(int64_t value, int length) {
+  std::string result;
+  for (int i = length - 1; i >= 0; --i) {
+    int base = (value >> (2 * i)) & 0b11;
+    switch(base) {
+    case 0: result += 'A'; break;
+    case 1: result += 'C'; break;
+    case 2: result += 'T'; break;
+    case 3: result += 'G'; break;
     }
   }
   return result;
 }
 
+std::vector<int64_t> generate_shifted_barcodes(int64_t original, int sequence_length, int max_shift = 2) {
+  std::vector<int64_t> shifted_barcodes;
+  int64_t mask = (1LL << (2 * sequence_length)) - 1;  // Mask for the original sequence length
+  // Generate right shifts
+  for (int shift = 1; shift <= max_shift; ++shift) {
+    for (int padding = 0; padding < 4; ++padding) {
+      int64_t shifted = ((original >> (2 * shift)) & (mask >> (2 * shift))) | (padding << (2 * (sequence_length - shift)));
+      shifted_barcodes.push_back(shifted);
+    }
+  }
+  // Generate left shifts
+  for (int shift = 1; shift <= max_shift; ++shift) {
+    for (int padding = 0; padding < 4; ++padding) {
+      int64_t shifted = ((original << (2 * shift)) & mask) | padding;
+      shifted_barcodes.push_back(shifted);
+    }
+  }
+  return shifted_barcodes;
+}
+
 // [[Rcpp::export]]
-Rcpp::NumericVector bit_substring(Rcpp::NumericVector bit_sequences, int start_pos, int stop_pos) {
-  start_pos = start_pos - 1;
-  stop_pos = stop_pos -1;
-  //fixing this index for r to c++
-  std::vector<int64_t> sequence = Rcpp::as<std::vector<int64_t>>(bit_sequences);
-  std::vector<int64_t> extracted = extract_subsequence_cpp(sequence, start_pos, stop_pos);
-  return Rcpp::toInteger64(extracted);
+Rcpp::List shift_barcodes(
+    SEXP sequences,
+    int sequence_length,
+    int max_shift = 2,
+    bool verbose = false
+  ) {
+  std::vector<int64_t> cpp_input_list = Rcpp::as<std::vector<int64_t>>(sequences);
+  Rcpp::List result(cpp_input_list.size());
+  for (size_t seq_index = 0; seq_index < cpp_input_list.size(); ++seq_index) {
+    int64_t original = cpp_input_list[seq_index];
+    if (verbose) {
+      Rcpp::Rcout << "Processing sequence " << seq_index + 1 << ":\n";
+      Rcpp::Rcout << "Original sequence: " << int64_to_quaternary(original, sequence_length) << "\n";
+      Rcpp::Rcout << "Binary representation: " << int64_to_binary(original, sequence_length) << "\n";
+    }
+    std::vector<int64_t> shifted = generate_shifted_barcodes(original, sequence_length, max_shift);
+    Rcpp::List seq_result(shifted.size());  // +1 to include the original sequence
+    //seq_result[0] = Rcpp::wrap(original);  // Include the original sequence
+    for (size_t i = 0; i < shifted.size(); ++i) {
+      //seq_result[i + 1] = Rcpp::wrap(shifted[i]);
+      seq_result[i] = Rcpp::wrap(shifted[i]);
+      if (verbose) {
+        Rcpp::Rcout << "Shifted " << (i < shifted.size()/2 ? "right" : "left") << ": " 
+                    << int64_to_quaternary(shifted[i], sequence_length) << "\n";
+        Rcpp::Rcout << "Binary: " << int64_to_binary(shifted[i], sequence_length) << "\n";
+      }
+    }
+    result[seq_index] = seq_result;
+  }
+  return result;
 }
 
-std::string to_binary_string(int64_t value, int total_length) {
-  std::string binary = "";
-  for(int i = total_length - 1; i >= 0; --i) {
-    binary += ((value >> i) & 1) ? "1" : "0";
+// Helper function to convert int64_t to string representation
+std::string int64_to_string(uint64_t value, int length) {
+  std::string result;
+  for (int i = length - 1; i >= 0; --i) {
+    int base = (value >> (2 * i)) & 0b11;
+    switch(base) {
+    case 0: result += 'A'; break;
+    case 1: result += 'C'; break;
+    case 2: result += 'T'; break;
+    case 3: result += 'G'; break;
+    }
   }
-  return binary;
+  return result;
 }
 
-std::vector<int64_t> kmer_circ_cpp(int64_t sequence, int base_length, int kmerLength, bool verbose = false) {
-  if(base_length > 32) {
-    throw std::runtime_error("Base length exceeds 32 base pairs limit for int64_t representation.");
+// [[Rcpp::plugins(openmp)]]
+// [[Rcpp::export]]
+Rcpp::List generate_and_filter_mutations_v3(
+    SEXP true_barcodes,
+    SEXP invalid_barcodes,
+    int mutation_rounds = 3,
+    int sequence_length = 16,
+    int nthread = 1,
+    int max_shift = 3,
+    std::string input_fastq = "",
+    std::string output_fastq = "",
+    bool verbose = false,
+    bool generate_r_output = true,
+    bool update_fastq = true,
+    std::string barcode_header = "barcode:") {
+  
+  auto start_time = std::chrono::high_resolution_clock::now();
+  std::vector<int64_t> seq_vec = Rcpp::as<std::vector<int64_t>>(true_barcodes);
+  if (seq_vec.empty()) {
+    Rcpp::stop("Input sequences vector is empty.");
   }
-  int64_t circularizedSequence = sequence | (sequence << (base_length * 2));
+  
+  Rcpp::Rcout << "Number of input correct sequences: " << seq_vec.size() << "\n";
+  std::vector<int64_t> invalid_vec = Rcpp::as<std::vector<int64_t>>(invalid_barcodes);
+  Rcpp::Rcout << "Number of barcodes to correct: " << invalid_vec.size() << "\n";
+  
+  std::unordered_set<int64_t> invalid_set(invalid_vec.begin(), invalid_vec.end());
   if(verbose) {
-    Rcpp::Rcout << "Original sequence in binary: " << to_binary_string(sequence, base_length * 2) << "\n";
-    Rcpp::Rcout << "Circularized sequence in binary: " << to_binary_string(circularizedSequence, base_length * 4) << "\n";
+    Rcpp::Rcout << "Size of invalid_set: " << invalid_set.size() << "\n";
   }
-  std::vector<int64_t> kmers;
-  int totalBases = base_length * 2;
-  for (int start_pos = 1; start_pos <= totalBases - kmerLength - 1; ++start_pos) {
-    int stop_pos = start_pos + kmerLength - 1;
-    std::vector<int64_t> subsequence = extract_subsequence_cpp({circularizedSequence}, start_pos, stop_pos);
-    if (!subsequence.empty()) {
-      kmers.push_back(subsequence[0]);
-      if(verbose) {
-        Rcpp::Rcout << "Kmer " << start_pos + 1 << " in binary: " << to_binary_string(subsequence[0], kmerLength * 2) << "\n";
-      }
-    }
+  
+  std::unordered_set<int64_t> all_unique_results;
+  std::vector<std::pair<int64_t, int64_t>> shifted_results, mutated_results;
+  std::unordered_map<int64_t, std::vector<int64_t>> collision_map;
+  size_t collision_count = 0;
+  
+  Rcpp::Rcout << "Generating shifted and mutated barcodes...\n";
+  
+  size_t total_sequences = seq_vec.size();
+  size_t update_frequency = std::max(static_cast<size_t>(1), total_sequences / 100);
+  size_t next_update = update_frequency;
+  
+  omp_set_num_threads(nthread);
+#pragma omp parallel for schedule(dynamic) reduction(+:collision_count)
+  for (size_t i = 0; i < total_sequences; ++i) {
+    int64_t current_seq = seq_vec[i];
+    // Generate and filter shifted barcodes
+    std::vector<int64_t> shifted_barcodes = generate_shifted_barcodes(current_seq, sequence_length, max_shift);
+    for (const auto& shifted : shifted_barcodes) {
+      if (invalid_set.find(shifted) != invalid_set.end()) {
+#pragma omp critical
+{
+  shifted_results.emplace_back(shifted, current_seq);
+  collision_map[shifted].push_back(current_seq);
+  if (collision_map[shifted].size() > 1) {
+    collision_count++;
   }
-  return kmers;
 }
-
-std::vector<int64_t> kmer_circ_cpp_v2(int64_t sequence, int base_length, int kmerLength, bool verbose = false) {
-  if (base_length > 32) {
-    throw std::runtime_error("Base length exceeds 32 base pairs limit for int64_t representation.");
-  }
-  int64_t circularizedSequence = sequence | (sequence << (base_length * 2));
-  if (verbose) {
-    Rcpp::Rcout << "Original sequence in binary: " << to_binary_string(sequence, base_length * 2) << "\n";
-    Rcpp::Rcout << "Circularized sequence in binary: " << to_binary_string(circularizedSequence, base_length * 4) << "\n";
-  }
-  std::vector<int64_t> kmers;
-  int totalBases = base_length * 2;
-  int endRange = totalBases - kmerLength - 1;
-  // Extract the first two kmers
-  for (int start_pos = 1; start_pos <= 2; ++start_pos) {
-    int stop_pos = start_pos + kmerLength - 1;
-    std::vector<int64_t> subsequence = extract_subsequence_cpp({circularizedSequence}, start_pos, stop_pos);
-    if (!subsequence.empty()) {
-      kmers.push_back(subsequence[0]);
-      if (verbose) {
-        Rcpp::Rcout << "Kmer " << start_pos << " in binary: " << to_binary_string(subsequence[0], kmerLength * 2) << "\n";
       }
     }
+    // Generate and filter mutations
+  std::vector<int64_t> mutations;
+  //#pragma omp critical
+  //{
+    mutations = generate_recursive_quaternary_mutations_cpp_v2(current_seq, mutation_rounds, sequence_length);
+  //}
+    for (const auto& mutation : mutations) {
+      if (invalid_set.find(mutation) != invalid_set.end()) {
+#pragma omp critical
+{
+  mutated_results.emplace_back(mutation, current_seq);
+  collision_map[mutation].push_back(current_seq);
+  if (collision_map[mutation].size() > 1) {
+    collision_count++;
   }
-  // Extract the last two kmers
-  for (int start_pos = endRange - 1; start_pos <= endRange; ++start_pos) {
-    int stop_pos = start_pos + kmerLength - 1;
-    std::vector<int64_t> subsequence = extract_subsequence_cpp({circularizedSequence}, start_pos, stop_pos);
-    if (!subsequence.empty()) {
-      kmers.push_back(subsequence[0]);
-      if (verbose) {
-        Rcpp::Rcout << "Kmer " << start_pos << " in binary: " << to_binary_string(subsequence[0], kmerLength * 2) << "\n";
-      }
-    }
-  }
-  return kmers;
 }
-
-// [[Rcpp::export]]
-Rcpp::NumericVector kmer_circ(SEXP sequence, int base_length = 16, int kmerLength = 16, bool verbose = false) {
-  std::vector<int64_t> sequenceVec = Rcpp::as<std::vector<int64_t>>(Rcpp::NumericVector(sequence));
-  if (sequenceVec.size() != 1) {
-    stop("Expected a single integer64 value.");
-  }
-  std::vector<int64_t> kmers = kmer_circ_cpp_v2(sequenceVec[0], base_length, kmerLength, verbose);
-  return Rcpp::wrap(kmers);
-}
-
-int hamming_distance(int64_t a, int64_t b) {
-  return std::bitset<64>(a ^ b).count();
-}
-// Helper function to convert a DNA sequence to int64
-int64_t seq_to_int64(const std::string& seq) {
-  int64_t result = 0;
-  for (char nucleotide : seq) {
-    result <<= 2;
-    switch (nucleotide) {
-    case 'A':
-      result |= 0;
-      break;
-    case 'C':
-      result |= 1;
-      break;
-    case 'G':
-      result |= 2;
-      break;
-    case 'T':
-      result |= 3;
-      break;
-    default:
-      Rcpp::stop("Invalid nucleotide in sequence");
-    }
-  }
-  return result;
-}
-
-// [[Rcpp::export]]
-void bc_correct_module(std::string input_file,
-                       std::string output_file,
-                       bool verbose = false,
-                       int nthreads = 1,
-                       int maxDistance = 2,
-                       int sequence_length = 16,
-                       int depth = 2,
-                       int breadth = 1,
-                       bool high_speed = true) {
-  // Read input CSV file
-  std::ifstream infile(input_file);
-  if (!infile.is_open()) {
-    Rcpp::stop("Could not open input file.");
-  }
-  
-  std::ofstream outfile(output_file);
-  if (!outfile.is_open()) {
-    Rcpp::stop("Could not open output file.");
-  }
-  // Write the header to the output file
-  outfile << "seq,count,filtered,corrected_seq\n";
-  
-  std::vector<std::string> seq;
-  std::vector<int> count;
-  std::vector<std::string> filtered;
-  std::vector<int64_t> int64_seq;
-  std::vector<int64_t> rc_int64seq;
-  
-  std::string line;
-  
-  // Skip the header row
-  if (!std::getline(infile, line)) {
-    Rcpp::stop("Input file is empty.");
-  }
-  
-  while (std::getline(infile, line)) {
-    std::istringstream ss(line);
-    std::string tmp;
-    
-    std::getline(ss, tmp, ',');
-    seq.push_back(tmp.empty() ? "N" : tmp);  // Fill empty entries with "N"
-    
-    std::getline(ss, tmp, ',');
-    try {
-      count.push_back(tmp.empty() ? 0 : std::stoi(tmp));  // Fill empty entries with 0
-    } catch (const std::invalid_argument& e) {
-      Rcpp::stop("Error parsing count: " + tmp);
-    }
-    
-    std::getline(ss, tmp, ',');
-    filtered.push_back(tmp.empty() ? "unknown" : tmp);  // Fill empty entries with "unknown"
-    
-    // Skip pois_dist column
-    std::getline(ss, tmp, ',');
-    
-    std::getline(ss, tmp, ',');
-    try {
-      int64_seq.push_back(tmp.empty() ? 0 : std::stoll(tmp));  // Fill empty entries with 0
-    } catch (const std::invalid_argument& e) {
-      Rcpp::stop("Error parsing int64_seq: " + tmp);
-    }
-    
-    std::getline(ss, tmp, ',');
-    try {
-      rc_int64seq.push_back(tmp.empty() ? 0 : std::stoll(tmp));  // Fill empty entries with 0
-    } catch (const std::invalid_argument& e) {
-      Rcpp::stop("Error parsing rc_int64seq: " + tmp);
-    }
-  }
-  infile.close();
-  // Debugging: Print the parsed input
-  Rcpp::Rcout << "Parsed " << seq.size() << " entries from the input file.\n";
-  // Generate the whitelist from the pois_validated_barcode
-  std::unordered_map<int64_t, std::pair<std::string, double>> wl;
-  for (size_t i = 0; i < seq.size(); ++i) {
-    if (filtered[i] == "pois_validated_barcode") {
-      wl[int64_seq[i]] = std::make_pair(seq[i], double(count[i]));
-    }
-  }
-  // Collapse false positives in the whitelist
-  for (size_t i = 0; i < seq.size(); ++i) {
-    if (filtered[i] == "whitelist_barcode") {
-      int64_t wl_barcode = int64_seq[i];
-      for (const auto& validated : wl) {
-        if (hamming_distance(wl_barcode, validated.first) <= maxDistance) {
-          wl[validated.first].second = std::max(wl[validated.first].second, double(count[i]));
-          break;
-        }
       }
     }
+    
+#pragma omp critical
+{
+  if (i + 1 >= next_update || i == total_sequences - 1) {
+    double progress = (i + 1.0) / total_sequences * 100.0;
+    std::cout << "\rProgress: " << std::fixed << std::setprecision(1) << progress << "% complete" << std::flush;
+    next_update = std::min(next_update + update_frequency, total_sequences);
   }
-  int corrected_count = 0; // Variable to count the number of corrections
-  int scanned_count = 0;   // Variable to count the number of scanned barcodes
-
-  omp_set_num_threads(nthreads);
+}
+  }
+  Rcpp::Rcout << "\n";
+  Rcpp::Rcout << "Resolving collisions...\n";
   
-#pragma omp parallel for schedule(dynamic)
-  for (size_t i = 0; i < seq.size(); ++i) {
-    if (filtered[i] == "barcode_to_correct") {
-      int64_t barcode = int64_seq[i];
-      double highest_poisson_score = -1.0;
-      int best_distance = std::numeric_limits<int>::max();
-      int64_t best_match = 0;
-    
-      // First check against pois_validated_barcodes
-      for (const auto& validated : wl) {
-        int distance = hamming_distance(barcode, validated.first);
-        if (distance <= 2) {
-          double poisson_score = validated.second.second;
-          if (poisson_score > highest_poisson_score ||
-              (poisson_score == highest_poisson_score && distance < best_distance)) {
-            best_match = validated.first;
-            highest_poisson_score = poisson_score;
-            best_distance = distance;
-          }
-        }
+  std::vector<std::pair<int64_t, std::vector<int64_t>>> resolved_collisions;
+  Rcpp::NumericVector weight = Rcpp::NumericVector::create(1.0, 1.0, 1.0, 1.0);
+  double p = 0.0, bt = 0.0;
+  int q = 1, useBytes = 0;
+  int method = 2; // Damerau-Levenshtein distance
+  
+  for (const auto& entry : collision_map) {
+    if (entry.second.size() > 1) {
+      std::string incorrect_barcode = int64_to_string(entry.first, sequence_length);
+      std::vector<std::string> putative_correct_barcodes;
+      for (const auto& match : entry.second) {
+        putative_correct_barcodes.push_back(int64_to_string(match, sequence_length));
       }
-      // If no match found, check against whitelist_barcodes
-      if (best_match == 0) {
-        for (size_t j = 0; j < seq.size(); ++j) {
-          if (filtered[j] == "whitelist_barcode") {
-            int64_t wl_barcode = int64_seq[j];
-            int distance = hamming_distance(barcode, wl_barcode);
-            if (distance <= 2) {
-              double poisson_score = double(count[j]);
-              if (poisson_score > highest_poisson_score ||
-                  (poisson_score == highest_poisson_score && distance < best_distance)) {
-                best_match = wl_barcode;
-                highest_poisson_score = poisson_score;
-                best_distance = distance;
-              }
-            }
-          }
-        }
-      }
-    
-      // If no match found, generate mutations and circular sequences
-      if (best_match == 0) {
-        auto mutations = generate_recursive_mutations_cpp(barcode, depth, sequence_length);
-        for (auto& mutation : mutations) {
-          if (wl.find(mutation) != wl.end()) {
-            int dl_distance = dl_dist_cpp({barcode}, {mutation}, maxDistance)[0];
-            if (dl_distance <= maxDistance) {
-              double poisson_score = wl[mutation].second;
-              if (poisson_score > highest_poisson_score ||
-                  (poisson_score == highest_poisson_score && dl_distance < best_distance)) {
-                best_match = mutation;
-                highest_poisson_score = poisson_score;
-                best_distance = dl_distance;
-              }
-            }
-          }
-        }
-        if (best_match == 0) {
-          auto circularizedSequences = kmer_circ_cpp(barcode, sequence_length, sequence_length, false);
-          for (auto& circSeq : circularizedSequences) {
-            auto circMutations = generate_recursive_mutations_cpp(circSeq, breadth, sequence_length);
-            for (auto& mutation : circMutations) {
-              if (wl.find(mutation) != wl.end()) {
-                int dl_distance = dl_dist_cpp({barcode}, {mutation}, maxDistance)[0];
-                if (dl_distance <= maxDistance) {
-                  double poisson_score = wl[mutation].second;
-                  if (poisson_score > highest_poisson_score ||
-                      (poisson_score == highest_poisson_score && dl_distance < best_distance)) {
-                    best_match = mutation;
-                    highest_poisson_score = poisson_score;
-                    best_distance = dl_distance;
-                  }
-                }
-              }
-            }
-          }
+      
+      SEXP incorrect_sexp = Rcpp::wrap(incorrect_barcode);
+      SEXP correct_sexp = Rcpp::wrap(putative_correct_barcodes);
+      
+      SEXP dl_dist_results = sd_stringdist(incorrect_sexp, 
+        correct_sexp,
+        Rcpp::wrap(method), 
+        weight,
+        Rcpp::wrap(p), 
+        Rcpp::wrap(bt), 
+        Rcpp::wrap(q), 
+        Rcpp::wrap(useBytes),
+        Rcpp::wrap(nthread));
+      
+      std::vector<double> dl_dist = Rcpp::as<std::vector<double>>(dl_dist_results);
+      
+      double min_distance = *std::min_element(dl_dist.begin(), dl_dist.end());
+      std::vector<int> min_indices;
+      
+      for (int i = 0; i < dl_dist.size(); ++i) {
+        if (dl_dist[i] == min_distance) {
+          min_indices.push_back(i);
         }
       }
       
-      // Update the output file within the critical section
-#pragma omp critical
-{
-  if (best_match != 0) {
-    wl[best_match].second++;
-    filtered[i] = "corrected_barcode";
-    outfile << seq[i] << ',' << count[i] << ",corrected_barcode," << wl[best_match].first << '\n';
-    corrected_count++;
-  } else {
-    outfile << seq[i] << ',' << count[i] << ',' << filtered[i] << ',' << "" << '\n';
-  }
-  
-  scanned_count++;
-  if (scanned_count % 10000 == 0) {
-    Rcpp::Rcout << scanned_count << " barcodes scanned, " << corrected_count << " barcodes corrected.\n";
-  }
-}
+      if (min_indices.size() == 1) {
+        // Single minimum
+        resolved_collisions.emplace_back(entry.first, std::vector<int64_t>{entry.second[min_indices[0]]});
+      } else {
+        // Tie
+        std::vector<int64_t> tied_barcodes;
+        for (int index : min_indices) {
+          tied_barcodes.push_back(entry.second[index]);
+        }
+        resolved_collisions.emplace_back(entry.first, tied_barcodes);
+      }
     }
   }
   
-  Rcpp::Rcout << "Total barcodes corrected: " << corrected_count << "\n";
-  outfile.close();
+  Rcpp::Rcout << "Shifted results: " << shifted_results.size() << "\n";
+  Rcpp::Rcout << "Mutated results: " << mutated_results.size() << "\n";
+  Rcpp::Rcout << "Resolved collisions: " << resolved_collisions.size() << "\n";
+  
+  // Process FASTQ file if provided
+  if (!input_fastq.empty() && update_fastq) {
+    std::cout << "Processing FASTQ file...\n";
+    // Open input gzipped FASTQ file for reading
+    gzFile fp = gzopen(input_fastq.c_str(), "r");
+    if (fp == NULL) {
+      Rcpp::stop("Failed to open input FASTQ file.");
+    }
+    // Open output gzipped FASTQ file for writing
+    gzFile gz_out = gzopen(output_fastq.c_str(), "wb");
+    if (gz_out == NULL) {
+      gzclose(fp);
+      Rcpp::stop("Failed to open output FASTQ file.");
+    }
+    
+    kseq_t* seq = kseq_init(fp);
+    
+    std::unordered_map<int64_t, int64_t> correction_map;
+    
+    // Prepare correction map
+    for (const auto& result : shifted_results) {
+      correction_map[result.first] = result.second;
+    }
+    for (const auto& result : mutated_results) {
+      correction_map[result.first] = result.second;
+    }
+    for (const auto& result : resolved_collisions) {
+      if (result.second.size() == 1) {
+        correction_map[result.first] = result.second[0];
+      }
+    }
+    
+    size_t processed_reads = 0;
+    while (kseq_read(seq) >= 0) {
+      std::string name(seq->name.s);
+      size_t header_pos = name.find(barcode_header);
+      if (header_pos != std::string::npos) {
+        size_t barcode_start = header_pos + barcode_header.length();
+        size_t barcode_end = name.find_first_of(" \t", barcode_start);
+        if (barcode_end == std::string::npos) {
+          barcode_end = name.length();
+        }
+        std::string barcode_str = name.substr(barcode_start, barcode_end - barcode_start);
+        
+        std::vector<int64_t> barcode_bits = sequence_to_bits_cpp(barcode_str);
+        if (!barcode_bits.empty()) {
+          auto it = correction_map.find(barcode_bits[0]);
+          if (it != correction_map.end()) {
+            // Replace the incorrect barcode with the corrected one
+            std::string corrected_barcode = int64_to_string(it->second, sequence_length);
+            std::string corrected_name = name.substr(0, barcode_start) + corrected_barcode + name.substr(barcode_end);
+            gzprintf(gz_out, "@%s\n", corrected_name.c_str());
+          } else {
+            gzprintf(gz_out, "@%s\n", name.c_str());
+          }
+        } else {
+          gzprintf(gz_out, "@%s\n", name.c_str());
+        }
+      } else {
+        gzprintf(gz_out, "@%s\n", name.c_str());
+      }
+      
+      gzprintf(gz_out, "%s\n", seq->seq.s);
+      gzprintf(gz_out, "+%s\n", seq->comment.l ? seq->comment.s : "");
+      gzprintf(gz_out, "%s\n", seq->qual.s);
+      
+      processed_reads++;
+      if (processed_reads % 1000000 == 0) {
+        std::cout << "\rProcessed " << processed_reads << " reads..." << std::flush;
+      }
+    }
+    
+    std::cout << "\nFASTQ processing complete. Processed " << processed_reads << " reads.\n";
+    
+    kseq_destroy(seq);
+    gzclose(fp);
+    gzclose(gz_out);  // Close the output file
+    
+    std::cout << "FASTQ file updated.\n";
+  }
+  
+  auto end_time = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+  std::cout << "Total execution time: " << duration.count() << " seconds\n";
+  
+  if (generate_r_output) {
+    // Prepare results for R
+    Rcpp::List r_shifted_results(shifted_results.size());
+    Rcpp::List r_mutated_results(mutated_results.size());
+    Rcpp::List r_resolved_collisions(resolved_collisions.size());
+    
+    for (size_t i = 0; i < shifted_results.size(); ++i) {
+      r_shifted_results[i] = Rcpp::List::create(
+        Rcpp::Named("incorrect_barcode") = Rcpp::wrap(shifted_results[i].first),
+        Rcpp::Named("corrected_barcode") = Rcpp::wrap(shifted_results[i].second),
+        Rcpp::Named("type") = "shifted"
+      );
+    }
+    
+    for (size_t i = 0; i < mutated_results.size(); ++i) {
+      r_mutated_results[i] = Rcpp::List::create(
+        Rcpp::Named("incorrect_barcode") = Rcpp::wrap(mutated_results[i].first),
+        Rcpp::Named("corrected_barcode") = Rcpp::wrap(mutated_results[i].second),
+        Rcpp::Named("type") = "mutated"
+      );
+    }
+    
+    for (size_t i = 0; i < resolved_collisions.size(); ++i) {
+      r_resolved_collisions[i] = Rcpp::List::create(
+        Rcpp::Named("incorrect_barcode") = Rcpp::wrap(resolved_collisions[i].first),
+        Rcpp::Named("corrected_barcodes") = Rcpp::wrap(resolved_collisions[i].second),
+        Rcpp::Named("type") = resolved_collisions[i].second.size() == 1 ? "resolved_single" : "unresolved"
+      );
+    }
+    
+    return Rcpp::List::create(
+      Rcpp::Named("shifted") = r_shifted_results,
+      Rcpp::Named("mutated") = r_mutated_results,
+      Rcpp::Named("resolved") = r_resolved_collisions
+    );
+  } else {
+    return Rcpp::List::create(Rcpp::Named("message") = "Processing complete");
+  }
+}
+
+// [[Rcpp::plugins(openmp)]]
+// [[Rcpp::export]]
+Rcpp::List generate_and_filter_mutations_v4(
+    SEXP true_barcodes,
+    SEXP invalid_barcodes,
+    int mutation_rounds = 3,
+    int sequence_length = 16,
+    int nthread = 1,
+    int max_shift = 3,
+    std::string input_fastq = "",
+    std::string output_fastq = "",
+    bool verbose = false,
+    bool generate_r_output = true,
+    bool update_fastq = true,
+    std::string barcode_header = "barcode:",
+    std::string counts_output_csv = "barcode_counts.csv") {
+  
+  auto start_time = std::chrono::high_resolution_clock::now();
+  
+  // Step 1: Initialize input vectors and validate
+  std::vector<int64_t> seq_vec = Rcpp::as<std::vector<int64_t>>(true_barcodes);
+  if (seq_vec.empty()) {
+    Rcpp::stop("Input sequences vector is empty.");
+  }
+  
+  Rcpp::Rcout << "Number of input correct sequences: " << seq_vec.size() << "\n";
+  std::vector<int64_t> invalid_vec = Rcpp::as<std::vector<int64_t>>(invalid_barcodes);
+  Rcpp::Rcout << "Number of barcodes to correct: " << invalid_vec.size() << "\n";
+  
+  std::unordered_set<int64_t> invalid_set(invalid_vec.begin(), invalid_vec.end());
+  if(verbose) {
+    Rcpp::Rcout << "Size of invalid_set: " << invalid_set.size() << "\n";
+  }
+  
+  // Step 2: Initialize data structures to store results and track counts
+  std::unordered_set<int64_t> all_unique_results;
+  std::vector<std::pair<int64_t, int64_t>> shifted_results, mutated_results;
+  std::unordered_map<int64_t, std::vector<int64_t>> collision_map;
+  std::unordered_map<int64_t, int> original_counts, corrected_counts;  // Track original and corrected counts
+  size_t collision_count = 0;
+  
+  Rcpp::Rcout << "Generating shifted and mutated barcodes...\n";
+  
+  size_t total_sequences = seq_vec.size();
+  size_t update_frequency = std::max(static_cast<size_t>(1), total_sequences / 100);
+  size_t next_update = update_frequency;
+  
+  // Step 3: OpenMP parallel loop for barcode correction
+  omp_set_num_threads(nthread);
+#pragma omp parallel for schedule(dynamic) reduction(+:collision_count)
+  for (size_t i = 0; i < total_sequences; ++i) {
+    int64_t current_seq = seq_vec[i];
+    original_counts[current_seq]++;  // Track original counts
+    
+    // Generate and filter shifted barcodes
+    std::vector<int64_t> shifted_barcodes = generate_shifted_barcodes(current_seq, sequence_length, max_shift);
+    for (const auto& shifted : shifted_barcodes) {
+      if (invalid_set.find(shifted) != invalid_set.end()) {
+#pragma omp critical
+{
+  shifted_results.emplace_back(shifted, current_seq);
+  collision_map[shifted].push_back(current_seq);
+  if (collision_map[shifted].size() > 1) {
+    collision_count++;
+  }
+}
+      }
+    }
+    
+    // Generate and filter mutations
+    std::vector<int64_t> mutations = generate_recursive_quaternary_mutations_cpp_v2(current_seq, mutation_rounds, sequence_length);
+    for (const auto& mutation : mutations) {
+      if (invalid_set.find(mutation) != invalid_set.end()) {
+#pragma omp critical
+{
+  mutated_results.emplace_back(mutation, current_seq);
+  collision_map[mutation].push_back(current_seq);
+  if (collision_map[mutation].size() > 1) {
+    collision_count++;
+  }
+}
+      }
+    }
+    
+#pragma omp critical
+{
+  if (i + 1 >= next_update || i == total_sequences - 1) {
+    double progress = (i + 1.0) / total_sequences * 100.0;
+    std::cout << "\rProgress: " << std::fixed << std::setprecision(1) << progress << "% complete" << std::flush;
+    next_update = std::min(next_update + update_frequency, total_sequences);
+  }
+}
+  }
+  Rcpp::Rcout << "\n";
+  Rcpp::Rcout << "Resolving collisions...\n";
+  
+  // Step 4: Collision resolution using Damerau-Levenshtein distance
+  std::vector<std::pair<int64_t, std::vector<int64_t>>> resolved_collisions;
+  Rcpp::NumericVector weight = Rcpp::NumericVector::create(1.0, 1.0, 1.0, 1.0);
+  double p = 0.0, bt = 0.0;
+  int q = 1, useBytes = 0;
+  int method = 2;  // Damerau-Levenshtein distance
+  
+  for (const auto& entry : collision_map) {
+    if (entry.second.size() > 1) {
+      std::string incorrect_barcode = int64_to_string(entry.first, sequence_length);
+      std::vector<std::string> putative_correct_barcodes;
+      for (const auto& match : entry.second) {
+        putative_correct_barcodes.push_back(int64_to_string(match, sequence_length));
+      }
+      
+      SEXP incorrect_sexp = Rcpp::wrap(incorrect_barcode);
+      SEXP correct_sexp = Rcpp::wrap(putative_correct_barcodes);
+      
+      SEXP dl_dist_results = sd_stringdist(incorrect_sexp, correct_sexp, Rcpp::wrap(method), weight, Rcpp::wrap(p), Rcpp::wrap(bt), Rcpp::wrap(q), Rcpp::wrap(useBytes), Rcpp::wrap(nthread));
+      
+      std::vector<double> dl_dist = Rcpp::as<std::vector<double>>(dl_dist_results);
+      double min_distance = *std::min_element(dl_dist.begin(), dl_dist.end());
+      std::vector<int> min_indices;
+      
+      for (int i = 0; i < dl_dist.size(); ++i) {
+        if (dl_dist[i] == min_distance) {
+          min_indices.push_back(i);
+        }
+      }
+      
+      if (min_indices.size() == 1) {
+        // Single minimum
+        resolved_collisions.emplace_back(entry.first, std::vector<int64_t>{entry.second[min_indices[0]]});
+      } else {
+        // Tie
+        std::vector<int64_t> tied_barcodes;
+        for (int index : min_indices) {
+          tied_barcodes.push_back(entry.second[index]);
+        }
+        resolved_collisions.emplace_back(entry.first, tied_barcodes);
+      }
+    }
+  }
+  
+  // Step 5: Prepare correction map for fastq updates
+  std::unordered_map<int64_t, int64_t> correction_map;
+  for (const auto& result : shifted_results) {
+    correction_map[result.first] = result.second;
+    corrected_counts[result.second]++;  // Update corrected counts
+  }
+  for (const auto& result : mutated_results) {
+    correction_map[result.first] = result.second;
+    corrected_counts[result.second]++;
+  }
+  for (const auto& result : resolved_collisions) {
+    if (result.second.size() == 1) {
+      correction_map[result.first] = result.second[0];
+      corrected_counts[result.second[0]]++;
+    }
+  }
+  
+  // Step 6: Process FASTQ file and update barcodes if required
+  if (!input_fastq.empty() && update_fastq) {
+    std::cout << "Processing FASTQ file...\n";
+    // Open input gzipped FASTQ file for reading
+    gzFile fp = gzopen(input_fastq.c_str(), "r");
+    if (fp == NULL) {
+      Rcpp::stop("Failed to open input FASTQ file.");
+    }
+    // Open output gzipped FASTQ file for writing
+    gzFile gz_out = gzopen(output_fastq.c_str(), "wb");
+    if (gz_out == NULL) {
+      gzclose(fp);
+      Rcpp::stop("Failed to open output FASTQ file.");
+    }
+    
+    kseq_t* seq = kseq_init(fp);
+    size_t processed_reads = 0;
+    while (kseq_read(seq) >= 0) {
+      std::string name(seq->name.s);
+      size_t header_pos = name.find(barcode_header);
+      if (header_pos != std::string::npos) {
+        size_t barcode_start = header_pos + barcode_header.length();
+        size_t barcode_end = name.find_first_of(" \t", barcode_start);
+        if (barcode_end == std::string::npos) {
+          barcode_end = name.length();
+        }
+        std::string barcode_str = name.substr(barcode_start, barcode_end - barcode_start);
+        std::vector<int64_t> barcode_bits = sequence_to_bits_cpp(barcode_str);
+        if (!barcode_bits.empty()) {
+          auto it = correction_map.find(barcode_bits[0]);
+          if (it != correction_map.end()) {
+            // Replace the incorrect barcode with the corrected one
+            std::string corrected_barcode = int64_to_string(it->second, sequence_length);
+            std::string corrected_name = name.substr(0, barcode_start) + corrected_barcode + name.substr(barcode_end);
+            gzprintf(gz_out, "@%s\n", corrected_name.c_str());
+          } else {
+            gzprintf(gz_out, "@%s\n", name.c_str());
+          }
+        } else {
+          gzprintf(gz_out, "@%s\n", name.c_str());
+        }
+      } else {
+        gzprintf(gz_out, "@%s\n", name.c_str());
+      }
+      
+      gzprintf(gz_out, "%s\n", seq->seq.s);
+      gzprintf(gz_out, "+%s\n", seq->comment.l ? seq->comment.s : "");
+      gzprintf(gz_out, "%s\n", seq->qual.s);
+      
+      processed_reads++;
+      if (processed_reads % 1000000 == 0) {
+        std::cout << "\rProcessed " << processed_reads << " reads..." << std::flush;
+      }
+    }
+    
+    std::cout << "\nFASTQ processing complete. Processed " << processed_reads << " reads.\n";
+    
+    kseq_destroy(seq);
+    gzclose(fp);
+    gzclose(gz_out);  // Close the output file
+    
+    std::cout << "FASTQ file updated.\n";
+  }
+  
+  // Step 7: Write barcode counts to CSV
+  std::ofstream csv_file(counts_output_csv);
+  csv_file << "barcode,original_counts,corrected_counts,total_counts\n";
+  for (const auto& [barcode, orig_count] : original_counts) {
+    int corrected_count = corrected_counts[barcode];
+    csv_file << int64_to_string(barcode, sequence_length) << ","
+             << orig_count << ","
+             << corrected_count << ","
+             << (orig_count + corrected_count) << "\n";
+  }
+  csv_file.close();
+  
+  // Step 8: Generate R output if requested
+  if (generate_r_output) {
+    // Prepare results for R
+    Rcpp::List r_shifted_results(shifted_results.size());
+    Rcpp::List r_mutated_results(mutated_results.size());
+    Rcpp::List r_resolved_collisions(resolved_collisions.size());
+    
+    for (size_t i = 0; i < shifted_results.size(); ++i) {
+      r_shifted_results[i] = Rcpp::List::create(
+        Rcpp::Named("incorrect_barcode") = Rcpp::wrap(shifted_results[i].first),
+        Rcpp::Named("corrected_barcode") = Rcpp::wrap(shifted_results[i].second),
+        Rcpp::Named("type") = "shifted"
+      );
+    }
+    
+    for (size_t i = 0; i < mutated_results.size(); ++i) {
+      r_mutated_results[i] = Rcpp::List::create(
+        Rcpp::Named("incorrect_barcode") = Rcpp::wrap(mutated_results[i].first),
+        Rcpp::Named("corrected_barcode") = Rcpp::wrap(mutated_results[i].second),
+        Rcpp::Named("type") = "mutated"
+      );
+    }
+    
+    for (size_t i = 0; i < resolved_collisions.size(); ++i) {
+      r_resolved_collisions[i] = Rcpp::List::create(
+        Rcpp::Named("incorrect_barcode") = Rcpp::wrap(resolved_collisions[i].first),
+        Rcpp::Named("corrected_barcodes") = Rcpp::wrap(resolved_collisions[i].second),
+        Rcpp::Named("type") = resolved_collisions[i].second.size() == 1 ? "resolved_single" : "unresolved"
+      );
+    }
+    
+    return Rcpp::List::create(
+      Rcpp::Named("shifted") = r_shifted_results,
+      Rcpp::Named("mutated") = r_mutated_results,
+      Rcpp::Named("resolved") = r_resolved_collisions
+    );
+  } else {
+    return Rcpp::List::create(Rcpp::Named("message") = "Processing complete");
+  }
+}
+
+// [[Rcpp::plugins(openmp)]]
+// [[Rcpp::export]]
+Rcpp::List generate_and_filter_mutations_v5(
+    SEXP true_barcodes,
+    SEXP invalid_barcodes,
+    SEXP true_counts,
+    SEXP invalid_counts,
+    int mutation_rounds = 3,
+    int sequence_length = 16,
+    int nthread = 1,
+    int max_shift = 3,
+    std::string input_fastq = "",
+    std::string output_fastq = "",
+    bool verbose = false,
+    bool generate_r_output = true,
+    bool update_fastq = true,
+    std::string barcode_header = "barcode:",
+    std::string counts_output_csv = "barcode_counts.csv") {
+  
+  auto start_time = std::chrono::high_resolution_clock::now();
+  
+  // Step 1: Initialize input vectors and validate
+  std::vector<int64_t> seq_vec = Rcpp::as<std::vector<int64_t>>(true_barcodes);
+  std::vector<int> original_counts_input = Rcpp::as<std::vector<int>>(true_counts);
+  Rcpp::Rcout << "Number of input correct sequences: " << seq_vec.size() << "\n";
+  
+  if (seq_vec.empty()) {
+    Rcpp::stop("Input sequences vector is empty.");
+  }
+  
+  std::vector<int64_t> invalid_vec = Rcpp::as<std::vector<int64_t>>(invalid_barcodes);
+  std::vector<int> invalid_counts_input = Rcpp::as<std::vector<int>>(invalid_counts);
+  Rcpp::Rcout << "Number of barcodes to correct: " << invalid_vec.size() << "\n";
+  
+  std::unordered_set<int64_t> invalid_set(invalid_vec.begin(), invalid_vec.end());
+  if(verbose) {
+    Rcpp::Rcout << "Size of invalid_set: " << invalid_set.size() << "\n";
+  }
+  
+  // Step 2: Initialize data structures to store results and track counts
+  std::vector<std::pair<int64_t, int64_t>> shifted_results, mutated_results;
+  std::unordered_map<int64_t, std::vector<int64_t>> collision_map;
+  std::unordered_map<int64_t, int64_t> correction_map;
+  
+  std::unordered_map<int64_t, int> original_counts, corrected_counts;
+  for (size_t i = 0; i < seq_vec.size(); ++i) {
+    original_counts[seq_vec[i]] = original_counts_input[i];
+  }
+  for (size_t i = 0; i < invalid_vec.size(); ++i) {
+    corrected_counts[invalid_vec[i]] = 0;  // Initialize corrected counts for invalid barcodes
+  }
+  
+  size_t collision_count = 0;
+  
+  Rcpp::Rcout << "Generating shifted and mutated barcodes...\n";
+  
+  size_t total_sequences = seq_vec.size();
+  size_t update_frequency = std::max(static_cast<size_t>(1), total_sequences / 100);
+  size_t next_update = update_frequency;
+  
+  // Step 3: OpenMP parallel loop for barcode correction
+  omp_set_num_threads(nthread);
+#pragma omp parallel for schedule(dynamic) reduction(+:collision_count)
+  for (size_t i = 0; i < total_sequences; ++i) {
+    int64_t current_seq = seq_vec[i];
+    
+    // Generate and filter shifted barcodes
+    std::vector<int64_t> shifted_barcodes = generate_shifted_barcodes(current_seq, sequence_length, max_shift);
+    for (const auto& shifted : shifted_barcodes) {
+      if (invalid_set.find(shifted) != invalid_set.end()) {
+#pragma omp critical
+{
+  shifted_results.emplace_back(shifted, current_seq);
+  collision_map[shifted].push_back(current_seq);
+  if (collision_map[shifted].size() > 1) {
+    collision_count++;
+  }
+}
+      }
+    }
+    
+    // Generate and filter mutations
+    std::vector<int64_t> mutations = generate_recursive_quaternary_mutations_cpp_v2(current_seq, mutation_rounds, sequence_length);
+    for (const auto& mutation : mutations) {
+      if (invalid_set.find(mutation) != invalid_set.end()) {
+#pragma omp critical
+{
+  mutated_results.emplace_back(mutation, current_seq);
+  collision_map[mutation].push_back(current_seq);
+  if (collision_map[mutation].size() > 1) {
+    collision_count++;
+  }
+}
+      }
+    }
+    
+#pragma omp critical
+{
+  if (i + 1 >= next_update || i == total_sequences - 1) {
+    double progress = (i + 1.0) / total_sequences * 100.0;
+    std::cout << "\rProgress: " << std::fixed << std::setprecision(1) << progress << "% complete" << std::flush;
+    next_update = std::min(next_update + update_frequency, total_sequences);
+  }
+}
+  }
+  Rcpp::Rcout << "\n";
+  Rcpp::Rcout << "Resolving collisions...\n";
+  
+  // Step 4: Collision resolution using Damerau-Levenshtein distance
+  std::vector<std::pair<int64_t, std::vector<int64_t>>> resolved_collisions;
+  Rcpp::NumericVector weight = Rcpp::NumericVector::create(1.0, 1.0, 1.0, 1.0);
+  double p = 0.0, bt = 0.0;
+  int q = 1, useBytes = 0;
+  int method = 2;  // Damerau-Levenshtein distance
+  
+  for (const auto& entry : collision_map) {
+    if (entry.second.size() > 1) {
+      std::string incorrect_barcode = int64_to_string(entry.first, sequence_length);
+      std::vector<std::string> putative_correct_barcodes;
+      for (const auto& match : entry.second) {
+        putative_correct_barcodes.push_back(int64_to_string(match, sequence_length));
+      }
+      
+      SEXP incorrect_sexp = Rcpp::wrap(incorrect_barcode);
+      SEXP correct_sexp = Rcpp::wrap(putative_correct_barcodes);
+      
+      SEXP dl_dist_results = sd_stringdist(incorrect_sexp, correct_sexp, Rcpp::wrap(method), weight, Rcpp::wrap(p), Rcpp::wrap(bt), Rcpp::wrap(q), Rcpp::wrap(useBytes), Rcpp::wrap(nthread));
+      
+      std::vector<double> dl_dist = Rcpp::as<std::vector<double>>(dl_dist_results);
+      double min_distance = *std::min_element(dl_dist.begin(), dl_dist.end());
+      std::vector<int> min_indices;
+      
+      for (int i = 0; i < dl_dist.size(); ++i) {
+        if (dl_dist[i] == min_distance) {
+          min_indices.push_back(i);
+        }
+      }
+      
+      if (min_indices.size() == 1) {
+        // Single minimum
+        resolved_collisions.emplace_back(entry.first, std::vector<int64_t>{entry.second[min_indices[0]]});
+      } else {
+        // Tie
+        std::vector<int64_t> tied_barcodes;
+        for (int index : min_indices) {
+          tied_barcodes.push_back(entry.second[index]);
+        }
+        resolved_collisions.emplace_back(entry.first, tied_barcodes);
+      }
+    }
+  }
+  
+  // Step 5: Prepare correction map for fastq updates
+  for (const auto& result : shifted_results) {
+    correction_map[result.first] = result.second;
+    corrected_counts[result.second]++;  // Update corrected counts
+  }
+  for (const auto& result : mutated_results) {
+    correction_map[result.first] = result.second;
+    corrected_counts[result.second]++;
+  }
+  for (const auto& result : resolved_collisions) {
+    if (result.second.size() == 1) {
+      correction_map[result.first] = result.second[0];
+      corrected_counts[result.second[0]]++;
+    }
+  }
+  
+  // Step 6: Process FASTQ file and update barcodes if required
+  if (!input_fastq.empty() && update_fastq) {
+    std::cout << "Processing FASTQ file...\n";
+    gzFile fp = gzopen(input_fastq.c_str(), "r");
+    if (fp == NULL) {
+      Rcpp::stop("Failed to open input FASTQ file.");
+    }
+    gzFile gz_out = gzopen(output_fastq.c_str(), "wb");
+    if (gz_out == NULL) {
+      gzclose(fp);
+      Rcpp::stop("Failed to open output FASTQ file.");
+    }
+    
+    kseq_t* seq = kseq_init(fp);
+    size_t processed_reads = 0;
+    while (kseq_read(seq) >= 0) {
+      std::string name(seq->name.s);
+      size_t header_pos = name.find(barcode_header);
+      if (header_pos != std::string::npos) {
+        size_t barcode_start = header_pos + barcode_header.length();
+        size_t barcode_end = name.find_first_of(" \t", barcode_start);
+        if (barcode_end == std::string::npos) {
+          barcode_end = name.length();
+        }
+        std::string barcode_str = name.substr(barcode_start, barcode_end - barcode_start);
+        std::vector<int64_t> barcode_bits = sequence_to_bits_cpp(barcode_str);
+        if (!barcode_bits.empty()) {
+          auto it = correction_map.find(barcode_bits[0]);
+          if (it != correction_map.end()) {
+            std::string corrected_barcode = int64_to_string(it->second, sequence_length);
+            std::string corrected_name = name.substr(0, barcode_start) + corrected_barcode + name.substr(barcode_end);
+            gzprintf(gz_out, "@%s\n", corrected_name.c_str());
+          } else {
+            gzprintf(gz_out, "@%s\n", name.c_str());
+          }
+        } else {
+          gzprintf(gz_out, "@%s\n", name.c_str());
+        }
+      } else {
+        gzprintf(gz_out, "@%s\n", name.c_str());
+      }
+      
+      gzprintf(gz_out, "%s\n", seq->seq.s);
+      gzprintf(gz_out, "+%s\n", seq->comment.l ? seq->comment.s : "");
+      gzprintf(gz_out, "%s\n", seq->qual.s);
+      
+      processed_reads++;
+      if (processed_reads % 1000000 == 0) {
+        std::cout << "\rProcessed " << processed_reads << " reads..." << std::flush;
+      }
+    }
+    std::cout << "\nFASTQ processing complete. Processed " << processed_reads << " reads.\n";
+    kseq_destroy(seq);
+    gzclose(fp);
+    gzclose(gz_out);  // Close the output file
+    std::cout << "FASTQ file updated.\n";
+  }
+  // Step 7: Write barcode counts to CSV
+  std::ofstream csv_file(counts_output_csv);
+  csv_file << "barcode,original_counts,corrected_counts,total_counts\n";
+  for (const auto& [barcode, orig_count] : original_counts) {
+    int corrected_count = corrected_counts[barcode];
+    csv_file << int64_to_string(barcode, sequence_length) << ","
+             << orig_count << ","
+             << corrected_count << ","
+             << (orig_count + corrected_count) << "\n";
+  }
+  csv_file.close();
+  
+  // Step 8: Generate R output if requested
+  if (generate_r_output) {
+    Rcpp::List r_shifted_results(shifted_results.size());
+    Rcpp::List r_mutated_results(mutated_results.size());
+    Rcpp::List r_resolved_collisions(resolved_collisions.size());
+    
+    for (size_t i = 0; i < shifted_results.size(); ++i) {
+      r_shifted_results[i] = Rcpp::List::create(
+        Rcpp::Named("incorrect_barcode") = Rcpp::wrap(shifted_results[i].first),
+        Rcpp::Named("corrected_barcode") = Rcpp::wrap(shifted_results[i].second),
+        Rcpp::Named("type") = "shifted"
+      );
+    }
+    
+    for (size_t i = 0; i < mutated_results.size(); ++i) {
+      r_mutated_results[i] = Rcpp::List::create(
+        Rcpp::Named("incorrect_barcode") = Rcpp::wrap(mutated_results[i].first),
+        Rcpp::Named("corrected_barcode") = Rcpp::wrap(mutated_results[i].second),
+        Rcpp::Named("type") = "mutated"
+      );
+    }
+    
+    for (size_t i = 0; i < resolved_collisions.size(); ++i) {
+      r_resolved_collisions[i] = Rcpp::List::create(
+        Rcpp::Named("incorrect_barcode") = Rcpp::wrap(resolved_collisions[i].first),
+        Rcpp::Named("corrected_barcodes") = Rcpp::wrap(resolved_collisions[i].second),
+        Rcpp::Named("type") = resolved_collisions[i].second.size() == 1 ? "resolved_single" : "unresolved"
+      );
+    }
+    
+    return Rcpp::List::create(
+      Rcpp::Named("shifted") = r_shifted_results,
+      Rcpp::Named("mutated") = r_mutated_results,
+      Rcpp::Named("resolved") = r_resolved_collisions
+    );
+  } else {
+    return Rcpp::List::create(Rcpp::Named("message") = "Processing complete");
+  }
+}
+
+// [[Rcpp::plugins(openmp)]]
+// [[Rcpp::export]]
+Rcpp::List generate_and_filter_mutations_v6(
+    SEXP true_barcodes,
+    SEXP invalid_barcodes,
+    SEXP true_counts,
+    SEXP invalid_counts,
+    int mutation_rounds = 3,
+    int sequence_length = 16,
+    int nthread = 1,
+    int max_shift = 3,
+    std::string input_fastq = "",
+    std::string filtered_fastq = "filtered_fastq.gz",
+    std::string unfiltered_fastq = "unfiltered_fastq.gz",
+    bool verbose = false,
+    bool verbose_output = true,
+    std::string barcode_header = "barcode:",
+    std::string detailed_output_csv = "",
+    std::string counts_output_csv = "") {
+  
+  auto start_time = std::chrono::high_resolution_clock::now();
+  
+  // Step 1: Initialize input vectors and validate
+  std::vector<int64_t> seq_vec = Rcpp::as<std::vector<int64_t>>(true_barcodes);
+  std::vector<int> original_counts_input = Rcpp::as<std::vector<int>>(true_counts);
+  Rcpp::Rcout << "Number of input correct sequences: " << seq_vec.size() << "\n";
+  
+  if (seq_vec.empty()) {
+    Rcpp::stop("Input sequences vector is empty.");
+  }
+  
+  std::vector<int64_t> invalid_vec = Rcpp::as<std::vector<int64_t>>(invalid_barcodes);
+  std::vector<int> invalid_counts_input = Rcpp::as<std::vector<int>>(invalid_counts);
+  Rcpp::Rcout << "Number of barcodes to correct: " << invalid_vec.size() << "\n";
+  
+  std::unordered_set<int64_t> invalid_set(invalid_vec.begin(), invalid_vec.end());
+  if(verbose) {
+    Rcpp::Rcout << "Size of invalid_set: " << invalid_set.size() << "\n";
+  }
+  
+  // Step 2: Initialize data structures to store results and track counts
+  std::vector<std::pair<int64_t, int64_t>> shifted_results, mutated_results;
+  std::unordered_map<int64_t, std::vector<int64_t>> collision_map;
+  std::unordered_map<int64_t, int64_t> correction_map;
+  
+  std::unordered_map<int64_t, int> original_counts, corrected_counts;
+  for (size_t i = 0; i < seq_vec.size(); ++i) {
+    original_counts[seq_vec[i]] = original_counts_input[i];
+  }
+  for (size_t i = 0; i < invalid_vec.size(); ++i) {
+    corrected_counts[invalid_vec[i]] = 0;  // Initialize corrected counts for invalid barcodes
+  }
+  
+  size_t collision_count = 0;
+  Rcpp::Rcout << "Generating shifted and mutated barcodes...\n";
+  
+  size_t total_sequences = seq_vec.size();
+  size_t update_frequency = std::max(static_cast<size_t>(1), total_sequences / 100);
+  size_t next_update = update_frequency;
+  
+  // Step 3: barcode correction
+  omp_set_num_threads(nthread);
+#pragma omp parallel for schedule(dynamic) reduction(+:collision_count)
+  for (size_t i = 0; i < total_sequences; ++i) {
+    int64_t current_seq = seq_vec[i];
+    
+    // Generate and filter shifted barcodes
+    std::vector<int64_t> shifted_barcodes = generate_shifted_barcodes(current_seq, sequence_length, max_shift);
+    for (const auto& shifted : shifted_barcodes) {
+      if (invalid_set.find(shifted) != invalid_set.end()) {
+#pragma omp critical
+{
+  shifted_results.emplace_back(shifted, current_seq);
+  collision_map[shifted].push_back(current_seq);
+  if (collision_map[shifted].size() > 1) {
+    collision_count++;
+  }
+}
+      }
+    }
+    // Generate and filter mutations
+    std::vector<int64_t> mutations = generate_recursive_quaternary_mutations_cpp_v2(current_seq, mutation_rounds, sequence_length);
+    for (const auto& mutation : mutations) {
+      if (invalid_set.find(mutation) != invalid_set.end()) {
+#pragma omp critical
+{
+  mutated_results.emplace_back(mutation, current_seq);
+  collision_map[mutation].push_back(current_seq);
+  if (collision_map[mutation].size() > 1) {
+    collision_count++;
+  }
+}
+      }
+    }
+    
+#pragma omp critical
+{
+  if (i + 1 >= next_update || i == total_sequences - 1) {
+    double progress = (i + 1.0) / total_sequences * 100.0;
+    std::cout << "\rProgress: " << std::fixed << std::setprecision(1) << progress << "% complete" << std::flush;
+    next_update = std::min(next_update + update_frequency, total_sequences);
+  }
+}
+  }
+  Rcpp::Rcout << "\n";
+  Rcpp::Rcout << "Resolving collisions...\n";
+  
+  // Step 4: Collision resolution using Damerau-Levenshtein distance
+  std::vector<std::pair<int64_t, std::vector<int64_t>>> resolved_collisions;
+  Rcpp::NumericVector weight = Rcpp::NumericVector::create(1.0, 1.0, 1.0, 1.0);
+  double p = 0.0, bt = 0.0;
+  int q = 1, useBytes = 0;
+  int method = 2;  // Damerau-Levenshtein distance
+  
+  for (const auto& entry : collision_map) {
+    if (entry.second.size() > 1) {
+      std::string incorrect_barcode = int64_to_string(entry.first, sequence_length);
+      std::vector<std::string> putative_correct_barcodes;
+      for (const auto& match : entry.second) {
+        putative_correct_barcodes.push_back(int64_to_string(match, sequence_length));
+      }
+      
+      SEXP incorrect_sexp = Rcpp::wrap(incorrect_barcode);
+      SEXP correct_sexp = Rcpp::wrap(putative_correct_barcodes);
+      
+      SEXP dl_dist_results = sd_stringdist(
+        incorrect_sexp,
+        correct_sexp,
+        Rcpp::wrap(method),
+        weight, Rcpp::wrap(p),
+        Rcpp::wrap(bt),
+        Rcpp::wrap(q),
+        Rcpp::wrap(useBytes),
+        Rcpp::wrap(nthread));
+      
+      std::vector<double> dl_dist = Rcpp::as<std::vector<double>>(dl_dist_results);
+      double min_distance = *std::min_element(dl_dist.begin(), dl_dist.end());
+      std::vector<int> min_indices;
+      
+      for (int i = 0; i < dl_dist.size(); ++i) {
+        if (dl_dist[i] == min_distance) {
+          min_indices.push_back(i);
+        }
+      }
+      
+      if (min_indices.size() == 1) {
+        // Single minimum
+        resolved_collisions.emplace_back(entry.first, std::vector<int64_t>{entry.second[min_indices[0]]});
+      } else {
+        // Tie
+        std::vector<int64_t> tied_barcodes;
+        for (int index : min_indices) {
+          tied_barcodes.push_back(entry.second[index]);
+        }
+        resolved_collisions.emplace_back(entry.first, tied_barcodes);
+      }
+    }
+  }
+  
+  // Step 5: Prepare correction map for fastq updates
+  for (const auto& result : shifted_results) {
+    correction_map[result.first] = result.second;
+    corrected_counts[result.second]++;  // Update corrected counts
+  }
+  for (const auto& result : mutated_results) {
+    correction_map[result.first] = result.second;
+    corrected_counts[result.second]++;
+  }
+  for (const auto& result : resolved_collisions) {
+    if (result.second.size() == 1) {
+      correction_map[result.first] = result.second[0];
+      corrected_counts[result.second[0]]++;
+    }
+  }
+  for (const auto& result : seq_vec) {
+    correction_map[result] = result;  // Map correct barcodes to themselves
+    corrected_counts[result]++;  // Increment the count for correct barcodes
+  }
+  
+  // Step 6: Stream FASTQ into filtered and unfiltered FASTQ files
+  if (!input_fastq.empty()) {
+    std::cout << "\nProcessing and splitting FASTQ file...\n";
+    // Open input gzipped FASTQ file for reading
+    gzFile fp = gzopen(input_fastq.c_str(), "r");
+    if (fp == NULL) {
+      Rcpp::stop("Failed to open input FASTQ file.");
+    }
+    // Open filtered and unfiltered gzipped FASTQ files
+    gzFile gz_filtered_out = gzopen(filtered_fastq.c_str(), "wb");  // Write mode, overwrite filtered output
+    gzFile gz_unfiltered_out = gzopen(unfiltered_fastq.c_str(), "ab");  // Append mode for unfiltered output
+    
+    if (gz_filtered_out == NULL || gz_unfiltered_out == NULL) {
+      gzclose(fp);
+      Rcpp::stop("Failed to open output FASTQ files.");
+    }
+    
+    kseq_t* seq = kseq_init(fp);
+    size_t processed_reads = 0;
+    
+    // Process each read in the input FASTQ
+    while (kseq_read(seq) >= 0) {
+      std::string name(seq->name.s);
+      size_t header_pos = name.find(barcode_header);
+      
+      gzFile gz_out = gz_unfiltered_out; // Default to unfiltered output
+      
+      if (header_pos != std::string::npos) {
+        size_t barcode_start = header_pos + barcode_header.length();
+        size_t barcode_end = name.find_first_of(" \t|", barcode_start);
+        if (barcode_end == std::string::npos) {
+          barcode_end = name.length();
+        }
+        std::string barcode_str = name.substr(barcode_start, barcode_end - barcode_start);
+        std::string rc_barcode_str = revcomp_cpp(barcode_str);
+        std::vector<int64_t> barcode_bits = sequence_to_bits_cpp(barcode_str);
+        std::vector<int64_t> revcomp_bits = sequence_to_bits_cpp(rc_barcode_str);
+        if (!barcode_bits.empty()) {
+          auto it = correction_map.find(barcode_bits[0]);
+          auto it_revcomp = correction_map.find(revcomp_bits[0]);
+          if (it != correction_map.end()) {
+            // Found in correction map (barcode corrected)
+            std::string corrected_barcode = int64_to_string(it->second, sequence_length);
+            std::string corrected_name = name.substr(0, barcode_start) + corrected_barcode + name.substr(barcode_end);
+            gz_out = gz_filtered_out;  // Switch to filtered output
+            gzprintf(gz_out, "@%s\n", corrected_name.c_str());
+          } else if (it_revcomp != correction_map.end()) {
+            // Found reverse complement in correction map
+            std::string corrected_barcode = int64_to_string(it->second, sequence_length);
+            std::string corrected_name = name.substr(0, barcode_start) + corrected_barcode + name.substr(barcode_end);
+            gz_out = gz_filtered_out;  // Switch to filtered output
+            gzprintf(gz_out, "@%s\n", corrected_name.c_str());
+          } else {
+            // Barcode not found, write to unfiltered
+            gzprintf(gz_out, "@%s\n", name.c_str());
+          }
+        } else {
+          gzprintf(gz_out, "@%s\n", name.c_str());
+        }
+      } else {
+        gzprintf(gz_unfiltered_out, "@%s\n", name.c_str());
+      }
+      gzprintf(gz_out, "%s\n", seq->seq.s);
+      gzprintf(gz_out, "+%s\n", seq->comment.l ? seq->comment.s : "");
+      gzprintf(gz_out, "%s\n", seq->qual.s);
+      processed_reads++;
+      if (processed_reads % 1000000 == 0) {
+        std::cout << "\rProcessed " << processed_reads << " reads..." << std::flush;
+      }
+    }
+    
+    std::cout << "\nFASTQ processing complete. Processed " << processed_reads << " reads...\n";
+    // Clean up and close files
+    kseq_destroy(seq);
+    gzclose(fp);
+    gzclose(gz_filtered_out);
+    gzclose(gz_unfiltered_out);
+    std::cout << "FASTQ files updated.\n";
+  }
+  
+  // Step 7: Write barcode counts to CSV
+  std::ofstream csv_file(counts_output_csv);
+  csv_file << "barcode,original_counts,corrected_counts,total_counts\n";
+  for (const auto& [barcode, orig_count] : original_counts) {
+    int corrected_count = corrected_counts[barcode];
+    csv_file << int64_to_string(barcode, sequence_length) << ","
+             << orig_count << ","
+             << corrected_count << ","
+             << (orig_count + corrected_count) << "\n";
+  }
+  csv_file.close();
+  
+  // Step 8: Write detailed output to CSV if verbose_output is enabled
+  if (verbose_output) {
+    std::ofstream detailed_csv(detailed_output_csv);
+    detailed_csv << "barcode,type,original,corrected\n";
+    
+    for (const auto& result : shifted_results) {
+      detailed_csv << int64_to_string(result.first, sequence_length) << ",shifted,"
+                   << int64_to_string(result.first, sequence_length) << ","
+                   << int64_to_string(result.second, sequence_length) << "\n";
+    }
+    
+    for (const auto& result : mutated_results) {
+      detailed_csv << int64_to_string(result.first, sequence_length) << ",mutated,"
+                   << int64_to_string(result.first, sequence_length) << ","
+                   << int64_to_string(result.second, sequence_length) << "\n";
+    }
+    for (const auto& result : resolved_collisions) {
+      if (result.second.size() == 1) {
+        detailed_csv << int64_to_string(result.first, sequence_length) << ",resolved_single,"
+                     << int64_to_string(result.first, sequence_length) << ","
+                     << int64_to_string(result.second[0], sequence_length) << "\n";
+      } else {
+        // Unresolved barcodes: concatenate them with their distances
+        std::string unresolved_str;
+        for (size_t i = 0; i < result.second.size(); ++i) {
+          std::string unresolved_barcode = int64_to_string(result.second[i], sequence_length);
+          unresolved_str += unresolved_barcode;
+          if (i != result.second.size() - 1) {
+            unresolved_str += "|"; // Use '|' as the delimiter
+          }
+        }
+        detailed_csv << int64_to_string(result.first, sequence_length) << ",unresolved,"
+                     << int64_to_string(result.first, sequence_length) << ","
+                     << unresolved_str << "\n";
+      }
+    }
+    detailed_csv.close();
+  }
+
+  auto end_time = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+  std::cout << "Total execution time: " << duration.count() << " seconds\n";
+  return Rcpp::List::create(Rcpp::Named("message") = "Processing complete");
 }

@@ -620,47 +620,6 @@ for (size_t i = 0; i < sigrun_results.size(); ++i) {
   }
 }
 
-// for (size_t i = 0; i < sigrun_results.size(); ++i) {
-//   size_t original_index = i % chunk_ids.size();
-//   
-//   if (original_index >= chunk_ids.size()) {
-//     if (verbose) {
-// #pragma omp critical
-// {
-//   Rcpp::Rcout << "Original index out of bounds: " << original_index << std::endl;
-// }
-//     }
-//     continue;
-//   }
-//   
-//   chunk_processed_signatures.push_back(sigrun_results[i]);
-//   
-//   if (verbose) {
-// #pragma omp critical
-// {
-//   Rcpp::Rcout << "Processing sigrun result " << i << ": " << sigrun_results[i] << std::endl;
-//   Rcpp::Rcout << "Original index: " << original_index << std::endl;
-//   Rcpp::Rcout << "Sequence length: " << chunk_sequences[original_index].length() << std::endl;
-//   Rcpp::Rcout << "Min length: " << min_length << std::endl;
-// }
-//   }
-//   
-//   if (original_index < chunk_sequences.size() && 
-//       chunk_sequences[original_index].length() >= min_length && 
-//       sigrun_results[i].find(":undecided>") == std::string::npos) {
-//     chunk_chunk_ids.push_back(chunk_ids[original_index]);
-//     chunk_chunk_sequences.push_back(chunk_sequences[original_index]);
-//     chunk_chunk_quality_scores.push_back(chunk_quality_scores[original_index]);
-//   } else {
-//     if (verbose) {
-// #pragma omp critical
-// {
-//   Rcpp::Rcout << "Skipping sequence due to length or undecided: " << original_index << std::endl;
-// }
-//     }
-//   }
-// }
-
 #pragma omp critical
 {
   writeSigstrings(sigstringsFilePath, chunk_processed_signatures, compress);
@@ -908,7 +867,6 @@ void tabulate_barcodes(
       std::string token;
       std::string id;
       std::getline(iss, id, '|'); 
-      id = id.substr(1);
       while (std::getline(iss, token, '|')) {
         std::smatch matches;
         if (std::regex_search(token, matches, barcode_regex)) {

@@ -314,8 +314,14 @@ process_barcodes<-function(barcode_path, read_layout) {
   if (nrow(poly_runs) > 0){
     barcodes[poly_runs, on = .(seq), filtered := i.filtered]
   }
-  static_seqs<-read_layout[type == "static" & !is.na(expected_length) & expected_length > 0, seq]
+  static_seqs<-read_layout[type == "static" & !is.na(expected_length) & expected_length > 0 & class != "poly_tail", seq]
   static_qgrams<-colnames(stringdist::qgrams(static_seqs, q = expected_length, useNames = TRUE))
+  static_qgrams_mutations<-static_qgrams %>% 
+    sequence_to_bits(.) %>% 
+    generate_recursive_quaternary_mutations(., mutation_rounds =  2, sequence_length = 16) %>%
+    bits_to_sequence(.)
+  static_qgrams<-append(static_qgrams, static_qgrams_mutations)
+  
   barcodes[is.na(filtered) & seq %in% static_qgrams, filtered := "adapter_segment_filtered"]
   whitelist_path<-read_layout[barcode_id, whitelist]
   cat(paste0("The whitelist path is ", whitelist_path,"\n"))
@@ -349,22 +355,46 @@ process_barcodes<-function(barcode_path, read_layout) {
 }
 
 correct_barcodes<-function(input_file,
-                           output_file,
                            verbose = FALSE,
                            nthreads = 1,
-                           maxDistance = 2,
-                           sequence_length = 16,
-                           depth = 2,
-                           breadth = 1,
-                           read_layout){
-  barcodes<-data.table::fread(input_file, col.names = c("seq","count","filtered","pois_dist","int64_seq","int64_rcseq"))
+                           mutation_rounds = 3,
+                           max_shift = 3,
+                           read_layout
+                           ){
+  barcode<-data.table::fread(
+    input_file,
+    col.names = c("seq","count","filtered","pois_dist","int64_seq","int64_rcseq"))
   data.table::setkey(read_layout, "class_id")
-  
-  dir_path<-paste0(dirname(input_file),"/")
+  data.table::setkey(barcode, "filtered")
   barcode_id<-basename(tools::file_path_sans_ext(input_file))
   
+  dir_path<-paste0(dirname(input_file),"/")
+  input_fastq_path<-paste0(dirname(dir_path),"/demuxed_reads.fastq.gz")
+  filtered_fastq_path<-paste0(dirname(dir_path),"/filtered_reads.fastq.gz")
+  unfiltered_fastq_path<-paste0(dirname(dir_path),"/unfiltered_reads.fastq.gz")
+  barcode_counts_output_path<-paste0(dir_path, barcode_id, "_counts.csv")
+  verbose_barcode_output_path<-paste0(dir_path, barcode_id, "_correction_counts.csv")
   expected_length<-read_layout[barcode_id, expected_length]
-  bc_correct_module(input_file, output_file, verbose, nthreads, maxDistance, sequence_length, depth, breadth)
+  
+  generate_and_filter_mutations_v6(
+    barcode_header = paste0(barcode_id,":"),
+    true_barcodes =  barcode["pois_validated_barcode"]$int64_seq, 
+    invalid_barcodes = barcode["barcode_to_correct"]$int64_seq,
+    true_counts = barcode["pois_validated_barcode"]$count,
+    invalid_counts = barcode["barcode_to_correct"]$count,
+    mutation_rounds = mutation_rounds,
+    sequence_length = expected_length,
+    max_shift = max_shift,
+    nthread = nthreads,
+    input_fastq = input_fastq_path,
+    filtered_fastq = filtered_fastq_path,
+    unfiltered_fastq = unfiltered_fastq_path,
+    counts_output_csv = barcode_counts_output_path,
+    detailed_output_csv = verbose_barcode_output_path,
+    verbose_output = TRUE,
+    verbose = FALSE)
+  
+  file.copy(filtered_fastq_path, input_fastq_path, overwrite = TRUE)
 }
 
 process_sig<-function(file_path,
@@ -418,7 +448,6 @@ process_sig<-function(file_path,
   data.table::fwrite(summary_results, paste0(output_prefix,"/summary_table.csv", ifelse(test = compress, yes = ".gz", no = "")))
 }
 
-
 rad_run<-function(
     fastq_file_or_directory_path, 
     read_layout_path, 
@@ -429,7 +458,7 @@ rad_run<-function(
     misalignment_threshold_path = NULL,
     tabulated_sigstring_count = -1,
     chunk_size = 50000,
-    maxDistance = 3,
+    mutation_rounds = 3,
     nthreads = 1){
   start_time = Sys.time()
   if(!dir.exists(output_directory_path)){
@@ -490,8 +519,32 @@ rad_run<-function(
   barcode_files<-list.files(path = paste0(output_directory_path,"/variable_seqs/"), full.names = TRUE, pattern = "barcode")
   out<-lapply(X = barcode_files, FUN = function(X){
     process_barcodes(barcode_path = X, read_layout = read_layout)
-    correct_barcodes(input_file = X, output_file = X, verbose = FALSE, nthreads = nthreads, maxDistance = maxDistance, read_layout = read_layout)
+    correct_barcodes(input_file = X, read_layout = read_layout, nthreads = nthreads)
   })
   end_time = Sys.time()
   cat(paste0("Finished running! Total run time: ", difftime(end_time, start_time, units='mins'), "\n"))
 }
+
+generate_synthetic_data<-function(read_layout_path){
+  prep_read_layout(read_layout_path)
+  data.table::setkey(read_layout, "class_id")
+  
+  
+  
+  cat(paste0("The whitelist path is ", whitelist_path,"\n"))
+  whitelist<-NULL
+  whitelist_path<-ifelse(whitelist_path == "10x_3v3", 
+    system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz"), 
+    ifelse(whitelist_path == "10x_3v1", 
+      system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"), 
+      whitelist_path))
+  cat(paste0("The whitelist path is ", whitelist_path, "\n"))
+  if(!is.na(whitelist_path) && file.exists(whitelist_path)){
+    ext<-tools::file_ext(whitelist_path)
+    convert<-ext == "csv" || ext == "txt"
+    whitelist<-whitelist_importer(whitelist_path, convert = convert)
+  }
+  
+}
+
+
