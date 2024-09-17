@@ -301,7 +301,7 @@ process_barcodes<-function(barcode_path, read_layout) {
   data.table::setkey(read_layout, "class_id")
   
   dir_path<-paste0(dirname(barcode_path),"/")
-  barcode_id<-basename(tools::file_path_sans_ext(barcode_path))
+  barcode_id<-basename(tools::file_path_sans_ext(barcode_path, compression = TRUE))
   
   expected_length<-read_layout[barcode_id, expected_length]
   barcodes[, filtered := NA_character_]
@@ -349,8 +349,14 @@ process_barcodes<-function(barcode_path, read_layout) {
       int64_seq %in% whitelist$whitelist_bcs | int64_rcseq %in% whitelist$whitelist_bcs,
       "whitelist_barcode", "barcode_to_correct"
     )]
-    barcodes[(filtered == "whitelist_barcode" & pois_dist >= 0.95), filtered := "pois_validated_barcode"]
+    barcodes[(filtered == "whitelist_barcode" & pois_dist >= 0.95), 
+      filtered := "pois_validated_barcode"]
+    barcodes[(pois_dist >= 0.95 & filtered == "pois_validated_barcode"), 
+      new_pois_dist := stats::ppois(q = count, lambda = mean(count))]
+    barcodes[(((pois_dist - new_pois_dist) > 0) & filtered == "pois_validated_barcode"),
+      filtered := "whitelist_barcode"]
   }
+  
   data.table::fwrite(x = barcodes, file = barcode_path)
 }
 
@@ -376,7 +382,7 @@ correct_barcodes<-function(input_file,
   verbose_barcode_output_path<-paste0(dir_path, barcode_id, "_correction_counts.csv")
   expected_length<-read_layout[barcode_id, expected_length]
   
-  generate_and_filter_mutations_v6(
+  out<-generate_and_filter_mutations_v13(
     barcode_header = paste0(barcode_id,":"),
     true_barcodes =  barcode["pois_validated_barcode"]$int64_seq, 
     invalid_barcodes = barcode["barcode_to_correct"]$int64_seq,
@@ -391,8 +397,9 @@ correct_barcodes<-function(input_file,
     unfiltered_fastq = unfiltered_fastq_path,
     counts_output_csv = barcode_counts_output_path,
     detailed_output_csv = verbose_barcode_output_path,
-    verbose_output = TRUE,
     verbose = FALSE)
+  data.table::fwrite(out$detailed_output, file = detailed_output_csv)
+  data.table::fwrite(out$barcode_counts, file = barcode_counts_output_path)
   
   file.copy(filtered_fastq_path, input_fastq_path, overwrite = TRUE)
 }
@@ -522,29 +529,137 @@ rad_run<-function(
     correct_barcodes(input_file = X, read_layout = read_layout, nthreads = nthreads)
   })
   end_time = Sys.time()
-  cat(paste0("Finished running! Total run time: ", difftime(end_time, start_time, units='mins'), "\n"))
+  cat(paste0("Finished running! Total run time: ", difftime(end_time, start_time, units='mins'), " minutes.\n"))
 }
 
-generate_synthetic_data<-function(read_layout_path){
-  prep_read_layout(read_layout_path)
-  data.table::setkey(read_layout, "class_id")
-  
-  
-  
-  cat(paste0("The whitelist path is ", whitelist_path,"\n"))
-  whitelist<-NULL
-  whitelist_path<-ifelse(whitelist_path == "10x_3v3", 
-    system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz"), 
-    ifelse(whitelist_path == "10x_3v1", 
-      system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"), 
-      whitelist_path))
-  cat(paste0("The whitelist path is ", whitelist_path, "\n"))
-  if(!is.na(whitelist_path) && file.exists(whitelist_path)){
-    ext<-tools::file_ext(whitelist_path)
-    convert<-ext == "csv" || ext == "txt"
-    whitelist<-whitelist_importer(whitelist_path, convert = convert)
+generate_synthetic_reads<-function(
+  read_layout_path,
+  num_cells,
+  read_length = 100) {
+  # Read the read layout
+  read_layout<-fread(read_layout_path, header = TRUE, fill = TRUE, na.strings = "", skip = 1)
+  # Fill missing expected_length based on seq length
+  read_layout[is.na(expected_length) & !is.na(seq), expected_length := str_length(seq)]
+  # Set default expected_length for poly_a and poly_t
+  read_layout[(class %in% c('poly_a', 'poly_t')) & is.na(expected_length), expected_length := 12]
+  # Set default expected_length for read
+  read_layout[class == 'read' & (is.na(expected_length) | expected_length == 0), expected_length := read_length]
+  # Prepare segments
+  segments<-read_layout[, .(id, seq, expected_length = as.integer(expected_length), type, class, whitelist)]
+  # Initialize lists to hold generated sequences
+  num_segments<-nrow(segments)
+  seq_list<-vector("list", num_segments)
+  names(seq_list)<-segments$id
+  # Handle multiple barcodes
+  barcode_segments<-segments[class == 'barcode']
+  if (nrow(barcode_segments) > 0) {
+    barcode_data<-data.table(cell = seq_len(num_cells))
+    for (i in seq_len(nrow(barcode_segments))) {
+      barcode_segment<-barcode_segments[i]
+      whitelist<-NULL
+      whitelist_path<-barcode_segment$whitelist
+      # Load whitelist if provided
+      if (!is.na(whitelist_path)) {
+        if (whitelist_path == "10x_3v3") {
+          whitelist_path<-system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz")
+        } else if (whitelist_path == "10x_3v1") {
+          whitelist_path<-system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz")
+        }
+        if (file.exists(whitelist_path)) {
+          whitelist<-fread(whitelist_path, header = FALSE, col.names = "seq")
+        } else {
+          stop(paste("Whitelist file not found at", whitelist_path))
+        }
+      }
+      # Generate barcodes
+      barcode_length<-barcode_segment$expected_length
+      whitelist$seq<-bits_to_sequence(whitelist$seq, sequence_length = barcode_length)
+      if (!is.null(whitelist)) {
+        if (nrow(whitelist) < num_cells) {
+          barcodes<-sample(whitelist$seq, num_cells, replace = TRUE)
+        } else {
+          barcodes<-sample(whitelist$seq, num_cells, replace = FALSE)
+        }
+      } else {
+        barcodes<-replicate(num_cells, paste0(sample(c('A', 'C', 'G', 'T'), barcode_length, replace = TRUE), collapse = ''))
+      }
+      # Store barcodes
+      barcode_id<-barcode_segment$id
+      barcode_data[, (barcode_id) := barcodes]
+      seq_list[[barcode_id]]<-barcodes
+    }
+  } else {
+    barcode_data<-data.table(cell = seq_len(num_cells))
   }
-  
+  # Generate UMIs
+  umi_segments <- segments[class == 'umi']
+  if (nrow(umi_segments) > 0) {
+    umi_length <- umi_segments$expected_length[1]
+    umis <- replicate(num_cells, paste0(sample(c('A', 'C', 'G', 'T'), umi_length, replace = TRUE), collapse = ''))
+    seq_list[[umi_segments$id[1]]] <- umis
+  }
+  # Generate reads
+  read_segments <- segments[class == 'read']
+  if (nrow(read_segments) > 0) {
+    read_length <- read_segments$expected_length[1]
+    reads <- replicate(num_cells, paste0(sample(c('A', 'C', 'G', 'T'), read_length, replace = TRUE), collapse = ''))
+    seq_list[[read_segments$id[1]]] <- reads
+  }
+  # Process each segment
+  for (i in seq_len(num_segments)) {
+    segment<-segments[i]
+    segment_id<-segment$id
+    if (segment$type == 'static') {
+      if (!is.na(segment$seq) & !is.na(segment$class)) {
+        if (segment$class == 'poly_a') {
+          poly_a_seq<-str_dup('A', segment$expected_length)
+          seq_list[[segment_id]]<-rep(poly_a_seq, num_cells)
+        } else if (segment$class == 'poly_t') {
+          poly_t_seq<-str_dup('T', segment$expected_length)
+          seq_list[[segment_id]]<-rep(poly_t_seq, num_cells)
+        } else {
+          seq_list[[segment_id]]<-rep(segment$seq, num_cells)
+        }
+      } else {
+        seq_list[[segment_id]] <- rep('', num_cells)
+      }
+    } else if (segment$type == 'variable') {
+      # Already handled barcodes, UMIs, and reads
+      if (!(segment$class %in% c('barcode', 'umi', 'read'))) {
+        # Generate random sequences for other variable segments
+        random_seqs <- replicate(num_cells, paste0(sample(c('A', 'C', 'G', 'T'), segment$expected_length, replace = TRUE), collapse = ''))
+        seq_list[[segment_id]] <- random_seqs
+      }
+    }
+  }
+  # Combine sequences in the order specified by read layout
+  sequence_order <- segments$id
+  full_sequences <- do.call(paste0, seq_list[sequence_order])
+  # Construct IDs
+  id_data <- data.table(cell = paste0('cell', seq_len(num_cells)))
+  # Include barcodes in IDs
+  if (nrow(barcode_segments) > 0) {
+    for (barcode_id in barcode_segments$id) {
+      id_data[, (barcode_id) := seq_list[[barcode_id]]]
+    }
+  }
+  # Include UMIs in IDs
+  if (nrow(umi_segments) > 0) {
+    id_data[, UMI := seq_list[[umi_segments$id[1]]]]
+  }
+  # Build ID strings
+  id_columns<-names(id_data)[-1]  # Exclude 'cell' column
+  id_strings<-id_data[, paste0(cell, 
+    if (length(id_columns) > 0) paste0('_', mapply(function(name, seqs) paste0(name, ':', seqs), id_columns, .SD), collapse = '_') else ''),
+    .SDcols = id_columns]
+  # Create the final data.table
+  synthetic_reads <- data.table(id = id_strings, seq = full_sequences)
+  # Reverse complement some reads (e.g., 50%)
+  num_to_revcomp <- floor(0.5 * num_cells)
+  indices_to_revcomp <- sample(num_cells, num_to_revcomp)
+  # Apply reverse complement using your Rcpp function
+  synthetic_reads$seq[indices_to_revcomp] <- revcomp(synthetic_reads$seq[indices_to_revcomp])
+  # Optionally, adjust IDs to indicate reverse complement
+  synthetic_reads$id[indices_to_revcomp] <- paste0(synthetic_reads$id[indices_to_revcomp], '_rc')
+  return(synthetic_reads)
 }
-
-

@@ -81,6 +81,22 @@ generate_and_filter_mutations_v6 <- function(true_barcodes, invalid_barcodes, tr
     .Call(`_rad_generate_and_filter_mutations_v6`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, input_fastq, filtered_fastq, unfiltered_fastq, verbose, verbose_output, barcode_header, detailed_output_csv, counts_output_csv)
 }
 
+generate_and_filter_mutations_v7 <- function(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, input_fastq = "", filtered_fastq = "filtered_fastq.gz", unfiltered_fastq = "unfiltered_fastq.gz", verbose = FALSE, verbose_output = TRUE, barcode_header = "barcode:", detailed_output_csv = "", counts_output_csv = "") {
+    .Call(`_rad_generate_and_filter_mutations_v7`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, input_fastq, filtered_fastq, unfiltered_fastq, verbose, verbose_output, barcode_header, detailed_output_csv, counts_output_csv)
+}
+
+generate_and_filter_mutations_v10 <- function(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, verbose = FALSE) {
+    .Call(`_rad_generate_and_filter_mutations_v10`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose)
+}
+
+generate_and_filter_mutations_v11 <- function(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, verbose = FALSE, process_fastq = FALSE, input_fastq = "", filtered_fastq = "filtered_fastq.gz", unfiltered_fastq = "unfiltered_fastq.gz", barcode_header = "barcode:", detailed_output_csv = "", counts_output_csv = "") {
+    .Call(`_rad_generate_and_filter_mutations_v11`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose, process_fastq, input_fastq, filtered_fastq, unfiltered_fastq, barcode_header, detailed_output_csv, counts_output_csv)
+}
+
+generate_and_filter_mutations_v13 <- function(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, verbose = FALSE, process_fastq = FALSE, input_fastq = "", filtered_fastq = "filtered_fastq.gz", unfiltered_fastq = "unfiltered_fastq.gz", barcode_header = "barcode:", detailed_output_csv = "detailed_output.csv", counts_output_csv = "barcode_counts.csv") {
+    .Call(`_rad_generate_and_filter_mutations_v13`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose, process_fastq, input_fastq, filtered_fastq, unfiltered_fastq, barcode_header, detailed_output_csv, counts_output_csv)
+}
+
 sigstream <- function(input_path, sigstringsFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, outputPath, write_fastq = TRUE, compress = TRUE, max_sequences = -1L, min_length = 100L, verbose = FALSE) {
     invisible(.Call(`_rad_sigstream`, input_path, sigstringsFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, outputPath, write_fastq, compress, max_sequences, min_length, verbose))
 }
