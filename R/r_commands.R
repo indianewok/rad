@@ -369,7 +369,7 @@ correct_barcodes<-function(input_file,
                            ){
   barcode<-data.table::fread(
     input_file,
-    col.names = c("seq","count","filtered","pois_dist","int64_seq","int64_rcseq"))
+    col.names = c("seq","count","filtered","pois_dist","int64_seq","int64_rcseq","new_pois_dist"))
   data.table::setkey(read_layout, "class_id")
   data.table::setkey(barcode, "filtered")
   barcode_id<-basename(tools::file_path_sans_ext(input_file))
@@ -620,9 +620,9 @@ generate_synthetic_reads<-function(
         } else {
           seq_list[[segment_id]]<-rep(segment$seq, num_cells)
         }
-      } else {
-        seq_list[[segment_id]] <- rep('', num_cells)
-      }
+      } #else {
+        #seq_list[[segment_id]] <- rep('', num_cells)
+      #}
     } else if (segment$type == 'variable') {
       # Already handled barcodes, UMIs, and reads
       if (!(segment$class %in% c('barcode', 'umi', 'read'))) {
@@ -648,18 +648,15 @@ generate_synthetic_reads<-function(
     id_data[, UMI := seq_list[[umi_segments$id[1]]]]
   }
   # Build ID strings
-  id_columns<-names(id_data)[-1]  # Exclude 'cell' column
-  id_strings<-id_data[, paste0(cell, 
-    if (length(id_columns) > 0) paste0('_', mapply(function(name, seqs) paste0(name, ':', seqs), id_columns, .SD), collapse = '_') else ''),
-    .SDcols = id_columns]
+  id_data<-tidytable::unite(id_data, col = "id", sep = "_", remove = TRUE)
   # Create the final data.table
-  synthetic_reads <- data.table(id = id_strings, seq = full_sequences)
+  synthetic_reads<-data.table(id = id_strings, seq = full_sequences)
   # Reverse complement some reads (e.g., 50%)
-  num_to_revcomp <- floor(0.5 * num_cells)
-  indices_to_revcomp <- sample(num_cells, num_to_revcomp)
+  num_to_revcomp<-floor(0.5 * num_cells)
+  indices_to_revcomp<-sample(num_cells, num_to_revcomp)
   # Apply reverse complement using your Rcpp function
-  synthetic_reads$seq[indices_to_revcomp] <- revcomp(synthetic_reads$seq[indices_to_revcomp])
+  synthetic_reads$seq[indices_to_revcomp]<-revcomp(synthetic_reads$seq[indices_to_revcomp])
   # Optionally, adjust IDs to indicate reverse complement
-  synthetic_reads$id[indices_to_revcomp] <- paste0(synthetic_reads$id[indices_to_revcomp], '_rc')
+  synthetic_reads$id[indices_to_revcomp]<-paste0(synthetic_reads$id[indices_to_revcomp], '_rc')
   return(synthetic_reads)
 }
