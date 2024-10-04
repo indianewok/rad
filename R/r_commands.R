@@ -352,7 +352,7 @@ process_barcodes<-function(barcode_path, read_layout) {
     )]
   }
   whitelist_output<-density_estimator_v12(barcode_df = barcodes)
-  kde_density<-ggpar(
+  kde_density<-ggpubr::ggpar(
     whitelist_output$kde_density,
     title = paste0(basename(dirname(dir_path)), " KDE Density with Threshold",
     subtitle = paste0("Threshold: ", 
@@ -361,7 +361,7 @@ process_barcodes<-function(barcode_path, read_layout) {
       length(which(whitelist_output$results$kde_threshold)))),
     legend = "none", font.x = 14, font.y = 14, font.main = 14)
   
-  ggsave(
+  ggplot::ggsave(
     filename = paste0(dir_path, barcode_id, "_kde_density.jpeg"), 
     plot =  kde_density,
     width = 11, height = 8.5, 
@@ -390,28 +390,20 @@ correct_barcodes<-function(input_file,
   verbose_barcode_output_path<-paste0(dir_path, barcode_id, "_correction_counts.csv")
   expected_length<-read_layout[barcode_id, expected_length]
   
-  out<-generate_and_filter_mutations_v13(
-    barcode_header = paste0(barcode_id,":"),
-    true_barcodes =  barcode["pois_validated_barcode"]$int64_seq, 
+  out<-barcode_correction_v3(
+    true_barcodes = barcode["pois_validated_barcode"]$int64_seq,
     invalid_barcodes = barcode["barcode_to_correct"]$int64_seq,
     true_counts = barcode["pois_validated_barcode"]$count,
     invalid_counts = barcode["barcode_to_correct"]$count,
     mutation_rounds = mutation_rounds,
     sequence_length = expected_length,
-    max_shift = max_shift,
     nthread = nthreads,
-    input_fastq = input_fastq_path,
-    process_fastq = TRUE,
-    filtered_fastq = filtered_fastq_path,
-    unfiltered_fastq = unfiltered_fastq_path,
-    counts_output_csv = barcode_counts_output_path,
-    detailed_output_csv = verbose_barcode_output_path,
+    max_shift = max_shift, 
     verbose = FALSE)
   
-  data.table::fwrite(out$detailed_output, file = verbose_barcode_output_path)
-  data.table::fwrite(out$barcode_counts, file = barcode_counts_output_path)
+  data.table::fwrite(out, file = barcode_counts_output_path)
   
-  file.copy(filtered_fastq_path, input_fastq_path, overwrite = TRUE)
+  #file.copy(filtered_fastq_path, input_fastq_path, overwrite = TRUE)
 }
 
 process_sig<-function(file_path,
@@ -675,7 +667,7 @@ generate_synthetic_reads<-function(
 }
 
 density_estimator_v12<-function(barcode_df){
-  setkey(barcode_df, "filtered")
+  data.table::setkey(barcode_df, "filtered")
   # Calculate ncpm and log1p_ncpm
   barcode_df[, ncpm := (count / sum(count)) * 1e6] 
   barcode_df[, log1p_ncpm := log1p(ncpm)]
@@ -683,9 +675,9 @@ density_estimator_v12<-function(barcode_df){
   # Subset the data based on conditions
   data_subset<-barcode_df[filtered == "whitelist_barcode" & ncpm_pois >= 0.95, log1p_ncpm]
   # Perform GMM clustering
-  gmm_scan<-densityMclust(data = data_subset, plot = FALSE, modelNames = c("V", "E"))
+  gmm_scan<-mclust::densityMclust(data = data_subset, plot = FALSE, modelNames = c("V", "E"))
   density_output<-density(data_subset)
-  plot_df<-data.table(x = density_output$x, y = density_output$y)
+  plot_df<-data.table::data.table(x = density_output$x, y = density_output$y)
   # Find peaks and valleys
   peaks<-pracma::findpeaks(density_output$y)
   valleys<-pracma::findpeaks(-density_output$y)
@@ -734,17 +726,17 @@ density_estimator_v12<-function(barcode_df){
       .(seq, count, concatenate_count, log1p_ncpm, 
         uncertainty_percentage, best_cluster,
          kde_threshold, cluster_threshold)]
-    kde_density_plot<-ggplot(plot_df, aes(x = x, y = y, color = cluster)) +
-      geom_line(linewidth = 1) +
-      geom_vline(xintercept = threshold, linetype = "dashed", color = "blue") +  
-      geom_vline(xintercept = peak_one, linetype = "dashed", color = "red") + 
-      geom_vline(xintercept = peak_two, linetype = "dashed", color = "red") +  
+    kde_density_plot<-ggplot2::ggplot(plot_df, aes(x = x, y = y, color = cluster)) +
+      ggplot2::geom_line(linewidth = 1) +
+      ggplot2::geom_vline(xintercept = threshold, linetype = "dashed", color = "blue") +  
+      ggplot2::geom_vline(xintercept = peak_one, linetype = "dashed", color = "red") + 
+      ggplot2::geom_vline(xintercept = peak_two, linetype = "dashed", color = "red") +  
       labs(title = "KDE Density with Threshold", x = "log1p_ncpm", y = "Density") +
-      scale_color_manual(values = c("Below Threshold" = "black", "Above Threshold" = "green")) +
-      theme_minimal()
+      ggplot2::scale_color_manual(values = c("Below Threshold" = "black", "Above Threshold" = "green")) +
+      ggplot2::theme_minimal()
     
-    setkey(barcode_df, "seq")
-    setkey(results, "kde_threshold")
+    data.table::setkey(barcode_df, "seq")
+    data.table::setkey(results, "kde_threshold")
     barcode_df[results[J(TRUE)]$seq, filtered:="pois_validated_barcode"]
     # Return the results, plots, and GMM model
     return(list(

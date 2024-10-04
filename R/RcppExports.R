@@ -101,14 +101,6 @@ barcode_correction_v3 <- function(true_barcodes, invalid_barcodes, true_counts, 
     .Call(`_rad_barcode_correction_v3`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose)
 }
 
-barcode_correction_v4 <- function(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, verbose = FALSE) {
-    .Call(`_rad_barcode_correction_v4`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose)
-}
-
-barcode_correction_v5 <- function(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, verbose = FALSE) {
-    .Call(`_rad_barcode_correction_v5`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose)
-}
-
 sigstream <- function(input_path, sigstringsFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, outputPath, write_fastq = TRUE, compress = TRUE, max_sequences = -1L, min_length = 100L, verbose = FALSE) {
     invisible(.Call(`_rad_sigstream`, input_path, sigstringsFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, outputPath, write_fastq, compress, max_sequences, min_length, verbose))
 }

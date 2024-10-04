@@ -423,44 +423,6 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
-// barcode_correction_v4
-Rcpp::DataFrame barcode_correction_v4(SEXP true_barcodes, SEXP invalid_barcodes, SEXP true_counts, SEXP invalid_counts, int mutation_rounds, int sequence_length, int nthread, int max_shift, bool verbose);
-RcppExport SEXP _rad_barcode_correction_v4(SEXP true_barcodesSEXP, SEXP invalid_barcodesSEXP, SEXP true_countsSEXP, SEXP invalid_countsSEXP, SEXP mutation_roundsSEXP, SEXP sequence_lengthSEXP, SEXP nthreadSEXP, SEXP max_shiftSEXP, SEXP verboseSEXP) {
-BEGIN_RCPP
-    Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< SEXP >::type true_barcodes(true_barcodesSEXP);
-    Rcpp::traits::input_parameter< SEXP >::type invalid_barcodes(invalid_barcodesSEXP);
-    Rcpp::traits::input_parameter< SEXP >::type true_counts(true_countsSEXP);
-    Rcpp::traits::input_parameter< SEXP >::type invalid_counts(invalid_countsSEXP);
-    Rcpp::traits::input_parameter< int >::type mutation_rounds(mutation_roundsSEXP);
-    Rcpp::traits::input_parameter< int >::type sequence_length(sequence_lengthSEXP);
-    Rcpp::traits::input_parameter< int >::type nthread(nthreadSEXP);
-    Rcpp::traits::input_parameter< int >::type max_shift(max_shiftSEXP);
-    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    rcpp_result_gen = Rcpp::wrap(barcode_correction_v4(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose));
-    return rcpp_result_gen;
-END_RCPP
-}
-// barcode_correction_v5
-Rcpp::DataFrame barcode_correction_v5(SEXP true_barcodes, SEXP invalid_barcodes, SEXP true_counts, SEXP invalid_counts, int mutation_rounds, int sequence_length, int nthread, int max_shift, bool verbose);
-RcppExport SEXP _rad_barcode_correction_v5(SEXP true_barcodesSEXP, SEXP invalid_barcodesSEXP, SEXP true_countsSEXP, SEXP invalid_countsSEXP, SEXP mutation_roundsSEXP, SEXP sequence_lengthSEXP, SEXP nthreadSEXP, SEXP max_shiftSEXP, SEXP verboseSEXP) {
-BEGIN_RCPP
-    Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< SEXP >::type true_barcodes(true_barcodesSEXP);
-    Rcpp::traits::input_parameter< SEXP >::type invalid_barcodes(invalid_barcodesSEXP);
-    Rcpp::traits::input_parameter< SEXP >::type true_counts(true_countsSEXP);
-    Rcpp::traits::input_parameter< SEXP >::type invalid_counts(invalid_countsSEXP);
-    Rcpp::traits::input_parameter< int >::type mutation_rounds(mutation_roundsSEXP);
-    Rcpp::traits::input_parameter< int >::type sequence_length(sequence_lengthSEXP);
-    Rcpp::traits::input_parameter< int >::type nthread(nthreadSEXP);
-    Rcpp::traits::input_parameter< int >::type max_shift(max_shiftSEXP);
-    Rcpp::traits::input_parameter< bool >::type verbose(verboseSEXP);
-    rcpp_result_gen = Rcpp::wrap(barcode_correction_v5(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose));
-    return rcpp_result_gen;
-END_RCPP
-}
 // sigstream
 void sigstream(const std::string& input_path, const std::string& sigstringsFilePath, Rcpp::CharacterVector adapters, const Rcpp::DataFrame& read_layout, const Rcpp::DataFrame& misalignment_threshold, int chunkSize, int nthreads, const std::string& outputPath, bool write_fastq, bool compress, int max_sequences, int min_length, bool verbose);
 RcppExport SEXP _rad_sigstream(SEXP input_pathSEXP, SEXP sigstringsFilePathSEXP, SEXP adaptersSEXP, SEXP read_layoutSEXP, SEXP misalignment_thresholdSEXP, SEXP chunkSizeSEXP, SEXP nthreadsSEXP, SEXP outputPathSEXP, SEXP write_fastqSEXP, SEXP compressSEXP, SEXP max_sequencesSEXP, SEXP min_lengthSEXP, SEXP verboseSEXP) {
@@ -567,8 +529,6 @@ static const R_CallMethodDef CallEntries[] = {
     {"_rad_generate_and_filter_mutations_v11", (DL_FUNC) &_rad_generate_and_filter_mutations_v11, 16},
     {"_rad_generate_and_filter_mutations_v13", (DL_FUNC) &_rad_generate_and_filter_mutations_v13, 16},
     {"_rad_barcode_correction_v3", (DL_FUNC) &_rad_barcode_correction_v3, 9},
-    {"_rad_barcode_correction_v4", (DL_FUNC) &_rad_barcode_correction_v4, 9},
-    {"_rad_barcode_correction_v5", (DL_FUNC) &_rad_barcode_correction_v5, 9},
     {"_rad_sigstream", (DL_FUNC) &_rad_sigstream, 13},
     {"_rad_misalignment_stream", (DL_FUNC) &_rad_misalignment_stream, 5},
     {"_rad_tabulate_variable_sequences", (DL_FUNC) &_rad_tabulate_variable_sequences, 5},
