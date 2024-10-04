@@ -827,118 +827,153 @@ Rcpp::DataFrame misalignment_stream(
 }
 
 // [[Rcpp::export]]
-void tabulate_barcodes(
-    const std::vector<std::string>& input_files, 
-    const std::string& output_prefix, 
-    bool compress = true) {
-  std::unordered_map<std::string, std::unordered_map<std::string, int>> barcode_counts;
-  std::regex barcode_regex("(barcode(?:_\\d+)?|umi):([ACGTN]+)");
-  std::unordered_map<std::string, std::unordered_map<std::string, std::string>> master_sequences;
-  std::vector<std::string> column_order;
-  auto write_output = [compress](const std::string& filename, const std::string& content) {
+void tabulate_variable_sequences(const std::vector<std::string>& input_files, 
+  const std::string& output_prefix, 
+  const std::vector<std::string>& identity_elements,
+  bool compress = true, 
+  size_t batch_size = 50000) {
+  auto write_output = [compress](gzFile& gz_file, const std::string& content) {
     if (compress) {
-      gzFile file = gzopen(filename.c_str(), "wb");
-      if (!file) {
-        Rcpp::stop("Error opening output file: " + filename);
-      }
-      gzwrite(file, content.c_str(), content.length());
-      gzclose(file);
+      gzwrite(gz_file, content.c_str(), content.length());
     } else {
-      std::ofstream file(filename);
-      if (!file.is_open()) {
-        Rcpp::stop("Error opening output file: " + filename);
-      }
-      file << content;
-      file.close();
+      Rcpp::Rcout << "Compression should be true if using gzFile." << std::endl;
     }
   };
+  
+  std::vector<std::string> column_order = identity_elements;  // Use the provided identity elements as column names
+  
+  // Initialize gzFile for the master sequence output
+  gzFile master_gz = gzopen((output_prefix + "mvs.csv.gz").c_str(), "wb");
+  if (!master_gz) {
+    Rcpp::stop("Failed to open the master sequence file.");
+  }
+  
+  // Write the header for the master sequence file
+  std::stringstream master_ss;
+  master_ss << "id";  // Start with the ID column
+  for (const auto& col : column_order) {
+    master_ss << "," << col;
+  }
+  master_ss << "\n";
+  write_output(master_gz, master_ss.str());  // Write the header to the file
+  
+  // Hash maps to store barcode counts for each barcode column
+  // Each barcode map will have: {barcode => {non_concatenate_count, concatenate_count}}
+  std::vector<std::unordered_map<std::string, std::pair<int, int>>> barcode_counts;
+  for (const auto& col : column_order) {
+    if (col.find("barcode") != std::string::npos) {
+      barcode_counts.emplace_back();  // Initialize count for each barcode-related column
+    }
+  }
+  
+  // Process each input file
   for (const auto& file_path : input_files) {
     gzFile fp = gzopen(file_path.c_str(), "r");
     if (!fp) {
       Rcpp::warning("Error opening file: " + file_path);
       continue;
     }
-    kseq_t* seq = kseq_init(fp);
+    
+    kseq_t* seq = kseq_init(fp);  // Initialize kseq for sequence reading
     int l;
+    size_t processed = 0;
+    
+    // Process reads in batches
     while ((l = kseq_read(seq)) >= 0) {
-      std::string header(seq->name.s);
-      bool skip_counting = (header.find("+FR_RF") != std::string::npos);
+      std::string header(seq->name.s);  // Read header
       std::istringstream iss(header);
-      std::string token;
-      std::string id;
-      std::getline(iss, id, '|'); 
+      std::string token, id, barcode_seq;
+      bool concatenate_flag = header.find("+FR_RF") != std::string::npos;  // Check for "+FR_RF" in the ID
+      
+      // Preallocate a vector to hold values for each identity element in the correct order
+      std::vector<std::string> identity_values(identity_elements.size(), "");
+      
+      // Extract ID
+      std::getline(iss, id, '|');  // Extract the read ID
+      
+      // Build the master sequence file line
+      master_ss.str("");  // Clear the stringstream
+      master_ss << id;  // Start the line with the read ID
+      
+      // Track which barcode column we are currently processing
+      size_t barcode_column_index = 0;
+      
+      // Extract barcode, UMI, or other identity elements using find
       while (std::getline(iss, token, '|')) {
-        std::smatch matches;
-        if (std::regex_search(token, matches, barcode_regex)) {
-          std::string barcode_type = matches[1].str();
-          std::string barcode_seq = matches[2].str();
-          std::string revcomp_seq = revcomp_cpp(barcode_seq);
-        
-          // Check if barcode or its reverse complement already exists
-          if (!skip_counting) {
-            if (barcode_counts[barcode_type].find(barcode_seq) == barcode_counts[barcode_type].end() &&
-                barcode_counts[barcode_type].find(revcomp_seq) == barcode_counts[barcode_type].end()) {
-              barcode_counts[barcode_type][barcode_seq]++;
-            } else if (barcode_counts[barcode_type].find(revcomp_seq) != barcode_counts[barcode_type].end()) {
-              barcode_counts[barcode_type][revcomp_seq]++;
-              barcode_seq = revcomp_seq;  // Use the existing reverse complement
-            } else {
-              barcode_counts[barcode_type][barcode_seq]++;
+        for (size_t i = 0; i < identity_elements.size(); ++i) {
+          const auto& elem = identity_elements[i];
+          // Look for "elem:" (e.g., "barcode:", "umi:")
+          size_t pos = token.find(elem + ":");
+          if (pos != std::string::npos) {
+            barcode_seq = token.substr(pos + elem.size() + 1);  // Extract the sequence part
+            identity_values[i] = barcode_seq;  // Store the extracted sequence in the correct position
+            
+            // If this element is a "barcode", increment the count
+            if (elem.find("barcode") != std::string::npos) {
+              std::string revcomp_seq = revcomp_cpp(barcode_seq);  // Compute the reverse complement
+              if (barcode_counts[barcode_column_index].count(revcomp_seq)) {
+                // If the reverse complement exists, collapse the counts into the forward complement
+                barcode_counts[barcode_column_index][barcode_seq].first += barcode_counts[barcode_column_index][revcomp_seq].first;
+                barcode_counts[barcode_column_index][barcode_seq].second += barcode_counts[barcode_column_index][revcomp_seq].second;
+                barcode_counts[barcode_column_index].erase(revcomp_seq);  // Remove the reverse complement entry
+              }
+              
+              if (concatenate_flag) {
+                barcode_counts[barcode_column_index][barcode_seq].second++;  // Increment concatenate count
+              } else {
+                barcode_counts[barcode_column_index][barcode_seq].first++;   // Increment non-concatenate count
+              }
+              barcode_column_index++;
             }
-          }
-          master_sequences[id][barcode_type] = barcode_seq;
-          // Add to column order if not already present
-          if (std::find(column_order.begin(), column_order.end(), barcode_type) == column_order.end()) {
-            column_order.push_back(barcode_type);
+            break;  // No need to check the remaining identity elements for this token
           }
         }
       }
-    }
-    kseq_destroy(seq);
-    gzclose(fp);
-  }
-  // Write results to CSV files
-  for (const auto& [barcode_type, counts] : barcode_counts) {
-    std::string output_file = output_prefix + barcode_type + (compress ? ".csv.gz" : ".csv");
-    std::stringstream ss;
-    ss << barcode_type << ",count\n";
-    std::vector<BarcodeCount> sorted_barcodes;
-    for (const auto& [barcode, count] : counts) {
-      sorted_barcodes.push_back({barcode, count});
-    }
-    std::sort(sorted_barcodes.begin(), sorted_barcodes.end(),
-              [](const BarcodeCount& a, const BarcodeCount& b) {
-                return a.count > b.count;
-              });
-    for (const auto& bc : sorted_barcodes) {
-      ss << bc.barcode << "," << bc.count << "\n";
-    }
-    write_output(output_file, ss.str());
-    Rcpp::Rcout << "Saved " << barcode_type << " counts to " << output_file << std::endl;
-  }
-  // Write master_variable_sequence file
-  std::string master_file = output_prefix + "master_variable_sequence" + (compress ? ".csv.gz" : ".csv");
-  std::stringstream master_ss;
-  // Write header
-  master_ss << "id";
-  for (const auto& col : column_order) {
-    master_ss << "," << col;
-  }
-  master_ss << "\n";
-  // Write data
-  for (const auto& [id, sequences] : master_sequences) {
-    master_ss << id;
-    for (const auto& col : column_order) {
-      master_ss << ",";
-      auto it = sequences.find(col);
-      if (it != sequences.end()) {
-        master_ss << it->second;
+      
+      // Append all values in the correct order (matching the header)
+      for (const auto& value : identity_values) {
+        master_ss << "," << value;
+      }
+      
+      // Complete the line and write it to the file
+      master_ss << "\n";
+      write_output(master_gz, master_ss.str());
+      
+      processed++;
+      
+      if (processed % batch_size == 0) {
+        std::cout << "Processed " << processed << " reads from " << file_path << std::endl;
       }
     }
-    master_ss << "\n";
+    
+    kseq_destroy(seq);  // Clean up kseq resources
+    gzclose(fp);  // Close the input file
   }
-  write_output(master_file, master_ss.str());
-  Rcpp::Rcout << "Saved master variable sequence data to " << master_file << std::endl;
+  
+  gzclose(master_gz);  // Close the master sequence file at the end
+  
+  // Write the barcode counts to separate CSV files
+  for (size_t i = 0; i < barcode_counts.size(); ++i) {
+    std::string output_file = output_prefix + "barcode";
+    if (i > 0) {
+      output_file += "_" + std::to_string(i);  // Add a suffix for subsequent barcode columns
+    }
+    output_file += ".csv.gz";
+    
+    gzFile barcode_gz = gzopen(output_file.c_str(), "wb");
+    if (!barcode_gz) {
+      Rcpp::warning("Error opening file: " + output_file);
+      continue;
+    }
+    
+    std::stringstream ss;
+    ss << "barcode,non_concatenate_count,concatenate_count\n";  // Write header
+    for (const auto& entry : barcode_counts[i]) {
+      ss << entry.first << "," << entry.second.first << "," << entry.second.second << "\n";  // Write barcode and counts
+    }
+    write_output(barcode_gz, ss.str());
+    gzclose(barcode_gz);  // Close the barcode output file
+  }
 }
 
 // [[Rcpp::export]]
@@ -1056,4 +1091,76 @@ void tabulate_sigs(const std::string& file_path,
   }
   write_output(summary_output_file, summary_ss.str());
   Rcpp::Rcout << "Completed processing " << sequence_count << " sigstrings." << std::endl;
+}
+
+
+std::string extract_corrected_barcode(const std::string& full_header) {
+  size_t start_pos = full_header.find("CB:Z:");
+  if (start_pos == std::string::npos) return "";
+  
+  size_t barcode_start = start_pos + 5; // Skip "CB:Z:"
+  
+  // Find the next space or tab after the barcode, stopping before any UB:Z: field
+  size_t barcode_end = full_header.find_first_of("\t ", barcode_start);
+  if (barcode_end == std::string::npos) {
+    barcode_end = full_header.length(); // In case there is no space/tab after the barcode
+  }
+  
+  return full_header.substr(barcode_start, barcode_end - barcode_start);
+}
+// [[Rcpp::export]]
+Rcpp::DataFrame extract_blaze_barcode(std::string fastq_file, int print_every = 10000) {
+  gzFile fp = gzopen(fastq_file.c_str(), "r");
+  if (!fp) Rcpp::stop("Failed to open file.");
+  
+  kseq_t *seq = kseq_init(fp);
+  int l;
+  
+  // Hash map to store the counts of corrected barcodes
+  std::unordered_map<std::string, int> barcode_counts;
+  
+  int sequence_count = 0;
+  
+  // Read through the fastq file with kseq
+  while ((l = kseq_read(seq)) >= 0) {
+    sequence_count++;
+    
+    // Capture both the sequence name (header) and the comment (which might contain CB:Z)
+    std::string header = "@" + std::string(seq->name.s);  // Add '@' symbol to the header
+    std::string full_header = header;
+    if (seq->comment.l > 0) {
+      full_header += "\t" + std::string(seq->comment.s); // Append the comment section (CB:Z might be here)
+    }
+    
+    // Extract the corrected barcode (CB:Z: field)
+    std::string corrected_barcode = extract_corrected_barcode(full_header);
+    
+    // If the corrected barcode is missing, skip
+    if (corrected_barcode.empty()) continue;
+    
+    // Increment the count for the corrected barcode
+    barcode_counts[corrected_barcode]++;
+    
+    // Print progress every 'print_every' sequences
+    if (sequence_count % print_every == 0) {
+      std::cout << "Processed " << sequence_count << " sequences so far." << std::endl;
+    }
+  }
+  
+  kseq_destroy(seq);
+  gzclose(fp);
+  
+  std::cout << "Total sequences processed: " << sequence_count << std::endl;
+  
+  // Prepare vectors for the DataFrame
+  Rcpp::CharacterVector barcodes;
+  Rcpp::IntegerVector total_counts;
+  for (const auto& entry : barcode_counts) {
+    barcodes.push_back(entry.first);              // Corrected barcode
+    total_counts.push_back(entry.second);  // Total count
+  }
+  
+  // Return the DataFrame with barcode and total counts
+  return Rcpp::DataFrame::create(Rcpp::Named("barcode") = barcodes,
+    Rcpp::Named("total") = total_counts);
 }

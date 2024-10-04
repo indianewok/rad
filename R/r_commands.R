@@ -297,7 +297,7 @@ aggc<-function(){
 }
 
 process_barcodes<-function(barcode_path, read_layout) {
-  barcodes<-data.table::fread(barcode_path, col.names = c("seq", "count"))
+  barcodes<-data.table::fread(barcode_path, col.names = c("seq", "count","concatenate_count"))
   data.table::setkey(read_layout, "class_id")
   
   dir_path<-paste0(dirname(barcode_path),"/")
@@ -340,6 +340,7 @@ process_barcodes<-function(barcode_path, read_layout) {
   }
   
   barcodes[, pois_dist := stats::ppois(q = count, lambda = mean(count))]
+  
   barcodes[is.na(filtered), ':='(
     int64_seq = sequence_to_bits(seq),
     int64_rcseq = sequence_to_bits(revcomp(seq))
@@ -349,15 +350,24 @@ process_barcodes<-function(barcode_path, read_layout) {
       int64_seq %in% whitelist$whitelist_bcs | int64_rcseq %in% whitelist$whitelist_bcs,
       "whitelist_barcode", "barcode_to_correct"
     )]
-    barcodes[(filtered == "whitelist_barcode" & pois_dist >= 0.95), 
-      filtered := "pois_validated_barcode"]
-    barcodes[(pois_dist >= 0.95 & filtered == "pois_validated_barcode"), 
-      new_pois_dist := stats::ppois(q = count, lambda = mean(count))]
-    barcodes[(((pois_dist - new_pois_dist) > 0) & filtered == "pois_validated_barcode"),
-      filtered := "whitelist_barcode"]
   }
+  whitelist_output<-density_estimator_v12(barcode_df = barcodes)
+  kde_density<-ggpar(
+    whitelist_output$kde_density,
+    title = paste0(basename(dirname(dir_path)), " KDE Density with Threshold",
+    subtitle = paste0("Threshold: ", 
+      whitelist_output$threshold,
+      "\nPredicted Count: ",
+      length(which(whitelist_output$results$kde_threshold)))),
+    legend = "none", font.x = 14, font.y = 14, font.main = 14)
   
-  data.table::fwrite(x = barcodes, file = barcode_path)
+  ggsave(
+    filename = paste0(dir_path, barcode_id, "_kde_density.jpeg"), 
+    plot =  kde_density,
+    width = 11, height = 8.5, 
+    unit = "in"
+    )
+  data.table::fwrite(x = barcodes, file = barcode_path, col.names = TRUE)
 }
 
 correct_barcodes<-function(input_file,
@@ -368,10 +378,8 @@ correct_barcodes<-function(input_file,
                            read_layout
                            ){
   barcode<-data.table::fread(
-    input_file,
-    col.names = c("seq","count","filtered","pois_dist","int64_seq","int64_rcseq","new_pois_dist"))
+    input_file, key = "filtered")
   data.table::setkey(read_layout, "class_id")
-  data.table::setkey(barcode, "filtered")
   barcode_id<-basename(tools::file_path_sans_ext(input_file))
   
   dir_path<-paste0(dirname(input_file),"/")
@@ -393,12 +401,14 @@ correct_barcodes<-function(input_file,
     max_shift = max_shift,
     nthread = nthreads,
     input_fastq = input_fastq_path,
+    process_fastq = TRUE,
     filtered_fastq = filtered_fastq_path,
     unfiltered_fastq = unfiltered_fastq_path,
     counts_output_csv = barcode_counts_output_path,
     detailed_output_csv = verbose_barcode_output_path,
     verbose = FALSE)
-  data.table::fwrite(out$detailed_output, file = detailed_output_csv)
+  
+  data.table::fwrite(out$detailed_output, file = verbose_barcode_output_path)
   data.table::fwrite(out$barcode_counts, file = barcode_counts_output_path)
   
   file.copy(filtered_fastq_path, input_fastq_path, overwrite = TRUE)
@@ -518,11 +528,14 @@ rad_run<-function(
   
   dir.create(path = paste0(output_directory_path,"/variable_seqs/"))
   cat("Tabulating barcodes...\n")
-  tabulate_barcodes(
+  extractable_elements<-read_layout[type == "variable" & class != "read" & direction == "forward", class_id]
+  
+  tabulate_variable_sequences(
     input_files = paste0(output_directory_path, "/demuxed_reads.fastq", 
                          ifelse(test = compress, yes = ".gz", no = "")), 
+    identity_elements = c(extractable_elements),
     output_prefix = paste0(output_directory_path,"/variable_seqs/"), 
-    compress = FALSE)
+    compress = TRUE)
   barcode_files<-list.files(path = paste0(output_directory_path,"/variable_seqs/"), full.names = TRUE, pattern = "barcode")
   out<-lapply(X = barcode_files, FUN = function(X){
     process_barcodes(barcode_path = X, read_layout = read_layout)
@@ -659,4 +672,98 @@ generate_synthetic_reads<-function(
   # Optionally, adjust IDs to indicate reverse complement
   synthetic_reads$id[indices_to_revcomp]<-paste0(synthetic_reads$id[indices_to_revcomp], '_rc')
   return(synthetic_reads)
+}
+
+density_estimator_v12<-function(barcode_df){
+  setkey(barcode_df, "filtered")
+  # Calculate ncpm and log1p_ncpm
+  barcode_df[, ncpm := (count / sum(count)) * 1e6] 
+  barcode_df[, log1p_ncpm := log1p(ncpm)]
+  barcode_df[, ncpm_pois := stats::ppois(q = ncpm, lambda = mean(ncpm))]
+  # Subset the data based on conditions
+  data_subset<-barcode_df[filtered == "whitelist_barcode" & ncpm_pois >= 0.95, log1p_ncpm]
+  # Perform GMM clustering
+  gmm_scan<-densityMclust(data = data_subset, plot = FALSE, modelNames = c("V", "E"))
+  density_output<-density(data_subset)
+  plot_df<-data.table(x = density_output$x, y = density_output$y)
+  # Find peaks and valleys
+  peaks<-pracma::findpeaks(density_output$y)
+  valleys<-pracma::findpeaks(-density_output$y)
+  # If more than 3 peaks, drop the lowest peak
+  if (nrow(peaks) > 3) {
+    min_peak_index <- which.min(peaks[, 1])
+    peaks <- peaks[-min_peak_index, , drop = FALSE]
+  }
+  # If still more than 3 peaks, iterate over bandwidths to reduce peaks to 2
+  bw<-density_output$bw
+  iter<-1
+  while(nrow(peaks) > 2 && iter <= 50){
+    bw<-bw + 0.05  # Increment bandwidth
+    density_output<-density(data_subset, bw = bw)
+    peaks<-pracma::findpeaks(density_output$y)
+    valleys<-pracma::findpeaks(-density_output$y)
+    iter<-iter + 1
+  }
+  # Now, find the valley between the two peaks
+  if (nrow(peaks) == 2){
+    peak1_position<-peaks[1, 2]
+    peak2_position<-peaks[2, 2]
+    valley_in_between<-valleys[valleys[, 2] > peak1_position & valleys[, 2] < peak2_position, ]
+    if (!is.matrix(valley_in_between)) {
+      valley_in_between<-matrix(valley_in_between, nrow = 1)
+    }
+    if (nrow(valley_in_between) > 0) {
+      valid_valley<-valley_in_between[1, 2]
+    } else {
+      stop("No valley found between the two peaks.")
+    }
+    # Threshold is the x-position of the valid valley
+    threshold<-density_output$x[valid_valley]
+    # Calculate the x positions of the peaks
+    peak_one<-density_output$x[peaks[1, 2]]
+    peak_two<-density_output$x[peaks[2, 2]]
+    # Classify points based on threshold
+    plot_df[, cluster := ifelse(x >= threshold, "Above Threshold", "Below Threshold")]
+    # Extract GMM results
+    best_gmm<-gmm_scan
+    uncertainty_percentage<-round(best_gmm$uncertainty, digits = 4) * 100
+    best_cluster<-best_gmm$classification
+    kde_threshold<-barcode_df[filtered == "whitelist_barcode" & ncpm_pois >= 0.95]$log1p_ncpm >= threshold
+    cluster_threshold<-uncertainty_percentage <= 5
+    results<-barcode_df[filtered == "whitelist_barcode" & ncpm_pois >= 0.95, 
+      .(seq, count, concatenate_count, log1p_ncpm, 
+        uncertainty_percentage, best_cluster,
+         kde_threshold, cluster_threshold)]
+    kde_density_plot<-ggplot(plot_df, aes(x = x, y = y, color = cluster)) +
+      geom_line(linewidth = 1) +
+      geom_vline(xintercept = threshold, linetype = "dashed", color = "blue") +  
+      geom_vline(xintercept = peak_one, linetype = "dashed", color = "red") + 
+      geom_vline(xintercept = peak_two, linetype = "dashed", color = "red") +  
+      labs(title = "KDE Density with Threshold", x = "log1p_ncpm", y = "Density") +
+      scale_color_manual(values = c("Below Threshold" = "black", "Above Threshold" = "green")) +
+      theme_minimal()
+    
+    setkey(barcode_df, "seq")
+    setkey(results, "kde_threshold")
+    barcode_df[results[J(TRUE)]$seq, filtered:="pois_validated_barcode"]
+    # Return the results, plots, and GMM model
+    return(list(
+      threshold = threshold,
+      density = density_output,
+      results = results,
+      kde_density = kde_density_plot,
+      best_gmm = best_gmm
+    ))
+  }
+}
+
+blaze_data_processor<-function(path_to_matched_fastq, path_to_putative_bcs){
+  putative_bcs<-data.table::fread(path_to_putative_bcs, na.strings = "", select = 2) #2 is the putative_bc column
+  putative_bcs<-putative_bcs[, .N, by = putative_bc]
+  setnames(putative_bcs, "N", "original")
+  final_counts<-extract_blaze_barcode(path_to_matched_fastq)
+  final_counts<-as.data.table(final_counts)
+  merged_barcodes<-final_counts[putative_bcs, on = c("barcode" = "putative_bc"), nomatch = 0L]
+  merged_barcodes$corrected<-merged_barcodes$total-merged_barcodes$original
+  return(merged_barcodes)
 }

@@ -407,23 +407,27 @@ std::string int64_to_quaternary(int64_t value, int length) {
 }
 
 std::vector<int64_t> generate_shifted_barcodes(int64_t original, int sequence_length, int max_shift = 2) {
-  std::vector<int64_t> shifted_barcodes;
+  std::unordered_set<int64_t> shifted_barcodes_set;  // Use a set to avoid duplicates
   int64_t mask = (1LL << (2 * sequence_length)) - 1;  // Mask for the original sequence length
+  
   // Generate right shifts
   for (int shift = 1; shift <= max_shift; ++shift) {
     for (int padding = 0; padding < 4; ++padding) {
       int64_t shifted = ((original >> (2 * shift)) & (mask >> (2 * shift))) | (padding << (2 * (sequence_length - shift)));
-      shifted_barcodes.push_back(shifted);
+      shifted_barcodes_set.insert(shifted);  // Insert into set
     }
   }
+  
   // Generate left shifts
   for (int shift = 1; shift <= max_shift; ++shift) {
     for (int padding = 0; padding < 4; ++padding) {
       int64_t shifted = ((original << (2 * shift)) & mask) | padding;
-      shifted_barcodes.push_back(shifted);
+      shifted_barcodes_set.insert(shifted);  // Insert into set
     }
   }
-  return shifted_barcodes;
+  
+  // Convert set to vector and return
+  return std::vector<int64_t>(shifted_barcodes_set.begin(), shifted_barcodes_set.end());
 }
 
 // [[Rcpp::export]]
@@ -2469,7 +2473,7 @@ Rcpp::List generate_and_filter_mutations_v13(
     Rcpp::stop("No incorrect barcodes provided.");
   }
   
-  // Step 2: Initialize incorrect barcode map (resolved, putative_barcodes, dl_distances)
+  // Step 2: Initialize incorrect barcode map (resolved, [putative_barcodes, mutation_type], dl_distances)
   std::unordered_map<int64_t, std::tuple<bool, std::vector<std::pair<int64_t, int>>, std::vector<double>>> incorrect_map;
   for (const auto& incorrect_barcode : incorrect_barcodes) {
     incorrect_map[incorrect_barcode] = std::make_tuple(false, std::vector<std::pair<int64_t, int>>(), std::vector<double>());
@@ -2486,7 +2490,10 @@ Rcpp::List generate_and_filter_mutations_v13(
     int64_t correct_barcode = correct_barcodes[i];
     
     // Generate mutated barcodes
-    std::vector<int64_t> mutated_barcodes = generate_recursive_quaternary_mutations_cpp_v2(correct_barcode, mutation_rounds, sequence_length);
+    std::vector<int64_t> mutated_barcodes = generate_recursive_quaternary_mutations_cpp_v2(
+      correct_barcode,
+      mutation_rounds,
+      sequence_length);
     for (const auto& mutated : mutated_barcodes) {
       if (incorrect_set.find(mutated) != incorrect_set.end()) {
 #pragma omp critical
@@ -2573,33 +2580,81 @@ Rcpp::List generate_and_filter_mutations_v13(
     }
     
     if (putative_barcodes.size() > 1) {
-      double min_dl_dist = *std::min_element(dl_distances.begin(), dl_distances.end());
-      std::vector<int> min_indices;
+      // Create a map of unique barcodes and their corresponding minimum DL distances
+      std::unordered_map<int64_t, double> barcode_to_min_dl_dist;
       
-      // Collect the indices of barcodes with the minimum DL distance
-      for (int i = 0; i < dl_distances.size(); ++i) {
-        if (dl_distances[i] == min_dl_dist) {
-          min_indices.push_back(i);
+      // Loop through putative_barcodes and dl_distances to build the unique barcode set
+      for (size_t i = 0; i < putative_barcodes.size(); ++i) {
+        int64_t barcode = putative_barcodes[i].first;
+        double dist = dl_distances[i];
+        
+        // Keep the minimum DL distance for each unique barcode
+        if (barcode_to_min_dl_dist.find(barcode) == barcode_to_min_dl_dist.end()) {
+          barcode_to_min_dl_dist[barcode] = dist;
+        } else {
+          barcode_to_min_dl_dist[barcode] = std::min(barcode_to_min_dl_dist[barcode], dist);
         }
       }
-      // If there's exactly one minimum index, resolve to that barcode
-      if (min_indices.size() == 1) {
-        putative_barcodes = {putative_barcodes[min_indices[0]]};
-        resolved = true;  // Resolved, only one match
-      } 
-      // Otherwise, we reduce to the barcodes with the same minimum distance
-      else {
-        std::vector<std::pair<int64_t, int>> reduced_barcodes;
-        // Collect all barcodes with the same minimum DL distance
-        for (int index : min_indices) {
-          reduced_barcodes.push_back(putative_barcodes[index]);
+      
+      // Now find the minimum DL distance from the unique barcode set
+      auto min_it = std::min_element(
+        barcode_to_min_dl_dist.begin(),
+        barcode_to_min_dl_dist.end(),
+        [](const std::pair<int64_t, double>& a, const std::pair<int64_t, double>& b) {
+          return a.second < b.second;
         }
-        // Set putative_barcodes to the reduced set and mark unresolved
-        putative_barcodes = reduced_barcodes;
-        resolved = false;  // Still unresolved due to ties
+      );
+      
+      double min_dl_dist = min_it->second;
+      std::vector<int64_t> min_barcodes;
+      
+      // Collect all barcodes that have this minimum DL distance
+      for (const auto& [barcode, dist] : barcode_to_min_dl_dist) {
+        if (dist == min_dl_dist) {
+          min_barcodes.push_back(barcode);
+        }
+      }
+      
+      // If exactly one barcode has the minimum DL distance, resolve to that barcode
+      if (min_barcodes.size() == 1) {
+        // Find and keep the pair in putative_barcodes that matches this barcode
+        for (const auto& pair : putative_barcodes) {
+          if (pair.first == min_barcodes[0]) {
+            putative_barcodes = {pair};  // Resolve to this barcode
+            break;
+          }
+        }
+        resolved = true;  // Only one match, so it's resolved
+      }
+      // If there are multiple barcodes with the same minimum distance, check for uniqueness
+      else {
+        std::unordered_set<int64_t> unique_barcodes(min_barcodes.begin(), min_barcodes.end());
+        
+        // If all barcodes are the same (mutated/shifted), resolve to one of them
+        if (unique_barcodes.size() == 1) {
+          resolved = true;
+          // Find and keep one of the matching pairs in putative_barcodes
+          for (const auto& pair : putative_barcodes) {
+            if (pair.first == *unique_barcodes.begin()) {
+              putative_barcodes = {pair};  // Keep one of the pairs
+              break;
+            }
+          }
+        }
+        // If not, keep the reduced set of barcodes and mark unresolved
+        else {
+          std::vector<std::pair<int64_t, int>> reduced_barcodes;
+          for (const auto& pair : putative_barcodes) {
+            if (unique_barcodes.count(pair.first)) {
+              reduced_barcodes.push_back(pair);
+            }
+          }
+          putative_barcodes = reduced_barcodes;
+          resolved = false;  // Still unresolved due to multiple candidates
+        }
       }
     }
-
+    
     if (processed_incorrect % log_frequency == 0 || processed_incorrect == total_incorrect) {
 #pragma omp critical
 {
@@ -2623,33 +2678,35 @@ Rcpp::List generate_and_filter_mutations_v13(
 #pragma omp parallel for schedule(dynamic)
   for (size_t idx = 0; idx < incorrect_keys.size(); ++idx) {
     int64_t incorrect_barcode = incorrect_keys[idx];
-    const auto& [resolved, putative_barcodes, dl_distances] = incorrect_map[incorrect_barcode];
-    incorrect_barcode_vec[idx] = int64_to_string(incorrect_barcode, sequence_length);
+    auto& [resolved, putative_barcodes, dl_distances] = incorrect_map[incorrect_barcode];
     
+    incorrect_barcode_vec[idx] = int64_to_string(incorrect_barcode, sequence_length);
     // If resolved, assign the correct barcode and mutation type
     if (resolved) {
       corrected_barcode_vec[idx] = int64_to_string(putative_barcodes[0].first, sequence_length);
       mutation_type_vec[idx] = (putative_barcodes[0].second == 0) ? "mutated" : "shifted";
+      resolved_status_vec[idx] = resolved;  // Update resolved status
     }
     // Handle unresolved cases
     else {
       if (putative_barcodes.empty()) {
         mutation_type_vec[idx] = "unresolved_empty";
       } else {
-        // Multiple unresolved barcodes: concatenate them with '|'
         mutation_type_vec[idx] = "unresolved_multiple";
-        // Concatenate all putative barcodes
+        // Fix the concatenation of multiple unresolved barcodes
         std::string unresolved_barcodes;
         for (size_t j = 0; j < putative_barcodes.size(); ++j) {
           unresolved_barcodes += int64_to_string(putative_barcodes[j].first, sequence_length);
-          if (j != putative_barcodes.size() - 1) {
-            unresolved_barcodes += "|";  // Add delimiter between barcodes
+          if (putative_barcodes.size() > 1 && j != putative_barcodes.size() - 1) {
+            unresolved_barcodes += "|";  // Proper delimiter between barcodes
           }
         }
-        corrected_barcode_vec[idx] = unresolved_barcodes;  // Store the concatenated result
+        corrected_barcode_vec[idx] = unresolved_barcodes;  // Store the concatenated unresolved barcodes
       }
+      // No mutation type should be assigned for unresolved barcodes
+      //mutation_type_vec[idx] = "unresolved";  // Reset mutation type for unresolved cases
     }
-    resolved_status_vec[idx] = resolved;  // Update the resolved status
+    
   }
   // Step 7: FASTQ Processing (Count reads in chunks)
   size_t total_reads = 0, corrected_reads = 0, uncorrected_reads = 0;
@@ -2786,7 +2843,6 @@ Rcpp::List generate_and_filter_mutations_v13(
     gzclose(gz_unfiltered_out);
   }
   
-
   // Step 8: Prepare barcode counts output and DataFrames
   std::vector<std::string> whitelist_barcode_vec(correct_barcodes.size());
   std::vector<int> total_counts_vec(correct_barcodes.size());
@@ -2828,4 +2884,489 @@ Rcpp::List generate_and_filter_mutations_v13(
   );
 }
 
+// [[Rcpp::plugins(openmp)]]
+// [[Rcpp::depends(data.table)]]
+// [[Rcpp::export]]
+Rcpp::DataFrame barcode_correction_v3(
+    SEXP true_barcodes,
+    SEXP invalid_barcodes,
+    SEXP true_counts,
+    SEXP invalid_counts,
+    int mutation_rounds = 3,
+    int sequence_length = 16,
+    int nthread = 1,
+    int max_shift = 3,
+    bool verbose = false) {
+  //auto start_time = std::chrono::high_resolution_clock::now();
+  // Step 1: Initialize input vectors and validate
+  std::vector<int64_t> correct_barcodes = Rcpp::as<std::vector<int64_t>>(true_barcodes);
+  std::vector<int64_t> incorrect_barcodes = Rcpp::as<std::vector<int64_t>>(invalid_barcodes);
+  std::unordered_map<int64_t, int> original_counts, corrected_counts;  // Track counts for original and corrected barcodes
+  
+  // Step 2: Deduplicate correct barcodes and consolidate counts
+  for (size_t i = 0; i < correct_barcodes.size(); ++i) {
+    original_counts[correct_barcodes[i]] += Rcpp::as<std::vector<int>>(true_counts)[i];  // Consolidate counts
+    corrected_counts[correct_barcodes[i]] = 0;  // Initialize corrected counts
+  }
+  
+  // Deduplicate incorrect barcodes
+  std::unordered_set<int64_t> incorrect_set(incorrect_barcodes.begin(), incorrect_barcodes.end());
+  
+  if (correct_barcodes.empty()) {
+    Rcpp::stop("No correct barcodes provided.");
+  }
+  if (incorrect_barcodes.empty()) {
+    Rcpp::stop("No incorrect barcodes provided.");
+  }
+  
+  // Step 3: Initialize incorrect barcode map (resolved, [putative_barcodes, mutation_type], dl_distances)
+  std::unordered_map<int64_t, std::tuple<bool, std::vector<std::pair<int64_t, int>>, std::vector<double>>> incorrect_map;
+  for (const auto& incorrect_barcode : incorrect_barcodes) {
+    incorrect_map[incorrect_barcode] = std::make_tuple(false, std::vector<std::pair<int64_t, int>>(), std::vector<double>());
+  }
+  
+  size_t total_sequences = correct_barcodes.size();
+  size_t processed_sequences = 0;
+  size_t log_frequency = 10000;  // Log progress every 10,000 sequences
+  
+  // Step 4: Generate mutations and shifts, including checking for both mutations and shifts
+  omp_set_num_threads(nthread);
+#pragma omp parallel for schedule(dynamic)
+  for (size_t i = 0; i < correct_barcodes.size(); ++i) {
+    int64_t correct_barcode = correct_barcodes[i];
+    
+    std::unordered_set<int64_t> mutated_set;
+    std::unordered_set<int64_t> shifted_set;
+    
+    // Generate mutated barcodes
+    std::vector<int64_t> mutated_barcodes = generate_recursive_quaternary_mutations_cpp_v2(
+      correct_barcode,
+      mutation_rounds,
+      sequence_length);
+    
+    mutated_set.insert(mutated_barcodes.begin(), mutated_barcodes.end());
+    
+    // Generate shifted barcodes
+    if(max_shift > 0){
+      std::vector<int64_t> shifted_barcodes = generate_shifted_barcodes(correct_barcode, sequence_length, max_shift);
+      shifted_set.insert(shifted_barcodes.begin(), shifted_barcodes.end());
+    }
+    // Combine both sets to track "mutated", "shifted", and "mutated_and_shifted"
+    std::unordered_set<int64_t> unique_barcodes(mutated_set.begin(), mutated_set.end());
+    unique_barcodes.insert(shifted_set.begin(), shifted_set.end());
+    
+    for (const auto& barcode : unique_barcodes) {
+      if (incorrect_set.find(barcode) != incorrect_set.end()) {
+        int mutation_type = 0;  // Default: mutated
+        if (mutated_set.find(barcode) != mutated_set.end() && shifted_set.find(barcode) != shifted_set.end()) {
+          mutation_type = 2;  // mutated and shifted
+        } else if (shifted_set.find(barcode) != shifted_set.end()) {
+          mutation_type = 1;  // shifted
+        }
+#pragma omp critical
+        std::get<1>(incorrect_map[barcode]).emplace_back(correct_barcode, mutation_type);
+      }
+    }
+    
+#pragma omp critical
+{
+  processed_sequences++;
+  if (processed_sequences % log_frequency == 0 || processed_sequences == total_sequences) {
+    size_t remaining_sequences = total_sequences - processed_sequences;
+    std::cout << "Total barcodes to process: " << total_sequences
+              << ", Processed: " << processed_sequences
+              << ", Remaining: " << remaining_sequences << std::endl;
+  }
+}
+  }
+  
+  std::cout << "Mutations and shifts generated.\n";
+  std::cout << "Populating DL distances...\n";
+  
+  // Step 5: Populate DL distances
+  Rcpp::NumericVector weight = Rcpp::NumericVector::create(1.0, 1.0, 1.0, 1.0);
+  int method = 2; // Damerau-Levenshtein distance method
+  
+  for (auto& [incorrect_barcode, data] : incorrect_map) {
+    auto& [resolved, putative_barcodes, dl_distances] = data;
+    if (putative_barcodes.size() > 1) {
+      std::string incorrect_str = int64_to_string(incorrect_barcode, sequence_length);
+      std::vector<std::string> putative_correct_strs;
+      for (const auto& [correct_barcode, _] : putative_barcodes) {
+        putative_correct_strs.push_back(int64_to_string(correct_barcode, sequence_length));
+      }
+      SEXP incorrect_sexp = Rcpp::wrap(incorrect_str);
+      SEXP correct_sexp = Rcpp::wrap(putative_correct_strs);
+      SEXP dl_dist_results = sd_stringdist(
+        incorrect_sexp,
+        correct_sexp,
+        Rcpp::wrap(method),
+        weight, Rcpp::wrap(0.0), Rcpp::wrap(0.0), Rcpp::wrap(1), Rcpp::wrap(0), Rcpp::wrap(1)  // Single thread
+      );
+      dl_distances = Rcpp::as<std::vector<double>>(dl_dist_results);
+    }
+  }
+  
+  std::cout << "DL distances populated.\n";
+  
+  // Step 6: Resolve collisions
+  //size_t total_incorrect = incorrect_map.size();
+  log_frequency = 50000;  // Log progress every 50,000 sequences
+  std::atomic<size_t> processed_incorrect(0);
+  std::vector<int64_t> incorrect_keys;
+  incorrect_keys.reserve(incorrect_map.size());
+  for (const auto& pair : incorrect_map) {
+    incorrect_keys.push_back(pair.first);
+  }
+  
+  omp_set_num_threads(nthread);
+#pragma omp parallel for schedule(dynamic)
+  for (size_t idx = 0; idx < incorrect_keys.size(); ++idx) {
+    int64_t incorrect_barcode = incorrect_keys[idx];
+    auto& [resolved, putative_barcodes, dl_distances] = incorrect_map[incorrect_barcode];
+    
+    processed_incorrect++;
+    
+    if (putative_barcodes.empty()) {
+      resolved = false;
+      continue;
+    }
+    
+    if (putative_barcodes.size() == 1) {
+      resolved = true;
+      continue;
+    }
+    
+    // Find the minimum DL distance and handle uniqueness
+    std::unordered_map<int64_t, double> barcode_to_min_dl_dist;
+    for (size_t i = 0; i < putative_barcodes.size(); ++i) {
+      int64_t barcode = putative_barcodes[i].first;
+      double dist = dl_distances[i];
+      barcode_to_min_dl_dist[barcode] = std::min(barcode_to_min_dl_dist[barcode], dist);
+    }
+    
+    // Find the barcode with the smallest DL distance
+    auto min_it = std::min_element(
+      barcode_to_min_dl_dist.begin(),
+      barcode_to_min_dl_dist.end(),
+      [](const std::pair<int64_t, double>& a, const std::pair<int64_t, double>& b) {
+        return a.second < b.second;
+      }
+    );
+    
+    double min_dl_dist = min_it->second;
+    std::vector<int64_t> min_barcodes;
+    
+    for (const auto& [barcode, dist] : barcode_to_min_dl_dist) {
+      if (dist == min_dl_dist) {
+        min_barcodes.push_back(barcode);
+      }
+    }
+    
+    if (min_barcodes.size() == 1) {
+      for (const auto& pair : putative_barcodes) {
+        if (pair.first == min_barcodes[0]) {
+          putative_barcodes = {pair};
+          break;
+        }
+      }
+      resolved = true;
+    } else {
+      resolved = false;
+    }
+  }
+  
+  std::cout << "Collision resolution completed.\n";
+  
+  // Step 7: Prepare outputs
+  std::vector<std::string> incorrect_barcode_vec(incorrect_map.size());
+  std::vector<std::string> corrected_barcode_vec(incorrect_map.size());
+  std::vector<bool> resolved_status_vec(incorrect_map.size());
+  std::vector<std::string> mutation_type_vec(incorrect_map.size());
+  
+  for (size_t idx = 0; idx < incorrect_keys.size(); ++idx) {
+    int64_t incorrect_barcode = incorrect_keys[idx];
+    auto& [resolved, putative_barcodes, dl_distances] = incorrect_map[incorrect_barcode];
+    
+    incorrect_barcode_vec[idx] = int64_to_string(incorrect_barcode, sequence_length);
+    if (resolved) {
+      corrected_barcode_vec[idx] = int64_to_string(putative_barcodes[0].first, sequence_length);
+      mutation_type_vec[idx] = (putative_barcodes[0].second == 0) ? "mutated" :
+        (putative_barcodes[0].second == 1) ? "shifted" : "mutated_and_shifted";
+    } else {
+      if (putative_barcodes.empty()) {
+        mutation_type_vec[idx] = "unresolved_empty";
+      } else {
+        mutation_type_vec[idx] = "unresolved_multiple";
+        std::string unresolved_barcodes;
+        for (size_t j = 0; j < putative_barcodes.size(); ++j) {
+          unresolved_barcodes += int64_to_string(putative_barcodes[j].first, sequence_length);
+          if (putative_barcodes.size() > 1 && j != putative_barcodes.size() - 1) {
+            unresolved_barcodes += "|";
+          }
+        }
+        corrected_barcode_vec[idx] = unresolved_barcodes;
+      }
+    }
+    resolved_status_vec[idx] = resolved;
+  }
+  // Step 8: Return as DataFrame
+  return Rcpp::DataFrame::create(
+    Rcpp::Named("incorrect_barcodes") = Rcpp::wrap(incorrect_barcode_vec),
+    Rcpp::Named("corrected_barcodes") = Rcpp::wrap(corrected_barcode_vec),
+    Rcpp::Named("resolved_status") = Rcpp::wrap(resolved_status_vec),
+    Rcpp::Named("mutation_type") = Rcpp::wrap(mutation_type_vec)
+  );
+}
 
+// [[Rcpp::plugins(openmp)]]
+// [[Rcpp::depends(data.table)]]
+// [[Rcpp::export]]
+Rcpp::DataFrame barcode_correction_v4(
+    SEXP true_barcodes,
+    SEXP invalid_barcodes,
+    SEXP true_counts,
+    SEXP invalid_counts,
+    int mutation_rounds = 3,
+    int sequence_length = 16,
+    int nthread = 1,
+    int max_shift = 3,
+    bool verbose = false) {
+  
+  // Step 1: Initialize input vectors and validate
+  std::vector<int64_t> correct_barcodes = Rcpp::as<std::vector<int64_t>>(true_barcodes);
+  std::vector<int64_t> incorrect_barcodes = Rcpp::as<std::vector<int64_t>>(invalid_barcodes);
+  std::unordered_map<int64_t, int> original_counts, corrected_counts;  // Track counts for original and corrected barcodes
+  
+  // Step 2: Deduplicate correct barcodes and consolidate counts
+  for (size_t i = 0; i < correct_barcodes.size(); ++i) {
+    original_counts[correct_barcodes[i]] += Rcpp::as<std::vector<int>>(true_counts)[i];  // Consolidate counts
+    corrected_counts[correct_barcodes[i]] = 0;  // Initialize corrected counts
+  }
+  
+  // Deduplicate incorrect barcodes
+  std::unordered_set<int64_t> incorrect_set(incorrect_barcodes.begin(), incorrect_barcodes.end());
+  
+  if (correct_barcodes.empty()) {
+    Rcpp::stop("No correct barcodes provided.");
+  }
+  if (incorrect_barcodes.empty()) {
+    Rcpp::stop("No incorrect barcodes provided.");
+  }
+  
+  // Step 3: Initialize incorrect barcode map (resolved, [putative_barcodes, mutation_type], dl_distances)
+  std::unordered_map<int64_t, std::tuple<bool, std::vector<std::pair<int64_t, int>>, std::vector<double>>> incorrect_map;
+  for (const auto& incorrect_barcode : incorrect_barcodes) {
+    incorrect_map[incorrect_barcode] = std::make_tuple(false, std::vector<std::pair<int64_t, int>>(), std::vector<double>());
+  }
+  
+  size_t total_sequences = correct_barcodes.size();
+  size_t processed_sequences = 0;
+  size_t log_frequency = 10000;  // Log progress every 10,000 sequences
+  
+  // Step 4: Generate mutations and shifts, including checking for both mutations and shifts
+  omp_set_num_threads(nthread);
+#pragma omp parallel for schedule(dynamic)
+  for (size_t i = 0; i < correct_barcodes.size(); ++i) {
+    int64_t correct_barcode = correct_barcodes[i];
+    
+    std::unordered_set<int64_t> mutated_set;
+    std::unordered_set<int64_t> shifted_set;
+    
+    // Generate mutated barcodes
+    std::vector<int64_t> mutated_barcodes = generate_recursive_quaternary_mutations_cpp_v2(
+      correct_barcode,
+      mutation_rounds,
+      sequence_length);
+    
+    mutated_set.insert(mutated_barcodes.begin(), mutated_barcodes.end());
+    
+    // Generate shifted barcodes
+    std::vector<int64_t> shifted_barcodes = generate_shifted_barcodes(correct_barcode, sequence_length, max_shift);
+    
+    shifted_set.insert(shifted_barcodes.begin(), shifted_barcodes.end());
+    
+    // Combine both sets to track "mutated", "shifted", and "mutated_and_shifted"
+    std::unordered_set<int64_t> unique_barcodes(mutated_set.begin(), mutated_set.end());
+    unique_barcodes.insert(shifted_set.begin(), shifted_set.end());
+    
+    for (const auto& barcode : unique_barcodes) {
+      if (incorrect_set.find(barcode) != incorrect_set.end()) {
+        int mutation_type = 0;  // Default: mutated
+        if (mutated_set.find(barcode) != mutated_set.end() && shifted_set.find(barcode) != shifted_set.end()) {
+          mutation_type = 2;  // mutated and shifted
+        } else if (shifted_set.find(barcode) != shifted_set.end()) {
+          mutation_type = 1;  // shifted
+        }
+#pragma omp critical
+        std::get<1>(incorrect_map[barcode]).emplace_back(correct_barcode, mutation_type);
+      }
+    }
+    
+#pragma omp critical
+{
+  processed_sequences++;
+  if (processed_sequences % log_frequency == 0 || processed_sequences == total_sequences) {
+    size_t remaining_sequences = total_sequences - processed_sequences;
+    std::cout << "Total barcodes to process: " << total_sequences
+              << ", Processed: " << processed_sequences
+              << ", Remaining: " << remaining_sequences << std::endl;
+  }
+}
+  }
+  
+  std::cout << "Mutations and shifts generated.\n";
+  std::cout << "Populating DL distances...\n";
+  
+  // Step 5: Populate DL distances
+  Rcpp::NumericVector weight = Rcpp::NumericVector::create(1.0, 1.0, 1.0, 1.0);
+  int method = 2; // Damerau-Levenshtein distance method
+  
+  for (auto& [incorrect_barcode, data] : incorrect_map) {
+    auto& [resolved, putative_barcodes, dl_distances] = data;
+    if (putative_barcodes.size() > 1) {
+      std::string incorrect_str = int64_to_string(incorrect_barcode, sequence_length);
+      std::vector<std::string> putative_correct_strs;
+      for (const auto& [correct_barcode, _] : putative_barcodes) {
+        putative_correct_strs.push_back(int64_to_string(correct_barcode, sequence_length));
+      }
+      SEXP incorrect_sexp = Rcpp::wrap(incorrect_str);
+      SEXP correct_sexp = Rcpp::wrap(putative_correct_strs);
+      SEXP dl_dist_results = sd_stringdist(
+        incorrect_sexp,
+        correct_sexp,
+        Rcpp::wrap(method),
+        weight, Rcpp::wrap(0.0), Rcpp::wrap(0.0), Rcpp::wrap(1), Rcpp::wrap(0), Rcpp::wrap(1)  // Single thread
+      );
+      dl_distances = Rcpp::as<std::vector<double>>(dl_dist_results);
+    }
+  }
+  
+  std::cout << "DL distances populated.\n";
+  
+  // Step 6: Resolve collisions and update corrected counts
+  log_frequency = 50000;  // Log progress every 50,000 sequences
+  std::atomic<size_t> processed_incorrect(0);
+  std::vector<int64_t> incorrect_keys;
+  incorrect_keys.reserve(incorrect_map.size());
+  for (const auto& pair : incorrect_map) {
+    incorrect_keys.push_back(pair.first);
+  }
+  
+  omp_set_num_threads(nthread);
+#pragma omp parallel for schedule(dynamic)
+  for (size_t idx = 0; idx < incorrect_keys.size(); ++idx) {
+    int64_t incorrect_barcode = incorrect_keys[idx];
+    auto& [resolved, putative_barcodes, dl_distances] = incorrect_map[incorrect_barcode];
+    
+    processed_incorrect++;
+    
+    if (putative_barcodes.empty()) {
+      resolved = false;
+      continue;
+    }
+    
+    if (putative_barcodes.size() == 1) {
+      resolved = true;
+      // Increment corrected counts
+      int64_t correct_barcode = putative_barcodes[0].first;
+#pragma omp critical
+{
+  corrected_counts[correct_barcode] += original_counts[correct_barcode];
+}
+continue;
+    }
+    
+    // Find the minimum DL distance and handle uniqueness
+    std::unordered_map<int64_t, double> barcode_to_min_dl_dist;
+    for (size_t i = 0; i < putative_barcodes.size(); ++i) {
+      int64_t barcode = putative_barcodes[i].first;
+      double dist = dl_distances[i];
+      barcode_to_min_dl_dist[barcode] = std::min(barcode_to_min_dl_dist[barcode], dist);
+    }
+    
+    // Find the barcode with the smallest DL distance
+    auto min_it = std::min_element(
+      barcode_to_min_dl_dist.begin(),
+      barcode_to_min_dl_dist.end(),
+      [](const std::pair<int64_t, double>& a, const std::pair<int64_t, double>& b) {
+        return a.second < b.second;
+      }
+    );
+    
+    double min_dl_dist = min_it->second;
+    std::vector<int64_t> min_barcodes;
+    
+    for (const auto& [barcode, dist] : barcode_to_min_dl_dist) {
+      if (dist == min_dl_dist) {
+        min_barcodes.push_back(barcode);
+      }
+    }
+    
+    if (min_barcodes.size() == 1) {
+      for (const auto& pair : putative_barcodes) {
+        if (pair.first == min_barcodes[0]) {
+          putative_barcodes = {pair};
+          break;
+        }
+      }
+      resolved = true;
+      // Increment corrected counts
+      int64_t correct_barcode = putative_barcodes[0].first;
+#pragma omp critical
+{
+  corrected_counts[correct_barcode] += original_counts[correct_barcode];
+}
+    } else {
+      resolved = false;
+    }
+  }
+  
+  std::cout << "Collision resolution completed.\n";
+  
+  // Step 7: Prepare outputs
+  std::vector<std::string> incorrect_barcode_vec(incorrect_map.size());
+  std::vector<std::string> corrected_barcode_vec(incorrect_map.size());
+  std::vector<bool> resolved_status_vec(incorrect_map.size());
+  std::vector<std::string> mutation_type_vec(incorrect_map.size());
+  std::vector<int> corrected_count_vec(incorrect_map.size());
+  
+  for (size_t idx = 0; idx < incorrect_keys.size(); ++idx) {
+    int64_t incorrect_barcode = incorrect_keys[idx];
+    auto& [resolved, putative_barcodes, dl_distances] = incorrect_map[incorrect_barcode];
+    
+    incorrect_barcode_vec[idx] = int64_to_string(incorrect_barcode, sequence_length);
+    if (resolved) {
+      corrected_barcode_vec[idx] = int64_to_string(putative_barcodes[0].first, sequence_length);
+      mutation_type_vec[idx] = (putative_barcodes[0].second == 0) ? "mutated" :
+        (putative_barcodes[0].second == 1) ? "shifted" : "mutated_and_shifted";
+      corrected_count_vec[idx] = corrected_counts[putative_barcodes[0].first];
+    } else {
+      if (putative_barcodes.empty()) {
+        mutation_type_vec[idx] = "unresolved_empty";
+        corrected_count_vec[idx] = 0;
+      } else {
+        mutation_type_vec[idx] = "unresolved_multiple";
+        std::string unresolved_barcodes;
+        for (size_t j = 0; j < putative_barcodes.size(); ++j) {
+          unresolved_barcodes += int64_to_string(putative_barcodes[j].first, sequence_length);
+          if (putative_barcodes.size() > 1 && j != putative_barcodes.size() - 1) {
+            unresolved_barcodes += "|";
+          }
+        }
+        corrected_barcode_vec[idx] = unresolved_barcodes;
+        corrected_count_vec[idx] = 0;
+      }
+    }
+    resolved_status_vec[idx] = resolved;
+  }
+  
+  // Step 8: Return as DataFrame
+  return Rcpp::DataFrame::create(
+    Rcpp::Named("incorrect_barcodes") = Rcpp::wrap(incorrect_barcode_vec),
+    Rcpp::Named("corrected_barcodes") = Rcpp::wrap(corrected_barcode_vec),
+    Rcpp::Named("resolved_status") = Rcpp::wrap(resolved_status_vec),
+    Rcpp::Named("mutation_type") = Rcpp::wrap(mutation_type_vec),
+    Rcpp::Named("corrected_count") = Rcpp::wrap(corrected_count_vec)
+  );
+}

@@ -97,6 +97,18 @@ generate_and_filter_mutations_v13 <- function(true_barcodes, invalid_barcodes, t
     .Call(`_rad_generate_and_filter_mutations_v13`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose, process_fastq, input_fastq, filtered_fastq, unfiltered_fastq, barcode_header, detailed_output_csv, counts_output_csv)
 }
 
+barcode_correction_v3 <- function(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, verbose = FALSE) {
+    .Call(`_rad_barcode_correction_v3`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose)
+}
+
+barcode_correction_v4 <- function(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, verbose = FALSE) {
+    .Call(`_rad_barcode_correction_v4`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose)
+}
+
+barcode_correction_v5 <- function(true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds = 3L, sequence_length = 16L, nthread = 1L, max_shift = 3L, verbose = FALSE) {
+    .Call(`_rad_barcode_correction_v5`, true_barcodes, invalid_barcodes, true_counts, invalid_counts, mutation_rounds, sequence_length, nthread, max_shift, verbose)
+}
+
 sigstream <- function(input_path, sigstringsFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, outputPath, write_fastq = TRUE, compress = TRUE, max_sequences = -1L, min_length = 100L, verbose = FALSE) {
     invisible(.Call(`_rad_sigstream`, input_path, sigstringsFilePath, adapters, read_layout, misalignment_threshold, chunkSize, nthreads, outputPath, write_fastq, compress, max_sequences, min_length, verbose))
 }
@@ -105,11 +117,15 @@ misalignment_stream <- function(input_path, adapters, nthreads = 1L, max_sequenc
     .Call(`_rad_misalignment_stream`, input_path, adapters, nthreads, max_sequences, chunk_size)
 }
 
-tabulate_barcodes <- function(input_files, output_prefix, compress = TRUE) {
-    invisible(.Call(`_rad_tabulate_barcodes`, input_files, output_prefix, compress))
+tabulate_variable_sequences <- function(input_files, output_prefix, identity_elements, compress = TRUE, batch_size = 50000L) {
+    invisible(.Call(`_rad_tabulate_variable_sequences`, input_files, output_prefix, identity_elements, compress, batch_size))
 }
 
 tabulate_sigs <- function(file_path, output_prefix, chunk_size = 50000L, max_sequences = -1L, nthreads = 1L, compress = TRUE, output_type = "summary") {
     invisible(.Call(`_rad_tabulate_sigs`, file_path, output_prefix, chunk_size, max_sequences, nthreads, compress, output_type))
+}
+
+extract_blaze_barcode <- function(fastq_file, print_every = 10000L) {
+    .Call(`_rad_extract_blaze_barcode`, fastq_file, print_every)
 }
 
