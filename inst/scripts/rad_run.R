@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 
 cat("Welcome to rad! Checking which packages are necessary...\n")
-libraries<-c("docopt", "data.table", "magrittr", "stringr", "stringdist","bit64","mclust","pracma")
+libraries<-c("docopt", "data.table", "magrittr", "stringr", "stringdist","bit64","mclust","pracma", "ggplot2","ggpubr")
 github_libraries<-c("rad" = "indianewok/rad@dev")
 install_and_load<-function(lib, repo = NULL) {
   if (!require(lib, character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)) {

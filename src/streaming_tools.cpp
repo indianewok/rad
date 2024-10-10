@@ -1164,3 +1164,259 @@ Rcpp::DataFrame extract_blaze_barcode(std::string fastq_file, int print_every = 
   return Rcpp::DataFrame::create(Rcpp::Named("barcode") = barcodes,
     Rcpp::Named("total") = total_counts);
 }
+
+std::string find_and_replace_barcode(
+  const std::string& header, 
+  const std::string& barcode_id,
+  const std::unordered_map<std::string, std::string>& barcode_map,
+  const std::vector<std::string>& correct_barcodes,
+  bool &barcode_found,
+  bool &barcode_corrected) {
+  // Look for the barcode identifier (e.g., "barcode:") in the header
+  size_t barcode_start = header.find(barcode_id + ":");
+  if (barcode_start == std::string::npos) {
+    barcode_found = false;
+    barcode_corrected = false;
+    return header;
+  }
+  
+  // Find where the barcode sequence starts (just after 'barcode_id:')
+  barcode_start += barcode_id.size() + 1;
+  
+  // Find where the barcode sequence ends (next pipe `|` or end of line)
+  size_t barcode_end = header.find_first_of("|", barcode_start);
+  if (barcode_end == std::string::npos) {
+    barcode_end = header.size();
+  }
+  
+  // Extract the barcode sequence
+  std::string barcode = header.substr(barcode_start, barcode_end - barcode_start);
+  
+  // Check if the barcode is in the barcode_map (incorrect barcodes)
+  auto it = barcode_map.find(barcode);
+  if (it != barcode_map.end()) {
+    // Replace the incorrect barcode with the corrected one
+    std::string corrected_header = header;
+    corrected_header.replace(barcode_start, barcode.size(), it->second);
+    barcode_found = true;
+    barcode_corrected = true;
+    return corrected_header;
+  }
+  
+  // Check if the barcode is in the correct_barcodes list
+  if (std::find(correct_barcodes.begin(), correct_barcodes.end(), barcode) != correct_barcodes.end()) {
+    barcode_found = true;
+    barcode_corrected = false;
+    return header;
+  }
+  
+  // If the barcode is neither incorrect nor correct, return the original header and mark it as not found
+  barcode_found = false;
+  barcode_corrected = false;
+  return header;
+}
+
+// [[Rcpp::export]]
+Rcpp::DataFrame fastq_correction(
+    std::string input_file,
+    std::string output_file,
+    Rcpp::StringVector incorrect_bcs,
+    Rcpp::StringVector correct_bcs,
+    std::string barcode_id = "barcode",
+    int chunk_size = 50000,
+    int print_freq = 10000,
+    int nthreads = 4,
+    int downsample = -1) {
+  // Set the number of OpenMP threads
+  omp_set_num_threads(nthreads);
+  // Create a map for barcode correction
+  std::unordered_map<std::string, std::string> barcodeMap;
+  for (int i = 0; i < incorrect_bcs.size(); ++i) {
+    barcodeMap[Rcpp::as<std::string>(incorrect_bcs[i])] = Rcpp::as<std::string>(correct_bcs[i]);
+  }
+  std::vector<std::string> correct_bcsVec = Rcpp::as<std::vector<std::string>>(correct_bcs);
+  // Open input file
+  gzFile fp = gzopen(input_file.c_str(), "r");
+  if (!fp) {
+    Rcpp::stop("Failed to open input file");
+  }
+  // Open output file
+  gzFile outFp = gzopen(output_file.c_str(), "wb");
+  if (!outFp) {
+    gzclose(fp);
+    Rcpp::stop("Failed to open output file");
+  }
+  // Initialize kseq for reading fastq
+  kseq_t* seq = kseq_init(fp);
+  // Variables to track read counts
+  std::atomic<size_t> totalReads{0};
+  std::atomic<size_t> keptReads{0};
+  std::atomic<size_t> correctedReads{0};
+  std::atomic<size_t> discardedReads{0};
+  // Chunk storage for parallel processing
+  std::vector<std::string> chunkHeaders;
+  std::vector<std::string> chunkSequences;
+  std::vector<std::string> chunkQuals;
+  std::vector<std::string> chunkComments;
+  // Process each record in the fastq file
+  while (kseq_read(seq) >= 0) {
+    if (downsample != -1 && totalReads >= static_cast<size_t>(downsample)) {
+      break;
+    }
+    ++totalReads;
+    // Capture fastq elements (header, sequence, quality, etc.)
+    std::string header = "@" + std::string(seq->name.s);
+    std::string seqStr(seq->seq.s, seq->seq.l);
+    std::string qualStr(seq->qual.s, seq->qual.l);
+    std::string commentStr = (seq->comment.l > 0) ? std::string(seq->comment.s, seq->comment.l) : "+";
+    
+    // Store elements in chunk
+    chunkHeaders.push_back(header);
+    chunkSequences.push_back(seqStr);
+    chunkQuals.push_back(qualStr);
+    chunkComments.push_back(commentStr);
+    
+    // If chunk reaches the chunk size, process it
+    if (chunkHeaders.size() >= static_cast<size_t>(chunk_size)) {
+#pragma omp parallel
+{
+  // Local thread storage to avoid critical section contention
+  std::vector<std::string> localHeaders;
+  std::vector<std::string> localSequences;
+  std::vector<std::string> localQuals;
+  std::vector<std::string> localComments;
+  size_t localDiscarded = 0;
+  
+#pragma omp for
+  for (size_t i = 0; i < chunkHeaders.size(); ++i) {
+    bool barcodeFound = false;
+    bool barcodeCorrected = false;
+    
+    // Find and replace the barcode in the header
+    std::string processedHeader = find_and_replace_barcode(
+      chunkHeaders[i],
+      barcode_id,
+      barcodeMap,
+      correct_bcsVec,
+      barcodeFound,
+      barcodeCorrected);
+    
+    if (barcodeFound) {
+      localHeaders.push_back(processedHeader);
+      localSequences.push_back(chunkSequences[i]);
+      localQuals.push_back(chunkQuals[i]);
+      localComments.push_back(chunkComments[i]);
+      ++keptReads;
+      if (barcodeCorrected) {
+        ++correctedReads;
+      }
+    } else {
+      ++localDiscarded;
+    }
+  }
+  
+#pragma omp critical
+{
+  // Write out local data to file
+  for (size_t i = 0; i < localHeaders.size(); ++i) {
+    gzwrite(outFp, localHeaders[i].c_str(), localHeaders[i].size());
+    gzwrite(outFp, "\n", 1);
+    gzwrite(outFp, localSequences[i].c_str(), localSequences[i].size());
+    gzwrite(outFp, "\n", 1);
+    gzwrite(outFp, localComments[i].c_str(), localComments[i].size());
+    gzwrite(outFp, "\n", 1);
+    gzwrite(outFp, localQuals[i].c_str(), localQuals[i].size());
+    gzwrite(outFp, "\n", 1);
+  }
+  discardedReads += localDiscarded;
+}
+}
+      
+      // Clear chunk after processing
+      chunkHeaders.clear();
+      chunkSequences.clear();
+      chunkQuals.clear();
+      chunkComments.clear();
+    }
+    
+    // Log progress
+    if (totalReads % print_freq == 0) {
+      std::cout << "\rProcessed " << totalReads << " reads, kept " << keptReads 
+                << ", corrected " << correctedReads << ", discarded " << discardedReads << std::flush;
+    }
+  }
+  
+  // Process any remaining reads
+  if (!chunkHeaders.empty()) {
+#pragma omp parallel
+{
+  // Local thread storage for processing remaining chunk
+  std::vector<std::string> localHeaders;
+  std::vector<std::string> localSequences;
+  std::vector<std::string> localQuals;
+  std::vector<std::string> localComments;
+  size_t localDiscarded = 0;
+  
+#pragma omp for
+  for (size_t i = 0; i < chunkHeaders.size(); ++i) {
+    bool barcodeFound = false;
+    bool barcodeCorrected = false;
+    
+    // Process barcode replacement
+    std::string processedHeader = find_and_replace_barcode(
+      chunkHeaders[i],
+      barcode_id,
+      barcodeMap,
+      correct_bcsVec,
+      barcodeFound,
+      barcodeCorrected);
+    
+    if (barcodeFound) {
+      localHeaders.push_back(processedHeader);
+      localSequences.push_back(chunkSequences[i]);
+      localQuals.push_back(chunkQuals[i]);
+      localComments.push_back(chunkComments[i]);
+      ++keptReads;
+      if (barcodeCorrected) {
+        ++correctedReads;
+      }
+    } else {
+      ++localDiscarded;
+    }
+  }
+  
+#pragma omp critical
+{
+  // Write remaining data to file
+  for (size_t i = 0; i < localHeaders.size(); ++i) {
+    gzwrite(outFp, localHeaders[i].c_str(), localHeaders[i].size());
+    gzwrite(outFp, "\n", 1);
+    gzwrite(outFp, localSequences[i].c_str(), localSequences[i].size());
+    gzwrite(outFp, "\n", 1);
+    gzwrite(outFp, localComments[i].c_str(), localComments[i].size());
+    gzwrite(outFp, "\n", 1);
+    gzwrite(outFp, localQuals[i].c_str(), localQuals[i].size());
+    gzwrite(outFp, "\n", 1);
+  }
+  discardedReads += localDiscarded;
+}
+}
+  }
+  
+  // Final log
+  std::cout << "\nFinished processing. Total reads: " << totalReads 
+            << ", kept: " << keptReads << ", corrected: " << correctedReads 
+            << ", discarded: " << discardedReads << "." << std::endl;
+  
+  // Cleanup
+  kseq_destroy(seq);
+  gzclose(fp);
+  gzclose(outFp);
+  
+  return Rcpp::DataFrame::create(
+    Rcpp::Named("total_reads") = totalReads.load(),
+    Rcpp::Named("kept_reads") = keptReads.load(),
+    Rcpp::Named("corrected_reads") = correctedReads.load(),
+    Rcpp::Named("discarded_reads") = discardedReads.load()
+  );
+}
