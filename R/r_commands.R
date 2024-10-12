@@ -326,11 +326,20 @@ process_barcodes<-function(barcode_path, read_layout) {
   whitelist_path<-read_layout[barcode_id, whitelist]
   cat(paste0("The whitelist path is ", whitelist_path,"\n"))
   whitelist<-NULL
-  whitelist_path<-ifelse(whitelist_path == "10x_3v3", 
-                           system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz"), 
-                           ifelse(whitelist_path == "10x_3v1", 
-                                  system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"), 
-                                  whitelist_path))
+  whitelist_path<-switch(
+    whitelist_path,
+    "10x_3v1" = system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"),
+    "10x_3v2" = system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"),
+    "10x_3v3" = system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz"),
+    "10x_3v3.1" = system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz"),
+    "10x_3HTv3.1" = system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz"),
+    "10x_3v4" = system.file(package = "rad", "extdata", "3M-3pgex-may-2023.txt_bitlist.csv.gz"),
+    "10x_5v1" = system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"),
+    "10x_5v2" = system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"),
+    "10x_5HTv2" = system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"),
+    "10x_5v3" = system.file(package = "rad", "extdata", "3M-5pgex-jan-2023.txt_bitlist.csv.gz"),
+    default = whitelist_path
+  )
   cat(paste0("The whitelist path is ", whitelist_path, "\n"))
   
   if(!is.na(whitelist_path) && file.exists(whitelist_path)){

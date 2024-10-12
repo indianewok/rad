@@ -309,6 +309,18 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// extract_blaze_post_correction
+void extract_blaze_post_correction(std::string fastq_file, std::string output_file, int print_every);
+RcppExport SEXP _rad_extract_blaze_post_correction(SEXP fastq_fileSEXP, SEXP output_fileSEXP, SEXP print_everySEXP) {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< std::string >::type fastq_file(fastq_fileSEXP);
+    Rcpp::traits::input_parameter< std::string >::type output_file(output_fileSEXP);
+    Rcpp::traits::input_parameter< int >::type print_every(print_everySEXP);
+    extract_blaze_post_correction(fastq_file, output_file, print_every);
+    return R_NilValue;
+END_RCPP
+}
 // fastq_correction
 Rcpp::DataFrame fastq_correction(std::string input_file, std::string output_file, Rcpp::StringVector incorrect_bcs, Rcpp::StringVector correct_bcs, std::string barcode_id, int chunk_size, int print_freq, int nthreads, int downsample);
 RcppExport SEXP _rad_fastq_correction(SEXP input_fileSEXP, SEXP output_fileSEXP, SEXP incorrect_bcsSEXP, SEXP correct_bcsSEXP, SEXP barcode_idSEXP, SEXP chunk_sizeSEXP, SEXP print_freqSEXP, SEXP nthreadsSEXP, SEXP downsampleSEXP) {
@@ -352,6 +364,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_rad_tabulate_variable_sequences", (DL_FUNC) &_rad_tabulate_variable_sequences, 5},
     {"_rad_tabulate_sigs", (DL_FUNC) &_rad_tabulate_sigs, 7},
     {"_rad_extract_blaze_barcode", (DL_FUNC) &_rad_extract_blaze_barcode, 2},
+    {"_rad_extract_blaze_post_correction", (DL_FUNC) &_rad_extract_blaze_post_correction, 3},
     {"_rad_fastq_correction", (DL_FUNC) &_rad_fastq_correction, 9},
     {NULL, NULL, 0}
 };

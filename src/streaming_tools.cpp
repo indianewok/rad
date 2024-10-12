@@ -1108,6 +1108,19 @@ std::string extract_corrected_barcode(const std::string& full_header) {
   
   return full_header.substr(barcode_start, barcode_end - barcode_start);
 }
+
+std::string extract_blaze_id(const std::string& header) {
+  size_t start_pos = header.find("#");
+  size_t end_pos = header.find("_", start_pos);
+  
+  if (start_pos != std::string::npos && end_pos != std::string::npos) {
+    return header.substr(start_pos + 1, end_pos - start_pos - 1);
+  }
+  
+  // Return the full header if the pattern is not found
+  return header;
+}
+
 // [[Rcpp::export]]
 Rcpp::DataFrame extract_blaze_barcode(std::string fastq_file, int print_every = 10000) {
   gzFile fp = gzopen(fastq_file.c_str(), "r");
@@ -1163,6 +1176,74 @@ Rcpp::DataFrame extract_blaze_barcode(std::string fastq_file, int print_every = 
   // Return the DataFrame with barcode and total counts
   return Rcpp::DataFrame::create(Rcpp::Named("barcode") = barcodes,
     Rcpp::Named("total") = total_counts);
+}
+
+// [[Rcpp::export]]
+void extract_blaze_id_bc(std::string fastq_file, std::string output_file, int print_every = 10000) {
+  gzFile fp = gzopen(fastq_file.c_str(), "r");
+  if (!fp) Rcpp::stop("Failed to open file.");
+  
+  kseq_t *seq = kseq_init(fp);
+  int l;
+  
+  // Vectors to store the extracted IDs and barcodes
+  std::vector<std::string> ids;
+  std::vector<std::string> barcodes;
+  
+  int sequence_count = 0;
+  
+  // Read through the fastq file with kseq
+  while ((l = kseq_read(seq)) >= 0) {
+    sequence_count++;
+    
+    // Capture both the sequence name (header) and the comment (which might contain CB:Z)
+    std::string header = "@" + std::string(seq->name.s);  // Add '@' symbol to the header
+    std::string full_header = header;
+    if (seq->comment.l > 0) {
+      full_header += "\t" + std::string(seq->comment.s); // Append the comment section (CB:Z might be here)
+    }
+    
+    // Extract the corrected barcode (CB:Z: field)
+    std::string corrected_barcode = extract_corrected_barcode(full_header);
+    
+    // If the corrected barcode is missing, skip
+    if (corrected_barcode.empty()) continue;
+    
+    // Extract the read ID part between '#' and '_'
+    std::string extracted_id = extract_id(header);
+    
+    // Add the extracted ID and corrected barcode to the vectors
+    ids.push_back(extracted_id);
+    barcodes.push_back(corrected_barcode);
+    
+    // Print progress every 'print_every' sequences
+    if (sequence_count % print_every == 0) {
+      std::cout << "Processed " << sequence_count << " sequences so far." << std::endl;
+    }
+  }
+  
+  kseq_destroy(seq);
+  gzclose(fp);
+  
+  std::cout << "Total sequences processed: " << sequence_count << std::endl;
+  
+  // Write the results to a CSV file
+  std::ofstream out_file(output_file);
+  if (!out_file.is_open()) {
+    Rcpp::stop("Failed to open output file.");
+  }
+  
+  // Write the header
+  out_file << "ID,Barcode\n";
+  
+  // Write the data
+  for (size_t i = 0; i < ids.size(); ++i) {
+    out_file << ids[i] << "," << barcodes[i] << "\n";
+  }
+  
+  out_file.close();
+  
+  std::cout << "Data successfully written to " << output_file << std::endl;
 }
 
 std::string find_and_replace_barcode(

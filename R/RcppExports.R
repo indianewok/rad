@@ -89,6 +89,10 @@ extract_blaze_barcode <- function(fastq_file, print_every = 10000L) {
     .Call(`_rad_extract_blaze_barcode`, fastq_file, print_every)
 }
 
+extract_blaze_post_correction <- function(fastq_file, output_file, print_every = 10000L) {
+    invisible(.Call(`_rad_extract_blaze_post_correction`, fastq_file, output_file, print_every))
+}
+
 fastq_correction <- function(input_file, output_file, incorrect_bcs, correct_bcs, barcode_id = "barcode", chunk_size = 50000L, print_freq = 10000L, nthreads = 4L, downsample = -1L) {
     .Call(`_rad_fastq_correction`, input_file, output_file, incorrect_bcs, correct_bcs, barcode_id, chunk_size, print_freq, nthreads, downsample)
 }
