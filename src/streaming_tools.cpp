@@ -1210,7 +1210,7 @@ void extract_blaze_id_bc(std::string fastq_file, std::string output_file, int pr
     if (corrected_barcode.empty()) continue;
     
     // Extract the read ID part between '#' and '_'
-    std::string extracted_id = extract_id(header);
+    std::string extracted_id = extract_blaze_id(header);
     
     // Add the extracted ID and corrected barcode to the vectors
     ids.push_back(extracted_id);

@@ -4,11 +4,20 @@ whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
   cat("Importing a little bit of your whitelist to figure out its type...\n")
   whitelist<-data.table::fread(input = whitelist_path, header = FALSE, data.table = TRUE, nrows = 10, nThread = 1)
   if(ncol(whitelist) == 1){
-    colnames(whitelist)<-"whitelist_bcs"
+    data.table::setnames(whitelist, new = "whitelist_bcs")
+  } else {
+    cat("More than one column detected! Assuming the first one is the one with the barcodes.\n")
+    data.table::setnames(whitelist, old = "V1", new = "whitelist_bcs")
   }
   if(class(whitelist$whitelist_bcs) == "character"){
     cat("Character type detected! Importing the whitelist.\n")
-    whitelist<-data.table::fread(input = whitelist_path, header = FALSE, data.table = TRUE, nThread = 1, col.names = "whitelist_bcs")
+    if(ncol(whitelist) == 1){
+      whitelist<-data.table::fread(input = whitelist_path, header = FALSE, data.table = TRUE, nThread = 1, col.names = "whitelist_bcs")
+    } else {
+      whitelist<-data.table::fread(input = whitelist_path, header = FALSE, data.table = TRUE, nThread = 1)
+      whitelist<-whitelist[,1]
+      data.table::setnames(whitelist, "whitelist_bcs")
+    }
     if(convert != FALSE){
       cat("Converting the whitelist into a more efficient format!\n")
       whitelist$whitelist_bcs<-sequence_to_bits(whitelist$whitelist_bcs)
@@ -328,7 +337,7 @@ process_barcodes<-function(barcode_path, read_layout) {
   whitelist<-NULL
   whitelist_path<-switch(
     whitelist_path,
-    "10x_3v1" = system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"),
+    "10x_3v1" = system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"), #don't know if true
     "10x_3v2" = system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"),
     "10x_3v3" = system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz"),
     "10x_3v3.1" = system.file(package = "rad", "extdata", "3M-february-2018-3v3.txt_bitlist.csv.gz"),
@@ -338,6 +347,11 @@ process_barcodes<-function(barcode_path, read_layout) {
     "10x_5v2" = system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"),
     "10x_5HTv2" = system.file(package = "rad", "extdata", "737K-august-2016_bitlist.csv.gz"),
     "10x_5v3" = system.file(package = "rad", "extdata", "3M-5pgex-jan-2023.txt_bitlist.csv.gz"),
+    "10x_Vis_V1" = system.file(package = "rad", "extdata", "visium-v1_v2_bitlist.csv.gz"),
+    "10x_Vis_V2" = system.file(package = "rad", "extdata", "visium-v1_v2_bitlist.csv.gz"),
+    "10x_Vis_V3" = system.file(package = "rad", "extdata", "visium-v3_v4_bitlist.csv.gz"),
+    "10x_Vis_V4" = system.file(package = "rad", "extdata", "visium-v3_v4_bitlist.csv.gz"),
+    "10x_Vis_V5" = system.file(package = "rad", "extdata", "visium-v5_bitlist.csv.gz"),
     default = whitelist_path
   )
   cat(paste0("The whitelist path is ", whitelist_path, "\n"))
@@ -422,6 +436,17 @@ correct_barcodes<-function(input_file,
   data.table::fwrite(correction_map, file = barcode_mutation_data_path)
   correction_map<-data.table::fread(input = barcode_mutation_data_path, na.strings = "")
   
+  correction_map<-correction_map[which(correction_map$resolved_status == TRUE),]
+  
+  fastq_correction(
+    input_file = input_fastq_path,
+    output_file = filtered_fastq_path,
+    incorrect_bcs = correction_map$incorrect_barcodes,
+    correct_bcs = correction_map$corrected_barcodes,
+    barcode_id = barcode_id,
+    nthreads = nthreads,
+    downsample = -1
+  )
 }
 
 process_sig<-function(file_path,
@@ -547,6 +572,7 @@ rad_run<-function(
     output_prefix = paste0(output_directory_path,"/variable_seqs/"), 
     compress = TRUE)
   barcode_files<-list.files(path = paste0(output_directory_path,"/variable_seqs/"), full.names = TRUE, pattern = "barcode")
+  #need to figure out how to loop over multiple barcodes and rewrite the output file
   out<-lapply(X = barcode_files, FUN = function(X){
     process_barcodes(barcode_path = X, read_layout = read_layout)
     correct_barcodes(input_file = X, read_layout = read_layout, nthreads = nthreads)
