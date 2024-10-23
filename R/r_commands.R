@@ -9,7 +9,8 @@ whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
     cat("More than one column detected! Assuming the first one is the one with the barcodes.\n")
     data.table::setnames(whitelist, old = "V1", new = "whitelist_bcs")
   }
-  if(class(whitelist$whitelist_bcs) == "character"){
+  if(class(whitelist$whitelist_bcs) == "character" || 
+      !grepl(pattern = "bitlist", x = whitelist_path, fixed = TRUE)){
     cat("Character type detected! Importing the whitelist.\n")
     if(ncol(whitelist) == 1){
       whitelist<-data.table::fread(input = whitelist_path, header = FALSE, data.table = TRUE, nThread = 1, col.names = "whitelist_bcs")
@@ -26,7 +27,7 @@ whitelist_importer<-function(whitelist_path, save = NULL, convert = FALSE){
     gc()
     if(!is.null(save)){
       if(save == TRUE){
-        new_path<-paste0(dirname(whitelist_path),"/",file_path_sans_ext(whitelist_path)
+        new_path<-paste0(dirname(whitelist_path),"/",tools::file_path_sans_ext(whitelist_path)
           %>% basename(.),
           "_bitlist.csv.gz")
         cat(paste0("Now saving the integer whitelist to ",new_path,"!\n"))
@@ -384,8 +385,8 @@ process_barcodes<-function(barcode_path, read_layout) {
       length(which(whitelist_output$results$kde_threshold)))),
     legend = "none", font.x = 14, font.y = 14, font.main = 14)
   
-  ggplot::ggsave(
-    filename = paste0(dir_path, barcode_id, "_kde_density.jpeg"), 
+  ggplot2::ggsave(
+    filename = paste0(dir_path, barcode_id, "_kde_density.pdf"), 
     plot =  kde_density,
     width = 11, height = 8.5, 
     unit = "in"
@@ -398,6 +399,7 @@ correct_barcodes<-function(input_file,
                            nthreads = 1,
                            mutation_rounds = 3,
                            max_shift = 3,
+                           chunk_size = 50000,
                            read_layout = read_layout
                            ){
   barcode<-data.table::fread(
@@ -416,7 +418,6 @@ correct_barcodes<-function(input_file,
   verbose_barcode_output_path<-paste0(dir_path, barcode_id, "_correction_counts.csv")
   barcode_mutation_data_path<-paste0(dir_path, barcode_id, "_mutation_counts.csv.gz")
   expected_length<-read_layout[barcode_id, expected_length]
-  
   
   true_barcodes<- bit64::as.integer64(barcode["pois_validated_barcode"]$int64_seq)
   invalid_barcodes<-bit64::as.integer64(barcode["barcode_to_correct"]$int64_seq)
@@ -438,6 +439,7 @@ correct_barcodes<-function(input_file,
   
   correction_map<-correction_map[which(correction_map$resolved_status == TRUE),]
   
+  #this guy really runs slow, but i think it's chunk size dependent
   fastq_correction(
     input_file = input_fastq_path,
     output_file = filtered_fastq_path,
@@ -445,6 +447,7 @@ correct_barcodes<-function(input_file,
     correct_bcs = correction_map$corrected_barcodes,
     barcode_id = barcode_id,
     nthreads = nthreads,
+    chunk_size = chunk_size,
     downsample = -1
   )
 }
@@ -575,7 +578,8 @@ rad_run<-function(
   #need to figure out how to loop over multiple barcodes and rewrite the output file
   out<-lapply(X = barcode_files, FUN = function(X){
     process_barcodes(barcode_path = X, read_layout = read_layout)
-    correct_barcodes(input_file = X, read_layout = read_layout, nthreads = nthreads)
+    #think I need to do it here, because the input file gets chosen internally in correct_barcodes
+    correct_barcodes(input_file = X, read_layout = read_layout, nthreads = nthreads, chunk_size = chunk_size)
   })
   end_time = Sys.time()
   cat(paste0("Finished running! Total run time: ", difftime(end_time, start_time, units='mins'), " minutes.\n"))
@@ -710,8 +714,8 @@ density_estimator_v12<-function(barcode_df){
   valleys<-pracma::findpeaks(-density_output$y)
   # If more than 3 peaks, drop the lowest peak
   if (nrow(peaks) > 3) {
-    min_peak_index <- which.min(peaks[, 1])
-    peaks <- peaks[-min_peak_index, , drop = FALSE]
+    min_peak_index<-which.min(peaks[, 1])
+    peaks<-peaks[-min_peak_index, , drop = FALSE]
   }
   # If still more than 3 peaks, iterate over bandwidths to reduce peaks to 2
   bw<-density_output$bw
@@ -722,9 +726,9 @@ density_estimator_v12<-function(barcode_df){
     peaks<-pracma::findpeaks(density_output$y)
     valleys<-pracma::findpeaks(-density_output$y)
     iter<-iter + 1
-  }
+    }
   # Now, find the valley between the two peaks
-  if (nrow(peaks) == 2){
+  if(nrow(peaks) == 2){
     peak1_position<-peaks[1, 2]
     peak2_position<-peaks[2, 2]
     valley_in_between<-valleys[valleys[, 2] > peak1_position & valleys[, 2] < peak2_position, ]
@@ -774,9 +778,78 @@ density_estimator_v12<-function(barcode_df){
       best_gmm = best_gmm
     ))
   }
+  # if you have a single peak after bandwidth iteration, try the density_gmm
+  if(nrow(peaks)  < 2 && is.null(valleys)){
+    xrange<-extendrange(gmm_scan$data, f = 0.1)
+    eval.points<-seq(from = xrange[1], to = xrange[2], length = 1000)
+    gmm_density<-predict(gmm_scan, newdata = eval.points, what = "dens")
+    ggdensity_plot<-data.table::data.table(x = eval.points, y = gmm_density)
+    
+    peaks<-pracma::findpeaks(ggdensity_plot$y)
+    valleys<-pracma::findpeaks(-ggdensity_plot$y)
+    
+    if (nrow(peaks) >= 3) {
+      min_peak_index<-which.min(peaks[, 1])
+      peaks<-peaks[-min_peak_index, , drop = FALSE]
+    }
+    
+    if(nrow(peaks) == 2){
+      peak1_position<-peaks[1, 2]
+      peak2_position<-peaks[2, 2]
+      valley_in_between<-valleys[valleys[, 2] > peak1_position & valleys[, 2] < peak2_position, ]
+      if (!is.matrix(valley_in_between)) {
+        valley_in_between<-matrix(valley_in_between, nrow = 1)
+      }
+      if (nrow(valley_in_between) > 0) {
+        valid_valley<-valley_in_between[1, 2]
+      } else {
+        stop("No valley found between the two peaks.")
+      }
+      # Threshold is the x-position of the valid valley
+      threshold<-ggdensity_plot$x[valid_valley]
+      # Calculate the x positions of the peaks
+      peak_one<-ggdensity_plot$x[peaks[1, 2]]
+      peak_two<-ggdensity_plot$x[peaks[2, 2]]
+      # Classify points based on threshold
+      ggdensity_plot[, cluster := ifelse(x >= threshold, "Above Threshold", "Below Threshold")]
+      # Extract GMM results
+      best_gmm<-gmm_scan
+      uncertainty_percentage<-round(best_gmm$uncertainty, digits = 4) * 100
+      best_cluster<-best_gmm$classification
+      kde_threshold<-barcode_df[filtered == "whitelist_barcode" & ncpm_pois >= 0.95]$log1p_ncpm >= threshold
+      cluster_threshold<-uncertainty_percentage <= 5
+      results<-barcode_df[filtered == "whitelist_barcode" & ncpm_pois >= 0.95, 
+        .(seq, count, concatenate_count, log1p_ncpm, 
+          uncertainty_percentage, best_cluster,
+          kde_threshold, cluster_threshold)]
+      kde_density_plot<-ggplot2::ggplot(ggdensity_plot, aes(x = x, y = y, color = cluster)) +
+        ggplot2::geom_line(linewidth = 1) +
+        ggplot2::geom_vline(xintercept = threshold, linetype = "dashed", color = "blue") +  
+        ggplot2::geom_vline(xintercept = peak_one, linetype = "dashed", color = "red") + 
+        ggplot2::geom_vline(xintercept = peak_two, linetype = "dashed", color = "red") +  
+        labs(title = "KDE Density with Threshold", x = "log1p_ncpm", y = "Density") +
+        ggplot2::scale_color_manual(values = c("Below Threshold" = "black", "Above Threshold" = "green")) +
+        ggplot2::theme_minimal()
+      
+      data.table::setkey(barcode_df, "seq")
+      data.table::setkey(results, "kde_threshold")
+      barcode_df[results[J(TRUE)]$seq, filtered:="pois_validated_barcode"]
+      # Return the results, plots, and GMM model
+      return(list(
+        threshold = threshold,
+        density = density_output,
+        results = results,
+        kde_density = kde_density_plot,
+        best_gmm = best_gmm
+      ))
+    }
+  }
 }
 
-blaze_data_processor<-function(path_to_matched_fastq, path_to_putative_bcs){
+blaze_data_processor<-function(
+  path_to_matched_fastq, 
+  path_to_putative_bcs
+  ){
   putative_bcs<-data.table::fread(path_to_putative_bcs, na.strings = "", select = 2) #2 is the putative_bc column
   putative_bcs<-putative_bcs[, .N, by = putative_bc]
   setnames(putative_bcs, "N", "original")
