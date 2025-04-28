@@ -1,0 +1,50 @@
+[
+{
+  "directory": "/Users/cmv/Desktop/cdev_rad/build",
+  "command": "/Library/Developer/CommandLineTools/usr/bin/cc  -I/Users/cmv/Desktop/cdev_rad/include/ssw -O3 -DNDEBUG -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -o CMakeFiles/ssw.dir/include/ssw/ssw.c.o -c /Users/cmv/Desktop/cdev_rad/include/ssw/ssw.c",
+  "file": "/Users/cmv/Desktop/cdev_rad/include/ssw/ssw.c",
+  "output": "CMakeFiles/ssw.dir/include/ssw/ssw.c.o"
+},
+{
+  "directory": "/Users/cmv/Desktop/cdev_rad/build",
+  "command": "/Library/Developer/CommandLineTools/usr/bin/c++  -I/Users/cmv/Desktop/cdev_rad/include/ssw -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -o CMakeFiles/ssw.dir/include/ssw/ssw_cpp.cpp.o -c /Users/cmv/Desktop/cdev_rad/include/ssw/ssw_cpp.cpp",
+  "file": "/Users/cmv/Desktop/cdev_rad/include/ssw/ssw_cpp.cpp",
+  "output": "CMakeFiles/ssw.dir/include/ssw/ssw_cpp.cpp.o"
+},
+{
+  "directory": "/Users/cmv/Desktop/cdev_rad/build",
+  "command": "/Library/Developer/CommandLineTools/usr/bin/c++  -I/Users/cmv/Desktop/cdev_rad -I/Users/cmv/Desktop/cdev_rad/include -I/Users/cmv/Desktop/cdev_rad/include/kseq -I/Users/cmv/Desktop/cdev_rad/include/csv-parser -I/Users/cmv/Desktop/cdev_rad/include/edlib/edlib/include -I/Users/cmv/Desktop/cdev_rad/include/ssw -isystem /opt/homebrew/include -isystem /opt/homebrew/opt/libomp/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -Xclang -fopenmp -o CMakeFiles/rad.dir/src/main.cpp.o -c /Users/cmv/Desktop/cdev_rad/src/main.cpp",
+  "file": "/Users/cmv/Desktop/cdev_rad/src/main.cpp",
+  "output": "CMakeFiles/rad.dir/src/main.cpp.o"
+},
+{
+  "directory": "/Users/cmv/Desktop/cdev_rad/build",
+  "command": "/Library/Developer/CommandLineTools/usr/bin/c++  -I/Users/cmv/Desktop/cdev_rad -I/Users/cmv/Desktop/cdev_rad/include -I/Users/cmv/Desktop/cdev_rad/include/kseq -I/Users/cmv/Desktop/cdev_rad/include/csv-parser -I/Users/cmv/Desktop/cdev_rad/include/edlib/edlib/include -I/Users/cmv/Desktop/cdev_rad/include/ssw -isystem /opt/homebrew/include -isystem /opt/homebrew/opt/libomp/include -O3 -DNDEBUG -std=gnu++17 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -Xclang -fopenmp -o CMakeFiles/rad_config.dir/src/config_tools.cpp.o -c /Users/cmv/Desktop/cdev_rad/src/config_tools.cpp",
+  "file": "/Users/cmv/Desktop/cdev_rad/src/config_tools.cpp",
+  "output": "CMakeFiles/rad_config.dir/src/config_tools.cpp.o"
+},
+{
+  "directory": "/Users/cmv/Desktop/cdev_rad/build/include/edlib",
+  "command": "/Library/Developer/CommandLineTools/usr/bin/c++ -DDLIB_BUILD -I/Users/cmv/Desktop/cdev_rad/include/edlib/edlib/include  -Wold-style-cast -Wshadow -Wall -Wextra -pedantic -O3 -DNDEBUG -std=c++14 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -fvisibility=hidden -fvisibility-inlines-hidden -o CMakeFiles/edlib.dir/edlib/src/edlib.cpp.o -c /Users/cmv/Desktop/cdev_rad/include/edlib/edlib/src/edlib.cpp",
+  "file": "/Users/cmv/Desktop/cdev_rad/include/edlib/edlib/src/edlib.cpp",
+  "output": "include/edlib/CMakeFiles/edlib.dir/edlib/src/edlib.cpp.o"
+},
+{
+  "directory": "/Users/cmv/Desktop/cdev_rad/build/include/edlib",
+  "command": "/Library/Developer/CommandLineTools/usr/bin/cc  -I/Users/cmv/Desktop/cdev_rad/include/edlib/edlib/include -O3 -DNDEBUG -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -o CMakeFiles/helloWorld.dir/apps/hello-world/helloWorld.c.o -c /Users/cmv/Desktop/cdev_rad/include/edlib/apps/hello-world/helloWorld.c",
+  "file": "/Users/cmv/Desktop/cdev_rad/include/edlib/apps/hello-world/helloWorld.c",
+  "output": "include/edlib/CMakeFiles/helloWorld.dir/apps/hello-world/helloWorld.c.o"
+},
+{
+  "directory": "/Users/cmv/Desktop/cdev_rad/build/include/edlib",
+  "command": "/Library/Developer/CommandLineTools/usr/bin/c++  -I/Users/cmv/Desktop/cdev_rad/include/edlib/edlib/include  -Wold-style-cast -Wshadow -Wall -Wextra -pedantic -O3 -DNDEBUG -std=c++14 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -o CMakeFiles/runTests.dir/test/runTests.cpp.o -c /Users/cmv/Desktop/cdev_rad/include/edlib/test/runTests.cpp",
+  "file": "/Users/cmv/Desktop/cdev_rad/include/edlib/test/runTests.cpp",
+  "output": "include/edlib/CMakeFiles/runTests.dir/test/runTests.cpp.o"
+},
+{
+  "directory": "/Users/cmv/Desktop/cdev_rad/build/include/edlib",
+  "command": "/Library/Developer/CommandLineTools/usr/bin/c++  -I/Users/cmv/Desktop/cdev_rad/include/edlib/edlib/include  -Wold-style-cast -Wshadow -Wall -Wextra -pedantic -O3 -DNDEBUG -std=c++14 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -o CMakeFiles/edlib-aligner.dir/apps/aligner/aligner.cpp.o -c /Users/cmv/Desktop/cdev_rad/include/edlib/apps/aligner/aligner.cpp",
+  "file": "/Users/cmv/Desktop/cdev_rad/include/edlib/apps/aligner/aligner.cpp",
+  "output": "include/edlib/CMakeFiles/edlib-aligner.dir/apps/aligner/aligner.cpp.o"
+}
+]
