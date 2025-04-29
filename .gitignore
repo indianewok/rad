@@ -31,8 +31,9 @@
 *.out
 *.app
 
-# VSCode and IDE
+# VSCode, IDE, and system
 *.vscode
+.DS_Store
 
 # build artifacts
 /build/
