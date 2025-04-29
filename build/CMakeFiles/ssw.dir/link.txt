@@ -1,2 +1,0 @@
-/Library/Developer/CommandLineTools/usr/bin/ar qc libssw.a CMakeFiles/ssw.dir/include/ssw/ssw.c.o CMakeFiles/ssw.dir/include/ssw/ssw_cpp.cpp.o
-/Library/Developer/CommandLineTools/usr/bin/ranlib libssw.a

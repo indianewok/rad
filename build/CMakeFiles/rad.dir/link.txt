@@ -1,1 +1,0 @@
-/Library/Developer/CommandLineTools/usr/bin/c++ -O3 -DNDEBUG -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/rad.dir/src/main.cpp.o -o rad  /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk/usr/lib/libz.tbd /opt/homebrew/opt/libomp/lib/libomp.dylib lib/libedlib.a libssw.a
