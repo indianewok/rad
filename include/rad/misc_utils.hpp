@@ -125,7 +125,6 @@ namespace seq_utils {
         return kmers;
     }
 
-
 };
 
 namespace streaming_utils { 
@@ -156,6 +155,12 @@ namespace streaming_utils {
 namespace whitelist_utils {
     // Map of kit names to their respective whitelist paths
     static std::unordered_map<std::string,std::string> kit_wl_paths = {
+        //splitseq barcodes
+        {"splitseq_bc1", "resources/wl/splitseq_bc1_bitlist.csv.gz"},
+        {"splitseq_bc2", "resources/wl/splitseq_bc2_bitlist.csv.gz"},
+        //CUSTOM ADDED, REMOVE BEFORE UP
+        {"splitseq_bc1_rc", "/Users/cmv/Desktop/splitseq_barcodes/bc_8nt_rc_v1_bitlist.csv.gz"},
+        //cellranger kits and whitelists
         { "10x_3v1", "resources/wl/737K-august-2016_bitlist.csv.gz" },
         { "10x_3v2", "resources/wl/737K-august-2016_bitlist.csv.gz" },
         { "10x_5v1", "resources/wl/wl/737K-august-2016_bitlist.csv.gz" },
@@ -258,19 +263,26 @@ namespace whitelist_utils {
 namespace config_utils {
 
     //config for read layout
-    //to do--add position map information as well
+    //to do--add position map information as well 
     static std::unordered_map<std::string, std::string> layout_files = {
         {"five_prime", "resources/read_layout/five_prime_read_layout.csv" },
         {"three_prime", "resources/read_layout/three_prime_read_layout.csv" },
         {"splitseq", "resources/read_layout/splitseq_read_layout.csv" }
     };
+
+    // check if the layout is a custom one
+    inline bool check_if_custom_rl(const std::string &type) {
+        return layout_files.find(type) == layout_files.end();
+    }
     
+    // get read layout path from pre-existing elements
     inline const std::string& get_read_layout(const std::string &type) {
         auto it = layout_files.find(type);
         if (it == layout_files.end())
             throw std::invalid_argument("Unknown layout type: " + type);
         return it->second;
     }
+
     inline void save_read_layout(const std::string &type, const std::string &path) {
         layout_files[type] = path;
     }

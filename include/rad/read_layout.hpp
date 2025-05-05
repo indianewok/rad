@@ -24,7 +24,7 @@ struct ParsedPosition {
     static ParsedPosition from_string(const std::string& pos_str, bool verbose = false) {
         ParsedPosition pos;
         if(pos_str.empty()){
-            std::cout << "Empty position string\n"; 
+            std::cout << "[from_string] Empty position string\n"; 
             return pos;
         } 
 
@@ -33,16 +33,16 @@ struct ParsedPosition {
         std::string temp;
         std::istringstream pipe_stream(pos_str);
         if(verbose){
-            std::cout << "Parsing position string: '" << pos_str << "'\n";
+            std::cout << "[from_string] Parsing position string: '" << pos_str << "'\n";
         }
         assert(pipe_stream.good());
         while(std::getline(pipe_stream, temp, '|')) {
             if(verbose){
-                std::cout << "Flags: eof=" << pipe_stream.eof()  << " fail=" << pipe_stream.fail()  << " bad=" << pipe_stream.bad() << "\n";
+                std::cout << "[from_string] Flags: eof =" << pipe_stream.eof()  << " fail =" << pipe_stream.fail()  << " bad =" << pipe_stream.bad() << "\n";
             }
             parts.push_back(temp);
             if(verbose){
-                std::cout << "Found part: '" << temp << "'\n";
+                std::cout << "[from_string] Found part: '" << temp << "'\n";
             }
         }
 
@@ -52,7 +52,7 @@ struct ParsedPosition {
         
         if(parts.size() >= 1) {
             pos.ref_id = parts[0];
-            if(verbose) std::cout << "Set ref_id: " << pos.ref_id << "\n";      
+            if(verbose) std::cout << "[from_string] Set ref_id: " << pos.ref_id << "\n";      
         }
 
         if(parts.size() >= 2) {
@@ -60,7 +60,7 @@ struct ParsedPosition {
             std::string pos_and_offset = parts[1];
             pos.is_start = (pos_and_offset.find("start") != std::string::npos);
             std::string is_start = pos.is_start ? "yes" : "no"; 
-            if(verbose) std::cout << "Is start: " << is_start << "\n";
+            if(verbose) std::cout << "[from_string] Is start: " << is_start << "\n";
 
             // Find the offset
             size_t plus_pos = pos_and_offset.find('+');
@@ -69,17 +69,17 @@ struct ParsedPosition {
             if(plus_pos != std::string::npos) {
                 std::string offset_str = pos_and_offset.substr(plus_pos + 1);
                 pos.offset = std::stoi(offset_str);
-                if(verbose) std::cout << "Found positive offset: " << pos.offset << "\n";
+                if(verbose) std::cout << "[from_string] Found positive offset: " << pos.offset << "\n";
             } else if(minus_pos != std::string::npos) {
                 std::string offset_str = pos_and_offset.substr(minus_pos + 1);
                 pos.offset = -std::stoi(offset_str);
-                if(verbose) std::cout << "Found negative offset: " << pos.offset << "\n";
+                if(verbose) std::cout << "[from_string] Found negative offset: " << pos.offset << "\n";
             }
         }
 
         if(parts.size() >= 3) {
             pos.add_flags = parts[2];
-            if(verbose) std::cout << "Set flags: " << pos.add_flags << "\n";
+            if(verbose) std::cout << "[from_string] Set flags: " << pos.add_flags << "\n";
         }
 
         return pos;
@@ -116,7 +116,22 @@ struct dir_order_tag {};        // Tag for accessing by order...and direction!
 
 
 /**
- * @brief Core element structure for read processing
+ * @brief Core element structure for read processing.
+ * @brief This structure is used to store information about each element in the read layout.
+ * @param class_id Unique identifier for the element class
+ * @param seq Raw sequence data
+ * @param masked_seq Masked version of the sequence (if static)
+ * @param expected_length Expected sequence length if known
+ * @param type Element type (e.g., "static", "variable")
+ * @param order Position in the layout
+ * @param direction Orientation ("forward" or "reverse")
+ * @param global_class Global classification
+ * @param whitelist_path Path to whitelist file (if applicable)
+ * @param misalignment_threshold Threshold for misalignment detection
+ * @param aligned_positions Alignment position storage
+ * @param misaligned_positions Alignment position storage
+ * @param ref_pos Position information
+ * 
  */
 struct ReadElement {
     std::string class_id;        // Unique identifier for the element class
@@ -127,7 +142,7 @@ struct ReadElement {
     int order;                   // Position in the layout
     std::string direction;       // Orientation ("forward" or "reverse")
     std::string global_class;    // Global classification
-    std::string whitelist_path; //path to whitelist_file (if applicable)
+    std::string whitelist_path;     //path to whitelist_file (if applicable)
     std::optional<std::tuple<int, int, int>> misalignment_threshold;  // Threshold for misalignment detection
     std::optional<AlignmentPositions> aligned_positions;  // Alignment position storage
     std::optional<AlignmentPositions> misaligned_positions;  // Alignment position storage
@@ -230,11 +245,58 @@ public:
     const auto& by_global_class() const { return layout.get<global_class_tag>(); }
     const auto& by_dir_order() const { return layout.get<dir_order_tag>(); }
 
+    // get read layout mode
+    std::string get_rl_mode(std::string input_file) const {
+        std::string mode;
+        std::ifstream fin(input_file);
+        std::string title;
+        std::getline(fin, title);           // e.g. "Read Layout:R1"
+        std::stringstream ss(title);
+
+        std::string drop;
+        std::getline(ss, drop, ':');        // drop “Read Layout”
+        if (!std::getline(ss, mode, ':')) { // try to read the part after the first colon
+            mode.clear();
+        }
+
+        // now trim whitespace and any double-quotes
+        const char* trim_chars = " \r\n\t\",";
+        auto start = mode.find_first_not_of(trim_chars);
+        if (start == std::string::npos) {
+            mode.clear();
+        } else {
+            auto end = mode.find_last_not_of(trim_chars);
+            mode = mode.substr(start, end - start + 1);
+        }
+        return mode;
+    }
+
     // Import data from CSV
-    void prep_new_layout(const std::string& input_file) {
+    void prep_new_layout(const std::string& input_file, bool verbose) {
         std::unordered_map<std::string, int> class_id_counts;
         std::unordered_map<std::string, int> class_id_total_counts;
+        bool build_forward_only, build_reverse_only = false;
 
+        auto log_elem = [&](const ReadElement &e){
+            std::cout << "[element] order=" << e.order
+                      << " id=" << e.class_id
+                      << " type=" << e.type
+                      << " dir=" << e.direction
+                      << " class=" << e.global_class
+                      << " seq=\"" << e.seq << "\""
+                      << " exp_len=" << (e.expected_length? std::to_string(*e.expected_length) : "none")
+                      << "\n";
+        };
+       
+        std::string mode = get_rl_mode(input_file);
+        // set flags
+        build_forward_only = (mode == "R1");
+        build_reverse_only = (mode == "R2");
+        if(verbose){
+            std::cout << "[prep_new_layout] Mode: '" << mode << "'\n";
+            std::cout << "[prep_new_layout] Build mode: " << (build_forward_only ? "forward"  : build_reverse_only  ? "reverse" : "both")<< "\n";    
+        }
+        
         // Configure CSV reader
         csv::CSVFormat format;
         format.delimiter(',').header_row(1);
@@ -245,25 +307,26 @@ public:
         for (auto& row : reader) {
             rows.push_back(row);
             std::string class_id = row["class"].is_null() || row["class"].get<std::string>().empty()
-                                        ? row["id"].get<std::string>()
-                                        : row["class"].get<std::string>();
+                                    ? row["id"].get<std::string>() : row["class"].get<std::string>();
             class_id_total_counts[class_id]++;
         }
 
         // Initialize order counter and insert seq_start
         int order_counter = 1;
         ReadElement seq_start("seq_start", "", "", 0, "static", order_counter++, "forward", "start");
+        //if(!build_reverse_only) 
         layout.insert(seq_start);
 
         // Process forward elements
         for (auto& row : rows) {
             std::string id = row["id"].is_null() ? "" : row["id"].get<std::string>();
             std::string seq = row["seq"].is_null() ? "" : row["seq"].get<std::string>();
+            std::transform(seq.begin(), seq.end(), seq.begin(), ::toupper);
             std::string type = row["type"].is_null() ? "variable" : row["type"].get<std::string>();
             std::string global_class = row["class"].is_null() ? "" : row["class"].get<std::string>();
             std::string direction = "forward";
             std::string class_id = row["class"].is_null() ? id : row["class"].get<std::string>();
-            std::string whitelist_path = row["whitelist"].is_null() ? id : row["whitelist"].get<std::string>();
+            std::string whitelist_path = row["whitelist"].is_null() ? "" : row["whitelist"].get<std::string>();
 
             // Fill empty class, class_id, or expected length
             std::optional<int> expected_length;
@@ -289,8 +352,14 @@ public:
             }
 
             if (class_id_total_counts[class_id] > 1) {
-                class_id_counts[class_id]++;
-                class_id += "_" + std::to_string(class_id_counts[class_id]);
+                int &cnt = class_id_counts[class_id];
+                ++cnt;
+                std::string original = class_id;
+                class_id += "_" + std::to_string(cnt);
+                if (verbose) {
+                    std::cout << "[prep_new_layout] Duplicate class " << original << "' found (total = " 
+                              << class_id_total_counts[original] << "), renaming to " << class_id << "\n";
+                }
             }
 
             if (!seq.empty() && !expected_length.has_value()) {
@@ -299,12 +368,21 @@ public:
             std::string masked_seq = (type == "static" && global_class != "poly_tail") ? "MASKED" : "";
 
             ReadElement elem(class_id, seq, masked_seq, expected_length, type, order_counter++, direction, global_class, whitelist_path);
+            //if(!build_reverse_only) 
             layout.insert(elem);
+            if (verbose) {
+                std::cout << "[read_layout] Inserted element: ";
+                log_elem(elem);
+            }
         }
         // Insert seq_stop
         ReadElement seq_stop("seq_stop", "", "", 0, "static", order_counter++, "forward", "stop");
+        //if(!build_reverse_only) 
         layout.insert(seq_stop);
-
+        if(build_forward_only){
+            std::cout << "[prep_new_layout] Forward-only (R1) layout generated.\n";
+            return;
+        }
         // Generate reverse complement entries
         std::vector<ReadElement> reverse_elements;
         // Determine the starting point for reverse complement orders
@@ -340,6 +418,23 @@ public:
         for (auto& reverse_elem : reverse_elements) {
             reverse_elem.order = reverse_order_start++;
             layout.insert(reverse_elem);
+            if (verbose) {
+                std::cout << "[prep_new_layout] Inserted element: ";
+                log_elem(reverse_elem);
+            }
+        }
+        if (build_reverse_only) {
+            // Get the index keyed on direction:
+            auto& dir_index = layout.get<direction_tag>();
+            // Find the sub-range where direction == "forward"
+            auto range = dir_index.equal_range("forward");
+            // Erase them
+            //dir_index.erase(range.first, range.second);
+            std::cout << "[prep_new_layout] Removed all forward elements; reverse-only layout ready. New layout :\n";
+            for(auto& elem : layout) {
+                log_elem(elem);
+            }
+            return;
         }
     }
 
@@ -457,12 +552,12 @@ public:
         for (auto& row : pos_reader) {
             std::string id = row["id"].get<std::string>();
             if(verbose){
-                std::cout << "Processing ID: " << id << "\n";
+                std::cout << "[import_from_both] Processing ID: " << id << "\n";
             }
             auto element_it = by_id().find(id);
             if (element_it == by_id().end()){
                 if(verbose){
-                    std::cout << "Skipping ID not found in layout: " << id << "\n";
+                    std::cout << "[import_from_both] Skipping ID not found in layout: " << id << "\n";
                 }
                 continue;
             }
@@ -470,9 +565,9 @@ public:
             if (!row["primary_start"].get<std::string>().empty()) {
             ReferencePositions pos;
             if(verbose){
-                std::cout << "This did work!\n";
-                std::cout << "Row data for " << id << ":\n";
-                std::cout << "primary_start value: '" << row["primary_start"].get<std::string>() << "'\n";
+                std::cout << "[import_from_both] This did work!\n";
+                std::cout << "[import_from_both] Row data for " << id << ":\n";
+                std::cout << "[import_from_both] primary_start value: '" << row["primary_start"].get<std::string>() << "'\n";
             }
             try {
                     pos.primary_start = ParsedPosition::from_string(row["primary_start"].get<std::string>());
@@ -482,7 +577,7 @@ public:
             
                     position_map[id] = pos;
                     if(verbose){
-                        std::cout << "Processing element " << id << " with positions:\n"
+                        std::cout << "[import_from_both] Processing element " << id << " with positions:\n"
                         << "Primary: " << pos.primary_start.to_string() << " -> " << pos.primary_stop.to_string() << "\n"
                         << "Secondary: " << pos.secondary_start.to_string() << " -> " << pos.secondary_stop.to_string() << "\n";
                     }
@@ -495,8 +590,8 @@ public:
                 }
             } else {
                 if(verbose){
-                    std::cout << "No primary start value!\n";
-                    std::cout << "Row data for " << id << ":\n";    
+                    std::cout << "[import_from_both] No primary start value!\n";
+                    std::cout << "[import_from_both] Row data for " << id << ":\n";    
                 }
         }
         // Parse misalignment and alignment stats
@@ -531,7 +626,7 @@ public:
     }
     
     // import a read layout .csv
-    void import_read_layout(const std::string& layout_csv, bool verbose = false){
+    void import_read_layout(const std::string& layout_csv, bool verbose){
         using namespace csv;
         CSVFormat fmt;
         fmt.delimiter(',').quote('"').header_row(0)
@@ -542,10 +637,7 @@ public:
                 row["id"].get<std::string>(),
                 row["seq"].get<std::string>(),
                 row["masked_seq"].get<std::string>(),
-                row["expected_length"].is_null()
-                ? std::nullopt
-                : std::optional<int>(
-                    std::stoi(row["expected_length"].get<std::string>())),
+                row["expected_length"].is_null() ? std::nullopt : std::optional<int>(std::stoi(row["expected_length"].get<std::string>())),
                 row["type"].get<std::string>(),
                 std::stoi(row["order"].get<std::string>()),
                 row["direction"].get<std::string>(),
@@ -576,9 +668,10 @@ public:
             auto print_list = [&](auto const &vec, const char *name){
                 std::cout << "[read_layout]:" << name;
                 for (auto const &e : vec) {
+                    std::string seq = e.seq.empty() ? "" : e.seq;
                     std::cout << "["
                             << e.class_id << ":"
-                            << e.global_class
+                            << seq
                             << "]";
                 }
                 std::cout << "\n";
@@ -589,17 +682,16 @@ public:
     }
     
     // import a position map .csv
-    void import_position_map(const std::string& map_csv,bool verbose = false){
+    void import_position_map(const std::string& map_csv,bool verbose){
         using namespace csv;
-        // 1) set up CSV reader for the position map
+        // set up CSV reader for the position map
         CSVFormat fmt;
         fmt.delimiter(',').quote('"').header_row(0)
             .variable_columns(VariableColumnPolicy::KEEP);
         CSVReader reader(map_csv, fmt);
-        // 2) iterate rows
+        // iterate rows
         for (auto &row : reader) {
             std::string id = row["id"].get<std::string>();
-
             // find the corresponding element from the layout
             auto element_it = by_id().find(id);
             if (element_it == by_id().end()) {
@@ -611,84 +703,77 @@ public:
 
             // only proceed if we have a non-empty primary_start
             const std::string &ps = row["primary_start"].get<std::string>();
-            if (ps.empty()) {
-                if (verbose) {
-                    std::cout << "[pos_map] no primary_start for " << id << "\n";
-                }
-                continue;
-            }
-
-            try {
+            if (!ps.empty()) {
                 // parse reference positions
                 ReferencePositions rp;
-                rp.primary_start   = ParsedPosition::from_string(ps);
+                rp.primary_start   = ParsedPosition::from_string(ps, verbose);
                 rp.primary_stop    = ParsedPosition::from_string(
-                                            row["primary_stop"].get<std::string>());
+                                            row["primary_stop"].get<std::string>(), verbose);
                 rp.secondary_start = ParsedPosition::from_string(
-                                            row["secondary_start"].get<std::string>());
+                                            row["secondary_start"].get<std::string>(), verbose);
                 rp.secondary_stop  = ParsedPosition::from_string(
-                                            row["secondary_stop"].get<std::string>());
+                                            row["secondary_stop"].get<std::string>(), verbose);
 
                 // store in the map and modify the element
                 position_map[id] = rp;
                 by_id().modify(element_it, [rp](ReadElement &e){
                     e.ref_pos = rp;
                 });
+            if (verbose) {
+                std::cout << "[pos_map] " << id
+                            << " -> primary("
+                            << rp.primary_start.to_string() << "-"
+                            << rp.primary_stop.to_string()   << ")\n";
+            }
+        }
+
+        // now, if misalignment stats are present, parse and attach
+        if (!row["misalign_lower"].is_null()) {
+                auto lower = std::stoi(row["misalign_lower"].get<std::string>());
+                auto mean  = std::stoi(row["misalign_mean" ].get<std::string>());
+                auto upper = std::stoi(row["misalign_upper"].get<std::string>());
+                std::tuple<int, int, int> threshold{lower, mean, upper};
+                if(verbose){
+                    std::cout << "[pos_map] " << id
+                                << " -> misalignment threshold: "
+                                << lower << "|" << mean << "|" << upper << "\n";
+                }
+
+                // alignment positions
+                AlignmentPositions align_pos{
+                    {
+                        std::stod(row["align_start"].get<std::string>()),
+                        std::stod(row["var_start"].get<std::string>())
+                    },
+                    {
+                        std::stod(row["align_stop"].get<std::string>()),
+                        std::stod(row["var_stop"].get<std::string>())
+                    }
+                };
+                // misalignment positions
+                AlignmentPositions misalign_pos{
+                    {
+                        std::stod(row["misalign_start"].get<std::string>()),
+                        std::stod(row["mvar_start"].get<std::string>())
+                    },
+                    {
+                        std::stod(row["misalign_stop" ].get<std::string>()),
+                        std::stod(row["mvar_stop"].get<std::string>())
+                    }
+                };
+
+                // attach them both in one modify call
+                by_id().modify(element_it, [&](ReadElement &e){
+                    e.misalignment_threshold = threshold;
+                    e.aligned_positions      = align_pos;
+                    e.misaligned_positions   = misalign_pos;
+                });
 
                 if (verbose) {
                     std::cout << "[pos_map] " << id
-                                << " → primary("
-                                << rp.primary_start.to_string() << "–"
-                                << rp.primary_stop.to_string()   << ")\n";
+                                << " -> misalignment threshold: "
+                                << lower << "|" << mean << "|" << upper << "\n";
                 }
-
-                // now, if misalignment stats are present, parse and attach
-                if (!row["misalign_lower"].is_null()) {
-                    auto lower = std::stoi(row["misalign_lower"].get<std::string>());
-                    auto mean  = std::stoi(row["misalign_mean" ].get<std::string>());
-                    auto upper = std::stoi(row["misalign_upper"].get<std::string>());
-                    std::tuple<int, int, int> threshold{lower, mean, upper};
-
-                    // alignment positions
-                    AlignmentPositions align_pos{
-                        {
-                            std::stod(row["align_start"].get<std::string>()),
-                            std::stod(row["var_start"  ].get<std::string>())
-                        },
-                        {
-                            std::stod(row["align_stop" ].get<std::string>()),
-                            std::stod(row["var_stop"  ].get<std::string>())
-                        }
-                    };
-                    // misalignment positions
-                    AlignmentPositions misalign_pos{
-                        {
-                            std::stod(row["misalign_start"].get<std::string>()),
-                            std::stod(row["mvar_start"   ].get<std::string>())
-                        },
-                        {
-                            std::stod(row["misalign_stop" ].get<std::string>()),
-                            std::stod(row["mvar_stop"    ].get<std::string>())
-                        }
-                    };
-
-                    // attach them both in one modify call
-                    by_id().modify(element_it, [&](ReadElement &e){
-                        e.misalignment_threshold = threshold;
-                        e.aligned_positions      = align_pos;
-                        e.misaligned_positions   = misalign_pos;
-                    });
-
-                    if (verbose) {
-                        std::cout << "[pos_map] " << id
-                                    << " -> misalign thr(" 
-                                    << lower << "/" << mean << "/" << upper << ")\n";
-                    }
-                }
-            }
-            catch (const std::exception &ex) {
-                std::cerr << "[pos_map] error for " << id
-                            << ": " << ex.what() << "\n";
             }
         }
     }
@@ -717,94 +802,99 @@ public:
     }
 
     //load whitelists from whitelist path in read layout
-    void load_wl() {
+    void load_wl(std::optional<int> shift, std::optional<int> mut, bool verbose) {
         using namespace std::chrono;
         auto t0 = high_resolution_clock::now();
-        std::unordered_set<std::string> seen_paths;
-
-        //collect static sequences for filtering purposes
+    
+        // collect all static seqs for filter_bcs
         std::vector<std::string> static_seqs;
         for (auto const &elem : layout) {
-            if (elem.type == "static" && !elem.seq.empty()) {
+            if (elem.type == "static" && !elem.seq.empty())
                 static_seqs.push_back(elem.seq);
-            }
         }
     
-        // Check if the whitelist path is empty
-        for (auto const &elem : ReadLayout::layout) {
-            if (elem.global_class != "barcode" || elem.type != "variable"){
+        // map each unique path -> one wl_entry
+        std::unordered_map<std::string, whitelist::wl_entry> path2entry;
+    
+        // for every barcode element in the layout…
+        for (auto const &elem : layout) {
+            if (elem.global_class != "barcode" || elem.type != "variable")
                 continue;
-            }
-            std::cout << "[whitelist] Found a barcode whitelist for " << elem.class_id << "\n";
-            std::cout << "[whitelist] Whitelist path: " << elem.whitelist_path << "\n";
-            // resolve kits to real path (or pass through if already a path)
-            std::string path = whitelist_utils::kit_to_path(elem.whitelist_path);
-            // de-duplication
-            if (!seen_paths.insert(path).second){
-                continue;
-            }
-
-            std::cout << "[whitelist] Loading whitelist for " << elem.class_id << " from " << path << "...\n";
-            auto t1 = high_resolution_clock::now();
-
-            // get expected length
-            size_t def_len = 0;
-            {
-            auto it = layout.find(elem.class_id);
-                if (it == layout.find(elem.class_id) && it->expected_length) {
-                    def_len = *it->expected_length;
-                } 
-            }
-
-            // import helper returns a fully‐populated wl_entry
-            whitelist::wl_entry entry = wl_map.import_whitelist(elem.whitelist_path);
-            // generate mismatch barcodes in true for datasets with < 15K barcodes, otherwise costs a lot of time.
-            // this threshold is hardcoded, but i should probably make the mismatch threshold a parameter
-            if(entry.true_bcs.size() <= 15000){
-                entry.generate_mismatch_barcodes(4, 2, false);
-            }
-            auto t2 = high_resolution_clock::now();
-            double ms = duration<double, std::milli>(t2 - t1).count();
-
-            // populate filter_bcs
-            entry.filter_bcs.clear();
-            for (auto const &s : static_seqs) {
-                // circular_kmerize is the function we wrote earlier
-                auto kmers = seq_utils::circ_kmerize(s, def_len);
-                for (auto const &kmer : kmers) {
-                    // convert string to int64_seq
-                    int64_seq bits(kmer);
-                    entry.filter_bcs.insert_bc_entry(bits);
+    
+            std::string key = elem.class_id;
+            // normalize the key (strip rc_)
+            if (seq_utils::is_rc(key))
+                key = seq_utils::remove_rc(key);
+    
+            // resolve kit or path
+            std::string spec = elem.whitelist_path;
+            std::string path = whitelist_utils::kit_to_path(spec);
+    
+            std::cout << "[whitelist] Found whitelist for " << elem.class_id
+                      << "[" << spec << "] at " << path << "\n";
+    
+            // if we've never loaded this file before, do so now
+            auto pit = path2entry.find(path);
+            if (pit == path2entry.end()) {
+                std::cout << "[whitelist] Loading from " << path << " ...\n";
+                auto t1 = high_resolution_clock::now();
+                // get expected length
+                size_t default_length = 16;
+                if (auto lit = layout.find(elem.class_id);
+                    lit != layout.end() && lit->expected_length)
+                {
+                    default_length = *lit->expected_length;
                 }
+    
+                // import & possibly generate mismatches
+                auto entry = wl_map.import_whitelist(spec, verbose, default_length);
+                if (entry.true_bcs.size() <= 15000){
+                    int shift_amt = shift.value_or(2);
+                    int mut_amt   = mut.value_or(3);
+                    entry.generate_mismatch_barcodes(shift_amt, mut_amt, verbose);
+                }
+    
+                // build filter_bcs
+                entry.filter_bcs.clear();
+                size_t def_len = 0;
+                if (auto lit = layout.find(elem.class_id);
+                    lit != layout.end() && lit->expected_length)
+                {
+                    def_len = *lit->expected_length;
+                }
+                for (auto const &s : static_seqs) {
+                    for (auto const &kmer : seq_utils::circ_kmerize(s, def_len)) {
+                        int64_seq bits(kmer);
+                        entry.filter_bcs.insert_bc_entry(bits);
+                    }
+                }
+    
+                auto t2 = high_resolution_clock::now();
+                double ms = duration<double, std::milli>(t2 - t1).count();
+                std::cout << "[whitelist] Loaded in " << (ms/1000.0) << " s\n";
+    
+                pit = path2entry.emplace(path, std::move(entry)).first;
             }
-
-            // normalize class_id (strip rc_ if present)
-            std::string cid = elem.class_id;
-            if (seq_utils::is_rc(cid))
-                cid = seq_utils::remove_rc(cid);
-
-            // store it
-            wl_map.lists[cid] = std::move(entry);
-
-            // report sizes
-            auto &E = wl_map.lists[cid];
-            auto true_bc_size = E.true_bcs.size() * sizeof(int64_seq) / 1e6;
-            auto global_bc_size = E.global_bcs.size() * sizeof(int64_seq) / 1e6;
-            auto filter_bc_size = E.filter_bcs.size() * sizeof(int64_seq) / 1e6;
-            std::cout << cid << ": global = " << E.global_bcs.size()
-                      << ", true = "   << E.true_bcs.size()
-                      << ", filter = " << E.filter_bcs.size()
-                      << " (loaded in " << (ms/1000.0) << " s)\n";
-            std::cout << "Approximate size of total barcodes in " << cid << " whitelist: " 
-                      << true_bc_size + global_bc_size + filter_bc_size
-                      << " MB\n";
+    
+            // map this normalized class_id -> the already‐loaded wl_entry
+            wl_map.lists[key] = pit->second;
+    
+            // report
+            auto &E = wl_map.lists[key];
+            std::cout << "[whitelist] " << key
+                      << ": global = "  << E.global_bcs.size()
+                      << ", true = "    << E.true_bcs.size()
+                      << ", filter = "  << E.filter_bcs.size()
+                      << "\n";
         }
-
+    
         auto t3 = high_resolution_clock::now();
         double total_s = duration<double>(t3 - t0).count();
-        std::cout << "Finished loading all whitelists in "  << total_s << " s\n";
+        std::cout << "[whitelist] Finished loading all whitelists in " 
+                  << total_s << " s\n";
     }
 
+    // save the whitelist to a CSV 
     void save_wl(std::ostream &out, bool full = false) const {
         //Loop over every whitelist in wl_map.lists
         for (auto const& [class_id, entry] : wl_map.lists) {
@@ -861,7 +951,7 @@ public:
     void save_wl(const std::string &path, bool full = false) const {
         std::ofstream out(path);
         if (!out.is_open()) {
-            std::cerr << "Error opening file for writing: " << path << "\n";
+            std::cerr << "[error] Error opening file for writing: " << path << "\n";
             return;
         }
         save_wl(out);
@@ -959,9 +1049,6 @@ private:
                     positions.secondary_start = {prev->class_id, false, 1, ""};
                     positions.secondary_stop = {prev->class_id, false, offset, ""};
             } else {
-                std::cout << "Next type: " << prev_prev->type << "\n";
-                std::cout << "Next global class: " << prev_prev->global_class << "\n";
-                std::cout << "Next class id: " << prev_prev->class_id << "\n";
 
                 if(prev->type == "variable" && prev_prev->global_class != "read" && prev_prev->type == "static"){
                     int length_offset = prev->expected_length.value_or(1);
@@ -1175,11 +1262,7 @@ public:
         }
     }
 
-    void generate_misalignment_data(
-                      const std::string& fastq_path,
-                      ReadLayout& layout, 
-                      int num_threads = 1,
-                      size_t max_reads = 5000) {
+    void generate_misalignment_data(const std::string& fastq_path, ReadLayout& layout, int num_threads = 1, size_t max_reads = 50000) {
         using ChunkFunc = std::function<bool(const std::vector<read_streaming::sequence>&, const std::string&)>;
         chunk_streaming<read_streaming::sequence, ChunkFunc> streamer;
         
@@ -1205,11 +1288,9 @@ public:
             // Print progress and current misalignment thresholds.
             #pragma omp critical
             {
-                std::cout << "\rProcessed reads - Forward perfect: " << forward_count 
-                        << ", Reverse perfect: " << reverse_count << "\n";
+                std::cout << "\r[misalignment_stats] Processed reads - Forward perfect: " << forward_count  << ", Reverse perfect: " << reverse_count << "\n";
                 for (const auto& [adapter_id, stats] : adapter_stats) {
-                    std::cout << adapter_id << " misalignment mean: " << stats.mean 
-                            << " (n=" << stats.count << ")"
+                    std::cout << "[misalignment_stats] " << adapter_id << " misalignment mean: " << stats.mean  << " (n = " << stats.count << ")"
                             << (stats.is_stable ? " [STABLE]" : "") << "\n";
                 }
             }
@@ -1230,10 +1311,7 @@ public:
                 }
                 return true;  // Continue processing.
         };
-        #pragma omp critical
-        {
-            std::cout << "attempting to process chunks!\n";
-        }
+
         streamer.process_chunks(fastq_path, process_func, num_threads);
         
         // Write final results
@@ -1282,7 +1360,7 @@ private:
         }
     }
 
-    void update_misalignment_stats(const std::string& read_seq,
+    void update_misalignment_stats(const std::string& read_seq, 
                        const std::vector<std::pair<std::string, std::string>>& adapters,
                        std::unordered_map<std::string, misalignment_stats>& adapter_stats,
                        std::unordered_map<std::string, misalignment_stats>& misalignment_stats,

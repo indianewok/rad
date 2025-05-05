@@ -12,6 +12,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # OpenMP (Homebrew libomp on macOS)
 # --------------------------------------------------------------------------
 if(APPLE)
+# hardcoded--change it
     list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libomp")
 endif()
 find_package(OpenMP REQUIRED)
@@ -53,6 +54,7 @@ target_include_directories(rad_lib INTERFACE
     include                          
     include/kseq
     include/csv-parser
+    include/progressbar
 )
 
 target_link_libraries(rad_lib INTERFACE
@@ -74,5 +76,5 @@ target_link_libraries(rad PRIVATE rad_lib)
 target_link_libraries(rad_config PRIVATE rad_lib)
 
 # --------------------------------------------------------------------------
-message(STATUS "Configure‑time compiler: ${CMAKE_CXX_COMPILER}")
+message(STATUS "Configure-time compiler: ${CMAKE_CXX_COMPILER}")
 message(STATUS "C++ flags: ${CMAKE_CXX_FLAGS}")

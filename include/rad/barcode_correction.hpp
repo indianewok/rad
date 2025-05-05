@@ -559,36 +559,38 @@ class whitelist {
     struct wl_entry {
         std::unordered_set<int64_seq> true_ref;
         bc_multimap<int64_seq, barcode_entry> true_bcs, global_bcs, filter_bcs;
-        
         // generates shifted and mutated barcodes for true elements in the whitelist
-        void generate_mismatch_barcodes(int shift, int mutation_rounds, bool verbose) {
-            if(verbose){
+        // to-do--parallelize this
+        void generate_mismatch_barcodes(int shift, int mutation_rounds,bool verbose) {
+            if (verbose) {
                 #pragma omp critical
                 std::cout << "Generating shifted and mutated barcodes for true barcodes...\n";
             }
-            // make a copy of true bcs as a reference to iterate over
-            std::vector<barcode_entry> originals;
+
+            // build a single hash‐map
+            std::unordered_map<int64_seq, barcode_entry> originals;
             originals.reserve(true_bcs.size());
             for (auto const &kv : true_bcs) {
-                originals.push_back(kv.second);
+                originals.emplace(kv.first, kv.second);
             }
-
-            for (auto const &orig_be : originals) {
-                // generate shifted barcodes
-                auto shifted = mutation_tools::generate_shifted_barcodes(orig_be.barcode, shift);
+            //generate shifts & mutations
+            for (auto const & [orig_bits, orig_be] : originals) {
+                // SHIFTED
+                auto shifted = mutation_tools::generate_shifted_barcodes(orig_bits, shift);
                 for (auto const &s_bits : shifted) {
-                    if(global_bcs.check_wl_for(s_bits)){
+                    // skip if it’s already a true barcode or if it equals one of the originals
+                    if (global_bcs.check_wl_for(s_bits) || originals.count(s_bits)){
                         continue;
                     }
                     barcode_entry obs = orig_be;
                     obs.barcode = s_bits;
                     true_bcs.insert_bc_entry(obs, orig_be);
                 }
-        
-                // generate mutated barcodes
-                auto mutated = mutation_tools::generate_mutated_barcodes(orig_be.barcode, mutation_rounds);
+
+                // MUTATED
+                auto mutated = mutation_tools::generate_mutated_barcodes(orig_bits, mutation_rounds);
                 for (auto const &m_bits : mutated) {
-                    if(global_bcs.check_wl_for(m_bits)){
+                    if (global_bcs.check_wl_for(m_bits) || originals.count(m_bits)){
                         continue;
                     }
                     barcode_entry obs = orig_be;
@@ -600,7 +602,7 @@ class whitelist {
     };
 
     std::unordered_map<std::string, wl_entry> lists;
-    // operator[] provides easy insert/access: W["barcode_1"].insert_bc_entry(obs, corr);
+    // operator[] for easy insert/access: W["barcode_1"].insert_bc_entry(obs, corr);
     wl_entry & operator[](const std::string &class_id) {
         return lists[class_id];
     }
@@ -615,17 +617,17 @@ class whitelist {
     }
     
       // for one spec (kit name or file path), load its int64_seq set
-    static std::unordered_set<int64_seq> load_spec_barcodes(std::string const &spec, uint16_t default_length, bool verbose = true) {
+    static std::unordered_set<int64_seq> load_barcodes(std::string const &spec, uint16_t default_length, bool verbose) {
         if (verbose) {
-            std::cout << "Loading barcodes from spec: " << spec << "\n";
+            std::cout << "[whitelist] Loading barcodes from path/kit: " << spec << "\n";
         }
         // check if spec is a kit name or a file path
         if (verbose) {
             if(whitelist_utils::is_kit(spec)){
-                std::cout << "Kit name: " << spec << "\n";
-                std::cout << "Kit path: " << whitelist_utils::kit_to_path(spec) << "\n";
+                std::cout << "[whitelist] Kit name: " << spec << "\n";
+                std::cout << "[whitelist] Kit path: " << whitelist_utils::kit_to_path(spec) << "\n";
             } else {
-                std::cout << "File path: " << spec << "\n";
+                std::cout << "[whitelist] File path: " << spec << "\n";
             }
         }
         std::string path = whitelist_utils::kit_to_path(spec);
@@ -644,7 +646,7 @@ class whitelist {
 
             int64_seq seq;
             if (isBitlist) {
-                // decimal → bits
+                // decimal -> bits
                 try {
                     int64_t code = std::stoll(tok);
                     seq.length = default_length;
@@ -728,8 +730,8 @@ class whitelist {
     //import a whitelist from file--can be true barcodes or not. cheap but easy way to import b/w both global or custom--just set
     //an arbitrary threshold for the number of true barcodes to be kept because ideally after a certain size of barcodes
     //you really just want to treat them both the same way
-    wl_entry import_whitelist(std::string const &field, uint16_t default_length = 16, bool verbose = false) {
-        std::cout << "Importing whitelist from " << field << "\n";
+    wl_entry import_whitelist(std::string const &field, bool verbose, uint16_t default_length = 16) {
+        std::cout << "[whitelist] Importing whitelist from " << field << "\n";
         // split into 1 or 2 specs
         auto specs = whitelist_utils::parse_whitelist_specs(field);
         if (specs.empty()) {
@@ -743,7 +745,7 @@ class whitelist {
 
         std::vector<std::unordered_set<int64_seq>> sets;
         for (auto const &spec : specs) {
-            sets.push_back(load_spec_barcodes(spec, default_length, true));
+            sets.push_back(load_barcodes(spec, default_length, true));
         }
 
         // assemble the wl_entry

@@ -1,9 +1,9 @@
 ﻿Read Layout,,,,,
 id,seq,expected_length,type,class,whitelist
 read,,,variable,read,
-barcode_1,,8,variable,barcode,/dartfs-hpc/rc/home/3/f005f43/whitelists/splitseq_barcodes/bc_8nt_v2.csv
+barcode_1,,8,variable,barcode,splitseq_bc2
 linker_1,CCACAGTCTCAAGCACGTGGAT,,static,linker,
-barcode_2,,8,variable,barcode,/dartfs-hpc/rc/home/3/f005f43/whitelists/splitseq_barcodes/bc_8nt_v1.csv
+barcode_2,,8,variable,barcode,splitseq_bc1_rc
 linker_2,AGTCGTACGCCGATGCGAAACATCGGCCAC,,static,linker,
-barcode_3,,8,variable,barcode,/dartfs-hpc/rc/home/3/f005f43/whitelists/splitseq_barcodes/bc_8nt_v1.csv
+barcode_3,,8,variable,barcode,splitseq_bc1_rc
 umi,,10,variable,umi,

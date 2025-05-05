@@ -193,8 +193,8 @@ private:
     }
 
 public:   
-static_alignments align_static_elements(const std::string& query, const std::string& target, int max_edit_distance = -1,
-                                          const std::string& masked_query = "", bool primary = true, bool verbose = false,
+static_alignments align_static_elements(const std::string& query, const std::string& target, bool verbose, int max_edit_distance = -1,
+                                          const std::string& masked_query = "", bool primary = true, 
                                           int expected_start = 1, int expected_end = -1) {
     static_alignments alignment;
     alignment.success = false;
@@ -389,7 +389,8 @@ static_alignments align_static_elements(const std::string& query, const std::str
 
 namespace barcode_correction {
     // returns the best candidate compared to the query candidate
-    std::optional<int64_seq> resolve_multiple_hits(const int64_seq& query, const std::unordered_set<int64_seq>& candidates, int max_dist = 4, bool verbose = false){
+    std::optional<int64_seq> resolve_multiple_hits(const int64_seq& query,
+         const std::unordered_set<int64_seq>& candidates, int max_dist, bool verbose){
         auto sorted = mutation_tools::int64_lvdist(query, candidates, max_dist);
         if (sorted.empty()){
             if(verbose){
@@ -398,7 +399,8 @@ namespace barcode_correction {
             }
             return std::nullopt;
         }
-        auto it = sorted.begin(); // lowest edit distance
+         // lowest edit distance
+        auto it = sorted.begin();
         int best_dist = it->first;
         const auto& best_set = it->second;
 
@@ -425,11 +427,11 @@ namespace barcode_correction {
     }
 
     // Returns true if we can correct this one barcode element into exactly one “true” whitelist entry.
-    std::optional<int64_seq> correct_barcode(const seq_element& elem, const ReadLayout& layout, bool verbose = false){
-        // 1) pick the right whitelist
+    std::optional<int64_seq> correct_barcode(const seq_element& elem, const ReadLayout& layout, bool verbose){
+        // pick the right whitelist
         auto key = seq_utils::remove_rc(elem.class_id);
         auto &wl = layout.wl_map.lists.at(key);
-        // 2) extract and reverse‐complement the raw string
+        // extract and reverse‐complement the raw string
         std::string raw = *elem.seq;
         if (elem.direction == "reverse"){
             raw = seq_utils::revcomp(raw);
@@ -437,8 +439,11 @@ namespace barcode_correction {
         // encoded barcode
         int64_seq bc;
         bc.sequence_to_bits(raw);
+        int max_shift_dist = static_cast<int>(bc.length*0.25);
+        int max_resolve_dist = static_cast<int>(bc.length*0.2);
+        int max_mutation_dist = static_cast<int>(bc.length*0.6);
         // === exact match ===
-        if (wl.true_bcs.check_wl_for(bc)) {
+        if (!wl.true_bcs.empty() && wl.true_bcs.check_wl_for(bc)) {
             auto matched = wl.true_bcs.return_putative_correct_bcs(bc);
             if(verbose){
                 #pragma omp critical
@@ -452,7 +457,7 @@ namespace barcode_correction {
                 }
               return std::optional<int64_seq>(*matched.begin()); 
             }
-            if (auto one = resolve_multiple_hits(bc, matched, 6)) {
+            if (auto one = resolve_multiple_hits(bc, matched, max_resolve_dist, verbose)) {
                 if(verbose){
                     #pragma omp critical
                     std::cout << "ORIGINAL_MATCH_COLLISION_RESOLVED\n";    
@@ -460,11 +465,14 @@ namespace barcode_correction {
                 
                 return std::optional<int64_seq>(*one);
             }
-            
             if(verbose){
                 #pragma omp critical
                 std::cout << "ORIGINAL_MATCH_COLLISION_UNRESOLVED\n";
             }
+        }
+        if(verbose){
+            #pragma omp critical
+            std::cout << "ORIGINAL_MATCH_NOT_FOUND\n";
         }
         // === global whitelist ===
         {
@@ -472,8 +480,7 @@ namespace barcode_correction {
                 auto matched = wl.global_bcs.return_putative_correct_bcs(bc);
                 if(verbose){
                     #pragma omp critical
-                    std::cout << "GLOBAL_CHECK_FOUND (" << matched.size()
-                            << " candidates)\n";
+                    std::cout << "GLOBAL_CHECK_FOUND (" << matched.size() << " candidates)\n";
                 }
                 if (matched.size() == 1) {
                     if(verbose){
@@ -495,8 +502,7 @@ namespace barcode_correction {
                 auto matched = wl.true_bcs.return_putative_correct_bcs(muts);
                 if(verbose){
                     #pragma omp critical
-                    std::cout << "MUTATION_CHECK_FOUND (" << matched.size()
-                            << " candidates)\n";
+                    std::cout << "MUTATION_CHECK_FOUND (" << matched.size() << " candidates)\n";
                 }
                 if (matched.size() == 1) {
                     int64_seq putative_candidate = *matched.begin();
@@ -505,8 +511,8 @@ namespace barcode_correction {
                         #pragma omp critical
                         std::cout << "MUTATION_CHECK_CANDIDATE::" << putative_candidate.bits_to_sequence() << "\n";
                     }
-                    int res = mutation_tools::int64_lvdist(bc, putative_candidate, 10);
-                    if(res >= 0 && res <= 6){
+                    int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
+                    if(res >= 0 && res <= max_resolve_dist){
                         if(verbose){
                             #pragma omp critical
                             std::cout << "LVDIST::" << res << "\n";
@@ -515,7 +521,7 @@ namespace barcode_correction {
                         return std::optional<int64_seq>(*matched.begin());
                     }
                 }
-                if (auto one = resolve_multiple_hits(bc, matched)) {
+                if (auto one = resolve_multiple_hits(bc, matched, max_mutation_dist, verbose)) {
                     if(verbose){
                         #pragma omp critical
                         std::cout << "WL_MULTIPLE_MATCHED_RESOLVED\n";
@@ -530,7 +536,7 @@ namespace barcode_correction {
         }
         // === shift fuzzy match ===
         {
-        auto shifts = mutation_tools::generate_shifted_barcodes(bc, 4);
+        auto shifts = mutation_tools::generate_shifted_barcodes(bc, max_shift_dist);
             if (wl.true_bcs.check_wl_for(shifts)) {
                 auto matched = wl.true_bcs.return_putative_correct_bcs(shifts);
                 if(verbose){
@@ -540,13 +546,13 @@ namespace barcode_correction {
                 }
                 if (matched.size() == 1) {
                     int64_seq putative_candidate = *matched.begin();
-                    int res = mutation_tools::int64_lvdist(bc, putative_candidate, 10);
+                    int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
                     if(verbose){
                         #pragma omp critical
                         std::cout << "SHIFT_CHECK_CANDIDATE::" << putative_candidate.bits_to_sequence() << "\n";
                         std::cout << "LVDIST::" << res << "\n";    
                     }
-                    if(res >= 0 && res <= 6){
+                    if(res >= 0 && res <= max_resolve_dist){
                         if(verbose){
                             #pragma omp critical
                             std::cout << "SHIFT_CHECK_MATCHED\n";    
@@ -555,7 +561,7 @@ namespace barcode_correction {
                     }
                 }
 
-                if (auto one = resolve_multiple_hits(bc, matched)) {  
+                if (auto one = resolve_multiple_hits(bc, matched, max_resolve_dist, verbose)) {  
                         if(verbose){
                             #pragma omp critical
                             std::cout << "SHIFT_MULTIPLE_MATCHED_RESOLVED\n";
@@ -1199,11 +1205,13 @@ private:
                 break;
             }
         }
-        // if no read at all → drop
-        if (read_len == 0) return false;
-    
+        // if no read at all -> drop
+        if (read_len == 0){
+            return false;
+        }
         // sum up all the expected static‐adapter lengths from the layout
         int adapters = calc_total_static_len(layout);
+        // if the read is long enough, say yes; if the read is too short, say no
         return read_len >= static_cast<size_t>(adapters);
     }
 
@@ -1325,6 +1333,13 @@ public:
     size_t read_length = read.seq.length();
 
     for (auto it = static_range.first; it != static_range.second; ++it) {
+        if(verbose){
+            #pragma omp critical
+            {
+                std::cout << "Processing static element: " << it->class_id << 
+                " with sequence " << it->seq << std::endl;
+            }
+        }
         // For 'start' or 'stop' types, add an element without alignment.
         if (it->global_class == "start" || it->global_class == "stop") {
             add_element(seq_element(
@@ -1343,12 +1358,15 @@ public:
             continue;
         }
 
-        // Update max_distance from misalignment_threshold if available.
+        // Update max_distance from misalignment_threshold if available. If not, set to ~20% of the adapter seq length.
+        // this will be the case for R1/R2 reads
         if (it->misalignment_threshold) {
             max_distance = std::get<0>(*it->misalignment_threshold);
+        } else {
+            max_distance = static_cast<int>(it->seq.length() * 0.2);
         }
 
-        // Handle poly_tail sequences separately.
+        // poly-tail solution--importantly, only will look for poly-tails if you tell it to
         if (it->global_class == "poly_tail") {
             auto result = aligner.find_poly_tails(it->seq, read.seq, 12);
             if (result.success) {
@@ -1373,35 +1391,41 @@ public:
             continue;
         }
         // For other static elements (non-poly_tail), use the alignment statistics
-        // to define the expected region for the adapter.
+        // to define the expected region for the adapter
+        int expected_start, expected_end;
+        // Check if the element has aligned and misaligned positions
         if (it->aligned_positions && it->misaligned_positions) {
             const auto& [start_mean, start_var] = it->aligned_positions->start_stats;
             const auto& [mis_start, start_mvar] = it->misaligned_positions->start_stats;
-            // Compute expected region boundaries based on the aligned stats.
+            // Compute expected region boundaries based on the aligned stats
             int expected_start = (start_mean < 50.0)
                 ? 1
                 : static_cast<int>(std::max(0.0, ((start_mean - (start_var * 1.25)) / 100.0) * read_length));
             int expected_end = (start_mean < 50.0)
                 ? static_cast<int>(std::min(((start_mean + (start_var * 1.25)) / 100.0) * read_length, static_cast<double>(read_length)))
                 : static_cast<int>(read_length);
-
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::cout << "Expected region for " << it->class_id << ": " 
-                              << expected_start << " - " << expected_end << std::endl;
-                }
+        } else {
+            // Default to using the entire read length if no statistics are available.
+            expected_start = 1;
+            expected_end = static_cast<int>(read_length);
+        }
+        if (verbose) {
+            #pragma omp critical
+            {
+                std::cout << "Expected region for " << it->class_id << ": " 
+                          << expected_start << " - " << expected_end << std::endl;
             }
+        }
 
-            // Use the entire mutable sequence as target.
-            auto result = aligner.align_static_elements(it->seq,
-                                                        mutable_seq,
-                                                        max_distance,
-                                                        it->masked_seq,
-                                                        true,
-                                                        verbose,
-                                                        expected_start,
-                                                        expected_end);
+        // Use the entire mutable sequence as target.
+        auto result = aligner.align_static_elements(it->seq,
+                                                    mutable_seq,
+                                                    verbose,
+                                                    max_distance,
+                                                    it->masked_seq,
+                                                    verbose,
+                                                    expected_start,
+                                                    expected_end);
             if (result.success) {
                 // Positions returned are relative to the full read.
                 for (const auto& pos : result.positions) {
@@ -1436,10 +1460,9 @@ public:
                 continue;
             }
         }
-    }
 }
     //this version iterates across reverse elements in reverse order, which fixes issues with rc umi/rc barcode dependencies
-    void sigalign_variable(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose = false) {
+    void sigalign_variable(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose) {
         if(verbose){
             #pragma omp critical
             {
@@ -1559,29 +1582,40 @@ public:
         }
     }
     // contains per-unit barcode correction
-    void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose = true) {
+    void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose) {
         // make a resever for the qual that doesn't interfere w/ASCII characters
         constexpr char qual_mask = '\x7F';
         auto direction_elements = group_directionally();
         // For recording validity and count per direction.
         std::map<std::string, bool> direction_valid;
-        std::map<std::string, int> pass_counts;
-        aligner_tools aligner;
+        std::map<std::string, int> pass_counts, static_counts;
         std::unordered_map<std::string, std::unordered_set<int64_seq>> seen_bcs;
-        std::map<std::string,int> static_counts;
+        aligner_tools aligner;
 
         // Process each direction separately.
         for (auto& [direction, elements] : direction_elements) {
+            int barcode_count = 0;
+            bool multiple_barcodes = false;
             std::string masked_read = read.seq;
             std::string masked_qual = read.is_fastq ? read.qual : "";
+            //step one--mask elements within the read from overlapping adapters/poly-tails
             for (auto const& ref : elements) {
                 const auto& e = ref.get();
                 if (e.global_class == "read" || e.position.first <= 0 || e.position.second <= e.position.first){
                     continue;
                 }
-
+                // for this direction, if there's more than one barcode, we can set the multiple barcodes flag
+                // to true
+                if (e.global_class == "barcode"){
+                    barcode_count++;
+                    if (barcode_count > 1) {
+                        multiple_barcodes = true;
+                    }
+                }
                 size_t s = e.position.first - 1;
                 size_t len = e.position.second - e.position.first + 1;
+                //this populates the masked read with 'N's
+                //if the read is shorter than the expected length, skip
                 if (s + len <= masked_read.size()) {
                     std::fill(masked_read.begin() + s, masked_read.begin() + s + len, 'N');
                     if (read.is_fastq && masked_qual.size() == masked_read.size()) {
@@ -1589,6 +1623,8 @@ public:
                     }
                 }
             }
+            
+            //step two--trim the read to remove 'N's
             for (auto const& ref : elements) {
                 const auto& e = ref.get();
                 if (e.global_class != "read" || !e.seq){
@@ -1597,18 +1633,20 @@ public:
 
                 size_t s = e.position.first - 1;
                 size_t len = e.position.second - e.position.first + 1;
-                if (s + len > masked_read.size()) 
+                if (s + len > masked_read.size()){
                     break;  // out of bounds—skip
+                } 
     
-                // extract then strip all 'N's
+                // extract, then strip all 'N's
                 std::string window = masked_read.substr(s, len);
                 std::string window_qual = read.is_fastq ? masked_qual.substr(s, len) : "";
 
                 std::string cleaned_seq;
                 std::string cleaned_qual;
-
+                // reserve space for cleaned sequences
                 cleaned_seq.reserve(window.size());
-                if (read.is_fastq) 
+                // if the read is fastq, reserve space for qualscores
+                if (read.is_fastq)
                     cleaned_qual.reserve(window.size());
 
                 for (size_t i = 0; i < window.size(); ++i) {
@@ -1620,7 +1658,7 @@ public:
                         }
                     }
                 }
-
+                // small lambda for dealing with editing elements
                 edit_elem(e.class_id, [cleaned_seq, cleaned_qual, &read, verbose](seq_element &el) {
                     *el.seq = cleaned_seq;
                     if (read.is_fastq) {
@@ -1634,7 +1672,7 @@ public:
                     }
                 });
 
-                // (optional) log
+                // verbose logging
                 if (verbose) {
                     #pragma omp critical
                     std::cout << "Trimmed read for " << e.class_id 
@@ -1653,13 +1691,20 @@ public:
             //per-direction check and length filter
             if (!filter_short_reads(elements, layout)) {
                 direction_valid[direction] = false;
+                if(verbose){
+                    #pragma omp critical
+                    {
+                        std::cout << "FILTERED_READ_LENGTH" << std::endl;
+                    }
+                }
                 continue;
             }
+
             // Sort by order.
             std::sort(elements.begin(), elements.end(), [](const auto& a, const auto& b) {
                 return a.get().order < b.get().order;
             });
-            
+
             // per element checks in this direction, and filters.
             for (auto &elem_ref : elements) {
                 int statics = 0;
@@ -1697,41 +1742,67 @@ public:
                             std::cout << "Barcode correction for " << *elem.seq << std::endl;
                         }
                     }
-                    auto out = barcode_correction::correct_barcode(elem, layout);
-                    bool corrected = out.has_value();
-                    if(corrected) {
-                        int64_seq correct_bc = *out;
-                        seen_bcs[seq_utils::remove_rc(elem.class_id)].insert(*out);
-                        std::string final_bc = elem.direction == "forward" ? correct_bc.bits_to_sequence() : 
-                        seq_utils::revcomp(correct_bc.bits_to_sequence());
-                        auto& wl = layout.wl_map.lists.at(seq_utils::remove_rc(elem.class_id));
-                        // add to corrected barcode count
-                        if(final_bc != *elem.seq) {
-                            wl.true_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
-                        }
-                        auto& id_index = sig_elements.get<sig_id_tag>();
-                        id_index.modify(
-                            id_index.find(elem.class_id),
-                            [&](seq_element &e){
-                                e.seq = final_bc;
-                                e.element_pass = true;
+                    auto& wl = layout.wl_map.lists.at(seq_utils::remove_rc(elem.class_id));
+                    //had originally included a check for global barcode class not empty (&& !wl.true_bcs.empty())
+                    //but this is not necessary, as the barcode correction function will handle it
+                    if(!wl.true_bcs.empty()){
+                        auto out = barcode_correction::correct_barcode(elem, layout, verbose);
+                        bool corrected = out.has_value();
+                        if(corrected) {
+                            int64_seq correct_bc = *out;
+                            seen_bcs[seq_utils::remove_rc(elem.class_id)].insert(*out);
+                            std::string final_bc = elem.direction == "forward" ? correct_bc.bits_to_sequence() : 
+                            seq_utils::revcomp(correct_bc.bits_to_sequence());
+                            // add to corrected barcode count
+                            if(final_bc != *elem.seq) {
+                                wl.true_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
                             }
-                        );
-                    } else {
-                        auto& id_index = sig_elements.get<sig_id_tag>();
-                        id_index.modify(
-                            id_index.find(elem.class_id),
-                            [](seq_element &e) {
-                                 e.element_pass = false; 
+                            auto& id_index = sig_elements.get<sig_id_tag>();
+                            id_index.modify(
+                                id_index.find(elem.class_id),
+                                [&](seq_element &e){
+                                    e.seq = final_bc;
+                                    e.element_pass = true;
                                 }
                             );
-                        valid_direction = false;
-                        pass_counts[direction] = 0;
-                        continue;
+                        } else {
+                            auto& id_index = sig_elements.get<sig_id_tag>();
+                            id_index.modify(
+                                id_index.find(elem.class_id),
+                                [](seq_element &e) {
+                                    e.element_pass = false; 
+                                    }
+                                );
+                            // adding this in to try to manage if there are multiple barcodes, whether we should set this entire direction to false. 
+                            // right now, we *only* return completely correct barcodes (all multiples are also correct) 
+                            if(!multiple_barcodes){
+                                // so if multiple barcodes is false, then we set the direction value to false
+                                // and set the pass counts to 0.
+                                valid_direction = false;
+                                pass_counts[direction] = 0;    
+                            }
+                            continue;
+                        }
+                    } else {
+                        //this branch is for generating a purely standalone whitelist that will occur IFF
+                        // there is no default whitelist--default whitelist generation has yet to happen
+                        // considering just dumping them into the true_bcs. will probably pull this out
+                        // and write a standalone sorting function internally here
+                        if(elem.seq.has_value()){
+                            std::string seq = *elem.seq;
+                            int64_seq putative_bc(seq);
+                            barcode_entry be;
+                            be.barcode = putative_bc;
+                            be.flags = "";
+                            be.edit_dist = 0;
+                            be.filtered = false;
+                            //wl.true_bcs.insert_bc_entry(be);
+                        }
                     }
                 }
             }
 
+            // If no static elements were found, mark the direction as invalid.
             if(static_counts[direction] == 0){
                 valid_direction = false;
                 pass_counts[direction] = 0;
@@ -1743,7 +1814,6 @@ public:
                 pass_counts[direction] = 0;
                 continue;
             }
-            
             // Second pass: Check for overlaps among variable elements (skip start/stop elements).
             for (size_t i = 0; i < elements.size(); i++) {
                 const auto& e1 = elements[i].get();
@@ -1771,22 +1841,22 @@ public:
                     }
                 }
             }
-            
             // Count passing variable elements after all modifications.
             for (auto &elem_ref : elements) {
                 const auto& elem = elem_ref.get();
-                if (elem.type == "variable" && elem.element_pass)
+                if (elem.type == "variable" && elem.element_pass && 
+                    (elem.global_class == "read" || elem.global_class == "barcode"))
                     count++;
             }
-            
+
             direction_valid[direction] = true;
             pass_counts[direction] = count;
 
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "\nDirection " << direction << " valid: yes with " 
-                              << count << " passing variable elements.\n";
+                    std::cout << "\nDirection " << direction << " valid: " << direction_valid[direction] 
+                              << " with " << count << " passing variable elements.\n";
                 }
             }
         }
@@ -1809,7 +1879,7 @@ public:
         }
 
         // Update the read barcode counts.
-        update_bc_counts(*this, layout, false);
+        update_bc_counts(*this, layout, verbose);
 
         if(verbose){
             #pragma omp critical
@@ -1820,8 +1890,8 @@ public:
         }
     }
     // full sigalign implementation
-    static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, int num_threads = 1, 
-        size_t max_reads = -1, bool verbose = false, bool split_bc = false) {
+    static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads = 1, 
+        size_t max_reads = -1, bool split_bc = false) {
         //std::string home = std::getenv("HOME");
         //std::string desktop_path = home + "/Desktop/";
 
@@ -1844,7 +1914,7 @@ public:
         chunk_streaming<read_streaming::sequence,ChunkFunc> streamer;
     
         ChunkFunc process_func = [&](auto const &chunk, auto const & /*unused_file*/) {
-            // collect the SigString objects we want
+            // collect SigString objects
             std::vector<SigString> to_write;
             to_write.reserve(chunk.size());
             for (auto const& read : chunk) {
@@ -1854,7 +1924,7 @@ public:
                 sig.sigalign_filter(read, layout, verbose);
                 if (sig.read_type != "filtered") {
                     to_write.push_back(std::move(sig));
-                }
+                }  
             }
     
             if (!to_write.empty()) {
@@ -1870,13 +1940,13 @@ public:
         // Process the chunks
         streamer.process_chunks(fastq_path, process_func, num_threads, static_cast<int64_t>(max_reads));
 
-        std::cout << "Output written to:\n"
-                << sig_path << "\n"
-                << csv_path << "\n"
-                << fastq_output_path << "\n";
+        std::cout << "[sigalign] Output written to:\n"
+                << "[sigalign] [sigstring]: " << sig_path << "\n"
+                << "[sigalign] [csv]: " << csv_path << " :"
+                << "[sigalign] [fastq]: " << fastq_output_path << " : ";
     }
 
-    // sigstring debug format
+    // sigstring format
     std::string to_sigstring() const {
         std::stringstream ss;
         std::string overall = read_type; // e.g., "forward", "reverse", "concatenate", "filtered"
@@ -1935,84 +2005,68 @@ public:
 
     // fasta or fastq output
     std::string to_fastqa() const {
-        // 1) Determine allowed directions
+        // 1) figure out which direction(s) to use
         bool allow_fwd = (read_type == "forward" || read_type == "concatenate");
         bool allow_rev = (read_type == "reverse" || read_type == "concatenate");
     
-        // 2) Extract the key fields
-        std::string barcode, umi, read_seq, read_qual;
-        std::stringstream comments;
-    
+        // 2) pull out all barcodes, the UMI, sequence, and quality
+        std::vector<std::string> all_bcs;
+        std::string umi, read_seq, read_qual;
         for (auto const &elem : sig_elements) {
-            if (!elem.seq){
+            if (!elem.seq) continue;
+    
+            if (elem.global_class == "barcode" &&
+               ((allow_fwd && elem.direction=="forward") ||
+                (allow_rev && elem.direction=="reverse"))) {
+                all_bcs.push_back(*elem.seq);
                 continue;
             }
-            // pull out barcode & umi
-            if (elem.global_class == "barcode" && allow_fwd && elem.direction=="forward" || elem.global_class == "barcode" 
-                && allow_rev && elem.direction=="reverse") {
-                barcode = *elem.seq;
-                continue;
-            }
-            if (elem.global_class == "umi" && allow_fwd && elem.direction=="forward"
-              || elem.global_class == "umi" && allow_rev && elem.direction=="reverse"){
+            if (elem.global_class == "umi" &&
+               ((allow_fwd && elem.direction=="forward") ||
+                (allow_rev && elem.direction=="reverse"))) {
                 umi = *elem.seq;
                 continue;
             }
-    
-            // grab the actual read
-            if (elem.global_class == "read" && ((elem.direction=="forward" && allow_fwd)
-              || (elem.direction=="reverse" && allow_rev))) {
+            if (elem.global_class == "read" &&
+               ((allow_fwd && elem.direction=="forward") ||
+                (allow_rev && elem.direction=="reverse"))) {
                 read_seq = *elem.seq;
                 if (elem.qual.has_value()|| (!elem.qual->empty())){
                     read_qual = *elem.qual;
-                } 
+                }
                 continue;
             }
-    
-            // skip non-informative classes
-            if (elem.global_class=="poly_tail" || elem.global_class=="start"  || elem.global_class=="stop") {
+            if (elem.global_class=="poly_tail" || elem.global_class=="start" || elem.global_class=="stop")
                 continue;
-            }
-    
-            // mod this to have concatenate info
-            /*           std::string s = *elem.seq;
-            if (elem.class_id.rfind("rc_",0)==0)
-                s = seq_utils::revcomp(s);
-    
-            comments << elem.class_id << ":" << s
-                     << "[" << elem.global_class << "]|";
-            */
         }
-    
-        // 3) Build the header
+        // 3) glue multiple barcodes (if any) into one string
+        std::string cb_tag;
+        if (!all_bcs.empty()) {
+            cb_tag = all_bcs[0];
+            for (size_t i = 1; i < all_bcs.size(); ++i)
+                cb_tag += "-" + all_bcs[i];
+        }
+        // 4) build FASTA/FASTQ header + body
         bool is_fastq = !read_qual.empty();
         std::stringstream out;
     
-        // '@' for FASTQ, '>' for FASTA
+        // header line
         out << (is_fastq ? '@' : '>') << sequence_id;
+        if (!cb_tag.empty()) out << " CB:Z:" << cb_tag;
+        if (!umi.empty())  out << " UB:Z:" << umi;
+        out << "\n";
     
-        // add the CB and UB tags
-        if (!barcode.empty()) out << " CB:Z:" << barcode;
-        if (!umi.empty()) out << " UB:Z:" << umi;
+        // sequence
+        out << read_seq << "\n";
     
-        // any extra comments
-        if (!comments.str().empty())
-            out << " " << comments.str();
-    
-        // 4) Sequence line
-        out << "\n"
-            << read_seq
-            << "\n";
-    
+        // optional quality
         if (is_fastq) {
-            // 5) fastq “+” & qual
             out << "+\n"
-                << read_qual
-                << "\n";
+                << read_qual << "\n";
         }
-    
         return out.str();
     }
+    
     
     // CSV conversion
     std::string to_csv(bool write_header = false) const {
@@ -2026,8 +2080,10 @@ public:
                 // Determine the element's direction.
                 std::string read_mintype = "forward";
                 std::string seq = *elem.seq;
+                std::string final_id = elem.class_id;
                 if (elem.class_id.substr(0, 3) == "rc_") {
                     seq = seq_utils::revcomp(seq);
+                    final_id = elem.class_id.substr(3);
                     read_mintype = "reverse";
                 }
                 // If the overall read type is "forward", skip reverse elements.
@@ -2041,7 +2097,7 @@ public:
                 }
                 // If read_type is "concatenate", include both.
                 ss << sequence_id << "," 
-                << elem.global_class << "," 
+                << final_id << "," 
                 << read_mintype << "," 
                 << seq << "\n";
             }

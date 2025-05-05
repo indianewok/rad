@@ -46,6 +46,7 @@
 // ————————————————————————————————————————————————————————————————
 #include "csv-parser/single_include/csv.hpp"
 #include "edlib/edlib/include/edlib.h"
+#include "progressbar/progressbar.hpp"
 #include "gzstream/gzstream.h"
 #include "ssw/ssw_cpp.h"
 #include "kseq/kseq.h"
