@@ -196,7 +196,7 @@ class sigstring_writing {
         // @param output_format which of the three formats to emit
         // @param compress      if true, writes to `output_path + ".gz"` via ogzstream
         // @param append        if true, opens in append mode; otherwise truncates
-        sigstring_writing(std::string output_path, format output_format, bool compress = false, bool append = false) : fmt(output_format) {
+        sigstring_writing(std::string output_path, format output_format, bool compress, bool append) : fmt(output_format) {
             std::ios::openmode mode = std::ios::out | (append ? std::ios::app : std::ios::trunc);
             if (compress) {
                 // ensure .gz suffix

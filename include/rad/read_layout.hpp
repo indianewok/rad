@@ -21,7 +21,7 @@ struct ParsedPosition {
         return ss.str();
     }
 
-    static ParsedPosition from_string(const std::string& pos_str, bool verbose = false) {
+    static ParsedPosition from_string(const std::string& pos_str, bool verbose) {
         ParsedPosition pos;
         if(pos_str.empty()){
             std::cout << "[from_string] Empty position string\n"; 
@@ -570,10 +570,10 @@ public:
                 std::cout << "[import_from_both] primary_start value: '" << row["primary_start"].get<std::string>() << "'\n";
             }
             try {
-                    pos.primary_start = ParsedPosition::from_string(row["primary_start"].get<std::string>());
-                    pos.primary_stop = ParsedPosition::from_string(row["primary_stop"].get<std::string>());
-                    pos.secondary_start = ParsedPosition::from_string(row["secondary_start"].get<std::string>());
-                    pos.secondary_stop = ParsedPosition::from_string(row["secondary_stop"].get<std::string>());
+                    pos.primary_start = ParsedPosition::from_string(row["primary_start"].get<std::string>(), verbose);
+                    pos.primary_stop = ParsedPosition::from_string(row["primary_stop"].get<std::string>(), verbose);
+                    pos.secondary_start = ParsedPosition::from_string(row["secondary_start"].get<std::string>(), verbose);
+                    pos.secondary_stop = ParsedPosition::from_string(row["secondary_stop"].get<std::string>(), verbose);
             
                     position_map[id] = pos;
                     if(verbose){
@@ -802,7 +802,8 @@ public:
     }
 
     //load whitelists from whitelist path in read layout
-    void load_wl(std::optional<int> shift, std::optional<int> mut, bool verbose) {
+    /*
+    void load_wl(std::optional<std::string> wl_path, std::optional<int> shift, std::optional<int> mut, bool verbose, int nthreads) {
         using namespace std::chrono;
         auto t0 = high_resolution_clock::now();
     
@@ -813,10 +814,9 @@ public:
                 static_seqs.push_back(elem.seq);
         }
     
-        // map each unique path -> one wl_entry
+        // map each unique path to one wl_entry
         std::unordered_map<std::string, whitelist::wl_entry> path2entry;
     
-        // for every barcode element in the layout…
         for (auto const &elem : layout) {
             if (elem.global_class != "barcode" || elem.type != "variable")
                 continue;
@@ -827,16 +827,22 @@ public:
                 key = seq_utils::remove_rc(key);
     
             // resolve kit or path
-            std::string spec = elem.whitelist_path;
+            std::string spec;
+            if(wl_path.has_value()){
+                spec = wl_path.value();
+            } else {
+                spec = elem.whitelist_path;
+            }
             std::string path = whitelist_utils::kit_to_path(spec);
     
-            std::cout << "[whitelist] Found whitelist for " << elem.class_id
-                      << "[" << spec << "] at " << path << "\n";
+            std::cout << "[load_wl] "
+                      << "[" << elem.class_id << "]" 
+                      << "[" << spec << "] @ " << path << "\n";
     
             // if we've never loaded this file before, do so now
             auto pit = path2entry.find(path);
             if (pit == path2entry.end()) {
-                std::cout << "[whitelist] Loading from " << path << " ...\n";
+                if(verbose) std::cout << "[load_wl] Loading from " << path << " ...\n";
                 auto t1 = high_resolution_clock::now();
                 // get expected length
                 size_t default_length = 16;
@@ -848,10 +854,15 @@ public:
     
                 // import & possibly generate mismatches
                 auto entry = wl_map.import_whitelist(spec, verbose, default_length);
+                //this is to generate mismatches for subsets that have been passed in--otherwise we're SOL
                 if (entry.true_bcs.size() <= 15000){
                     int shift_amt = shift.value_or(2);
-                    int mut_amt   = mut.value_or(3);
-                    entry.generate_mismatch_barcodes(shift_amt, mut_amt, verbose);
+                    int mut_amt   = mut.value_or(2);
+                    std::cout << "[load_wl] " << 
+                    "[" << elem.class_id << ":" << key << "]"
+                              << ", true barcodes = "    << entry.true_bcs.size()
+                              << "\n";        
+                    entry.generate_mismatch_barcodes(shift_amt, mut_amt, verbose, nthreads);
                 }
     
                 // build filter_bcs
@@ -868,40 +879,190 @@ public:
                         entry.filter_bcs.insert_bc_entry(bits);
                     }
                 }
-    
                 auto t2 = high_resolution_clock::now();
                 double ms = duration<double, std::milli>(t2 - t1).count();
-                std::cout << "[whitelist] Loaded in " << (ms/1000.0) << " s\n";
+                std::cout << "[load_wl] loaded in " << (ms/1000.0) << " s\n";
     
                 pit = path2entry.emplace(path, std::move(entry)).first;
             }
     
-            // map this normalized class_id -> the already‐loaded wl_entry
-            wl_map.lists[key] = pit->second;
-    
+            // map normalized class_id -> the already‐loaded wl_entry
+            auto [it, inserted] = wl_map.lists.try_emplace(key, pit->second);
+            if(inserted){
+                std::cout << "[load_wl] " << "New entry for " << key << "\n";
+            } else {
+                std::cout << "[load_wl] " << "Reusing entry for " << key << "\n";
+            }
+
             // report
             auto &E = wl_map.lists[key];
-            std::cout << "[whitelist] " << key
+            std::cout << "[load_wl] " << 
+            "[" << elem.class_id << ":" << key << "]"
                       << ": global = "  << E.global_bcs.size()
                       << ", true = "    << E.true_bcs.size()
                       << ", filter = "  << E.filter_bcs.size()
                       << "\n";
         }
+
+        for (auto & [key, entry] : wl_map.lists) {
+            // 1) collect unique barcodes in true_bcs
+            std::unordered_set<int64_seq> to_remove;
+            to_remove.reserve(entry.true_bcs.size());
+            for (auto const & [bc, be] : entry.true_bcs) {
+                to_remove.insert(bc);
+            }
+        
+            // 2) drop them all from global_bcs
+            for (auto const & bc : to_remove) {
+                entry.global_bcs.remove_bc_entry(bc);
+            }
+
+            auto &E = wl_map.lists[key];
+            std::cout << "[load_wl] " << 
+            "[" << key << "]"
+                      << ": global = "  << E.global_bcs.size()
+                      << ", true = "    << E.true_bcs.size()
+                      << ", filter = "  << E.filter_bcs.size()
+                      << "\n";
+
+       }
     
         auto t3 = high_resolution_clock::now();
         double total_s = duration<double>(t3 - t0).count();
-        std::cout << "[whitelist] Finished loading all whitelists in " 
-                  << total_s << " s\n";
+        std::cout << "[load_wl] finished loading all whitelists in " << total_s << " s\n";
+    }
+    */
+
+    void load_wl(std::optional<std::string> wl_path,std::optional<int> shift, std::optional<int> mut, bool verbose, int nthreads) {
+        using namespace std::chrono;
+        auto t0 = high_resolution_clock::now();
+
+        // Clear any old state
+        wl_map.lists.clear();
+        wl_map.maps.clear();
+
+        // 1) collect static seqs for filter_bcs
+        std::vector<std::string> static_seqs;
+        for (auto const &elem : layout) {
+            if (elem.type=="static" && !elem.seq.empty())
+                static_seqs.push_back(elem.seq);
+        }
+
+        // 2) import & alias
+        for (auto const &elem : layout) {
+            if (elem.global_class!="barcode" || elem.type!="variable")
+                continue;
+
+            // normalize class_id → key
+            std::string key = elem.class_id;
+            if (seq_utils::is_rc(key))
+                key = seq_utils::remove_rc(key);
+
+            // resolve the on-disk path
+            std::string spec = wl_path ? *wl_path : elem.whitelist_path;
+            std::string path = whitelist_utils::kit_to_path(spec);
+
+            std::cout << "[load_wl] ["<<elem.class_id<<"] ["<<spec<<"] @ "<<path<<"\n";
+
+            // 2a) import into the pool if not already
+            auto pit = wl_map.lists.find(path);
+            if (pit == wl_map.lists.end()) {
+                if (verbose) std::cout << "[load_wl] Loading from " << path << " ...\n";
+                auto t1 = high_resolution_clock::now();
+
+                // get expected_length
+                size_t default_length = 16;
+                if (auto lit = layout.find(elem.class_id);
+                    lit != layout.end() && lit->expected_length)
+                {
+                    default_length = *lit->expected_length;
+                }
+
+                // import & possibly generate mismatches
+                auto entry = wl_map.import_whitelist(spec, verbose, default_length);
+                if (entry.true_bcs.size() <= 15000) {
+                    entry.generate_mismatch_barcodes(shift.value_or(2), mut.value_or(2), verbose, nthreads);
+                }
+
+                // build filter_bcs from static_seqs
+                entry.filter_bcs.clear();
+                size_t def_len = default_length;
+                if (auto lit = layout.find(elem.class_id);
+                    lit != layout.end() && lit->expected_length)
+                {
+                    def_len = *lit->expected_length;
+                }
+                for (auto const &s : static_seqs) {
+                    for (auto const &kmer : seq_utils::circ_kmerize(s, def_len)) {
+                        int64_seq bits(kmer);
+                        entry.filter_bcs.insert_bc_entry(bits);
+                    }
+                }
+
+                auto t2 = high_resolution_clock::now();
+                double ms = duration<double, std::milli>(t2 - t1).count();
+                std::cout << "[load_wl] loaded in " << (ms/1000.0) << " s\n";
+
+                pit = wl_map.lists.emplace(path, std::move(entry)).first;
+            }
+
+            // 2b) alias into maps by reference
+            auto &master = pit->second;
+            auto [mit, inserted] =
+            wl_map.maps.try_emplace(key, std::ref(master));
+
+            if (inserted) {
+                std::cout << "[load_wl] New entry for key ='"<< key << "'\n";
+            } else if (verbose) {
+                std::cout << "[load_wl] Reusing entry for key ='"<< key << "'\n";
+            }
+
+            // 2c) immediate report
+            {
+                auto &E = mit->second.get();
+                std::cout << "[load_wl]"
+                        << " ["<<elem.class_id<<":"<<key<<"]"
+                        << ": global ="<<E.global_bcs.size()
+                        << ", true ="  <<E.true_bcs.size()
+                        << ", filter ="<<E.filter_bcs.size()
+                        << "\n";
+            }
+        }
+
+        // 3) final prune: for each alias, remove true_bcs from global_bcs
+        for (auto & [key, entry_ref] : wl_map.maps) {
+            auto &E = entry_ref.get();
+            std::unordered_set<int64_seq> to_remove;
+            to_remove.reserve(E.true_bcs.size());
+            for (auto const & [bc,be] : E.true_bcs)
+                to_remove.insert(bc);
+            for (auto const &bc : to_remove)
+                E.global_bcs.remove_bc_entry(bc);
+
+            // final report
+            std::cout << "[load_wl]"
+                    << " ["<<key<<"]"
+                    << ": global ="<<E.global_bcs.size()
+                    << ", true ="  <<E.true_bcs.size()
+                    << ", filter ="<<E.filter_bcs.size()
+                    << "\n";
+        }
+
+        auto t3 = high_resolution_clock::now();
+        double total_s = duration<double>(t3 - t0).count();
+        std::cout << "[load_wl] finished loading all whitelists in "
+                << total_s << " s\n";
     }
 
     // save the whitelist to a CSV 
     void save_wl(std::ostream &out, bool full = false) const {
         //Loop over every whitelist in wl_map.lists
-        for (auto const& [class_id, entry] : wl_map.lists) {
+        for (auto const& [class_id, wrap] : wl_map.maps) {
+            auto &entry = wrap.get();
             // return the true_bcs
             {
             if(!full){
-                entry.true_bcs.write_csv(out, &entry.true_ref);
+                entry.true_bcs.write_wl_summary(out, class_id, &entry.true_ref);
                 continue;
             }
             out << "class_id,source,barcode,"
@@ -948,14 +1109,66 @@ public:
         }
     }
 
+    // save wl but instead of streaming to output, take a path
     void save_wl(const std::string &path, bool full = false) const {
         std::ofstream out(path);
         if (!out.is_open()) {
             std::cerr << "[error] Error opening file for writing: " << path << "\n";
             return;
         }
-        save_wl(out);
+        save_wl(out, full);
         out.close();
+    }
+
+    // print full layout
+    void display_read_layout() {
+        std::cout << "[read_layout] COMPLETE_READ_LAYOUT:\n";
+        for (const auto& elem : layout) {
+            // Base fields
+            std::cout
+                << "ID: "             << elem.class_id
+                << ", Seq: "          << elem.seq
+                << ", Type: "         << elem.type
+                << ", Order: "        << elem.order
+                << ", Direction: "    << elem.direction
+                << ", Global Class: " << elem.global_class;
+    
+            // Optional: misalignment_threshold (tuple<int,int,int>)
+            if (elem.misalignment_threshold) {
+                auto [min_v, max_v, thr] = *elem.misalignment_threshold;
+                std::cout << ", Misalign Thresh: (min=" << min_v
+                          << ", max=" << max_v
+                          << ", thr=" << thr << ")";
+            }
+    
+            // Optional: aligned_positions
+            if (elem.aligned_positions) {
+                const auto& ap = *elem.aligned_positions;
+                std::cout << ", Aligned Pos: (start: mean="   << ap.start_stats.first
+                          << ", var="     << ap.start_stats.second
+                          << "; stop: mean=" << ap.stop_stats.first
+                          << ", var="     << ap.stop_stats.second << ")";
+            }
+    
+            // Optional: misaligned_positions
+            if (elem.misaligned_positions) {
+                const auto& mp = *elem.misaligned_positions;
+                std::cout << ", Misaligned Pos: (start: mean="   << mp.start_stats.first
+                          << ", var="     << mp.start_stats.second
+                          << "; stop: mean=" << mp.stop_stats.first
+                          << ", var="     << mp.stop_stats.second << ")";
+            }
+
+            if(elem.ref_pos) {
+                const auto& rp = *elem.ref_pos;
+                std::cout << ", Ref Pos: (primary_start: " << rp.primary_start.to_string()
+                          << ", primary_stop: " << rp.primary_stop.to_string()
+                          << ", secondary_start: " << rp.secondary_start.to_string()
+                          << ", secondary_stop: " << rp.secondary_stop.to_string() << ")";
+            }
+    
+            std::cout << "\n";
+        }
     }
 
     // Other utility methods for managing layout
@@ -1159,7 +1372,9 @@ private:
         position_map[read.class_id] = positions;
     }
 
-    const auto& get_pos_map() const { return position_map; }
+    const auto& get_pos_map() const { 
+        return position_map; 
+    }
 
 };
 
@@ -1273,8 +1488,7 @@ public:
         //collecting statistics of both adapter stats and misalignment stats
         std::unordered_map<std::string, misalignment_stats> adapter_stats;
         std::unordered_map<std::string, misalignment_stats> misalignment_stats;
-        ChunkFunc process_func = [&](const std::vector<read_streaming::sequence>& chunk,
-                               const std::string& file) -> bool {
+        ChunkFunc process_func = [&](const std::vector<read_streaming::sequence>& chunk, const std::string& file) -> bool {
             #pragma omp atomic
             total_reads_processed += chunk.size();
             process_misalignment_chunk(
@@ -1312,7 +1526,7 @@ public:
                 return true;  // Continue processing.
         };
 
-        streamer.process_chunks(fastq_path, process_func, num_threads);
+        streamer.process_chunks(fastq_path, process_func, num_threads, max_reads);
         
         // Write final results
         write_perfect_matches();
@@ -1326,11 +1540,10 @@ private:
     std::vector<std::pair<std::string, std::string>> reverse_adapters;
     std::vector<perfect_match> perfect_matches;
 
-    void process_misalignment_chunk(const std::vector<read_streaming::sequence>& chunk,
-                      size_t& forward_count,
-                      size_t& reverse_count,
-                      std::unordered_map<std::string, misalignment_stats>& adapter_stats,
-                      std::unordered_map<std::string, misalignment_stats>& misalignment_stats,
+    void process_misalignment_chunk(const std::vector<read_streaming::sequence>& chunk, 
+        size_t& forward_count, size_t& reverse_count,
+        std::unordered_map<std::string, misalignment_stats>& adapter_stats,
+        std::unordered_map<std::string, misalignment_stats>& misalignment_stats,
                       size_t total_reads) {
         for (const auto& read : chunk) {
 
@@ -1360,8 +1573,7 @@ private:
         }
     }
 
-    void update_misalignment_stats(const std::string& read_seq, 
-                       const std::vector<std::pair<std::string, std::string>>& adapters,
+    void update_misalignment_stats(const std::string& read_seq, const std::vector<std::pair<std::string, std::string>>& adapters,
                        std::unordered_map<std::string, misalignment_stats>& adapter_stats,
                        std::unordered_map<std::string, misalignment_stats>& misalignment_stats,
                        size_t total_reads) {
@@ -1419,10 +1631,8 @@ private:
         }
     }
 
-    bool find_perfect_match(
-        const std::string& read_seq,
-         const std::vector<std::pair<std::string, std::string>>& adapters,
-         std::unordered_map<std::string, misalignment_stats>& adapter_stats) {
+    bool find_perfect_match(const std::string& read_seq,const std::vector<std::pair<std::string, std::string>>& adapters,
+                            std::unordered_map<std::string, misalignment_stats>& adapter_stats) {
         for (const auto& [id, seq] : adapters) {
             EdlibAlignResult result = edlibAlign(
                 seq.c_str(), seq.length(),
@@ -1433,8 +1643,11 @@ private:
             if(is_perfect){
                 double normalized_start = (static_cast<double>(result.startLocations[0]) / read_seq.length()) * 100.0;
                 double normalized_stop = (static_cast<double>(result.endLocations[0]) / read_seq.length()) * 100.0;
-                adapter_stats[id].position_stats.start_positions.push_back(normalized_start);
-                adapter_stats[id].position_stats.stop_positions.push_back(normalized_stop);
+                #pragma omp critical
+                {
+                    adapter_stats[id].position_stats.start_positions.push_back(normalized_start);
+                    adapter_stats[id].position_stats.stop_positions.push_back(normalized_stop);    
+                }
             }
             edlibFreeAlignResult(result);
             if(!is_perfect) return false;
@@ -1478,9 +1691,7 @@ private:
         return aligned;
     }
 
-    std::string generate_masked_adapter(const std::string& adapter_id, 
-                                      const std::string adapter_seq, 
-                                      const misalignment_stats& stats) {
+    std::string generate_masked_adapter(const std::string& adapter_id, const std::string adapter_seq,  const misalignment_stats& stats) {
     int threshold = static_cast<int>(std::floor(stats.mean - stats.get_sd()));
     // Define max consecutive N's allowed as (threshold - 1), with a minimum of 1.
     int max_consecutive_N = (threshold > 1 ? threshold - 1 : 1);

@@ -54,6 +54,7 @@ struct counter {
     void subtract(int index) {
         counts[index].fetch_add(-1, std::memory_order_relaxed);
     }
+    
     // Overload: decrement using an enum value for clarity.
     void subtract(barcode_counts index) {
         counts[static_cast<int>(index)].fetch_add(-1, std::memory_order_relaxed);
@@ -427,15 +428,20 @@ template<typename key, typename value> struct bc_multimap:std::unordered_multima
     }
 
     // insert a barcode entry into this wl
-    template<typename T> void insert_bc_entry(const T &observed, const value &correct){
+    template<typename T> void insert_bc_entry(const T &observed, const value &correct) & {
         this->emplace(key_of(observed), correct);
     }
-    template<typename T> void insert_bc_entry(const T &observed) {
+    //insert a barcode entry into this wl, with barcode as key and value
+    template<typename T> void insert_bc_entry(const T &observed) & {
         value v{};
         v.barcode = key_of(observed);
         this->emplace(key_of(observed), std::move(v));
     }
-
+    //delete a barcode entry from this wl
+    template<typename T> void remove_bc_entry(const T &observed) {
+        this->erase(key_of(observed));
+    }
+    
     // return putative correct barcodes for an observed barcode we've seen before
     template<typename T> std::unordered_set<int64_seq> return_putative_correct_bcs(T const &x) const {
         std::unordered_set<int64_seq> out;
@@ -497,7 +503,7 @@ template<typename key, typename value> struct bc_multimap:std::unordered_multima
 
             rows.reserve(keys.size());
 
-            // 2) For each key, find its perfect‐match mapping and pull the counts
+            // For each key, find its perfect‐match mapping and pull the counts
             for (auto const &bc : keys) {
                 // get the sub‐range in the multimap
                 auto range = this->equal_range(bc);
@@ -524,8 +530,12 @@ template<typename key, typename value> struct bc_multimap:std::unordered_multima
         return rows;
     }
 
-    void write_csv(std::ostream &out, const std::unordered_set<key> *filter_keys = nullptr) const{
-        out << "class_id,true_barcode,total_count,corrected_count,forw_count,rev_count,forw_concat_count,rev_concat_count,filtered_count\n";
+    void write_wl_summary(std::ostream &out, const std::string class_id, const std::unordered_set<key> *filter_keys = nullptr) const{
+        static bool header_printed = false;
+        if(!header_printed) {
+            out << "class_id,true_barcode,total_count,corrected_count,forw_count,rev_count,forw_concat_count,rev_concat_count,filtered_count\n";
+            header_printed = true;
+        }
             auto rows = summarize_counts(filter_keys);
             for (auto const & tpl : rows) {
                     auto const & bc = std::get<0>(tpl);
@@ -537,17 +547,17 @@ template<typename key, typename value> struct bc_multimap:std::unordered_multima
                     auto rev_concat = std::get<6>(tpl);
                     auto filtered = std::get<7>(tpl);
                     // print the row
-                    out << ',' << bc << ','  << tot << ',' << corr << ',' << forw <<
+                    out << class_id << ',' << bc << ','  << tot << ',' << corr << ',' << forw <<
                     ',' << rev << ',' << forw_concat << ',' << rev_concat << ',' << filtered << '\n';
         }
     }
 
-    void write_csv(const std::string &path = "", const std::unordered_set<key> *filter_keys = nullptr) const {
+    void write_wl_summary(const std::string &path = "", const std::unordered_set<key> *filter_keys = nullptr) const {
     std::ofstream ofs(path);
         if (!ofs) {
             throw std::runtime_error("Failed to open output file: " + path);
         }
-      write_csv(ofs, filter_keys);
+        write_wl_summary(ofs, filter_keys);
     }
 };
 
@@ -559,12 +569,70 @@ class whitelist {
     struct wl_entry {
         std::unordered_set<int64_seq> true_ref;
         bc_multimap<int64_seq, barcode_entry> true_bcs, global_bcs, filter_bcs;
-        // generates shifted and mutated barcodes for true elements in the whitelist
-        // to-do--parallelize this
-        void generate_mismatch_barcodes(int shift, int mutation_rounds,bool verbose) {
+
+        void generate_mismatch_barcodes_old(int shift, int mutation_rounds, bool verbose, int nthreads) {
+            #pragma omp critical
+                std::cout << "[whitelist] Generating barcodes with " << shift << " shifts" 
+                << " and " << mutation_rounds << " mutations with " << nthreads << " thread(s)...\n";
+
+            // build vector + set of originals
+            std::vector<std::pair<int64_seq,barcode_entry>> originals;
+            originals.reserve(true_bcs.size());
+            std::unordered_set<int64_seq> original_seqs;
+            original_seqs.reserve(true_bcs.size());
+
+            for (auto const &kv : true_bcs) {
+                originals.emplace_back(kv.first, kv.second);
+                original_seqs.insert(kv.first);
+            }
+
+            // parallel loop over originals
+            #pragma omp parallel for schedule(dynamic)
+            for (size_t i = 0; i < originals.size(); ++i) {
+                auto const &orig_bits = originals[i].first;
+                auto const &orig_be   = originals[i].second;
+                // insert a barcode + its reverse‐complement
+                auto insert_with_rc = [&](const int64_seq &bits) {
+                    // skip if it’s already known
+                    if (global_bcs.check_wl_for(bits) || original_seqs.count(bits))
+                        return;
+
+                    // insert the forward strand barcode
+                    barcode_entry obs = orig_be;
+                    obs.barcode       = bits;
+                    #pragma omp critical
+                    true_bcs.insert_bc_entry(obs, orig_be);
+
+                    // compute & insert its reverse complement
+                    std::string s    = bits.bits_to_sequence();
+                    std::string rc_s = seq_utils::revcomp(s);
+                    int64_seq rc_bits;
+                    rc_bits.sequence_to_bits(rc_s);
+
+                    if (!global_bcs.check_wl_for(rc_bits) && !original_seqs.count(rc_bits)) {
+                        barcode_entry rc_obs = orig_be;
+                        rc_obs.barcode       = rc_bits;
+                        #pragma omp critical
+                        true_bcs.insert_bc_entry(rc_obs, orig_be);
+                    }
+                };
+                // shifted barcodes
+                for (auto const &s_bits : 
+                    mutation_tools::generate_shifted_barcodes(orig_bits, shift)) {
+                    insert_with_rc(s_bits);
+                }
+                // mutated barcodes
+                for (auto const &m_bits :
+                    mutation_tools::generate_mutated_barcodes(orig_bits, mutation_rounds)) {
+                    insert_with_rc(m_bits);
+                }
+            }
+        }
+    
+        void generate_mismatch_barcodes(int shift, int mutation_rounds,bool verbose, int nthreads = 1) {
             if (verbose) {
                 #pragma omp critical
-                std::cout << "Generating shifted and mutated barcodes for true barcodes...\n";
+                std::cout << "[generate_mismatch_barcodes] Generating shifted and mutated barcodes for true barcodes...\n";
             }
 
             // build a single hash‐map
@@ -598,36 +666,56 @@ class whitelist {
                     true_bcs.insert_bc_entry(obs, orig_be);
                 }
             }
+
+            size_t missing = 0;
+            for (auto const & [orig_bits, orig_be] : originals) {
+                if (! true_bcs.check_wl_for(orig_bits)) {
+                    ++missing;
+                    std::cerr << "[ERROR] Original barcode vanished: "
+                              << orig_bits.bits_to_sequence() << "\n";
+                }
+            }
+            if (verbose) {
+                if (missing == 0) {
+                    std::cout << "[generate_mismatch_barcodes] All "
+                              << originals.size()
+                              << " original barcodes are present\n";
+                } else {
+                    std::cerr << "[generate_mismatch_barcodes] "
+                              << missing << "/"
+                              << originals.size()
+                              << " originals missing!\n";
+                }
+            }
         }
     };
 
-    std::unordered_map<std::string, wl_entry> lists;
+    std::unordered_map<std::string, std::reference_wrapper<whitelist::wl_entry>> maps;
+    std::unordered_map<std::string, whitelist::wl_entry> lists;
     // operator[] for easy insert/access: W["barcode_1"].insert_bc_entry(obs, corr);
     wl_entry & operator[](const std::string &class_id) {
-        return lists[class_id];
+        return maps.at(class_id).get();
     }
 
     //check all loaded class_ids in an entry
     std::vector<std::string> class_ids() const {
         std::vector<std::string> out;
-        out.reserve(lists.size());
-        for (auto const &kv : lists)
+        out.reserve(maps.size());
+        for (auto const &kv : maps)
             out.push_back(kv.first);
         return out;
     }
     
       // for one spec (kit name or file path), load its int64_seq set
     static std::unordered_set<int64_seq> load_barcodes(std::string const &spec, uint16_t default_length, bool verbose) {
-        if (verbose) {
-            std::cout << "[whitelist] Loading barcodes from path/kit: " << spec << "\n";
-        }
+        if (verbose) std::cout << "[load_barcodes] Loading barcodes from path/kit: " << spec << "\n";
         // check if spec is a kit name or a file path
         if (verbose) {
             if(whitelist_utils::is_kit(spec)){
-                std::cout << "[whitelist] Kit name: " << spec << "\n";
-                std::cout << "[whitelist] Kit path: " << whitelist_utils::kit_to_path(spec) << "\n";
+                std::cout << "[load_barcodes] Kit name: " << spec << "\n";
+                std::cout << "[load_barcodes] Kit path: " << whitelist_utils::kit_to_path(spec) << "\n";
             } else {
-                std::cout << "[whitelist] File path: " << spec << "\n";
+                std::cout << "[load_barcodes] File path: " << spec << "\n";
             }
         }
         std::string path = whitelist_utils::kit_to_path(spec);
@@ -727,25 +815,26 @@ class whitelist {
             }
         }
     }
+    
     //import a whitelist from file--can be true barcodes or not. cheap but easy way to import b/w both global or custom--just set
     //an arbitrary threshold for the number of true barcodes to be kept because ideally after a certain size of barcodes
     //you really just want to treat them both the same way
     wl_entry import_whitelist(std::string const &field, bool verbose, uint16_t default_length = 16) {
-        std::cout << "[whitelist] Importing whitelist from " << field << "\n";
+        if(verbose) std::cout << "[import_whitelist] Importing whitelist from " << field << "\n";
         // split into 1 or 2 specs
         auto specs = whitelist_utils::parse_whitelist_specs(field);
         if (specs.empty()) {
-            std::cerr << "[warning] empty whitelist spec—returning empty entry\n";
+            std::cerr << "[warning][import_whitelist] empty whitelist spec—returning empty entry\n";
             return {};
         } else {
             for (auto const &spec : specs) {
-                std::cout << "[whitelist] whitelist kit or path:" << spec << "\n";
+                if(verbose) std::cout << "[import_whitelist] whitelist kit or path:" << spec << "\n";
             }
         }
 
         std::vector<std::unordered_set<int64_seq>> sets;
         for (auto const &spec : specs) {
-            sets.push_back(load_barcodes(spec, default_length, true));
+            sets.push_back(load_barcodes(spec, default_length, verbose));
         }
 
         // assemble the wl_entry

@@ -158,19 +158,23 @@ namespace whitelist_utils {
         //splitseq barcodes
         {"splitseq_bc1", "resources/wl/splitseq_bc1_bitlist.csv.gz"},
         {"splitseq_bc2", "resources/wl/splitseq_bc2_bitlist.csv.gz"},
-        //CUSTOM ADDED, REMOVE BEFORE UP
-        {"splitseq_bc1_rc", "/Users/cmv/Desktop/splitseq_barcodes/bc_8nt_rc_v1_bitlist.csv.gz"},
-        //cellranger kits and whitelists
+        //cellranger kits and whitelists--this is just the total list that I could pull together
+
+        //10x 3' kits
         { "10x_3v1", "resources/wl/737K-august-2016_bitlist.csv.gz" },
         { "10x_3v2", "resources/wl/737K-august-2016_bitlist.csv.gz" },
-        { "10x_5v1", "resources/wl/wl/737K-august-2016_bitlist.csv.gz" },
-        { "10x_5v2", "resources/wl/737K-august-2016_bitlist.csv.gz" },
-        { "10x_5HTv2", "resources/wl/737K-august-2016_bitlist.csv.gz" },
         { "10x_3v3", "resources/wl/3M-february-2018-3v3.txt_bitlist.csv.gz" },
         { "10x_3v3.1", "resources/wl/3M-february-2018-3v3.txt_bitlist.csv.gz" },
         { "10x_3HTv3.1","resources/wl/3M-february-2018-3v3.txt_bitlist.csv.gz" },
         { "10x_3v4", "resources/wl/3M-3pgex-may-2023.txt_bitlist.csv.gz" },
+
+        //10x 5' kits
+        { "10x_5v1", "resources/wl/wl/737K-august-2016_bitlist.csv.gz" },
+        { "10x_5v2", "resources/wl/737K-august-2016_bitlist.csv.gz" },
+        { "10x_5HTv2", "resources/wl/737K-august-2016_bitlist.csv.gz" },
         { "10x_5v3", "resources/wl/3M-5pgex-jan-2023.txt_bitlist.csv.gz" },
+
+        //10x Visium kits (and Xenium? need to check)
         { "10x_Vis_V1", "resources/wl/visium-v1_v2_bitlist.csv.gz" },
         { "10x_Vis_V2", "resources/wl/visium-v1_v2_bitlist.csv.gz" },
         { "10x_Vis_V3", "resources/wl/visium-v3_v4_bitlist.csv.gz" },
@@ -263,7 +267,6 @@ namespace whitelist_utils {
 namespace config_utils {
 
     //config for read layout
-    //to do--add position map information as well 
     static std::unordered_map<std::string, std::string> layout_files = {
         {"five_prime", "resources/read_layout/five_prime_read_layout.csv" },
         {"three_prime", "resources/read_layout/three_prime_read_layout.csv" },
@@ -286,6 +289,7 @@ namespace config_utils {
     inline void save_read_layout(const std::string &type, const std::string &path) {
         layout_files[type] = path;
     }
+    
     inline bool remove_read_layout(const std::string &type) {
         return layout_files.erase(type) > 0;
     }

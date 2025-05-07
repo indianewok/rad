@@ -153,7 +153,7 @@ private:
                 int count = segments[j].first;
                 if (op == '=' || op == 'M') {
                     current += count;
-                } else if ((op == 'I' || op == 'D' || op == 'X') && count == 1) {
+                } else if ((op == 'I' || op == 'D' || op == 'X') && count <= 2) {
                     if (!used_indel) {
                         used_indel = true;
                     } else {
@@ -193,145 +193,146 @@ private:
     }
 
 public:   
-static_alignments align_static_elements(const std::string& query, const std::string& target, bool verbose, int max_edit_distance = -1,
-                                          const std::string& masked_query = "", bool primary = true, 
-                                          int expected_start = 1, int expected_end = -1) {
-    static_alignments alignment;
-    alignment.success = false;
-    alignment.edit_distance = -1;
-    // Our threshold for a “good” alignment
-    const int min_match_bases = 6;
-    
+static_alignments align_static_elements(const std::string& query, const std::string& target,
+    bool verbose,
+    int max_edit_distance = -1, const std::string& masked_query = "", 
+    bool primary = true, int expected_start = 1, int expected_end = -1) {
 
-    // If expected_end is not provided, use the target's length
-    if (expected_end < 0)
-        expected_end = target.size();
+        static_alignments alignment;
+        alignment.success = false;
+        alignment.edit_distance = -1;
+        // Our threshold for a “good” alignment
+        const int min_match_bases = 5;
+        
+        // If expected_end is not provided, use the target's length
+        if (expected_end < 0)
+            expected_end = target.size();
 
-    // Custom equality rules:
-    // Uppercase A, C, T, G match their lowercase forms and also the pad character 'x'.
-    // The masked letter N matches uppercase A, C, T, G and 'x', but not lowercase.
-    const int numEq = 13;
-    EdlibEqualityPair customEqualities[numEq] = {
-        {'A','a'}, {'C','c'}, {'T','t'}, {'G','g'},
-        {'A','x'}, {'C','x'}, {'T','x'}, {'G','x'},
-        {'N','A'}, {'N','C'}, {'N','T'}, {'N','G'},
-        {'N','x'}
-    };
+        // Custom equality rules:
+        // Uppercase A, C, T, G match their lowercase forms and also the pad character 'x'.
+        // The masked letter N matches uppercase A, C, T, G and 'x', but not lowercase.
+        const int numEq = 13;
+        EdlibEqualityPair customEqualities[numEq] = {
+            {'A','a'}, {'C','c'}, {'T','t'}, {'G','g'},
+            {'A','x'}, {'C','x'}, {'T','x'}, {'G','x'},
+            {'N','A'}, {'N','C'}, {'N','T'}, {'N','G'},
+            {'N','x'}
+        };
 
-    std::string query_to_use = query;
+        std::string query_to_use = query;
 
-    // --- Phase 1: Run Edlib to obtain candidate intervals ---
-    EdlibAlignConfig config = edlibNewAlignConfig(max_edit_distance,
-                                                  EDLIB_MODE_HW,
-                                                  EDLIB_TASK_LOC,
-                                                  customEqualities, numEq);
+        // --- Phase 1: Run Edlib to obtain candidate intervals ---
+        EdlibAlignConfig config = edlibNewAlignConfig(max_edit_distance,
+                                                    EDLIB_MODE_HW,
+                                                    EDLIB_TASK_LOC,
+                                                    customEqualities, numEq);
 
-    EdlibAlignResult edlibResult = edlibAlign(query_to_use.c_str(), query_to_use.size(),
-                                              target.c_str(), target.size(),
-                                              config);
+        EdlibAlignResult edlibResult = edlibAlign(query_to_use.c_str(), query_to_use.size(),
+                                                target.c_str(), target.size(),
+                                                config);
 
-    std::vector<std::pair<int,int>> candidates;
-    if (edlibResult.status == EDLIB_STATUS_OK &&
-        edlibResult.numLocations > 0 &&
-        edlibResult.editDistance > -1) {
-        std::vector<std::pair<int,int>> intervals;
-        for (int i = 0; i < edlibResult.numLocations; ++i) {
-            int start = edlibResult.startLocations[i] + 1;  // Convert to 1-indexed
-            int end   = edlibResult.endLocations[i] + 1;
-            intervals.push_back({start, end});
+        std::vector<std::pair<int,int>> candidates;
+        if (edlibResult.status == EDLIB_STATUS_OK &&
+            edlibResult.numLocations > 0 &&
+            edlibResult.editDistance > -1) {
+            std::vector<std::pair<int,int>> intervals;
+            for (int i = 0; i < edlibResult.numLocations; ++i) {
+                int start = edlibResult.startLocations[i] + 1;  // Convert to 1-indexed
+                int end   = edlibResult.endLocations[i] + 1;
+                intervals.push_back({start, end});
+            }
+            std::sort(intervals.begin(), intervals.end(),
+                    [](const std::pair<int,int>& a, const std::pair<int,int>& b) {
+                        return a.first < b.first;
+                    });
+            // Collapse overlapping intervals.
+            if (!intervals.empty()) {
+                std::pair<int,int> current = intervals[0];
+                for (size_t i = 1; i < intervals.size(); ++i) {
+                    if (intervals[i].first <= current.second) {
+                        current.second = std::max(current.second, intervals[i].second);
+                    } else {
+                        candidates.push_back(current);
+                        current = intervals[i];
+                    }
+                }
+                candidates.push_back(current);
+            }
         }
-        std::sort(intervals.begin(), intervals.end(),
-                  [](const std::pair<int,int>& a, const std::pair<int,int>& b) {
-                      return a.first < b.first;
-                  });
-        // Collapse overlapping intervals.
-        if (!intervals.empty()) {
-            std::pair<int,int> current = intervals[0];
-            for (size_t i = 1; i < intervals.size(); ++i) {
-                if (intervals[i].first <= current.second) {
-                    current.second = std::max(current.second, intervals[i].second);
-                } else {
-                    candidates.push_back(current);
-                    current = intervals[i];
+
+        // --- Early Out: If Edlib returned exactly one candidate and it is within the expected region, use it.
+        if (candidates.size() == 1) {
+            auto cand = candidates.front();
+            if (cand.first >= expected_start && cand.second <= expected_end) {
+                alignment.positions.push_back(cand);
+                alignment.success = true;
+                alignment.edit_distance = edlibResult.editDistance;
+                // Optionally set alignment.seq, alignment.cigar, etc.
+                alignment.seq = target.substr(cand.first - 1, cand.second - cand.first + 1);
+                // Return immediately without SSW.
+                return alignment;
+            }
+        }
+        edlibFreeAlignResult(edlibResult);
+        // --- Phase 2: Run SSW on the entire target (for no candidate or multiple candidates) ---
+        // Prepare uppercase strings for SSW.
+        std::string query_ssw = query;
+        std::string target_ssw = target;
+        std::transform(query_ssw.begin(), query_ssw.end(), query_ssw.begin(), ::toupper);
+        std::transform(target_ssw.begin(), target_ssw.end(), target_ssw.begin(), ::toupper);
+
+        int32_t maskLen = static_cast<int32_t>(query_ssw.size() / 2);
+        if (maskLen < 15)
+            maskLen = 15;
+        //defaults of match/mismatch/gap_open/gap_extend is 2/2/3/1
+        //thoughts for a shorter sequence--i'm okay with a gap being opened, but the longer the gap goes the 
+        //more it should cost. so if we score gap open as a mismatch, but then gap extend as a mismatch as well?
+        //playing with 2,2,3,2 and 2,2,3,1
+        StripedSmithWaterman::Aligner ssw_aligner(2, 2, 3, 2);
+        StripedSmithWaterman::Filter ssw_filter;
+        ssw_filter.report_cigar = true;
+        StripedSmithWaterman::Alignment sswAlign;
+        ssw_aligner.Align(target_ssw.c_str(), query_ssw.c_str(), query_ssw.size(),
+                        ssw_filter, &sswAlign, maskLen);
+
+        if (sswAlign.query_begin >= 0 && sswAlign.query_end >= sswAlign.query_begin) {
+            int ssw_start = sswAlign.query_begin + 1; // Convert to 1-indexed
+            int ssw_end = sswAlign.query_end + 1;
+            int ssw_length = ssw_end - ssw_start + 1;
+            int ssw_max_matches_ind = get_max_consecutive_matches_with_indels(sswAlign.cigar_string.c_str());
+            int ssw_max_matches = get_max_consecutive_matches(sswAlign.cigar_string.c_str());
+            // Calculate deviation from expected region.
+            int deviation = 0;
+            if (ssw_start < expected_start)
+                deviation += (expected_start - ssw_start);
+            if (ssw_end > expected_end)
+                deviation += (ssw_end - expected_end);
+
+            if (verbose) {
+                #pragma omp critical
+                {
+                    std::cout << "SSW alignment: region ["
+                            << ssw_start << ", " << ssw_end << "], length = "
+                            << ssw_length << ", max_matches with indels = " 
+                            << ssw_max_matches_ind
+                            << " , max_matches = " << ssw_max_matches
+                            << ", deviation = " << deviation
+                            << ", cigar: " << sswAlign.cigar_string << "\n";
                 }
             }
-            candidates.push_back(current);
-        }
-    }
-
-    // --- Early Out: If Edlib returned exactly one candidate and it is within the expected region, use it.
-    if (candidates.size() == 1) {
-        auto cand = candidates.front();
-        if (cand.first >= expected_start && cand.second <= expected_end) {
-            alignment.positions.push_back(cand);
-            alignment.success = true;
-            alignment.edit_distance = edlibResult.editDistance;
-            // Optionally set alignment.seq, alignment.cigar, etc.
-            alignment.seq = target.substr(cand.first - 1, cand.second - cand.first + 1);
-            // Return immediately without SSW.
-            return alignment;
-        }
-    }
-    edlibFreeAlignResult(edlibResult);
-    // --- Phase 2: Run SSW on the entire target (for no candidate or multiple candidates) ---
-    // Prepare uppercase strings for SSW.
-    std::string query_ssw = query;
-    std::string target_ssw = target;
-    std::transform(query_ssw.begin(), query_ssw.end(), query_ssw.begin(), ::toupper);
-    std::transform(target_ssw.begin(), target_ssw.end(), target_ssw.begin(), ::toupper);
-
-    int32_t maskLen = static_cast<int32_t>(query_ssw.size() / 2);
-    if (maskLen < 15)
-        maskLen = 15;
-    //defaults of match/mismatch/gap_open/gap_extend is 2/2/3/1
-    //thoughts for a shorter sequence--i'm okay with a gap being opened, but the longer the gap goes the 
-    //more it should cost. so if we score gap open as a mismatch, but then gap extend as a mismatch as well?
-    //FLIPPED GAP EXTENSION AND GAP OPENING PENALTIES
-    //playing with 2,2,3,2 and 2,2,3,1
-    StripedSmithWaterman::Aligner ssw_aligner(2, 2, 3, 2);
-    StripedSmithWaterman::Filter ssw_filter;
-    ssw_filter.report_cigar = true;
-    StripedSmithWaterman::Alignment sswAlign;
-    ssw_aligner.Align(target_ssw.c_str(), query_ssw.c_str(), query_ssw.size(),
-                      ssw_filter, &sswAlign, maskLen);
-
-    if (sswAlign.query_begin >= 0 && sswAlign.query_end >= sswAlign.query_begin) {
-        int ssw_start = sswAlign.query_begin + 1; // Convert to 1-indexed
-        int ssw_end = sswAlign.query_end + 1;
-        int ssw_length = ssw_end - ssw_start + 1;
-        int ssw_max_matches_ind = get_max_consecutive_matches_with_indels(sswAlign.cigar_string.c_str());
-        int ssw_max_matches = get_max_consecutive_matches(sswAlign.cigar_string.c_str());
-        // Calculate deviation from expected region.
-        int deviation = 0;
-        if (ssw_start < expected_start)
-            deviation += (expected_start - ssw_start);
-        if (ssw_end > expected_end)
-            deviation += (ssw_end - expected_end);
-
-        if (verbose) {
-            #pragma omp critical
-            {
-                std::cout << "SSW alignment: region ["
-                          << ssw_start << ", " << ssw_end << "], length = "
-                          << ssw_length << ", max_matches with indels = " 
-                          << ssw_max_matches_ind
-                          << " , max_matches = " << ssw_max_matches
-                          << ", deviation = " << deviation
-                          << ", cigar: " << sswAlign.cigar_string << "\n";
+            // Accept candidate if it meets threshold. first case is within the deviation allowed. second case is for concats.
+            if ((ssw_max_matches > min_match_bases && deviation <= 100 && ssw_length >= 10 && ssw_max_matches_ind > 8)||
+            (deviation > 100 && ssw_length >= 10 && ssw_max_matches >= 10)) {
+                alignment.positions.push_back({ssw_start, ssw_end});
+                alignment.edit_distance = compute_edit_distance(sswAlign.cigar_string.c_str());
+                alignment.success = alignment.edit_distance < max_edit_distance + 1 ? true : false;
+                alignment.cigar = sswAlign.cigar_string;
+                alignment.seq = target.substr(ssw_start - 1, ssw_end - ssw_start + 1);
             }
         }
-        // Accept candidate if it meets threshold
-        if ((ssw_max_matches > min_match_bases && deviation <= 100 && ssw_length >= 10 && ssw_max_matches_ind > 8)||
-        (deviation > 100 && ssw_length >= 10 && ssw_max_matches >= 10)) {
-            alignment.positions.push_back({ssw_start, ssw_end});
-            alignment.edit_distance = compute_edit_distance(sswAlign.cigar_string.c_str());
-            alignment.success = alignment.edit_distance < max_edit_distance + 1 ? true : false;
-            alignment.cigar = sswAlign.cigar_string;
-            alignment.seq = target.substr(ssw_start - 1, ssw_end - ssw_start + 1);
-        }
-    }
     return alignment;
 }
+
     static_alignments find_poly_tails(const std::string& query, const std::string& sequence, int window_size = 12) {
         static_alignments result;
         result.success = false;
@@ -430,7 +431,7 @@ namespace barcode_correction {
     std::optional<int64_seq> correct_barcode(const seq_element& elem, const ReadLayout& layout, bool verbose){
         // pick the right whitelist
         auto key = seq_utils::remove_rc(elem.class_id);
-        auto &wl = layout.wl_map.lists.at(key);
+        auto &wl = layout.wl_map.maps.at(key).get();
         // extract and reverse‐complement the raw string
         std::string raw = *elem.seq;
         if (elem.direction == "reverse"){
@@ -442,6 +443,15 @@ namespace barcode_correction {
         int max_shift_dist = static_cast<int>(bc.length*0.25);
         int max_resolve_dist = static_cast<int>(bc.length*0.2);
         int max_mutation_dist = static_cast<int>(bc.length*0.6);
+        // === filter match ===
+        if(!wl.filter_bcs.empty() && wl.filter_bcs.check_wl_for(bc)){
+            if(verbose){
+                #pragma omp critical
+                std::cout << "FILTER_CHECK_FOUND\n";
+                std::cout << "NO_CHECK_WORKED\n";
+            }
+            return std::nullopt;
+        }
         // === exact match ===
         if (!wl.true_bcs.empty() && wl.true_bcs.check_wl_for(bc)) {
             auto matched = wl.true_bcs.return_putative_correct_bcs(bc);
@@ -664,7 +674,7 @@ public:
 private:
     //switched from map to multimap to be able to reference multiple positions    
     bool generate_variable_elements(const ReadElement* layout_elem,  const std::multimap<std::string, const seq_element*>& static_refs,
-                                  const std::string& read_seq, SigElement& sig_elements, bool verbose = false) {
+                                  const std::string& read_seq, SigElement& sig_elements, bool verbose) {
         auto& id_index = sig_elements.get<sig_id_tag>();
         auto it = id_index.find(layout_elem->class_id);
         if (it == id_index.end() || !layout_elem->ref_pos){
@@ -679,7 +689,7 @@ private:
                 std::cout << "Processing variable element: " << layout_elem->class_id << std::endl;
             }
         }
-        return map_positions(ref_pos, static_refs, read_seq, it, id_index, var_positions, false);
+        return map_positions(ref_pos, static_refs, read_seq, it, id_index, var_positions, verbose);
     }
 
     bool validate_var_positions(const std::pair<int, int>& positions, size_t read_length) {
@@ -691,10 +701,11 @@ private:
     }
 
     // master function to map variable element positions--super bulky and unweldy, but works. needs to be broken up into constituents
-    bool map_positions(const ReferencePositions& ref_pos, const std::multimap<std::string, const seq_element*>& static_refs,
+    bool map_positions(
+        const ReferencePositions& ref_pos, const std::multimap<std::string, const seq_element*>& static_refs,
                    const std::string& read_seq,  SigElement::index<sig_id_tag>::type::iterator var_it,
                    SigElement::index<sig_id_tag>::type& id_index,  std::pair<int, int>& var_positions,
-                   bool verbose = false) {
+                   bool verbose) {
     // Build an ordered list of static elements with the same direction as the variable element.
     std::vector<const seq_element*> ordered_elements;
     for (const auto& [key, elem] : static_refs) {
@@ -823,6 +834,10 @@ private:
                 break;
             }
         }
+        auto ref_order_pos = std::find_if(ordered_elements.begin(), ordered_elements.end(),
+        [&](const seq_element* elem) {
+            return elem->class_id == ref_pos.secondary_start.ref_id;
+        });
         if (secondary_candidate != nullptr) {
             if (verbose) {
                 #pragma omp critical
@@ -835,10 +850,6 @@ private:
                               << secondary_candidate->position.second << ")" << std::endl;
                 }
             }
-            auto ref_order_pos = std::find_if(ordered_elements.begin(), ordered_elements.end(),
-                                              [&](const seq_element* elem) {
-                                                  return elem->class_id == ref_pos.secondary_start.ref_id;
-                                              });
             bool is_ordered = true;
             if (ref_order_pos != ordered_elements.begin()) {
                 auto prev = std::prev(ref_order_pos);
@@ -882,17 +893,24 @@ private:
                     }
                 }
             } 
-            else if (!ref_pos.secondary_start.add_flags.empty() &&
-                     ref_pos.secondary_start.add_flags == "left_terminal_linked") {
-                if (verbose) {
-                    #pragma omp critical
-                    {
-                        std::cout << "Secondary start flagged as left_terminal_linked; attempting fallback." << std::endl;
-                    }
+        } else {
+            if (verbose) {
+                #pragma omp critical
+                {
+                    std::cout << "Secondary start reference " << ref_pos.secondary_start.ref_id 
+                              << " not found in static_refs." << std::endl;
                 }
+            }
+        if (!ref_pos.secondary_start.add_flags.empty() && ref_pos.secondary_start.add_flags == "left_truncated") {
+            if (verbose) {
+                #pragma omp critical
+                {
+                    std::cout << "Secondary start flagged as left_truncated; attempting fallback." << std::endl;
+                }
+            }
                 // Look for the nearest static element to the right.
-                auto nearest_static = std::find_if(ref_order_pos, ordered_elements.end(),
-                                                   [](const seq_element* elem) { return elem->type == "static"; });
+            auto nearest_static = std::find_if(ref_order_pos, ordered_elements.end(),
+                                                [](const seq_element* elem) { return elem->type == "static"; });
                 if (nearest_static != ordered_elements.end()) {
                     auto fallback_range = static_refs.equal_range((*nearest_static)->class_id);
                     const seq_element* fallback_candidate = nullptr;
@@ -908,8 +926,8 @@ private:
                             #pragma omp critical
                             {
                                 std::cout << "Using left terminal linked fallback: " 
-                                          << fallback_candidate->class_id 
-                                          << " with start_pos = " << start_pos << std::endl;
+                                            << fallback_candidate->class_id 
+                                            << " with start_pos = " << start_pos << std::endl;
                             }
                         }
                     } else {
@@ -927,14 +945,6 @@ private:
                             std::cout << "No suitable fallback static element found for secondary start." << std::endl;
                         }
                     }
-                }
-            }
-        } else {
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::cout << "Secondary start reference " << ref_pos.secondary_start.ref_id 
-                              << " not found in static_refs." << std::endl;
                 }
             }
         }
@@ -1023,6 +1033,14 @@ private:
     
     // If primary stop mapping failed, try secondary.
     if (stop_pos <= 0) {
+        if(verbose){
+            #pragma omp critical
+            {
+                std::cout << "Primary stop mapping failed; attempting secondary stop mapping." << std::endl;
+                std::cout << "Secondary stop reference ID: " << ref_pos.secondary_stop.ref_id << std::endl;
+                std::cout << "Secondary flags: " << ref_pos.secondary_stop.add_flags << std::endl;
+            }
+        }
         auto range = static_refs.equal_range(ref_pos.secondary_stop.ref_id);
         const seq_element* secondary_stop_candidate = nullptr;
         for (auto it = range.first; it != range.second; ++it) {
@@ -1031,6 +1049,12 @@ private:
                 break;
             }
         }
+        //moved this out of the verbosity loop
+        auto ref_order_pos = std::find_if(
+            ordered_elements.begin(), ordered_elements.end(),[&](const seq_element* elem) {
+               return elem->class_id == ref_pos.secondary_stop.ref_id;
+                }
+        );
         if (secondary_stop_candidate != nullptr) {
             if (verbose) {
                 #pragma omp critical
@@ -1043,10 +1067,6 @@ private:
                               << secondary_stop_candidate->position.second << ")" << std::endl;
                 }
             }
-            auto ref_order_pos = std::find_if(ordered_elements.begin(), ordered_elements.end(),
-                                              [&](const seq_element* elem) {
-                                                  return elem->class_id == ref_pos.secondary_stop.ref_id;
-                                              });
             bool is_ordered = true;
             if (ref_order_pos != ordered_elements.begin()) {
                 auto prev = std::prev(ref_order_pos);
@@ -1054,9 +1074,9 @@ private:
                     #pragma omp critical
                     {
                         std::cout << "Secondary stop: Previous element in ordered list is " 
-                                  << (*prev)->class_id << " (pos: " 
-                                  << (*prev)->position.first << "-" << (*prev)->position.second 
-                                  << ")." << std::endl;
+                                << (*prev)->class_id << " (pos: " 
+                                << (*prev)->position.first << "-" << (*prev)->position.second 
+                                << ")." << std::endl;
                     }
                 }
                 if ((*prev)->position.second > secondary_stop_candidate->position.first)
@@ -1079,19 +1099,26 @@ private:
                         std::cout << "Using secondary stop mapping: calculated stop_pos = " << stop_pos << std::endl;
                     }
                 }
-            } 
-            else if (!ref_pos.secondary_stop.add_flags.empty() &&
-                     ref_pos.secondary_stop.add_flags == "right_terminal_linked") {
+            }
+        } else {
+            if (verbose) {
+                #pragma omp critical
+                {
+                    std::cout << "Secondary stop reference " << ref_pos.secondary_stop.ref_id 
+                              << " not found in static_refs." << std::endl;
+                }
+            }
+            if (!ref_pos.secondary_stop.add_flags.empty() && ref_pos.secondary_stop.add_flags == "right_truncated") {
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Secondary stop flagged as right_terminal_linked; attempting fallback." << std::endl;
+                        std::cout << "Secondary stop flagged as right_truncated; attempting fallback." << std::endl;
                     }
                 }
                 // Look for the nearest static element to the left.
                 auto nearest_static = std::find_if(std::make_reverse_iterator(ref_order_pos),
-                                                   ordered_elements.rend(),
-                                                   [](const seq_element* elem) { return elem->type == "static"; });
+                                                    ordered_elements.rend(),
+                                                    [](const seq_element* elem) { return elem->type == "static"; });
                 if (nearest_static != ordered_elements.rend()) {
                     auto fallback_range = static_refs.equal_range((*nearest_static)->class_id);
                     const seq_element* fallback_candidate = nullptr;
@@ -1107,8 +1134,8 @@ private:
                             #pragma omp critical
                             {
                                 std::cout << "Using right terminal linked fallback: " 
-                                          << fallback_candidate->class_id 
-                                          << " with stop_pos = " << stop_pos << std::endl;
+                                            << fallback_candidate->class_id 
+                                            << " with stop_pos = " << stop_pos << std::endl;
                             }
                         }
                     } else {
@@ -1126,14 +1153,6 @@ private:
                             std::cout << "No suitable fallback static element found for secondary stop." << std::endl;
                         }
                     }
-                }
-            }
-        } else {
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::cout << "Secondary stop reference " << ref_pos.secondary_stop.ref_id 
-                              << " not found in static_refs." << std::endl;
                 }
             }
         }
@@ -1278,7 +1297,7 @@ private:
 
         // look up the right whitelist
         auto key = seq_utils::remove_rc(elem.class_id);
-        auto &wl = layout.wl_map.lists.at(key);
+        auto &wl = layout.wl_map.maps.at(key).get();
 
         // always bump the total counter
         if(verbose){
@@ -1336,8 +1355,21 @@ public:
         if(verbose){
             #pragma omp critical
             {
-                std::cout << "Processing static element: " << it->class_id << 
-                " with sequence " << it->seq << std::endl;
+                std::cout << "Processing static element: " << it->class_id << std::endl;
+                if(it->aligned_positions){
+                    std::cout << "  Aligned positions: " 
+                              << it->aligned_positions->start_stats.first << ", "
+                              << it->aligned_positions->start_stats.second << std::endl;
+                } else {
+                    std::cout << "  No aligned positions available." << std::endl;
+                }
+                if(it->misaligned_positions){
+                    std::cout << "  Misaligned positions: " 
+                              << it->misaligned_positions->start_stats.first << ", "
+                              << it->misaligned_positions->start_stats.second << std::endl;
+                } else {
+                    std::cout << "  No misaligned positions available." << std::endl;
+                }
             }
         }
         // For 'start' or 'stop' types, add an element without alignment.
@@ -1398,12 +1430,13 @@ public:
             const auto& [start_mean, start_var] = it->aligned_positions->start_stats;
             const auto& [mis_start, start_mvar] = it->misaligned_positions->start_stats;
             // Compute expected region boundaries based on the aligned stats
-            int expected_start = (start_mean < 50.0)
-                ? 1
-                : static_cast<int>(std::max(0.0, ((start_mean - (start_var * 1.25)) / 100.0) * read_length));
-            int expected_end = (start_mean < 50.0)
+            expected_start = (start_mean < 50.0) ? 1 
+            : static_cast<int>(std::max(0.0, ((start_mean - (start_var * 1.25)) / 100.0) * read_length));
+
+            expected_end = (start_mean < 50.0)
                 ? static_cast<int>(std::min(((start_mean + (start_var * 1.25)) / 100.0) * read_length, static_cast<double>(read_length)))
                 : static_cast<int>(read_length);
+
         } else {
             // Default to using the entire read length if no statistics are available.
             expected_start = 1;
@@ -1412,6 +1445,7 @@ public:
         if (verbose) {
             #pragma omp critical
             {
+
                 std::cout << "Expected region for " << it->class_id << ": " 
                           << expected_start << " - " << expected_end << std::endl;
             }
@@ -1532,7 +1566,7 @@ public:
         
         // Process forward non-read variables.
         for (const auto* var : non_read_forward) {
-            if (generate_variable_elements(var, static_refs, read.seq, sig_elements, false)) {
+            if (generate_variable_elements(var, static_refs, read.seq, sig_elements, verbose)) {
                 positioned_count++;
                 // Add the newly generated variable element(s) to the static_refs multimap so that secondary positions can be calculated.
                 auto found = sig_elements.get<sig_id_tag>().find(var->class_id);
@@ -1545,7 +1579,7 @@ public:
         // Process reverse non-read variables in reverse order.
         for (auto it = non_read_reverse.rbegin(); it != non_read_reverse.rend(); ++it) {
             const auto* var = *it;
-            if (generate_variable_elements(var, static_refs, read.seq, sig_elements, false)) {
+            if (generate_variable_elements(var, static_refs, read.seq, sig_elements, verbose)) {
                 positioned_count++;
                 auto found = sig_elements.get<sig_id_tag>().find(var->class_id);
                 if (found != sig_elements.get<sig_id_tag>().end()) {
@@ -1569,7 +1603,7 @@ public:
         }
         // Process read variables last.
         for (const auto* var : read_vars) {
-            if (generate_variable_elements(var, total_refs, read.seq, sig_elements, false)) {
+            if (generate_variable_elements(var, total_refs, read.seq, sig_elements, verbose)) {
                 positioned_count++;
             }
         }
@@ -1723,15 +1757,22 @@ public:
                 if (elem.position.first <= 0 || elem.position.second <= 0 || elem.position.second <= elem.position.first) {
                     valid_direction = false;
                     auto& id_index = sig_elements.get<sig_id_tag>();
-                    id_index.modify(id_index.find(elem.class_id),
-                                      [](seq_element &e) { e.element_pass = false; });
+                    id_index.modify(
+                        id_index.find(elem.class_id),
+                                      [](seq_element &e) { 
+                                        e.element_pass = false; 
+                                    });
                     if (verbose) {
                         #pragma omp critical
                         {
-                            std::cout << "Filtered element " << elem.class_id << " (invalid positions) in direction " << direction << ".\n";
+                            std::cout << 
+                            "Filtered element " << 
+                            elem.class_id << 
+                            " (invalid positions) in direction " << direction << ".\n";
                         }
                     }
-                    break; // Exit processing for this direction.
+                    // Exit processing for this direction.
+                    break;
                 }
 
                 //barcode correction here
@@ -1742,7 +1783,7 @@ public:
                             std::cout << "Barcode correction for " << *elem.seq << std::endl;
                         }
                     }
-                    auto& wl = layout.wl_map.lists.at(seq_utils::remove_rc(elem.class_id));
+                    auto& wl = layout.wl_map.maps.at(seq_utils::remove_rc(elem.class_id)).get();
                     //had originally included a check for global barcode class not empty (&& !wl.true_bcs.empty())
                     //but this is not necessary, as the barcode correction function will handle it
                     if(!wl.true_bcs.empty()){
@@ -1773,7 +1814,8 @@ public:
                                     e.element_pass = false; 
                                     }
                                 );
-                            // adding this in to try to manage if there are multiple barcodes, whether we should set this entire direction to false. 
+                            // adding this in to try to manage if there are multiple barcodes, 
+                            // whether we should set this entire direction to false. 
                             // right now, we *only* return completely correct barcodes (all multiples are also correct) 
                             if(!multiple_barcodes){
                                 // so if multiple barcodes is false, then we set the direction value to false
@@ -1784,10 +1826,9 @@ public:
                             continue;
                         }
                     } else {
-                        //this branch is for generating a purely standalone whitelist that will occur IFF
-                        // there is no default whitelist--default whitelist generation has yet to happen
-                        // considering just dumping them into the true_bcs. will probably pull this out
-                        // and write a standalone sorting function internally here
+                        //this branch is for generating a purely standalone whitelist that will occur IFF there is no default whitelist
+                        //--default whitelist generation has yet to happen considering just dumping them into the true_bcs. 
+                        //will probably pull this out and write a standalone sorting function internally here.
                         if(elem.seq.has_value()){
                             std::string seq = *elem.seq;
                             int64_seq putative_bc(seq);
@@ -1795,8 +1836,8 @@ public:
                             be.barcode = putative_bc;
                             be.flags = "";
                             be.edit_dist = 0;
-                            be.filtered = false;
-                            //wl.true_bcs.insert_bc_entry(be);
+                            be.filtered = true;
+                           // wl.filter_bcs.insert_bc_entry(be.barcode, be);
                         }
                     }
                 }
@@ -1814,6 +1855,7 @@ public:
                 pass_counts[direction] = 0;
                 continue;
             }
+
             // Second pass: Check for overlaps among variable elements (skip start/stop elements).
             for (size_t i = 0; i < elements.size(); i++) {
                 const auto& e1 = elements[i].get();
@@ -1841,6 +1883,7 @@ public:
                     }
                 }
             }
+            
             // Count passing variable elements after all modifications.
             for (auto &elem_ref : elements) {
                 const auto& elem = elem_ref.get();
@@ -1849,6 +1892,7 @@ public:
                     count++;
             }
 
+            // if we've gotten to this point, then we have a valid direction and a valid pass count
             direction_valid[direction] = true;
             pass_counts[direction] = count;
 
@@ -1884,35 +1928,41 @@ public:
         if(verbose){
             #pragma omp critical
             {
-                std::cout << "Final read type: " << read_type << ", forward count: "  <<
-                 forward_count << ", reverse count: " << reverse_count << "\n" << std::endl;
+                std::cout << "Final read type: "
+                          << read_type
+                          << ", forward count: "
+                          << forward_count
+                          << ", reverse count: "
+                          << reverse_count
+                          << "\n"
+                          << std::endl;
             }
         }
     }
-    // full sigalign implementation
+    // full sigalign implementation (took out const on read layout in sigalign filter->whitelist population)
     static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads = 1, 
         size_t max_reads = -1, bool split_bc = false) {
         //std::string home = std::getenv("HOME");
         //std::string desktop_path = home + "/Desktop/";
-
         std::string sig_path = output_prefix + ".sig";
         std::string csv_path = output_prefix + ".csv";
-        std::string fastq_output_path = output_prefix + ".fastq";
+        std::string fastq_output_path = output_prefix + ".fq";
 
         sigstring_writing sig_writer(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false);
-        sigstring_writing csv_writer(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false);
-        sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, /*compress=*/false, /*append=*/false);
+        sigstring_writing csv_writer(csv_path, sigstring_writing::format::CSV, /*compress=*/true, /*append=*/false);
+        sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, /*compress=*/true, /*append=*/false);
 
         // csv writer will emit exactly what to_csv(true) produces
         {
-          SigString header("",0);
-          csv_writer(std::vector<SigString>{header});
+            SigString header("",0);
+            csv_writer(std::vector<SigString>{header});
         }
 
-        // Define the chunk processing function.
+        // Define the chunk processing function
         using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
         chunk_streaming<read_streaming::sequence,ChunkFunc> streamer;
     
+        // Set up the chunk processing function to process each chunk of reads
         ChunkFunc process_func = [&](auto const &chunk, auto const & /*unused_file*/) {
             // collect SigString objects
             std::vector<SigString> to_write;
@@ -1922,9 +1972,10 @@ public:
                 sig.sigalign_static(read, layout, verbose);
                 sig.sigalign_variable(read, layout, verbose);
                 sig.sigalign_filter(read, layout, verbose);
+
                 if (sig.read_type != "filtered") {
                     to_write.push_back(std::move(sig));
-                }  
+                }
             }
     
             if (!to_write.empty()) {
@@ -1940,10 +1991,11 @@ public:
         // Process the chunks
         streamer.process_chunks(fastq_path, process_func, num_threads, static_cast<int64_t>(max_reads));
 
-        std::cout << "[sigalign] Output written to:\n"
+        std::cout <<
+                   "[sigalign] Output written to:\n"
                 << "[sigalign] [sigstring]: " << sig_path << "\n"
-                << "[sigalign] [csv]: " << csv_path << " :"
-                << "[sigalign] [fastq]: " << fastq_output_path << " : ";
+                << "[sigalign]       [csv]: " << csv_path << "\n"
+                << "[sigalign]     [fastq]: " << fastq_output_path << std::endl;
     }
 
     // sigstring format
@@ -1951,28 +2003,28 @@ public:
         std::stringstream ss;
         std::string overall = read_type; // e.g., "forward", "reverse", "concatenate", "filtered"
 
-        // Group elements by direction.
+        // Group elements by direction
         std::map<std::string, std::vector<std::reference_wrapper<const seq_element>>> direction_elements;
         for (const auto& elem : sig_elements) {
             direction_elements[elem.direction].push_back(std::ref(elem));
         }
         
         bool first_direction = true;
-        // Process each directional group.
+        // Process each directional group
         for (const auto& [direction, elements] : direction_elements) {
-            // If overall read type restricts the output, skip the other direction.
+            // If overall read type restricts the output, skip the other direction
             if ((overall == "forward" && direction != "forward") || (overall == "reverse" && direction != "reverse")) {
                  continue;
             }
             if (elements.empty()) {
-                continue; // Skip empty groups.
+                continue; // Skip empty groups
             }
             if (!first_direction) {
                 ss << "\n";
             }
             first_direction = false;
             
-            // Sort elements by order.
+            // Sort elements by order
             std::vector<std::reference_wrapper<const seq_element>> sorted_elements = elements;
             std::sort(sorted_elements.begin(), sorted_elements.end(),
                     [](const auto& a, const auto& b) {
@@ -1987,7 +2039,7 @@ public:
                     ss << "|";
                 }
                 if(elem.position.first == -1 && elem.position.second == -1){
-                    continue; // Skip elements with invalid positions.
+                    continue; // Skip elements with invalid positions
                 }
                 first_elem = false;
                 ss << elem.class_id << ":"
@@ -1995,38 +2047,61 @@ public:
                 << elem.position.first << ":"
                 << elem.position.second;
             }
-            // Append final tag: direction abbreviated as F or R.
+            // Append final tag: direction abbreviated as F or R
             std::string dir = (direction == "forward") ? "F" : "R";
-            ss << "<" << sequence_length << ":" << sequence_id << ":" << dir << ">";
+            std::string concat = read_type == "concatenate" ? ":C" : "";
+            ss << "<" << sequence_length << ":" << sequence_id << ":" << dir << concat << ">";
         }
-        // Return empty string if nothing was added.
+        // Return empty string if nothing was added
         return ss.str().empty() ? "" : ss.str();
     }
-
-    // fasta or fastq output
+   
     std::string to_fastqa() const {
-        // 1) figure out which direction(s) to use
+        // figure out which direction(s) to use
         bool allow_fwd = (read_type == "forward" || read_type == "concatenate");
         bool allow_rev = (read_type == "reverse" || read_type == "concatenate");
     
-        // 2) pull out all barcodes, the UMI, sequence, and quality
-        std::vector<std::string> all_bcs;
+        // collect barcodes into a map<base_id -> seq>, preserving insertion order and preferring forward over reverse
+        std::vector<std::string> bc_keys;
+        std::unordered_map<std::string,std::string> bc_map;
+        // tracks which dir stored 
+        std::unordered_map<std::string,std::string> bc_dir;  
+    
         std::string umi, read_seq, read_qual;
         for (auto const &elem : sig_elements) {
             if (!elem.seq) continue;
     
+            // ——— Barcode logic ———
             if (elem.global_class == "barcode" &&
                ((allow_fwd && elem.direction=="forward") ||
                 (allow_rev && elem.direction=="reverse"))) {
-                all_bcs.push_back(*elem.seq);
+                // collapse by base ID
+                std::string key = seq_utils::remove_rc(elem.class_id);
+                bool is_fwd = (elem.direction=="forward");
+    
+                auto it = bc_map.find(key);
+                if (it == bc_map.end()) {
+                    // first time we see this barcode key
+                    bc_keys.push_back(key);
+                    bc_map [key] = *elem.seq;
+                    bc_dir [key] = elem.direction;
+                }
+                else if ( is_fwd && bc_dir[key]=="reverse" ) {
+                    bc_map[key] = *elem.seq;
+                    bc_dir[key] = elem.direction;
+                }
                 continue;
             }
+    
+            // ——— UMI logic ———
             if (elem.global_class == "umi" &&
                ((allow_fwd && elem.direction=="forward") ||
                 (allow_rev && elem.direction=="reverse"))) {
                 umi = *elem.seq;
                 continue;
             }
+    
+            // ——— Read + quality logic ———
             if (elem.global_class == "read" &&
                ((allow_fwd && elem.direction=="forward") ||
                 (allow_rev && elem.direction=="reverse"))) {
@@ -2036,37 +2111,45 @@ public:
                 }
                 continue;
             }
-            if (elem.global_class=="poly_tail" || elem.global_class=="start" || elem.global_class=="stop")
+    
+            // skip the rest
+            if (elem.global_class == "poly_tail" ||
+                elem.global_class == "start" ||
+                elem.global_class == "stop")
+            {
                 continue;
+            }
         }
-        // 3) glue multiple barcodes (if any) into one string
+    
+        // glue barcodes (in insertion order) into one CB:Z: tag
         std::string cb_tag;
-        if (!all_bcs.empty()) {
-            cb_tag = all_bcs[0];
-            for (size_t i = 1; i < all_bcs.size(); ++i)
-                cb_tag += "-" + all_bcs[i];
+        for (size_t i = 0; i < bc_keys.size(); ++i) {
+            if (i) cb_tag += "-";
+            cb_tag += bc_map[ bc_keys[i] ];
         }
-        // 4) build FASTA/FASTQ header + body
+    
+        //  build FASTA/FASTQ
         bool is_fastq = !read_qual.empty();
         std::stringstream out;
     
-        // header line
         out << (is_fastq ? '@' : '>') << sequence_id;
-        if (!cb_tag.empty()) out << " CB:Z:" << cb_tag;
-        if (!umi.empty())  out << " UB:Z:" << umi;
+       
+        if(!cb_tag.empty()){
+            out << " CB:Z:" << cb_tag;
+        }
+        
+        if(!umi.empty()){
+            out << " UB:Z:" << umi;
+        }
         out << "\n";
     
-        // sequence
         out << read_seq << "\n";
-    
-        // optional quality
         if (is_fastq) {
-            out << "+\n"
-                << read_qual << "\n";
+            out << "+\n" << read_qual  << "\n";
         }
+    
         return out.str();
     }
-    
     
     // CSV conversion
     std::string to_csv(bool write_header = false) const {
@@ -2105,7 +2188,6 @@ public:
         return ss.str();
     }
 
-    //to add to--BAM or SAM conversion tools/straight to minimap2 and CR compatible barcode fields
     //SEAMLESSLY COMPATIBLE WITH MINIMAP2
     //add split per barcode on demux
     //igblast->airr.tsv (That's a little downstream)
