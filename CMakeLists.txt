@@ -13,6 +13,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # --------------------------------------------------------------------------
 if(APPLE)
 # hardcoded--change it
+    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libomp")
 endif()
 find_package(OpenMP REQUIRED)
 
