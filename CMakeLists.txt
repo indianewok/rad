@@ -30,6 +30,7 @@ find_package(Boost REQUIRED)
 # third part libraries
 # --------------------------------------------------------------------------
 add_subdirectory(include/edlib EXCLUDE_FROM_ALL)
+
 # Make edlib examples not interfere with build
 option(EDLIB_BUILD_EXAMPLES "Build example apps" OFF)
 option(EDLIB_BUILD_TESTS "Build tests" OFF)
