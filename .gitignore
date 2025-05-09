@@ -33,7 +33,7 @@
 
 # VSCode, IDE, and system
 *.vscode
-.DS_Store
+*.DS_Store
 
 # build artifacts
 /build/
