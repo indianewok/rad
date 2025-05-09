@@ -662,11 +662,12 @@ public:
     auto begin() const { return sig_elements.begin(); }
     auto end() const { return sig_elements.end(); }
 
-    template<typename mod>
-    bool edit_elem(const std::string &class_id, mod m) {
+    template<typename mod> bool edit_elem(const std::string &class_id, mod m) {
       auto &idx = sig_elements.get<sig_id_tag>();
       auto it = idx.find(class_id);
-      if (it == idx.end()) return false;
+      if (it == idx.end()){
+        return false;
+      }
       idx.modify(it, m);
       return true;
     }
@@ -1665,23 +1666,32 @@ public:
                     continue;
                 }
 
-                size_t s = e.position.first - 1;
-                size_t len = e.position.second - e.position.first + 1;
-                if (s + len > masked_read.size()){
+                size_t start = e.position.first - 1;
+                size_t length = e.position.second - e.position.first + 1;
+                if (start + length >= masked_read.size() || start < 1 || length <= 1 || start + length <= 1) {
+                    if(verbose){
+                        #pragma omp critical
+                        std::cout << "Skipping a read element due to out-of-bounds parameters." << std::endl;
+                        std::cout << "Start: " << start << ", Length: " << length 
+                                  << ", Read length: " << masked_read.size() << std::endl;
+                        std::cout << "Masked read: " << masked_read << std::endl;
+                        std::cout << "Direction: " << direction << std::endl;
+                    }
                     break;  // out of bounds—skip
-                } 
+                }
     
                 // extract, then strip all 'N's
-                std::string window = masked_read.substr(s, len);
-                std::string window_qual = read.is_fastq ? masked_qual.substr(s, len) : "";
+                std::string window = masked_read.substr(start, length);
+                std::string window_qual = read.is_fastq ? masked_qual.substr(start, length) : "";
 
                 std::string cleaned_seq;
                 std::string cleaned_qual;
                 // reserve space for cleaned sequences
                 cleaned_seq.reserve(window.size());
                 // if the read is fastq, reserve space for qualscores
-                if (read.is_fastq)
+                if (read.is_fastq){
                     cleaned_qual.reserve(window.size());
+                }
 
                 for (size_t i = 0; i < window.size(); ++i) {
                     if (window[i] != 'N') {
@@ -1696,13 +1706,14 @@ public:
                 edit_elem(e.class_id, [cleaned_seq, cleaned_qual, &read, verbose](seq_element &el) {
                     *el.seq = cleaned_seq;
                     if (read.is_fastq) {
-                        *el.qual = cleaned_qual;
+                        el.qual = cleaned_qual;
                         if(verbose){
                             #pragma omp critical
-                            std::cout << "Masked qual: " << *el.qual << "\n";
+                            std::cout << "Masked qual: " << el.qual.value() << "\n";
                         }
                     } else {
-                        el.qual.reset();
+                        //el.qual.reset();
+                        std::cout << "Masked qual: " << el.qual.value() << "\n";
                     }
                 });
 
@@ -2056,100 +2067,101 @@ public:
         return ss.str().empty() ? "" : ss.str();
     }
    
+    //to fastqa
     std::string to_fastqa() const {
-        // figure out which direction(s) to use
-        bool allow_fwd = (read_type == "forward" || read_type == "concatenate");
-        bool allow_rev = (read_type == "reverse" || read_type == "concatenate");
+        // 1) decide which directions to emit
+        std::vector<std::string> dirs;
+        if (read_type == "concatenate") {
+            dirs = { "forward", "reverse" };
+        } else {
+            dirs = { 
+                read_type 
+            };
+        }
     
-        // collect barcodes into a map<base_id -> seq>, preserving insertion order and preferring forward over reverse
-        std::vector<std::string> bc_keys;
-        std::unordered_map<std::string,std::string> bc_map;
-        // tracks which dir stored 
-        std::unordered_map<std::string,std::string> bc_dir;  
+        std::string all_records;
     
-        std::string umi, read_seq, read_qual;
-        for (auto const &elem : sig_elements) {
-            if (!elem.seq) continue;
+        // 2) for each requested direction, build one record
+        for (auto const &dir : dirs) {
+            // collect barcodes in insertion order, collapsing RC if needed
+            std::vector<std::string> bc_keys;
+            std::unordered_map<std::string, std::string> bc_map;
+            std::unordered_map<std::string, std::string> bc_dir;
     
-            // ——— Barcode logic ———
-            if (elem.global_class == "barcode" &&
-               ((allow_fwd && elem.direction=="forward") ||
-                (allow_rev && elem.direction=="reverse"))) {
-                // collapse by base ID
-                std::string key = seq_utils::remove_rc(elem.class_id);
-                bool is_fwd = (elem.direction=="forward");
+            std::string umi, read_seq, read_qual;
     
-                auto it = bc_map.find(key);
-                if (it == bc_map.end()) {
-                    // first time we see this barcode key
-                    bc_keys.push_back(key);
-                    bc_map [key] = *elem.seq;
-                    bc_dir [key] = elem.direction;
+            for (auto const &elem : sig_elements) {
+                if (!elem.seq.has_value()){
+                    continue;
                 }
-                else if ( is_fwd && bc_dir[key]=="reverse" ) {
-                    bc_map[key] = *elem.seq;
-                    bc_dir[key] = elem.direction;
+    
+                // only take elements in this direction
+                if (elem.direction != dir) 
+                    continue;
+    
+                // barcode
+                if (elem.global_class == "barcode") {
+                    auto key = seq_utils::remove_rc(elem.class_id);
+                    bool is_fwd = (dir == "forward");
+    
+                    auto it = bc_map.find(key);
+                    if (it == bc_map.end()) {
+                        bc_keys.push_back(key);
+                        bc_map[key] = elem.seq.value();
+                        bc_dir[key] = dir;
+                    }
+                    else if (is_fwd && bc_dir[key] == "reverse") {
+                        bc_map[key] = elem.seq.value();
+                        bc_dir[key] = dir;
+                    }
+                    continue;
                 }
-                continue;
-            }
     
-            // ——— UMI logic ———
-            if (elem.global_class == "umi" &&
-               ((allow_fwd && elem.direction=="forward") ||
-                (allow_rev && elem.direction=="reverse"))) {
-                umi = *elem.seq;
-                continue;
-            }
-    
-            // ——— Read + quality logic ———
-            if (elem.global_class == "read" &&
-               ((allow_fwd && elem.direction=="forward") ||
-                (allow_rev && elem.direction=="reverse"))) {
-                read_seq = *elem.seq;
-                if (elem.qual.has_value()|| (!elem.qual->empty())){
-                    read_qual = *elem.qual;
+                // umi 
+                if (elem.global_class == "umi") {
+                    if(elem.seq.has_value()){
+                        umi = elem.seq.value();
+                    }
+                    continue;
                 }
-                continue;
+    
+                // read and qual
+                if (elem.global_class == "read") {
+                    read_seq = elem.seq.value();
+                    if (elem.qual.has_value()) {
+                        read_qual = elem.qual.value();
+                    }
+                    continue;
+                }
+    
+                if (elem.global_class == "poly_tail" || elem.global_class == "start" || elem.global_class == "stop")
+                    {
+                        continue;
+                }
             }
     
-            // skip the rest
-            if (elem.global_class == "poly_tail" ||
-                elem.global_class == "start" ||
-                elem.global_class == "stop")
-            {
-                continue;
+            //add CB tag
+            std::string cb_tag;
+            for (size_t i = 0; i < bc_keys.size(); ++i) {
+                if (i) cb_tag += '-';
+                cb_tag += bc_map[bc_keys[i]];
             }
-        }
     
-        // glue barcodes (in insertion order) into one CB:Z: tag
-        std::string cb_tag;
-        for (size_t i = 0; i < bc_keys.size(); ++i) {
-            if (i) cb_tag += "-";
-            cb_tag += bc_map[ bc_keys[i] ];
-        }
+            bool is_fastq = !read_qual.empty();
+            std::stringstream ss;
+            ss << (is_fastq ? '@' : '>') << sequence_id;
+            if (!cb_tag.empty()) ss << " CB:Z:" << cb_tag;
+            if (!umi.empty())    ss << " UB:Z:" << umi;
+            ss << "\n" << read_seq << "\n";
+            if (is_fastq){
+                ss << "+\n" << read_qual << "\n";
+            }
     
-        //  build FASTA/FASTQ
-        bool is_fastq = !read_qual.empty();
-        std::stringstream out;
-    
-        out << (is_fastq ? '@' : '>') << sequence_id;
-       
-        if(!cb_tag.empty()){
-            out << " CB:Z:" << cb_tag;
+            all_records += ss.str();
         }
-        
-        if(!umi.empty()){
-            out << " UB:Z:" << umi;
-        }
-        out << "\n";
-    
-        out << read_seq << "\n";
-        if (is_fastq) {
-            out << "+\n" << read_qual  << "\n";
-        }
-    
-        return out.str();
+        return all_records;
     }
+    
     
     // CSV conversion
     std::string to_csv(bool write_header = false) const {

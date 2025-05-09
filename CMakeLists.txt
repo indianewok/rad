@@ -7,6 +7,12 @@ project(cdev_rad VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+function( set_required_build_settings_for_GCC8 )
+    # Always link with libstdc++fs.a when using GCC 8.
+    # Note: This command makes sure that this option comes pretty late on the cmdline.
+    link_libraries( "$<$<AND:$<CXX_COMPILER_ID:GNU>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,9.0>>:-lstdc++fs>" )
+endfunction()
+set_required_build_settings_for_GCC8()
 
 # --------------------------------------------------------------------------
 # OpenMP (Homebrew libomp on macOS)
