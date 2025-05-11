@@ -431,12 +431,14 @@ template<typename key, typename value> struct bc_multimap:std::unordered_multima
     template<typename T> void insert_bc_entry(const T &observed, const value &correct) & {
         this->emplace(key_of(observed), correct);
     }
+    
     //insert a barcode entry into this wl, with barcode as key and value
     template<typename T> void insert_bc_entry(const T &observed) & {
         value v{};
         v.barcode = key_of(observed);
         this->emplace(key_of(observed), std::move(v));
     }
+    
     //delete a barcode entry from this wl
     template<typename T> void remove_bc_entry(const T &observed) {
         this->erase(key_of(observed));
@@ -569,65 +571,6 @@ class whitelist {
     struct wl_entry {
         std::unordered_set<int64_seq> true_ref;
         bc_multimap<int64_seq, barcode_entry> true_bcs, global_bcs, filter_bcs;
-
-        void generate_mismatch_barcodes_old(int shift, int mutation_rounds, bool verbose, int nthreads) {
-            #pragma omp critical
-                std::cout << "[whitelist] Generating barcodes with " << shift << " shifts" 
-                << " and " << mutation_rounds << " mutations with " << nthreads << " thread(s)...\n";
-
-            // build vector + set of originals
-            std::vector<std::pair<int64_seq,barcode_entry>> originals;
-            originals.reserve(true_bcs.size());
-            std::unordered_set<int64_seq> original_seqs;
-            original_seqs.reserve(true_bcs.size());
-
-            for (auto const &kv : true_bcs) {
-                originals.emplace_back(kv.first, kv.second);
-                original_seqs.insert(kv.first);
-            }
-
-            // parallel loop over originals
-            #pragma omp parallel for schedule(dynamic)
-            for (size_t i = 0; i < originals.size(); ++i) {
-                auto const &orig_bits = originals[i].first;
-                auto const &orig_be   = originals[i].second;
-                // insert a barcode + its reverse‐complement
-                auto insert_with_rc = [&](const int64_seq &bits) {
-                    // skip if it’s already known
-                    if (global_bcs.check_wl_for(bits) || original_seqs.count(bits))
-                        return;
-
-                    // insert the forward strand barcode
-                    barcode_entry obs = orig_be;
-                    obs.barcode       = bits;
-                    #pragma omp critical
-                    true_bcs.insert_bc_entry(obs, orig_be);
-
-                    // compute & insert its reverse complement
-                    std::string s    = bits.bits_to_sequence();
-                    std::string rc_s = seq_utils::revcomp(s);
-                    int64_seq rc_bits;
-                    rc_bits.sequence_to_bits(rc_s);
-
-                    if (!global_bcs.check_wl_for(rc_bits) && !original_seqs.count(rc_bits)) {
-                        barcode_entry rc_obs = orig_be;
-                        rc_obs.barcode       = rc_bits;
-                        #pragma omp critical
-                        true_bcs.insert_bc_entry(rc_obs, orig_be);
-                    }
-                };
-                // shifted barcodes
-                for (auto const &s_bits : 
-                    mutation_tools::generate_shifted_barcodes(orig_bits, shift)) {
-                    insert_with_rc(s_bits);
-                }
-                // mutated barcodes
-                for (auto const &m_bits :
-                    mutation_tools::generate_mutated_barcodes(orig_bits, mutation_rounds)) {
-                    insert_with_rc(m_bits);
-                }
-            }
-        }
     
         void generate_mismatch_barcodes(int shift, int mutation_rounds,bool verbose, int nthreads = 1) {
             if (verbose) {
@@ -720,12 +663,17 @@ class whitelist {
         }
         std::string path = whitelist_utils::kit_to_path(spec);
         // detect bitlist vs char list
-        bool isBitlist = whitelist_utils::check_if_bitlist(spec, /*N=*/10);
+        bool isBitlist = whitelist_utils::check_if_bitlist(spec, verbose, /*N=*/10);
+        if(verbose){
+            std::string islist = isBitlist ? "IS" : "IS NOT";
+            std::cout << "Detected element " << islist << " a bit-configured whitelist!" << std::endl;
+        }
 
         // read all lines (skipping header)  
         auto lines = streaming_utils::import_text(path, SIZE_MAX);
-        if (!lines.empty()) lines.erase(lines.begin());
-
+        if (!lines.empty()){
+            lines.erase(lines.begin());
+        }
         std::unordered_set<int64_seq> out;
         for (auto &ln : lines) {
             if (ln.empty()) continue;

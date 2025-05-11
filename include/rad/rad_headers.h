@@ -33,9 +33,11 @@
 // ————————————————————————————————————————————————————————————————
 #include <boost/bimap.hpp>
 #include <boost/optional.hpp>
+#include <boost/filesystem.hpp>
 #include <boost/functional/hash.hpp>
 #include <boost/multi_index/member.hpp>
 #include <boost/bimap/unordered_set_of.hpp>
+#include <boost/dll/runtime_symbol_info.hpp>
 #include <boost/multi_index/ordered_index.hpp>
 #include <boost/multi_index/sequenced_index.hpp>
 #include <boost/multi_index/composite_key.hpp>

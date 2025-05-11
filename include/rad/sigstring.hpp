@@ -433,7 +433,7 @@ namespace barcode_correction {
         auto key = seq_utils::remove_rc(elem.class_id);
         auto &wl = layout.wl_map.maps.at(key).get();
         // extract and reverse‐complement the raw string
-        std::string raw = *elem.seq;
+        std::string raw = elem.seq.value();
         if (elem.direction == "reverse"){
             raw = seq_utils::revcomp(raw);
         }
@@ -698,7 +698,7 @@ private:
                positions.second > 0 && 
                positions.first <= static_cast<int>(read_length) &&
                positions.second <= static_cast<int>(read_length) &&
-               positions.second >= positions.first;
+               positions.second > positions.first;
     }
 
     // master function to map variable element positions--super bulky and unweldy, but works. needs to be broken up into constituents
@@ -1290,7 +1290,7 @@ private:
                 continue;
             }
         // recover the raw sequence (reverse‐comp if needed)
-        std::string bc_seq = *elem.seq;
+        std::string bc_seq = elem.seq.value();
         if (elem.direction == "reverse" && type != "forward"){
             bc_seq = seq_utils::revcomp(bc_seq);
         }
@@ -1557,8 +1557,8 @@ public:
                         std::cout << "Found static reference: " << elem.class_id 
                                   << " at position " << elem.position.first 
                                   << ":" << elem.position.second 
-                                  << " with edit distance " << (elem.edit_distance ? std::to_string(*elem.edit_distance) : "none")
-                                  << " and sequence " << (elem.seq ? *elem.seq : "none") 
+                                  << " with edit distance " << (elem.edit_distance ? std::to_string(elem.edit_distance.value()) : "none")
+                                  << " and sequence " << (elem.seq ? elem.seq.value() : "none") 
                                   << std::endl;
                     }
                 }
@@ -1791,7 +1791,7 @@ public:
                     if(verbose){
                         #pragma omp critical
                         {
-                            std::cout << "Barcode correction for " << *elem.seq << std::endl;
+                            std::cout << "Barcode correction for " << elem.seq.value() << std::endl;
                         }
                     }
                     auto& wl = layout.wl_map.maps.at(seq_utils::remove_rc(elem.class_id)).get();
@@ -1801,12 +1801,12 @@ public:
                         auto out = barcode_correction::correct_barcode(elem, layout, verbose);
                         bool corrected = out.has_value();
                         if(corrected) {
-                            int64_seq correct_bc = *out;
-                            seen_bcs[seq_utils::remove_rc(elem.class_id)].insert(*out);
+                            int64_seq correct_bc = out.value();
+                            seen_bcs[seq_utils::remove_rc(elem.class_id)].insert(out.value());
                             std::string final_bc = elem.direction == "forward" ? correct_bc.bits_to_sequence() : 
                             seq_utils::revcomp(correct_bc.bits_to_sequence());
                             // add to corrected barcode count
-                            if(final_bc != *elem.seq) {
+                            if(final_bc !=elem.seq.value()) {
                                 wl.true_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
                             }
                             auto& id_index = sig_elements.get<sig_id_tag>();
@@ -1825,6 +1825,16 @@ public:
                                     e.element_pass = false; 
                                     }
                                 );
+                                if(elem.seq.has_value()){
+                                    std::string seq = elem.seq.value();
+                                    int64_seq putative_bc(seq);
+                                    barcode_entry be;
+                                    be.barcode = putative_bc;
+                                    be.flags = "";
+                                    be.edit_dist = 0;
+                                    be.filtered = true;
+                                   wl.filter_bcs.insert_bc_entry(be.barcode, be);
+                                }
                             // adding this in to try to manage if there are multiple barcodes, 
                             // whether we should set this entire direction to false. 
                             // right now, we *only* return completely correct barcodes (all multiples are also correct) 
@@ -1841,14 +1851,14 @@ public:
                         //--default whitelist generation has yet to happen considering just dumping them into the true_bcs. 
                         //will probably pull this out and write a standalone sorting function internally here.
                         if(elem.seq.has_value()){
-                            std::string seq = *elem.seq;
+                            std::string seq = elem.seq.value();
                             int64_seq putative_bc(seq);
                             barcode_entry be;
                             be.barcode = putative_bc;
                             be.flags = "";
                             be.edit_dist = 0;
                             be.filtered = true;
-                           // wl.filter_bcs.insert_bc_entry(be.barcode, be);
+                           wl.filter_bcs.insert_bc_entry(be.barcode, be);
                         }
                     }
                 }
@@ -2054,7 +2064,7 @@ public:
                 }
                 first_elem = false;
                 ss << elem.class_id << ":"
-                << (elem.edit_distance ? std::to_string(*elem.edit_distance) : "0") << ":"
+                << (elem.edit_distance ? std::to_string(elem.edit_distance.value()) : "0") << ":"
                 << elem.position.first << ":"
                 << elem.position.second;
             }
@@ -2174,7 +2184,7 @@ public:
             if (elem.type == "variable" && elem.seq.has_value() && !elem.seq->empty()) {
                 // Determine the element's direction.
                 std::string read_mintype = "forward";
-                std::string seq = *elem.seq;
+                std::string seq = elem.seq.value();
                 std::string final_id = elem.class_id;
                 if (elem.class_id.substr(0, 3) == "rc_") {
                     seq = seq_utils::revcomp(seq);

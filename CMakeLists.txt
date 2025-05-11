@@ -7,7 +7,7 @@ project(cdev_rad VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-function( set_required_build_settings_for_GCC8 )
+function(set_required_build_settings_for_GCC8)
     # Always link with libstdc++fs.a when using GCC 8.
     # Note: This command makes sure that this option comes pretty late on the cmdline.
     link_libraries( "$<$<AND:$<CXX_COMPILER_ID:GNU>,$<VERSION_LESS:$<CXX_COMPILER_VERSION>,9.0>>:-lstdc++fs>" )
@@ -19,7 +19,7 @@ set_required_build_settings_for_GCC8()
 # --------------------------------------------------------------------------
 if(APPLE)
 # hardcoded--change it
-    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libomp")
+    #list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libomp")
 endif()
 find_package(OpenMP REQUIRED)
 
@@ -30,7 +30,7 @@ find_package(ZLIB REQUIRED)
 if(POLICY CMP0167)
     cmake_policy(SET CMP0167 OLD)     
 endif()
-find_package(Boost REQUIRED)
+find_package(Boost REQUIRED COMPONENTS filesystem system)
 
 # --------------------------------------------------------------------------
 # third part libraries
@@ -66,6 +66,8 @@ target_include_directories(rad_lib INTERFACE
 
 target_link_libraries(rad_lib INTERFACE
     Boost::boost
+    Boost::filesystem
+    Boost::system
     ZLIB::ZLIB
     OpenMP::OpenMP_CXX
     edlib

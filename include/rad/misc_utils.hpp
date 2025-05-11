@@ -19,6 +19,35 @@ namespace basic_stats {
     }
 };
 
+namespace path_utils {
+    namespace bfs = boost::filesystem;
+    namespace bdl = boost::dll;
+  
+    inline bfs::path find_resource_root() {
+      // 1) Where the exe lives
+      bfs::path exe = bdl::program_location();
+      bfs::path dir = exe.parent_path();
+  
+      // 2) Climb upwards looking for a "resources" folder
+      while (true) {
+        bfs::path cand = dir / "resources";
+        if (bfs::exists(cand) && bfs::is_directory(cand)) {
+          return bfs::canonical(cand);
+        }
+        if (!dir.has_parent_path()) break;
+        dir = dir.parent_path();
+      }
+  
+      // 3) Fallback: ./resources in your CWD
+      bfs::path alt = bfs::current_path() / "resources";
+      if (bfs::exists(alt) && bfs::is_directory(alt)) {
+        return bfs::canonical(alt);
+      }
+  
+      throw std::runtime_error("Cannot locate 'resources' folder up the tree or in CWD");
+    }
+};
+
 namespace seq_utils {
 
     std::string revcomp(const std::string& seq) {
@@ -169,7 +198,7 @@ namespace whitelist_utils {
         { "10x_3v4", "resources/wl/3M-3pgex-may-2023.txt_bitlist.csv.gz" },
 
         //10x 5' kits
-        { "10x_5v1", "resources/wl/wl/737K-august-2016_bitlist.csv.gz" },
+        { "10x_5v1", "resources/wl/737K-august-2016_bitlist.csv.gz" },
         { "10x_5v2", "resources/wl/737K-august-2016_bitlist.csv.gz" },
         { "10x_5HTv2", "resources/wl/737K-august-2016_bitlist.csv.gz" },
         { "10x_5v3", "resources/wl/3M-5pgex-jan-2023.txt_bitlist.csv.gz" },
@@ -182,6 +211,50 @@ namespace whitelist_utils {
         { "10x_Vis_V5", "resources/wl/visium-v5_bitlist.csv.gz" }
     };
 
+    inline std::string kit_to_path(const std::string &field) {
+        namespace bfs = boost::filesystem;
+        // 1) Peel off any "prefix:" to isolate the kit key
+        std::string kit = field;
+        if (auto pos = field.find(':'); pos!=std::string::npos) {
+          kit = field.substr(pos+1);
+        }
+    
+        // 2) If it's one of our known kits, build resources/wl/... from the relative map entry
+        auto it = kit_wl_paths.find(kit);
+        if (it != kit_wl_paths.end()) {
+          bfs::path orig_rel(it->second); // e.g. "resources/wl/foo.csv.gz" or "wl/foo.csv.gz"
+    
+          // strip leading "resources/" if present
+          auto iter = orig_rel.begin();
+          if (iter!=orig_rel.end() && *iter=="resources") {
+            ++iter;
+          }
+          // recombine what remains
+          bfs::path rel;
+          for (; iter!=orig_rel.end(); ++iter) {
+            rel /= *iter;
+          }
+    
+          // now join against the real resources folder
+          bfs::path root = path_utils::find_resource_root();
+          bfs::path full = root / rel;
+    
+          if (!bfs::exists(full))
+            throw std::runtime_error("Whitelist resource not found: " + full.string());
+          return bfs::canonical(full).string();
+        }
+    
+        // 3) Otherwise treat the field as a filesystem path and canonicalize it
+        bfs::path p(field);
+        if (p.is_relative()) {
+          p = bfs::absolute(p);
+        }
+        if (!bfs::exists(p))
+          throw std::runtime_error("Whitelist file not found: " + p.string());
+        return bfs::canonical(p).string();
+      }
+
+    /*
     std::string kit_to_path(const std::string &field) {
         auto kit = field;
         if (auto p = field.find(':'); p != std::string::npos){
@@ -192,6 +265,7 @@ namespace whitelist_utils {
         }
         return field; 
     }
+    */
 
     // Check if it's a kit
     bool is_kit(const std::string &name){
@@ -202,14 +276,28 @@ namespace whitelist_utils {
     }
 
     //check if the whitelist we're importing is a bitlist or a whitelist
-    bool check_if_bitlist(const std::string &field, size_t N = 10) {
+    bool check_if_bitlist(const std::string &field, bool verbose, size_t N = 10) {
         const std::string path = kit_to_path(field);
 
         //skip the header and keep it moving
         auto lines = streaming_utils::import_text(path, N + 1);
-        if (lines.empty()) return false;
-    
+        if (lines.empty()) {
+            if(verbose) std::cerr << "[check_if_bitlist] ERROR: no lines read from “" << path << "”\n";
+            return false;
+        }
+        if(verbose) std::cout << "[check_if_bitlist] debug: first " << lines.size() << " raw lines from “" << path << "”:\n";
+
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if(verbose) std::cout << "  [" << i << "]: " << lines[i] << "\n";
+        }
+
         lines.erase(lines.begin());
+
+        if(verbose) std::cout << "[check_if_bitlist] debug: next up to " << N << " content lines (after header):\n";
+
+        for (size_t i = 0; i < lines.size() && i < N; ++i) {
+            if(verbose) std::cout << "  [" << i << "]: " << lines[i] << "\n";
+        }
     
         // 2) extract up to N tokens (before first comma/tab)
         std::vector<std::string> tokens;
@@ -222,8 +310,9 @@ namespace whitelist_utils {
         }
     
         // nothing real to check?
-        if (tokens.empty()) return false;
-    
+        if (tokens.empty()){
+            return false;
+        }
         // 3) ensure every character in each token is a digit
         for (auto &t : tokens) {
           for (unsigned char c : t) {
@@ -279,12 +368,56 @@ namespace config_utils {
     }
     
     // get read layout path from pre-existing elements
+    /*
     inline const std::string& get_read_layout(const std::string &type) {
         auto it = layout_files.find(type);
         if (it == layout_files.end())
             throw std::invalid_argument("Unknown layout type: " + type);
         return it->second;
     }
+    */
+   inline std::string get_read_layout(const std::string &type) {
+    namespace bfs = boost::filesystem;
+    // 1) If `type` looks like an absolute or contains a path‐sep, treat it as a real file:
+    bfs::path p(type);
+    if (p.is_absolute() ||
+        type.find(bfs::path::preferred_separator) != std::string::npos)
+    {
+      if (!bfs::exists(p))
+        throw std::runtime_error("Layout file not found: " + type);
+      return bfs::canonical(p).string();
+    }
+
+    // 2) Otherwise look up our map
+    auto it = layout_files.find(type);
+    if (it == layout_files.end())
+      throw std::invalid_argument("Unknown layout key: " + type);
+
+    // 3) Take the stored relative‐to‐resources path
+    //    e.g. it->second == "splitseq_read_layout.csv"   OR
+    //         it->second == "read_layout/splitseq_read_layout.csv" OR
+    //         it->second == "resources/read_layout/splitseq_read_layout.csv"
+    bfs::path orig_rel(it->second);
+
+    // strip any leading "resources/" component:
+    auto iter = orig_rel.begin();
+    if (iter!=orig_rel.end() && *iter == "resources") {
+      ++iter;
+    }
+    // now build a new path from whatever remains
+    bfs::path rel;
+    for (; iter!=orig_rel.end(); ++iter) {
+      rel /= *iter;
+    }
+
+    // 4) Join against the real resources folder
+    bfs::path root = path_utils::find_resource_root();
+    bfs::path full = root / rel;
+
+    if (!bfs::exists(full))
+      throw std::runtime_error("Missing layout resource: " + full.string());
+    return bfs::canonical(full).string();
+  }
 
     inline void save_read_layout(const std::string &type, const std::string &path) {
         layout_files[type] = path;

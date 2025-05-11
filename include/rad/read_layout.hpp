@@ -1017,7 +1017,6 @@ public:
                 std::cout << "[load_wl] Reusing entry for key ='"<< key << "'\n";
             }
 
-            // 2c) immediate report
             {
                 auto &E = mit->second.get();
                 std::cout << "[load_wl]"
@@ -1055,11 +1054,18 @@ public:
     }
 
     // save the whitelist to a CSV 
-    void save_wl(std::ostream &out, bool full = false) const {
+    void save_wl(std::ostream &out, bool verbose, bool full = false) const {
         //Loop over every whitelist in wl_map.lists
         for (auto const& [class_id, wrap] : wl_map.maps) {
             auto &entry = wrap.get();
             // return the true_bcs
+            if(verbose) std::cout << "[save_wl]"
+            << " ["<<class_id<<"]"
+            << ": global = "<<entry.global_bcs.size()
+            << ", true = "  <<entry.true_bcs.size()
+            << ", filter = "<<entry.filter_bcs.size()
+            << "\n";
+
             {
             if(!full){
                 entry.true_bcs.write_wl_summary(out, class_id, &entry.true_ref);
@@ -1110,7 +1116,7 @@ public:
     }
 
     // save wl but instead of streaming to output, take a path
-    void save_wl(const std::string &path, bool full = false) const {
+    void save_wl(const std::string &path, bool verbose, bool full = false) const {
         std::ofstream out(path);
         if (!out.is_open()) {
             std::cerr << "[error] Error opening file for writing: " << path << "\n";
