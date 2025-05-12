@@ -72,6 +72,7 @@ target_link_libraries(rad_lib INTERFACE
     OpenMP::OpenMP_CXX
     edlib
     ssw
+    dl
 )
 
 # --------------------------------------------------------------------------
