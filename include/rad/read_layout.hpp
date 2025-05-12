@@ -953,13 +953,14 @@ public:
             if (elem.global_class!="barcode" || elem.type!="variable")
                 continue;
 
-            // normalize class_id → key
+            // normalize class_id -> key
             std::string key = elem.class_id;
-            if (seq_utils::is_rc(key))
+            if (seq_utils::is_rc(key)){
                 key = seq_utils::remove_rc(key);
+            }
 
             // resolve the on-disk path
-            std::string spec = wl_path ? *wl_path : elem.whitelist_path;
+            std::string spec = wl_path ? wl_path.value() : elem.whitelist_path;
             std::string path = whitelist_utils::kit_to_path(spec);
 
             std::cout << "[load_wl] ["<<elem.class_id<<"] ["<<spec<<"] @ "<<path<<"\n";

@@ -19,7 +19,7 @@ set_required_build_settings_for_GCC8()
 # --------------------------------------------------------------------------
 if(APPLE)
 # hardcoded--change it
-    #list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libomp")
+    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libomp")
 endif()
 find_package(OpenMP REQUIRED)
 
@@ -35,19 +35,21 @@ find_package(Boost REQUIRED COMPONENTS filesystem system)
 # --------------------------------------------------------------------------
 # third part libraries
 # --------------------------------------------------------------------------
-add_subdirectory(include/edlib EXCLUDE_FROM_ALL)
-
-# Make edlib examples not interfere with build
-option(EDLIB_BUILD_EXAMPLES "Build example apps" OFF)
-option(EDLIB_BUILD_TESTS "Build tests" OFF)
 
 # Striped Smith‑Waterman (stand‑alone C code)
 add_library(ssw STATIC
     include/ssw/ssw.c
     include/ssw/ssw_cpp.cpp
 )
-target_include_directories(ssw PUBLIC include/ssw)
 
+#header file for edlib
+add_library(edlib STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/edlib/src/edlib.cpp
+)
+    
+
+target_include_directories(ssw PUBLIC include/ssw)
+target_include_directories(edlib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/edlib/include)
 # --------------------------------------------------------------------------
 # header‑only rad library (collects all include paths & link deps)
 # --------------------------------------------------------------------------
@@ -60,8 +62,9 @@ target_include_directories(rad_lib INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}
     include                          
     include/kseq
-    include/csv-parser
+    include/edlib
     include/progressbar
+    include/csv-parser/single_include
 )
 
 target_link_libraries(rad_lib INTERFACE

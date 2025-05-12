@@ -211,6 +211,66 @@ namespace whitelist_utils {
         { "10x_Vis_V5", "resources/wl/visium-v5_bitlist.csv.gz" }
     };
 
+    // split “kit:path” or “kit:kit” or “path” into 1–2 specs
+    static std::vector<std::string> parse_whitelist_specs(std::string const &field) {
+        std::vector<std::string> specs;
+        std::stringstream ss(field);
+        std::string part;
+        while (std::getline(ss, part, ':')) {
+            if (!part.empty()) specs.push_back(part);
+        }
+        // keep 1 or 2
+        if (specs.size() > 2) specs.resize(2);
+        return specs;
+    }
+
+    inline std::string kit_to_path(const std::string &field) {
+        namespace bfs = boost::filesystem;
+    
+        // 1) Split into up to two specs
+        auto specs = whitelist_utils::parse_whitelist_specs(field);
+        std::vector<std::string> resolved;
+        resolved.reserve(specs.size());
+    
+        for (auto &spec : specs) {
+            // 2a) if it’s a known kit key, map into resources/wl/…
+            if (auto it = kit_wl_paths.find(spec); it != kit_wl_paths.end()) {
+                bfs::path rel(it->second); // e.g. "resources/wl/foo.csv.gz"
+    
+                // strip leading "resources/" if present
+                auto iter = rel.begin();
+                if (iter!=rel.end() && *iter=="resources") ++iter;
+    
+                // recombine the remainder
+                bfs::path sub;
+                for (; iter!=rel.end(); ++iter) sub /= *iter;
+    
+                // now prepend the true resources folder
+                bfs::path root = path_utils::find_resource_root();
+                bfs::path full = root / sub;
+    
+                if (!bfs::exists(full))
+                    throw std::runtime_error("Whitelist resource not found: " + full.string());
+                resolved.push_back(bfs::canonical(full).string());
+            }
+            else {
+                // 2b) otherwise treat spec as a path
+                bfs::path p(spec);
+                if (p.is_relative()) p = bfs::absolute(p);
+                if (!bfs::exists(p))
+                    throw std::runtime_error("Whitelist file not found: " + p.string());
+                resolved.push_back(bfs::canonical(p).string());
+            }
+        }
+    
+        // 3) re-join with ":" if there were two pieces
+        if (resolved.size() == 2) {
+            return resolved[0] + ":" + resolved[1];
+        } else {
+            return resolved[0];
+        }
+    }
+    /*
     inline std::string kit_to_path(const std::string &field) {
         namespace bfs = boost::filesystem;
         // 1) Peel off any "prefix:" to isolate the kit key
@@ -229,6 +289,7 @@ namespace whitelist_utils {
           if (iter!=orig_rel.end() && *iter=="resources") {
             ++iter;
           }
+
           // recombine what remains
           bfs::path rel;
           for (; iter!=orig_rel.end(); ++iter) {
@@ -253,8 +314,6 @@ namespace whitelist_utils {
           throw std::runtime_error("Whitelist file not found: " + p.string());
         return bfs::canonical(p).string();
       }
-
-    /*
     std::string kit_to_path(const std::string &field) {
         auto kit = field;
         if (auto p = field.find(':'); p != std::string::npos){
@@ -322,19 +381,6 @@ namespace whitelist_utils {
         }
         return true;  // all N tokens passed the digit test
       }
-
-    // split “kit:path” or “kit:kit” or “path” into 1–2 specs
-    static std::vector<std::string> parse_whitelist_specs(std::string const &field) {
-        std::vector<std::string> specs;
-        std::stringstream ss(field);
-        std::string part;
-        while (std::getline(ss, part, ':')) {
-            if (!part.empty()) specs.push_back(part);
-        }
-        // keep 1 or 2
-        if (specs.size() > 2) specs.resize(2);
-        return specs;
-    }
 
     inline const std::string& get_whitelist_path(const std::string &kit) {
         auto it = kit_wl_paths.find(kit);

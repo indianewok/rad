@@ -242,8 +242,7 @@ int main(int argc, char* argv[]) {
 static void usage(const char* prog) {
     std::cerr
       << "Usage: " << prog
-      << " -l LAYOUT -q FASTQ [-k KIT] [-g GLOBAL_WL] [-c CUSTOM_WL]\n"
-         "          [-o PREFIX] [-d DIR] [-b] [-t THREADS] [-v] [-D] [-h]\n\n"
+      << " -l LAYOUT -q FASTQ [-k KIT] [-g GLOBAL_WL] [-c CUSTOM_WL] [-o PREFIX] [-d DIR] [-b] [-t THREADS] [-v] [-D] [-h]\n"
       << "  -l, --layout            layout key (five_prime, three_prime, splitseq) or a custom path\n"
       << "  -q, --fastq             input FASTQ file\n"
       << "  -k, --kit               use this kit's default whitelist\n"
@@ -261,13 +260,10 @@ static void usage(const char* prog) {
 }
 
 int main(int argc, char* argv[]) {
-    std::string layout_key, fastq_path, kit;
-    std::string global_whitelist_path, custom_whitelist_path;
-    std::string output_prefix, output_dir;
+    std::string layout_key, fastq_path, custom_kit, global_whitelist_path, custom_whitelist_path, output_prefix, output_dir;
+    bool verbose = false, max_verbose = false, split_bc = false;
     std::optional<int> shift, mut;
     int nthreads = 1;
-    bool verbose = false, max_verbose = false;
-    bool split_bc = false;
 
     const char* optstring = "l:q:k:g:c:m:s:o:d:bt:vDh";
     struct option longopts[] = {
@@ -293,19 +289,19 @@ int main(int argc, char* argv[]) {
         switch (c) {
           case 'l': layout_key             = optarg;            break;
           case 'q': fastq_path             = optarg;            break;
-          case 'k': kit                    = optarg;            break;
+          case 'k': custom_kit                    = optarg;            break;
           case 'g': global_whitelist_path  = optarg;            break;
           case 'c': custom_whitelist_path  = optarg;            break;
-          case 'm': mut   = std::stoi(optarg); break;
-          case 's': shift = std::stoi(optarg); break;
+          case 'm': mut   = std::stoi(optarg);                  break;
+          case 's': shift = std::stoi(optarg);                  break;
           case 'o': output_prefix          = optarg;            break;
           case 'd': output_dir             = optarg;            break;
           case 'b': split_bc               = true;              break;
           case 't': nthreads               = std::stoi(optarg); break;
           case 'v': verbose                = true;              break;
           case 'D': max_verbose            = true;              break;
-          case 'h': usage(argv[0]); return 0;
-          default:  usage(argv[0]); return 1;
+          case 'h': usage(argv[0]);                             return 0;
+          default:  usage(argv[0]);                             return 1;
         }
     }
 
@@ -350,17 +346,17 @@ int main(int argc, char* argv[]) {
     }
 
     if (verbose) {
-        std::cout << "=== Configuration ===\n"
-                  << " Layout key/path    : " << layout_key               << "\n"
-                  << " FASTQ input        : " << fastq_path               << "\n"
-                  << " kit                : " << (kit.empty() ? "[none]" : kit) << "\n"
-                  << " global whitelist   : " << (global_whitelist_path.empty()? "[none]" : global_whitelist_path) << "\n"
-                  << " custom whitelist   : " << (custom_whitelist_path.empty()? "[none]" : custom_whitelist_path) << "\n"
-                  << " output directory   : " << outdir.string()          << "\n"
-                  << " filename base      : " << base                     << "\n"
-                  << " threads            : " << nthreads                 << "\n"
-                  << " verbose            : " << std::boolalpha<<verbose  << "\n"
-                  << " max_threads avail. : " << omp_get_max_threads()    << "\n\n";
+        std::cout << "============= Configuration =============\n"
+                  << "  Layout key/path    : " << layout_key               << "\n"
+                  << "  FASTQ input        : " << fastq_path               << "\n"
+                  << "  custom kit         : " << (custom_kit.empty() ? "[none]" : custom_kit) << "\n"
+                  << "  global whitelist   : " << (global_whitelist_path.empty()? "[none]" : global_whitelist_path) << "\n"
+                  << "  custom whitelist   : " << (custom_whitelist_path.empty()? "[none]" : custom_whitelist_path) << "\n"
+                  << "  output directory   : " << outdir.string()          << "\n"
+                  << "  filename base      : " << base                     << "\n"
+                  << "  threads            : " << nthreads                 << "\n"
+                  << "  verbose            : " << std::boolalpha <<verbose  << "\n"
+                  << "  max_threads avail. : " << omp_get_max_threads()    << "\n\n";
     }
 
     std::cout << "[main] Starting main processing...\n";
@@ -421,15 +417,15 @@ int main(int argc, char* argv[]) {
         }
 
         // Whitelist loading
-        std::string kit_or_wl = kit.empty() ? global_whitelist_path : kit;
+        std::string kit_or_wl = custom_kit.empty() ? global_whitelist_path : custom_kit;
         std::optional<std::string> whitelist_path;
         if (!kit_or_wl.empty() && !custom_whitelist_path.empty()) {
             whitelist_path = kit_or_wl + ":" + custom_whitelist_path;
         }
         if (whitelist_path) {
             if (verbose) std::cout << "[main] Loading custom kit & whitelist...\n";
-            read_layout.load_wl(*whitelist_path, shift, mut, verbose, nthreads);
-        } else if (!kit.empty()) {
+            read_layout.load_wl(whitelist_path.value(), shift, mut, verbose, nthreads);
+        } else if (!custom_kit.empty()) {
             if (verbose) std::cout << "[main] Loading kit whitelist...\n";
             read_layout.load_wl(std::nullopt, shift, mut, verbose, nthreads);
         } else {

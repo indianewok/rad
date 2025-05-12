@@ -27,8 +27,10 @@ which brew
 
 ```bash
 # Install LLVM (for up-to-date clang), OpenMP and Boost
-brew install llvm libomp boost
+brew install llvm libomp boost cmake
 ```
+
+For Mac users, 
 
 > **Tip:** If you already have these, `brew install` will skip or upgrade them.
 

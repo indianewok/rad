@@ -702,8 +702,7 @@ private:
     }
 
     // master function to map variable element positions--super bulky and unweldy, but works. needs to be broken up into constituents
-    bool map_positions(
-        const ReferencePositions& ref_pos, const std::multimap<std::string, const seq_element*>& static_refs,
+    bool map_positions(const ReferencePositions& ref_pos, const std::multimap<std::string, const seq_element*>& static_refs,
                    const std::string& read_seq,  SigElement::index<sig_id_tag>::type::iterator var_it,
                    SigElement::index<sig_id_tag>::type& id_index,  std::pair<int, int>& var_positions,
                    bool verbose) {
@@ -2079,7 +2078,7 @@ public:
    
     //to fastqa
     std::string to_fastqa() const {
-        // 1) decide which directions to emit
+        // decide which directions to emit
         std::vector<std::string> dirs;
         if (read_type == "concatenate") {
             dirs = { "forward", "reverse" };
@@ -2091,7 +2090,7 @@ public:
     
         std::string all_records;
     
-        // 2) for each requested direction, build one record
+        // for each requested direction, build one record
         for (auto const &dir : dirs) {
             // collect barcodes in insertion order, collapsing RC if needed
             std::vector<std::string> bc_keys;
@@ -2150,19 +2149,25 @@ public:
                 }
             }
     
-            //add CB tag
+            // add CB tag
             std::string cb_tag;
             for (size_t i = 0; i < bc_keys.size(); ++i) {
                 if (i) cb_tag += '-';
                 cb_tag += bc_map[bc_keys[i]];
             }
-    
+            // 
             bool is_fastq = !read_qual.empty();
             std::stringstream ss;
             ss << (is_fastq ? '@' : '>') << sequence_id;
-            if (!cb_tag.empty()) ss << " CB:Z:" << cb_tag;
-            if (!umi.empty())    ss << " UB:Z:" << umi;
+            if (!cb_tag.empty()){
+                ss << " CB:Z:" << cb_tag;
+            }
+            if (!umi.empty()){
+                    ss << " UB:Z:" << umi;
+            }
+
             ss << "\n" << read_seq << "\n";
+
             if (is_fastq){
                 ss << "+\n" << read_qual << "\n";
             }
@@ -2171,7 +2176,6 @@ public:
         }
         return all_records;
     }
-    
     
     // CSV conversion
     std::string to_csv(bool write_header = false) const {
@@ -2210,7 +2214,6 @@ public:
         return ss.str();
     }
 
-    //SEAMLESSLY COMPATIBLE WITH MINIMAP2
     //add split per barcode on demux
     //igblast->airr.tsv (That's a little downstream)
     //immcantation framework is separable by pipes (made into data.table, col.name is in the info)
