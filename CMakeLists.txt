@@ -47,7 +47,6 @@ add_library(edlib STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include/edlib/src/edlib.cpp
 )
     
-
 target_include_directories(ssw PUBLIC include/ssw)
 target_include_directories(edlib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/edlib/include)
 # --------------------------------------------------------------------------
