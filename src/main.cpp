@@ -289,7 +289,7 @@ int main(int argc, char* argv[]) {
         switch (c) {
           case 'l': layout_key             = optarg;            break;
           case 'q': fastq_path             = optarg;            break;
-          case 'k': custom_kit                    = optarg;            break;
+          case 'k': custom_kit             = optarg;            break;
           case 'g': global_whitelist_path  = optarg;            break;
           case 'c': custom_whitelist_path  = optarg;            break;
           case 'm': mut   = std::stoi(optarg);                  break;
@@ -310,8 +310,11 @@ int main(int argc, char* argv[]) {
         usage(argv[0]);
         return 1;
     }
-    if (max_verbose) verbose = true;
 
+    if (max_verbose){
+        verbose = true;
+    }
+    
     //
     // ─── OUTPUT PATHS ────────────────────────────────────────────────────────────
     //
@@ -422,6 +425,7 @@ int main(int argc, char* argv[]) {
         if (!kit_or_wl.empty() && !custom_whitelist_path.empty()) {
             whitelist_path = kit_or_wl + ":" + custom_whitelist_path;
         }
+
         if (whitelist_path) {
             if (verbose) std::cout << "[main] Loading custom kit & whitelist...\n";
             read_layout.load_wl(whitelist_path.value(), shift, mut, verbose, nthreads);
@@ -435,7 +439,7 @@ int main(int argc, char* argv[]) {
 
         // Demultiplex
         auto sigalign_start = std::chrono::steady_clock::now();
-        if (verbose) std::cout << "[sigalign] Running sigalign...\n";
+        std::cout << "[sigalign] Running sigalign...\n";
         SigString::sigalign(fastq_path, read_layout, outbase.string(),
                             max_verbose, nthreads, -1);
         auto sig_time = std::chrono::steady_clock::now() - sigalign_start;

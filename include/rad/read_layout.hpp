@@ -801,138 +801,6 @@ public:
         }
     }
 
-    //load whitelists from whitelist path in read layout
-    /*
-    void load_wl(std::optional<std::string> wl_path, std::optional<int> shift, std::optional<int> mut, bool verbose, int nthreads) {
-        using namespace std::chrono;
-        auto t0 = high_resolution_clock::now();
-    
-        // collect all static seqs for filter_bcs
-        std::vector<std::string> static_seqs;
-        for (auto const &elem : layout) {
-            if (elem.type == "static" && !elem.seq.empty())
-                static_seqs.push_back(elem.seq);
-        }
-    
-        // map each unique path to one wl_entry
-        std::unordered_map<std::string, whitelist::wl_entry> path2entry;
-    
-        for (auto const &elem : layout) {
-            if (elem.global_class != "barcode" || elem.type != "variable")
-                continue;
-    
-            std::string key = elem.class_id;
-            // normalize the key (strip rc_)
-            if (seq_utils::is_rc(key))
-                key = seq_utils::remove_rc(key);
-    
-            // resolve kit or path
-            std::string spec;
-            if(wl_path.has_value()){
-                spec = wl_path.value();
-            } else {
-                spec = elem.whitelist_path;
-            }
-            std::string path = whitelist_utils::kit_to_path(spec);
-    
-            std::cout << "[load_wl] "
-                      << "[" << elem.class_id << "]" 
-                      << "[" << spec << "] @ " << path << "\n";
-    
-            // if we've never loaded this file before, do so now
-            auto pit = path2entry.find(path);
-            if (pit == path2entry.end()) {
-                if(verbose) std::cout << "[load_wl] Loading from " << path << " ...\n";
-                auto t1 = high_resolution_clock::now();
-                // get expected length
-                size_t default_length = 16;
-                if (auto lit = layout.find(elem.class_id);
-                    lit != layout.end() && lit->expected_length)
-                {
-                    default_length = *lit->expected_length;
-                }
-    
-                // import & possibly generate mismatches
-                auto entry = wl_map.import_whitelist(spec, verbose, default_length);
-                //this is to generate mismatches for subsets that have been passed in--otherwise we're SOL
-                if (entry.true_bcs.size() <= 15000){
-                    int shift_amt = shift.value_or(2);
-                    int mut_amt   = mut.value_or(2);
-                    std::cout << "[load_wl] " << 
-                    "[" << elem.class_id << ":" << key << "]"
-                              << ", true barcodes = "    << entry.true_bcs.size()
-                              << "\n";        
-                    entry.generate_mismatch_barcodes(shift_amt, mut_amt, verbose, nthreads);
-                }
-    
-                // build filter_bcs
-                entry.filter_bcs.clear();
-                size_t def_len = 0;
-                if (auto lit = layout.find(elem.class_id);
-                    lit != layout.end() && lit->expected_length)
-                {
-                    def_len = *lit->expected_length;
-                }
-                for (auto const &s : static_seqs) {
-                    for (auto const &kmer : seq_utils::circ_kmerize(s, def_len)) {
-                        int64_seq bits(kmer);
-                        entry.filter_bcs.insert_bc_entry(bits);
-                    }
-                }
-                auto t2 = high_resolution_clock::now();
-                double ms = duration<double, std::milli>(t2 - t1).count();
-                std::cout << "[load_wl] loaded in " << (ms/1000.0) << " s\n";
-    
-                pit = path2entry.emplace(path, std::move(entry)).first;
-            }
-    
-            // map normalized class_id -> the already‐loaded wl_entry
-            auto [it, inserted] = wl_map.lists.try_emplace(key, pit->second);
-            if(inserted){
-                std::cout << "[load_wl] " << "New entry for " << key << "\n";
-            } else {
-                std::cout << "[load_wl] " << "Reusing entry for " << key << "\n";
-            }
-
-            // report
-            auto &E = wl_map.lists[key];
-            std::cout << "[load_wl] " << 
-            "[" << elem.class_id << ":" << key << "]"
-                      << ": global = "  << E.global_bcs.size()
-                      << ", true = "    << E.true_bcs.size()
-                      << ", filter = "  << E.filter_bcs.size()
-                      << "\n";
-        }
-
-        for (auto & [key, entry] : wl_map.lists) {
-            // 1) collect unique barcodes in true_bcs
-            std::unordered_set<int64_seq> to_remove;
-            to_remove.reserve(entry.true_bcs.size());
-            for (auto const & [bc, be] : entry.true_bcs) {
-                to_remove.insert(bc);
-            }
-        
-            // 2) drop them all from global_bcs
-            for (auto const & bc : to_remove) {
-                entry.global_bcs.remove_bc_entry(bc);
-            }
-
-            auto &E = wl_map.lists[key];
-            std::cout << "[load_wl] " << 
-            "[" << key << "]"
-                      << ": global = "  << E.global_bcs.size()
-                      << ", true = "    << E.true_bcs.size()
-                      << ", filter = "  << E.filter_bcs.size()
-                      << "\n";
-
-       }
-    
-        auto t3 = high_resolution_clock::now();
-        double total_s = duration<double>(t3 - t0).count();
-        std::cout << "[load_wl] finished loading all whitelists in " << total_s << " s\n";
-    }
-    */
-
     void load_wl(std::optional<std::string> wl_path,std::optional<int> shift, std::optional<int> mut, bool verbose, int nthreads) {
         using namespace std::chrono;
         auto t0 = high_resolution_clock::now();
@@ -948,9 +816,9 @@ public:
                 static_seqs.push_back(elem.seq);
         }
 
-        // 2) import & alias
+        // import & alias
         for (auto const &elem : layout) {
-            if (elem.global_class!="barcode" || elem.type!="variable")
+            if (elem.global_class != "barcode" || elem.type != "variable")
                 continue;
 
             // normalize class_id -> key
@@ -958,29 +826,32 @@ public:
             if (seq_utils::is_rc(key)){
                 key = seq_utils::remove_rc(key);
             }
+            
+            //select default length if at all, otherwise 
+            size_t default_length = 16;
+            if (auto lit = layout.find(elem.class_id);
+                lit != layout.end() && lit->expected_length)
+            {
+                default_length = *lit->expected_length;
+            }
 
-            // resolve the on-disk path
+            // resolve the on-disk path--BUG HERE--ELEM.WHITELIST_PATH CAN BE EMPTY
             std::string spec = wl_path ? wl_path.value() : elem.whitelist_path;
+            if(spec.empty() || spec == "" || elem.whitelist_path.empty() && wl_path){
+                std::cout << "'[load_wl] No whitelist path provided for " << elem.class_id << "\n";
+            }
+
             std::string path = whitelist_utils::kit_to_path(spec);
+            std::cout << "[load_wl] [" <<elem.class_id<< "] [" << spec << "] @ "<< path<<"\n";
 
-            std::cout << "[load_wl] ["<<elem.class_id<<"] ["<<spec<<"] @ "<<path<<"\n";
-
-            // 2a) import into the pool if not already
+            // import into the pool if not already
             auto pit = wl_map.lists.find(path);
             if (pit == wl_map.lists.end()) {
                 if (verbose) std::cout << "[load_wl] Loading from " << path << " ...\n";
                 auto t1 = high_resolution_clock::now();
 
-                // get expected_length
-                size_t default_length = 16;
-                if (auto lit = layout.find(elem.class_id);
-                    lit != layout.end() && lit->expected_length)
-                {
-                    default_length = *lit->expected_length;
-                }
-
                 // import & possibly generate mismatches
-                auto entry = wl_map.import_whitelist(spec, verbose, default_length);
+                whitelist::wl_entry entry = wl_map.import_whitelist(spec, verbose, default_length);
                 if (entry.true_bcs.size() <= 15000) {
                     entry.generate_mismatch_barcodes(shift.value_or(2), mut.value_or(2), verbose, nthreads);
                 }
@@ -1007,10 +878,9 @@ public:
                 pit = wl_map.lists.emplace(path, std::move(entry)).first;
             }
 
-            // 2b) alias into maps by reference
+            // alias into maps by reference
             auto &master = pit->second;
-            auto [mit, inserted] =
-            wl_map.maps.try_emplace(key, std::ref(master));
+            auto [mit, inserted] = wl_map.maps.try_emplace(key, std::ref(master));
 
             if (inserted) {
                 std::cout << "[load_wl] New entry for key ='"<< key << "'\n";
@@ -1029,7 +899,7 @@ public:
             }
         }
 
-        // 3) final prune: for each alias, remove true_bcs from global_bcs
+        // final prune: for each alias, remove true_bcs from global_bcs
         for (auto & [key, entry_ref] : wl_map.maps) {
             auto &E = entry_ref.get();
             std::unordered_set<int64_seq> to_remove;
@@ -1486,7 +1356,7 @@ public:
 
     void generate_misalignment_data(const std::string& fastq_path, ReadLayout& layout, int num_threads = 1, size_t max_reads = 50000) {
         using ChunkFunc = std::function<bool(const std::vector<read_streaming::sequence>&, const std::string&)>;
-        chunk_streaming<read_streaming::sequence, ChunkFunc> streamer;
+        chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(max_reads);
         
         size_t forward_count = 0;
         size_t reverse_count = 0;

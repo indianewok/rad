@@ -1,7 +1,7 @@
 ﻿Read Layout,,,,,
 id,seq,expected_length,type,class,whitelist
 forw_primer,CTACACGACGCTCTTCCGATCT,,static,,
-barcode,,16,variable,barcode,
+barcode,,16,variable,barcode,10x_3v3:/Users/cmv/Desktop/la1_barcodes.csv
 umi,,10,variable,umi,
 poly_t,,,static,poly_t,
 read,,,variable,read,

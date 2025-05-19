@@ -1768,8 +1768,7 @@ public:
                     valid_direction = false;
                     auto& id_index = sig_elements.get<sig_id_tag>();
                     id_index.modify(
-                        id_index.find(elem.class_id),
-                                      [](seq_element &e) { 
+                        id_index.find(elem.class_id), [](seq_element &e) { 
                                         e.element_pass = false; 
                                     });
                     if (verbose) {
@@ -1810,8 +1809,7 @@ public:
                             }
                             auto& id_index = sig_elements.get<sig_id_tag>();
                             id_index.modify(
-                                id_index.find(elem.class_id),
-                                [&](seq_element &e){
+                                id_index.find(elem.class_id), [&](seq_element &e){
                                     e.seq = final_bc;
                                     e.element_pass = true;
                                 }
@@ -1827,12 +1825,17 @@ public:
                                 if(elem.seq.has_value()){
                                     std::string seq = elem.seq.value();
                                     int64_seq putative_bc(seq);
-                                    barcode_entry be;
-                                    be.barcode = putative_bc;
-                                    be.flags = "";
-                                    be.edit_dist = 0;
-                                    be.filtered = true;
-                                   wl.filter_bcs.insert_bc_entry(be.barcode, be);
+                                    if(!wl.filter_bcs.check_wl_for(putative_bc)){
+                                        barcode_entry be;
+                                        be.barcode = putative_bc;
+                                        be.flags = "";
+                                        be.edit_dist = 0;
+                                        be.filtered = true;
+                                      //  #pragma omp critical
+                                      //  {
+                                       //     wl.filter_bcs.insert_bc_entry(be.barcode, be);
+                                       // }
+                                    }
                                 }
                             // adding this in to try to manage if there are multiple barcodes, 
                             // whether we should set this entire direction to false. 
@@ -1852,12 +1855,17 @@ public:
                         if(elem.seq.has_value()){
                             std::string seq = elem.seq.value();
                             int64_seq putative_bc(seq);
-                            barcode_entry be;
-                            be.barcode = putative_bc;
-                            be.flags = "";
-                            be.edit_dist = 0;
-                            be.filtered = true;
-                           wl.filter_bcs.insert_bc_entry(be.barcode, be);
+                            if(!wl.filter_bcs.check_wl_for(putative_bc)){
+                                barcode_entry be;
+                                be.barcode = putative_bc;
+                                be.flags = "";
+                                be.edit_dist = 0;
+                                be.filtered = true;
+                              //  #pragma omp critical
+                              //  {
+                              //      wl.filter_bcs.insert_bc_entry(be.barcode, be);
+                             //   }
+                            }
                         }
                     }
                 }
@@ -1960,7 +1968,7 @@ public:
         }
     }
     // full sigalign implementation (took out const on read layout in sigalign filter->whitelist population)
-    static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads = 1, 
+    static void sigalign_standard(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads = 1, 
         size_t max_reads = -1, bool split_bc = false) {
         //std::string home = std::getenv("HOME");
         //std::string desktop_path = home + "/Desktop/";
@@ -1980,7 +1988,7 @@ public:
 
         // Define the chunk processing function
         using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
-        chunk_streaming<read_streaming::sequence,ChunkFunc> streamer;
+        chunk_streaming<read_streaming::sequence,ChunkFunc> streamer(100000);
     
         // Set up the chunk processing function to process each chunk of reads
         ChunkFunc process_func = [&](auto const &chunk, auto const & /*unused_file*/) {
@@ -2017,7 +2025,758 @@ public:
                 << "[sigalign]       [csv]: " << csv_path << "\n"
                 << "[sigalign]     [fastq]: " << fastq_output_path << std::endl;
     }
+    
+    //metrics per chunk
+    static void sigalign_(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads, 
+        size_t max_reads = -1, bool split_bc = false, size_t initial_chunk_size = 5000) {
+        std::string sig_path = output_prefix + ".sig";
+        std::string csv_path = output_prefix + ".csv";
+        std::string fastq_output_path = output_prefix + ".fq";
+        std::string metrics_path = output_prefix + ".metrics.tsv";
+        
+        sigstring_writing sig_writer(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false);
+        sigstring_writing csv_writer(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false);
+        sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, /*compress=*/false, /*append=*/false);
+        parallel_writer writer;
 
+        std::ofstream metrics_file(metrics_path);
+        metrics_file << "chunk_id\tthread_id\tchunk_size\tread_time_ms\tprocess_time_ms\twrite_time_ms\ttotal_time_ms\n";
+        
+        // csv writer will emit exactly what to_csv(true) produces
+        {
+            SigString header("",0);
+            csv_writer(std::vector<SigString>{header});
+        }
+        
+        // Atomic counters for tracking
+        std::atomic<size_t> total_chunks{0};
+        std::atomic<size_t> total_reads{0};
+        std::atomic<size_t> total_passed_reads{0};
+        
+        // Fixed: Use regular doubles with mutex protection instead of atomic<double>
+        double total_read_time = 0;
+        double total_process_time = 0;
+        double total_write_time = 0;
+        std::mutex timing_mutex;
+        
+        // Timing metrics per thread
+        struct ThreadMetrics {
+            size_t chunks_processed = 0;
+            size_t reads_processed = 0;
+            double avg_chunk_size = 0;
+            double avg_processing_time_ms = 0;
+            double avg_read_time_ms = 0;
+            double avg_write_time_ms = 0;
+        };
+        std::vector<ThreadMetrics> thread_metrics(num_threads);
+        
+        // Adaptive chunk size - start with initial value and adjust
+        std::atomic<size_t> current_chunk_size{initial_chunk_size};
+        std::mutex chunk_size_mutex;
+        
+        // Define the chunk processing function
+        using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
+        chunk_streaming<read_streaming::sequence,ChunkFunc> streamer(initial_chunk_size);
+    
+        // Set up the chunk processing function to process each chunk of reads
+        ChunkFunc process_func = [&](auto const &chunk, auto const & /*unused_file*/) {
+            // Get thread ID for metrics
+            int thread_id = omp_get_thread_num();
+            size_t chunk_id = total_chunks.fetch_add(1) + 1;
+            size_t chunk_size = chunk.size();
+            total_reads += chunk_size;
+            
+            // Timing variables
+            auto start_time = std::chrono::high_resolution_clock::now();
+            auto read_end_time = start_time; // Will be set after read preparation
+            auto process_end_time = start_time; // Will be set after processing
+            auto write_end_time = start_time; // Will be set after writing
+            
+            // Read time ends here (chunk is already loaded)
+            read_end_time = std::chrono::high_resolution_clock::now();
+            
+            // collect SigString objects
+            std::vector<SigString> to_write;
+            to_write.reserve(chunk.size());
+            
+            // Process reads
+            for (auto const& read : chunk) {
+                SigString sig(read.id, read.seq.length());
+                sig.sigalign_static(read, layout, verbose);
+                sig.sigalign_variable(read, layout, verbose);
+                sig.sigalign_filter(read, layout, verbose);
+                if (sig.read_type != "filtered") {
+                    to_write.push_back(std::move(sig));
+                }
+            }
+            
+            size_t passed_reads = to_write.size();
+            total_passed_reads += passed_reads;
+            
+            // Process time ends here
+            process_end_time = std::chrono::high_resolution_clock::now();
+            
+            if (!to_write.empty()) {
+                writer.write(sig_writer, csv_writer, fastqa_writer, to_write);
+            }
+            
+            // Write time ends here
+            write_end_time = std::chrono::high_resolution_clock::now();
+            
+            // Calculate timing information
+            auto read_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(read_end_time - start_time).count();
+            auto process_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(process_end_time - read_end_time).count();
+            auto write_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(write_end_time - process_end_time).count();
+            auto total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(write_end_time - start_time).count();
+            
+            // Update thread metrics
+            ThreadMetrics& metrics = thread_metrics[thread_id];
+            metrics.chunks_processed++;
+            metrics.reads_processed += chunk_size;
+            metrics.avg_chunk_size = ((metrics.avg_chunk_size * (metrics.chunks_processed - 1)) + chunk_size) / metrics.chunks_processed;
+            metrics.avg_processing_time_ms = ((metrics.avg_processing_time_ms * (metrics.chunks_processed - 1)) + process_time_ms) / metrics.chunks_processed;
+            metrics.avg_read_time_ms = ((metrics.avg_read_time_ms * (metrics.chunks_processed - 1)) + read_time_ms) / metrics.chunks_processed;
+            metrics.avg_write_time_ms = ((metrics.avg_write_time_ms * (metrics.chunks_processed - 1)) + write_time_ms) / metrics.chunks_processed;
+            
+            // Update global timing with mutex protection
+            {
+                std::lock_guard<std::mutex> lock(timing_mutex);
+                total_read_time += read_time_ms;
+                total_process_time += process_time_ms;
+                total_write_time += write_time_ms;
+            }
+            
+            // Log metrics to file
+            #pragma omp critical
+            {
+                metrics_file << chunk_id << "\t" << thread_id << "\t" << chunk_size << "\t"
+                            << read_time_ms << "\t" << process_time_ms << "\t" << write_time_ms << "\t" << total_time_ms << "\n";
+                std::cout << chunk_id << " [thread " << thread_id << "] processed " << chunk_size 
+                          << " reads in " << total_time_ms / 1000.0 << " seconds ("
+                          << read_time_ms / 1000.0 << "s read, "
+                          << process_time_ms / 1000.0 << "s process, "
+                          << write_time_ms / 1000.0 << "s write)" << std::endl;
+            }
+            
+            // Adaptive chunk size logic - but without set_chunk_size
+            if (chunk_id % 10 == 0) { // Every 10 chunks, reconsider the chunk size
+                std::lock_guard<std::mutex> lock(chunk_size_mutex);
+                
+                double io_ratio = (read_time_ms + write_time_ms) / static_cast<double>(total_time_ms);
+                
+                // If IO takes more than 50% of time, increase chunk size
+                if (io_ratio > 0.5 && current_chunk_size < 100000) {
+                    size_t new_chunk_size = current_chunk_size * 1.5;
+                    std::cout << "[sigalign] Suggesting chunk size from " << current_chunk_size << " to " << new_chunk_size 
+                              << " (IO ratio: " << io_ratio << ")" << std::endl;
+                    //current_chunk_size = new_chunk_size;
+                    // Removed: streamer.set_chunk_size(new_chunk_size);
+                } 
+                // If IO takes less than 20% of time, consider decreasing chunk size for better load balancing
+                else if (io_ratio < 0.2 && current_chunk_size > 1000) {
+                    size_t new_chunk_size = current_chunk_size * 0.8;
+                    std::cout << "[sigalign] Suggesting chunk size from " << current_chunk_size << " to " << new_chunk_size 
+                              << " (IO ratio: " << io_ratio << ")" << std::endl;
+                   // current_chunk_size = new_chunk_size;
+                    // Removed: streamer.set_chunk_size(new_chunk_size);
+                }
+            }
+        };
+        
+        // Start time tracking
+        auto processing_start = std::chrono::high_resolution_clock::now();
+        
+        // Process the chunks - Cannot set chunk size
+        // Removed: streamer.set_chunk_size(initial_chunk_size);
+        streamer.process_chunks(fastq_path, process_func, num_threads, static_cast<int64_t>(max_reads));
+        
+        // End time tracking
+        auto processing_end = std::chrono::high_resolution_clock::now();
+        auto total_runtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(processing_end - processing_start).count();
+        
+        // Close metrics file
+        metrics_file.close();
+        
+        // Print summary statistics
+        std::cout << "\n[sigalign] Performance Summary:" << std::endl;
+        std::cout << "────────────────────────────────────────────────────" << std::endl;
+        std::cout << "[sigalign] Total runtime: " << total_runtime_ms / 1000.0 << " seconds" << std::endl;
+        std::cout << "[sigalign] Total chunks processed: " << total_chunks << std::endl;
+        std::cout << "[sigalign] Total reads processed: " << total_reads << std::endl;
+        std::cout << "[sigalign] Reads passing filter: " << total_passed_reads << " (" 
+                  << (total_reads > 0 ? (total_passed_reads * 100.0 / total_reads) : 0) << "%)" << std::endl;
+        std::cout << "[sigalign] Final target chunk size: " << current_chunk_size << std::endl;
+        std::cout << "[sigalign] Timing breakdown:" << std::endl;
+        std::cout << "  - Read time: " << total_read_time / 1000.0 << " seconds (" 
+                  << (total_read_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
+        std::cout << "  - Process time: " << total_process_time / 1000.0 << " seconds (" 
+                  << (total_process_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
+        std::cout << "  - Write time: " << total_write_time / 1000.0 << " seconds (" 
+                  << (total_write_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
+        
+        std::cout << "\n[sigalign] Thread Performance:" << std::endl;
+        for (int i = 0; i < num_threads; i++) {
+            std::cout << "  Thread " << i << ": " << thread_metrics[i].chunks_processed << " chunks, " 
+                      << thread_metrics[i].reads_processed << " reads, avg chunk size: " << thread_metrics[i].avg_chunk_size 
+                      << ", avg processing time: " << thread_metrics[i].avg_processing_time_ms << " ms" << std::endl;
+        }
+        
+        std::cout << "\n[sigalign] Output written to:\n"
+                << "[sigalign] [sigstring]: " << sig_path << "\n"
+                << "[sigalign]       [csv]: " << csv_path << "\n"
+                << "[sigalign]     [fastq]: " << fastq_output_path << "\n"
+                << "[sigalign]   [metrics]: " << metrics_path << std::endl;
+    }
+
+
+    static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
+                       bool verbose, int num_threads, size_t max_reads = -1, bool split_bc = false, 
+                       size_t initial_chunk_size = 50000) {
+    std::string sig_path = output_prefix + ".sig";
+    std::string csv_path = output_prefix + ".csv";
+    std::string fastq_output_path = output_prefix + ".fq";
+    std::string metrics_path = output_prefix + ".metrics.tsv";
+    std::string thread_metrics_path = output_prefix + ".thread_metrics.tsv";
+    
+    // Initialize writers - use non-compressed output initially
+    sigstring_writing sig_writer(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false);
+    sigstring_writing csv_writer(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false);
+    sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, /*compress=*/false, /*append=*/false);
+    
+    // Initialize parallel writer with enhanced metrics
+    parallel_writer writer;
+    
+    // Write CSV header
+    {
+        SigString header("", 0);
+        csv_writer(std::vector<SigString>{header});
+    }
+    
+    // Metrics files
+    std::ofstream metrics_file(metrics_path);
+    metrics_file << "chunk_id\tthread_id\tchunk_size\tread_time_ms\tprocess_time_ms\t"
+                 << "write_queue_time_ms\twrite_time_ms\ttotal_time_ms\tpassed_reads\tthread_load\n";
+                 
+    std::ofstream thread_metrics_file(thread_metrics_path);
+    thread_metrics_file << "thread_id\ttotal_chunks\ttotal_reads\ttotal_passed\ttotal_process_time_ms\tavg_load_pct\n";
+    
+    // Counters and metrics
+    std::atomic<size_t> total_chunks{0};
+    std::atomic<size_t> total_reads{0};
+    std::atomic<size_t> total_passed_reads{0};
+    
+    // Thread-specific metrics
+    struct ThreadMetrics {
+        size_t chunks_processed = 0;
+        size_t reads_processed = 0;
+        size_t passed_reads = 0;
+        double total_process_time_ms = 0;
+        double total_read_time_ms = 0;
+        double total_queue_time_ms = 0;
+        double total_write_time_ms = 0;
+        double total_active_time_ms = 0;  // Time spent actively processing
+        double cpu_load_pct = 0;          // Average CPU load percentage
+    };
+    
+    // Vector to store per-thread metrics
+    std::vector<ThreadMetrics> thread_metrics(num_threads);
+    std::mutex metrics_mutex;
+    
+    // Global timing metrics
+    double total_read_time = 0;
+    double total_process_time = 0;
+    double total_queue_time = 0;
+    double total_write_time = 0;
+    std::mutex timing_mutex;
+    
+    // Chunk size adaptation
+    std::atomic<size_t> current_chunk_size{initial_chunk_size};
+    std::mutex chunk_size_mutex;
+    
+    // Start time of the entire process
+    auto global_start_time = std::chrono::high_resolution_clock::now();
+    
+    // Thread activity tracking
+    std::vector<std::atomic<bool>> thread_active(num_threads);
+    for (int i = 0; i < num_threads; i++) {
+        thread_active[i] = false;
+    }
+    
+    // Thread to periodically sample thread activity
+    std::atomic<bool> sampling_active{true};
+    std::thread activity_sampler([&]() {
+        const int sample_interval_ms = 100; // Sample every 100ms
+        std::vector<size_t> activity_counts(num_threads, 0);
+        size_t total_samples = 0;
+        
+        while (sampling_active) {
+            // Sample thread activity
+            for (int i = 0; i < num_threads; i++) {
+                if (thread_active[i]) {
+                    activity_counts[i]++;
+                }
+            }
+            total_samples++;
+            
+            // Sleep for the sample interval
+            std::this_thread::sleep_for(std::chrono::milliseconds(sample_interval_ms));
+        }
+        
+        // Calculate CPU load percentages and store in thread metrics
+        {
+            std::lock_guard<std::mutex> lock(metrics_mutex);
+            for (int i = 0; i < num_threads; i++) {
+                if (total_samples > 0) {
+                    thread_metrics[i].cpu_load_pct = 
+                        (static_cast<double>(activity_counts[i]) / total_samples) * 100.0;
+                }
+            }
+        }
+    });
+    
+    // Define the chunk processing function
+    using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
+    chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(initial_chunk_size);
+    
+    // Set up the chunk processing function
+    ChunkFunc process_func = [&](auto const &chunk, auto const & /*unused_file*/) {
+        // Get thread ID and increment chunk counter
+        int thread_id = omp_get_thread_num();
+        size_t chunk_id = total_chunks.fetch_add(1) + 1;
+        size_t chunk_size = chunk.size();
+        total_reads += chunk_size;
+        
+        // Set thread as active
+        thread_active[thread_id] = true;
+        
+        // Timing variables
+        auto start_time = std::chrono::high_resolution_clock::now();
+        auto read_end_time = start_time;  // Chunk is already loaded at this point
+        auto process_start_time = read_end_time;
+        auto process_end_time = start_time;
+        auto queue_end_time = start_time;
+        auto write_end_time = start_time;
+        
+        // Read time is essentially 0 for chunk-based processing
+        read_end_time = std::chrono::high_resolution_clock::now();
+        
+        // Process the chunk - create SigString objects
+        std::vector<SigString> to_write;
+        to_write.reserve(chunk_size);
+        
+        process_start_time = std::chrono::high_resolution_clock::now();
+        
+        // Process each read in the chunk
+        for (const auto& read : chunk) {
+            SigString sig(read.id, read.seq.length());
+            sig.sigalign_static(read, layout, verbose);
+            sig.sigalign_variable(read, layout, verbose);
+            sig.sigalign_filter(read, layout, verbose);
+            
+            if (sig.read_type != "filtered") {
+                to_write.push_back(std::move(sig));
+            }
+        }
+        
+        size_t passed_reads = to_write.size();
+        total_passed_reads += passed_reads;
+        
+        // Process time ends
+        process_end_time = std::chrono::high_resolution_clock::now();
+        
+        // Queue for writing and measure queue time
+        auto write_start = process_end_time;
+        if (!to_write.empty()) {
+            writer.write(sig_writer, csv_writer, fastqa_writer, to_write);
+        }
+        
+        // Queue time ends (time to add to write queue)
+        queue_end_time = std::chrono::high_resolution_clock::now();
+        
+        // Set thread as inactive
+        thread_active[thread_id] = false;
+        
+        // Calculate timing information
+        auto read_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(read_end_time - start_time).count();
+        auto process_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(process_end_time - process_start_time).count();
+        auto queue_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time - process_end_time).count();
+        auto total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time - start_time).count();
+        
+        // Global elapsed time for calculating load
+        auto global_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            queue_end_time - global_start_time).count();
+        
+        // Calculate thread load as percentage of time this thread was active
+        double thread_load = (total_time_ms / static_cast<double>(global_elapsed)) * 100.0;
+        if (thread_load > 100.0) thread_load = 100.0;  // Cap at 100%
+        
+        // Update thread metrics
+        {
+            std::lock_guard<std::mutex> lock(metrics_mutex);
+            ThreadMetrics& metrics = thread_metrics[thread_id];
+            metrics.chunks_processed++;
+            metrics.reads_processed += chunk_size;
+            metrics.passed_reads += passed_reads;
+            metrics.total_process_time_ms += process_time_ms;
+            metrics.total_read_time_ms += read_time_ms;
+            metrics.total_queue_time_ms += queue_time_ms;
+            metrics.total_active_time_ms += total_time_ms;
+        }
+        
+        // Update global timing with mutex protection
+        {
+            std::lock_guard<std::mutex> lock(timing_mutex);
+            total_read_time += read_time_ms;
+            total_process_time += process_time_ms;
+            total_queue_time += queue_time_ms;
+        }
+        
+        // Log metrics to file
+        {
+            std::lock_guard<std::mutex> lock(metrics_mutex);
+            metrics_file << chunk_id << "\t" << thread_id << "\t" << chunk_size << "\t"
+                        << read_time_ms << "\t" << process_time_ms << "\t" << queue_time_ms << "\t"
+                        << 0 << "\t" << total_time_ms << "\t" << passed_reads << "\t" << thread_load << "\n";
+        }
+        
+        // Log progress
+        {
+            std::lock_guard<std::mutex> lock(metrics_mutex);
+            std::cout << "Chunk " << chunk_id << " [thread " << thread_id << "]: processed " 
+                    << chunk_size << " reads (" << passed_reads << " passed) in " 
+                    << total_time_ms / 1000.0 << "s (read:" << read_time_ms / 1000.0 
+                    << "s, process:" << process_time_ms / 1000.0 
+                    << "s, queue:" << queue_time_ms / 1000.0 
+                    << "s) - Load: " << thread_load << "%" << std::endl;
+        }
+        
+        // Adaptive chunk size evaluation
+        if (chunk_id % 10 == 0) {
+            std::lock_guard<std::mutex> lock(chunk_size_mutex);
+            
+            // Calculate I/O vs processing ratio for this thread
+            double io_ratio = (read_time_ms + queue_time_ms) / static_cast<double>(std::max(1UL, static_cast<unsigned long>(total_time_ms)));
+            
+            // Calculate a load-balanced chunk size adjustment
+            double load_factor = 1.0;
+            {
+                std::lock_guard<std::mutex> metrics_lock(metrics_mutex);
+                double min_load = 100.0;
+                double max_load = 0.0;
+                for (int i = 0; i < num_threads; i++) {
+                    double thread_util = (thread_metrics[i].total_active_time_ms / std::max(1.0, static_cast<double>(global_elapsed))) * 100.0;
+                    if (thread_util > 0) {
+                        min_load = std::min(min_load, thread_util);
+                        max_load = std::max(max_load, thread_util);
+                    }
+                }
+                // If there's a big difference in thread load, adjust chunk size
+                if (max_load > 0 && min_load < max_load * 0.7) {
+                    load_factor = 0.8;  // Decrease chunk size to balance load
+                } else if (max_load < 80.0) {
+                    load_factor = 1.2;  // Increase chunk size if all threads underutilized
+                }
+            }
+            
+            // Adjust chunk size based on I/O ratio and load balance
+            if ((io_ratio > 0.5 || load_factor > 1.1) && current_chunk_size < 200000) {
+                size_t new_chunk_size = current_chunk_size * 1.5;
+                std::cout << "[sigalign] Suggesting chunk size from " << current_chunk_size << " to " << new_chunk_size 
+                        << " (IO ratio: " << io_ratio << ", load factor: " << load_factor << ")" << std::endl;
+                // Uncomment if your chunk_streaming class supports dynamic chunk size adjustment
+                // current_chunk_size = new_chunk_size;
+                // streamer.set_chunk_size(new_chunk_size);
+            } 
+            else if ((io_ratio < 0.2 || load_factor < 0.9) && current_chunk_size > 5000) {
+                size_t new_chunk_size = current_chunk_size * 0.8;
+                std::cout << "[sigalign] Suggesting chunk size from " << current_chunk_size << " to " << new_chunk_size 
+                        << " (IO ratio: " << io_ratio << ", load factor: " << load_factor << ")" << std::endl;
+                // Uncomment if your chunk_streaming class supports dynamic chunk size adjustment
+                // current_chunk_size = new_chunk_size;
+                // streamer.set_chunk_size(new_chunk_size);
+            }
+        }
+    };
+    
+    // Start processing
+    auto processing_start = std::chrono::high_resolution_clock::now();
+    
+    // Process chunks
+    streamer.process_chunks(fastq_path, process_func, num_threads, static_cast<int64_t>(max_reads));
+    
+    // Stop the activity sampler
+    sampling_active = false;
+    if (activity_sampler.joinable()) {
+        activity_sampler.join();
+    }
+    
+    // Wait for writer to finish
+    writer.stop();
+    
+    // End time tracking
+    auto processing_end = std::chrono::high_resolution_clock::now();
+    auto total_runtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(processing_end - processing_start).count();
+    
+    // Write per-thread metrics
+    for (int i = 0; i < num_threads; i++) {
+        const auto& metrics = thread_metrics[i];
+        double avg_load = (metrics.total_active_time_ms / std::max(1.0, static_cast<double>(total_runtime_ms))) * 100.0;
+        
+        thread_metrics_file << i << "\t" 
+                          << metrics.chunks_processed << "\t"
+                          << metrics.reads_processed << "\t"
+                          << metrics.passed_reads << "\t"
+                          << metrics.total_process_time_ms << "\t"
+                          << avg_load << "\n";
+    }
+    
+    // Close metrics files
+    metrics_file.close();
+    thread_metrics_file.close();
+    
+    // Print summary statistics
+    std::cout << "\n[sigalign] Performance Summary:" << std::endl;
+    std::cout << "────────────────────────────────────────────────────" << std::endl;
+    std::cout << "[sigalign] Total runtime: " << total_runtime_ms / 1000.0 << " seconds" << std::endl;
+    std::cout << "[sigalign] Total chunks processed: " << total_chunks << std::endl;
+    std::cout << "[sigalign] Total reads processed: " << total_reads << std::endl;
+    std::cout << "[sigalign] Reads passing filter: " << total_passed_reads << " (" 
+              << (total_reads > 0 ? (total_passed_reads * 100.0 / total_reads) : 0) << "%)" << std::endl;
+    std::cout << "[sigalign] Final target chunk size: " << current_chunk_size << std::endl;
+    
+    // Timing breakdown
+    std::cout << "[sigalign] Timing breakdown:" << std::endl;
+    std::cout << "  - Read time: " << total_read_time / 1000.0 << " seconds (" 
+              << (total_read_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
+    std::cout << "  - Process time: " << total_process_time / 1000.0 << " seconds (" 
+              << (total_process_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
+    std::cout << "  - Queue time: " << total_queue_time / 1000.0 << " seconds (" 
+              << (total_queue_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
+    std::cout << "  - Write time: " << total_write_time / 1000.0 << " seconds (" 
+              << (total_write_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
+    
+    // Thread performance summary
+    std::cout << "\n[sigalign] Thread Performance:" << std::endl;
+    double max_load = 0.0;
+    double min_load = 100.0;
+    double avg_load = 0.0;
+    
+    for (int i = 0; i < num_threads; i++) {
+        const auto& metrics = thread_metrics[i];
+        double thread_load = (metrics.total_active_time_ms / std::max(1.0, static_cast<double>(total_runtime_ms))) * 100.0;
+        
+        max_load = std::max(max_load, thread_load);
+        if (metrics.chunks_processed > 0) {
+            min_load = std::min(min_load, thread_load);
+        }
+        avg_load += thread_load;
+        
+        std::cout << "  Thread " << i << ": " 
+                  << metrics.chunks_processed << " chunks, " 
+                  << metrics.reads_processed << " reads (" 
+                  << metrics.passed_reads << " passed), "
+                  << "avg process time: " << (metrics.total_process_time_ms / std::max(1UL, metrics.chunks_processed)) << " ms, "
+                  << "CPU load: " << thread_load << "%, "
+                  << "sampled load: " << metrics.cpu_load_pct << "%" << std::endl;
+    }
+    
+    avg_load /= num_threads;
+    
+    std::cout << "\n[sigalign] Thread Load Balance:" << std::endl;
+    std::cout << "  Average thread load: " << avg_load << "%" << std::endl;
+    std::cout << "  Min thread load: " << min_load << "%" << std::endl;
+    std::cout << "  Max thread load: " << max_load << "%" << std::endl;
+    std::cout << "  Load imbalance: " << (max_load - min_load) << "%" << std::endl;
+    
+    // File output information
+    std::cout << "\n[sigalign] Output written to:\n"
+              << "[sigalign] [sigstring]: " << sig_path << "\n"
+              << "[sigalign]       [csv]: " << csv_path << "\n"
+              << "[sigalign]     [fastq]: " << fastq_output_path << "\n"
+              << "[sigalign]   [metrics]: " << metrics_path << "\n"
+              << "[sigalign] [thread metrics]: " << thread_metrics_path << std::endl;
+    
+}
+    
+    //metrics parallelized over reads
+    static void sigalign_reads(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
+                                   bool verbose, int num_threads, size_t max_reads = -1, bool split_bc = false, 
+                                   size_t chunk_size = 50000) {
+    // Output file paths
+    std::string sig_path = output_prefix + ".sig";
+    std::string csv_path = output_prefix + ".csv";
+    std::string fastq_output_path = output_prefix + ".fq";
+    std::string metrics_path = output_prefix + ".metrics.tsv";
+    
+    // Initialize writers
+    sigstring_writing sig_writer(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false);
+    sigstring_writing csv_writer(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false);
+    sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, /*compress=*/true, /*append=*/false);
+    
+    // Initialize the parallel writer
+    parallel_writer writer;
+    
+    // Write CSV header
+    {
+        SigString header("", 0);
+        csv_writer(std::vector<SigString>{header});
+    }
+    
+    // Open metrics file
+    std::ofstream metrics_file(metrics_path);
+    metrics_file << "chunk_id\tseqs_in_chunk\tseqs_passed\tread_time_ms\tprocess_time_ms\tqueue_time_ms\ttotal_time_ms\n";
+    
+    // Initialize file and reader
+    file_streaming files(fastq_path);
+    read_streaming reader(files);
+    
+    // Counters
+    size_t total_reads = 0;
+    size_t total_passed = 0;
+    size_t chunk_id = 0;
+    
+    // Timing totals
+    double total_read_time = 0;
+    double total_process_time = 0;
+    double total_queue_time = 0;
+    
+    // Process chunks sequentially
+    while (true) {
+        chunk_id++;
+        
+        // Start timing
+        auto start_time = std::chrono::high_resolution_clock::now();
+        
+        // Read a chunk of sequences
+        std::vector<read_streaming::sequence> chunk;
+        chunk.reserve(chunk_size);
+        
+        size_t local_count = 0;
+        while (local_count < chunk_size) {
+            if (max_reads > 0 && total_reads >= max_reads) break;
+            
+            auto seq = reader.next_sequence();
+            if (!seq) break;
+            
+            chunk.push_back(*seq);
+            local_count++;
+            total_reads++;
+        }
+        
+        // If no more sequences, break
+        if (chunk.empty()) break;
+        
+        // Read time ends here
+        auto read_end_time = std::chrono::high_resolution_clock::now();
+        
+        // Process the sequences in parallel
+        std::vector<SigString> results;
+        results.resize(chunk.size());  // Pre-allocate space for results
+        std::atomic<size_t> passed_count{0};
+        
+        #pragma omp parallel num_threads(num_threads)
+        {
+            // Thread-local vector to collect passed SigStrings
+            std::vector<SigString> thread_results;
+            thread_results.reserve(chunk.size() / num_threads);
+            
+            #pragma omp for schedule(dynamic) nowait
+            for (size_t i = 0; i < chunk.size(); i++) {
+                const auto& read = chunk[i];
+                SigString sig(read.id, read.seq.length());
+                sig.sigalign_static(read, layout, verbose);
+                sig.sigalign_variable(read, layout, verbose);
+                sig.sigalign_filter(read, layout, verbose);
+                
+                if (sig.read_type != "filtered") {
+                    thread_results.push_back(std::move(sig));
+                }
+            }
+            
+            // Merge thread results into global results vector
+            #pragma omp critical
+            {
+                for (auto& sig : thread_results) {
+                    results[passed_count++] = std::move(sig);
+                }
+            }
+        }
+        
+        // Resize results to actual number of passed reads
+        results.resize(passed_count);
+        total_passed += passed_count;
+        
+        // Process time ends here
+        auto process_end_time = std::chrono::high_resolution_clock::now();
+        
+        // Queue results for writing (non-blocking)
+        if (!results.empty()) {
+            writer.write(sig_writer, csv_writer, fastqa_writer, results);
+        }
+        
+        // Queue time ends here
+        auto queue_end_time = std::chrono::high_resolution_clock::now();
+        
+        // Calculate timing information
+        auto read_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(read_end_time - start_time).count();
+        auto process_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(process_end_time - read_end_time).count();
+        auto queue_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time - process_end_time).count();
+        auto total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time - start_time).count();
+        
+        // Update timing totals
+        total_read_time += read_time_ms;
+        total_process_time += process_time_ms;
+        total_queue_time += queue_time_ms;
+        
+        // Log metrics
+        metrics_file << chunk_id << "\t" << chunk.size() << "\t" << passed_count << "\t"
+                    << read_time_ms << "\t" << process_time_ms << "\t" << queue_time_ms << "\t" << total_time_ms << "\n";
+        
+        // Print progress
+        std::cout << "Chunk " << chunk_id << ": processed " << chunk.size() << " reads in " 
+                  << total_time_ms / 1000.0 << " seconds ("
+                  << read_time_ms / 1000.0 << "s read, "
+                  << process_time_ms / 1000.0 << "s process, "
+                  << queue_time_ms / 1000.0 << "s queue), "
+                  << passed_count << " passed (" << (double)passed_count / chunk.size() * 100.0 << "%)" << std::endl;
+        
+        // Free memory explicitly
+        std::vector<read_streaming::sequence>().swap(chunk);
+        std::vector<SigString>().swap(results);
+    }
+    
+    // Wait for writer to finish all queued writes
+    writer.stop();
+    
+    // Close metrics file
+    metrics_file.close();
+    
+    // Calculate total time
+    double total_time = total_read_time + total_process_time + total_queue_time;
+    
+    // Print summary
+    std::cout << "\n[sigalign] Performance Summary:" << std::endl;
+    std::cout << "────────────────────────────────────────────────────" << std::endl;
+    std::cout << "[sigalign] Total runtime: " << total_time / 1000.0 << " seconds" << std::endl;
+    std::cout << "[sigalign] Total chunks processed: " << chunk_id << std::endl;
+    std::cout << "[sigalign] Total reads processed: " << total_reads << std::endl;
+    std::cout << "[sigalign] Reads passing filter: " << total_passed << " (" 
+              << (total_reads > 0 ? (total_passed * 100.0 / total_reads) : 0) << "%)" << std::endl;
+    std::cout << "[sigalign] Timing breakdown:" << std::endl;
+    std::cout << "  - Read time: " << total_read_time / 1000.0 << " seconds (" 
+              << (total_read_time * 100.0 / total_time) << "%)" << std::endl;
+    std::cout << "  - Process time: " << total_process_time / 1000.0 << " seconds (" 
+              << (total_process_time * 100.0 / total_time) << "%)" << std::endl;
+    std::cout << "  - Queue time: " << total_queue_time / 1000.0 << " seconds (" 
+              << (total_queue_time * 100.0 / total_time) << "%)" << std::endl;
+    
+    std::cout << "\n[sigalign] Output written to:\n"
+            << "[sigalign] [sigstring]: " << sig_path << "\n"
+            << "[sigalign]       [csv]: " << csv_path << "\n"
+            << "[sigalign]     [fastq]: " << fastq_output_path << "\n"
+            << "[sigalign]   [metrics]: " << metrics_path << std::endl;
+}
+    
     // sigstring format
     std::string to_sigstring() const {
         std::stringstream ss;

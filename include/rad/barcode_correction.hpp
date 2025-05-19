@@ -388,6 +388,7 @@ namespace mutation_tools {
 
 };
 
+/*
 template<typename key, typename value> struct bc_multimap:std::unordered_multimap<key, value> {
     using base = std::unordered_multimap<key, value>;
     using base::base;
@@ -562,6 +563,329 @@ template<typename key, typename value> struct bc_multimap:std::unordered_multima
         write_wl_summary(ofs, filter_keys);
     }
 };
+*/
+
+template<typename key, typename value>
+struct bc_multimap {
+private:
+    // Store unique values - using a set lets us find and reuse identical values
+    std::unordered_set<value> unique_values;
+    
+    // Maps keys to pointers to values in the unique set
+    std::unordered_multimap<key, const value*> associations;
+
+    // Helper to extract key from either a key or a value (unchanged)
+    static inline const key& key_of(key const &k) noexcept { 
+        return k;
+    }
+    static inline const key& key_of(value const &v) noexcept { 
+        return v.barcode; 
+    }
+
+public:
+    // Size reporting
+    size_t size() const { return associations.size(); }
+    bool empty() const { return associations.empty(); }
+    void clear() { associations.clear(); unique_values.clear(); }
+    
+    // ==== Core Insertion Methods ====
+    
+    // Insert a barcode entry with an existing value
+    template<typename T>
+    void insert_bc_entry(const T &observed, const value &correct) {
+        // First, insert or find the value in unique_values
+        auto [value_it, value_inserted] = unique_values.insert(correct);
+        const value* ptr = &(*value_it);
+        
+        // Now map the key to the unique value
+        associations.emplace(key_of(observed), ptr);
+    }
+    
+    // Insert with a moved value
+    template<typename T>
+    void insert_bc_entry(const T &observed, value &&correct) {
+        // When moving, we need to handle things a bit differently
+        // First check if an equivalent value already exists
+        auto find_it = unique_values.find(correct);
+        
+        if (find_it != unique_values.end()) {
+            // Use existing value
+            associations.emplace(key_of(observed), &(*find_it));
+        } else {
+            // Insert the moved value
+            auto [value_it, inserted] = unique_values.insert(std::move(correct));
+            associations.emplace(key_of(observed), &(*value_it));
+        }
+    }
+    
+    // Use the key as value too
+    template<typename T>
+    void insert_bc_entry(const T &observed) {
+        value v{};
+        v.barcode = key_of(observed);
+        insert_bc_entry(observed, std::move(v));
+    }
+    
+    // In-place construction
+    template<typename T, typename... Args>
+    void emplace_bc_entry(const T &observed, Args&&... args) {
+        // Construct the value with the provided arguments
+        value v{std::forward<Args>(args)...};
+        insert_bc_entry(observed, std::move(v));
+    }
+    
+    // Direct emplace method for compatibility with the original implementation
+    template<typename K, typename V>
+    void emplace(K&& k, V&& v) {
+        // First, insert or find the value in unique_values
+        // Use perfect forwarding to preserve move semantics if possible
+        auto [value_it, value_inserted] = unique_values.insert(std::forward<V>(v));
+        const value* ptr = &(*value_it);
+        
+        // Now map the key to the unique value
+        associations.emplace(std::forward<K>(k), ptr);
+    }
+    
+    // ==== Removal Methods ====
+    
+    // Remove a key-value entry
+    template<typename T>
+    void remove_bc_entry(const T &observed) {
+        associations.erase(key_of(observed));
+        // A periodic cleanup could remove orphaned values if needed
+    }
+    
+    // ==== Lookup Methods ====
+    
+    // Check if whitelist contains this key
+    template<typename T>
+    bool check_wl_for(T const &x) const {
+        if constexpr (std::is_same_v<T,key> || std::is_same_v<T,value>) {
+            return associations.find(key_of(x)) != associations.end();
+        } else {
+            // container of keys
+            for (auto const &y : x) {
+                if (check_wl_for(y)) return true;
+            }
+            return false;
+        }
+    }
+    
+    // Return matching barcodes
+    template<typename T>
+    std::unordered_set<key> return_matching_barcodes(T const &x) const {
+        std::unordered_set<key> out;
+        if constexpr (std::is_same_v<T,key> || std::is_same_v<T,value>) {
+            if (check_wl_for(x))
+                out.insert(key_of(x));
+        } else {
+            for (auto const &y : x) {
+                if (check_wl_for(y))
+                    out.insert(key_of(y));
+            }
+        }
+        return out;
+    }
+    
+    // Return putative correct barcodes
+    template<typename T>
+    std::unordered_set<key> return_putative_correct_bcs(T const &x) const {
+        std::unordered_set<key> out;
+        if constexpr (std::is_same_v<T,key> || std::is_same_v<T,value>) {
+            auto range = associations.equal_range(key_of(x));
+            for (auto it = range.first; it != range.second; ++it)
+                out.insert(it->second->barcode);
+        } else {
+            for (auto const &y : x) {
+                auto sub = return_putative_correct_bcs(y);
+                out.insert(sub.begin(), sub.end());
+            }
+        }
+        return out;
+    }
+    
+    // ==== Counter Methods ====
+    
+    // Add a count to a barcode_entry
+    template<typename T>
+    void update_bc_count(T const &x, barcode_counts slot = total) const {
+        auto range = associations.equal_range(key_of(x));
+        for (auto it = range.first; it != range.second; ++it) {
+            const_cast<value*>(it->second)->count.increment(slot);
+        }
+    }
+    
+    // Subtract a count
+    template<typename T>
+    void subtract_bc_count(T const &x, barcode_counts slot = total) const {
+        auto range = associations.equal_range(key_of(x));
+        for (auto it = range.first; it != range.second; ++it) {
+            const_cast<value*>(it->second)->count.subtract(slot);
+        }
+    }
+    
+    // Get the count for a barcode entry
+    template<typename T>
+    int get_bc_count(T const &x, barcode_counts slot = total) const {
+        auto range = associations.equal_range(key_of(x));
+        if (range.first != range.second)
+            return range.first->second->count.load(slot);
+        return 0;
+    }
+    
+    // ==== Summary Methods ====
+    
+    // Summarize counts
+    std::vector<std::tuple<std::string,int,int,int,int,int,int,int>>
+    summarize_counts(const std::unordered_set<key> *filter_keys = nullptr) const {
+        using row = std::tuple<std::string,int,int,int,int,int,int,int>;
+        std::vector<row> rows;
+        
+        // Build the list of keys to process
+        std::vector<key> keys;
+        if (filter_keys) {
+            keys.reserve(filter_keys->size());
+            for (auto const &k : *filter_keys)
+                keys.push_back(k);
+        } else {
+            // Collect distinct keys from the multimap
+            std::unordered_set<key> seen;
+            seen.reserve(associations.size());
+            for (auto const &kv : associations)
+                seen.insert(kv.first);
+            keys.reserve(seen.size());
+            for (auto const &k : seen)
+                keys.push_back(k);
+        }
+        
+        rows.reserve(keys.size());
+        
+        // For each key, find its perfect‐match mapping and pull the counts
+        for (auto const &bc : keys) {
+            auto range = associations.equal_range(bc);
+            int tot=0, corr=0, fwd=0, rev=0, fwd_c=0, rev_c=0, filt=0;
+            
+            if (range.first != range.second) {
+                // Prefer the exact key if present
+                auto it = range.first;
+                for (; it != range.second; ++it) {
+                    if (it->first == bc)
+                        break;
+                }
+                if (it == range.second)
+                    it = range.first;
+                
+                tot = it->second->count.load(barcode_counts::total);
+                corr = it->second->count.load(barcode_counts::corrected);
+                fwd = it->second->count.load(barcode_counts::forw);
+                rev = it->second->count.load(barcode_counts::rev);
+                fwd_c = it->second->count.load(barcode_counts::forw_concat);
+                rev_c = it->second->count.load(barcode_counts::rev_concat);
+                filt = it->second->count.load(barcode_counts::filtered);
+            }
+            rows.emplace_back(bc.bits_to_sequence(), tot, corr, fwd, rev, fwd_c, rev_c, filt);
+        }
+        return rows;
+    }
+    
+    // Write summary to stream
+    void write_wl_summary(std::ostream &out, const std::string class_id, 
+                        const std::unordered_set<key> *filter_keys = nullptr) const {
+        static bool header_printed = false;
+        if(!header_printed) {
+            out << "class_id,true_barcode,total_count,corrected_count,forw_count,rev_count,"
+                << "forw_concat_count,rev_concat_count,filtered_count\n";
+            header_printed = true;
+        }
+        
+        auto rows = summarize_counts(filter_keys);
+        for (auto const & tpl : rows) {
+            auto const & bc = std::get<0>(tpl);
+            auto tot  = std::get<1>(tpl);
+            auto corr = std::get<2>(tpl);
+            auto forw = std::get<3>(tpl);
+            auto rev  = std::get<4>(tpl);
+            auto forw_concat = std::get<5>(tpl);
+            auto rev_concat = std::get<6>(tpl);
+            auto filtered = std::get<7>(tpl);
+            
+            // Print the row
+            out << class_id << ',' << bc << ','  << tot << ',' << corr << ',' << forw 
+                << ',' << rev << ',' << forw_concat << ',' << rev_concat << ',' << filtered << '\n';
+        }
+    }
+    
+    // Write summary to file
+    void write_wl_summary(const std::string &path = "", 
+                        const std::unordered_set<key> *filter_keys = nullptr) const {
+        std::ofstream ofs(path);
+        if (!ofs) {
+            throw std::runtime_error("Failed to open output file: " + path);
+        }
+        write_wl_summary(ofs, filter_keys);
+    }
+    
+    // ==== Iterator Support ====
+    
+    // Iterator adapter to dereference pointers automatically
+    template<typename BaseIterator>
+    class deref_iterator {
+    private:
+        BaseIterator it;
+        
+    public:
+        // Iterator type definitions
+        using difference_type = typename BaseIterator::difference_type;
+        using value_type = std::pair<const key&, const value&>;
+        using reference = value_type;
+        using pointer = void;
+        using iterator_category = std::forward_iterator_tag;
+        
+        deref_iterator(BaseIterator iter) : it(iter) {}
+        
+        deref_iterator& operator++() { ++it; return *this; }
+        deref_iterator operator++(int) { auto tmp = *this; ++(*this); return tmp; }
+        
+        bool operator==(const deref_iterator& other) const { return it == other.it; }
+        bool operator!=(const deref_iterator& other) const { return it != other.it; }
+        
+        reference operator*() const { 
+            return {it->first, *(it->second)}; 
+        }
+    };
+    
+    // Iterator type definitions
+    using iterator = deref_iterator<typename std::unordered_multimap<key, const value*>::iterator>;
+    using const_iterator = deref_iterator<typename std::unordered_multimap<key, const value*>::const_iterator>;
+    
+    // Iterator methods
+    iterator begin() { return iterator(associations.begin()); }
+    iterator end() { return iterator(associations.end()); }
+    const_iterator begin() const { return const_iterator(associations.begin()); }
+    const_iterator end() const { return const_iterator(associations.end()); }
+    const_iterator cbegin() const { return const_iterator(associations.cbegin()); }
+    const_iterator cend() const { return const_iterator(associations.cend()); }
+    
+    // Equal range returning dereferencing iterators
+    std::pair<iterator, iterator> equal_range(const key& k) {
+        auto range = associations.equal_range(k);
+        return {iterator(range.first), iterator(range.second)};
+    }
+    
+    std::pair<const_iterator, const_iterator> equal_range(const key& k) const {
+        auto range = associations.equal_range(k);
+        return {const_iterator(range.first), const_iterator(range.second)};
+    }
+    
+    // Find method with dereferencing iterator
+    iterator find(const key& k) {
+        return iterator(associations.find(k));
+    }
+    
+    const_iterator find(const key& k) const {
+        return const_iterator(associations.find(k));
+    }
+};
 
 class whitelist {
     public:
@@ -666,7 +990,7 @@ class whitelist {
         bool isBitlist = whitelist_utils::check_if_bitlist(spec, verbose, /*N=*/10);
         if(verbose){
             std::string islist = isBitlist ? "IS" : "IS NOT";
-            std::cout << "Detected element " << islist << " a bit-configured whitelist!" << std::endl;
+            std::cout << "[check_if_bitlist] Detected element " << islist << " a bit-configured whitelist!" << std::endl;
         }
 
         // read all lines (skipping header)  
@@ -682,13 +1006,14 @@ class whitelist {
 
             int64_seq seq;
             if (isBitlist) {
-                // decimal -> bits
                 try {
+                    //if(verbose) std::cout << "[load_barcodes] Loading bitlist...\n";
                     int64_t code = std::stoll(tok);
                     seq.length = default_length;
                     seq.bits   = { code };
                 } catch (...) { continue; }
             } else {
+                //if(verbose) std::cout << "[load_barcodes] Converting characters to bits...\n";
                 seq.sequence_to_bits(tok);
                 if (seq.bits.empty()) continue;
             }
