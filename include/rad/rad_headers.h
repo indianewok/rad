@@ -17,6 +17,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <unordered_map>
