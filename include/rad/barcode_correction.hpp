@@ -3,25 +3,26 @@
 // set up a counter class to handle atomic operations
 // Define an enum with unique indices
 enum barcode_counts {
-    forw = 0,         // Forward count
-    forw_concat = 1,  // Forward concatenation count
-    rev = 2,          // Reverse count
-    rev_concat = 3,   // Reverse concatenation count
-    total = 4,         // Total count
-    corrected = 5,     // Corrected count
-    filtered = 6
+    raw = 0,          // Raw count
+    forw = 1,         // Forward count
+    forw_concat = 2,  // Forward concatenation count
+    rev = 3,          // Reverse count
+    rev_concat = 4,   // Reverse concatenation count
+    total = 5,         // Total count
+    corrected = 6,     // Corrected count
+    filtered = 7       // filtered count
 };
 
 // building a thread-safe counter to be used during count updating processes
 struct counter {
-    // Use an array of 7 atomic ints.
-    std::array<std::atomic<int>, 7> counts;
+    // Use an array of 8 atomic ints.
+    std::array<std::atomic<int>, 8> counts;
 
     // Default constructor: initialize all counters to 0.
-    counter() : counts{{0, 0, 0, 0, 0, 0, 0}} { }
+    counter() : counts{{0, 0, 0, 0, 0, 0, 0, 0}} { }
 
     // A constructor that initializes all counters to a given value.
-    counter(int init) : counts{{init, init, init, init, init, init, init}} { }
+    counter(int init) : counts{{init, init, init, init, init, init, init, init}} { }
 
     // Copy constructor: copy each counter's current value.
     counter(const counter &other) {
@@ -71,8 +72,9 @@ struct counter {
     }
 
     // Load all counter values into a tuple.
-    std::tuple<int, int, int, int, int, int, int> load_all() const {
+    std::tuple<int, int, int, int, int, int, int, int> load_all() const {
         return std::make_tuple(
+            counts[barcode_counts::raw].load(std::memory_order_relaxed),
             counts[barcode_counts::forw].load(std::memory_order_relaxed),
             counts[barcode_counts::forw_concat].load(std::memory_order_relaxed),
             counts[barcode_counts::rev].load(std::memory_order_relaxed),
@@ -90,6 +92,11 @@ class int64_seq {
         uint16_t length;            // Total number of bases in the sequence.
         std::vector<int64_t> bits;  // Each int64_t encodes a chunk (2 bits per nucleotide, up to 32 bases per chunk).
         int64_seq() : length(0) {}
+
+        explicit int64_seq(int64_t raw_bits, uint16_t seq_length) : length(seq_length) {
+            bits.reserve(1);
+            bits.push_back(raw_bits);
+        }
     
         explicit int64_seq(const std::string& sequence) {
             sequence_to_bits(sequence);
@@ -152,7 +159,6 @@ class int64_seq {
             }
             std::cout << "\n";
         }
-        
     };
 
 // class structure to hold barcode information and its associated count
@@ -181,6 +187,16 @@ namespace std {
     template <>
     struct hash<int64_seq> {
         std::size_t operator()(const int64_seq &seq) const {
+             // Skip length hashing
+            return std::hash<int64_t>{}(seq.bits[0]);
+        }
+    };
+
+    /* 
+    //this version is slower, but takes bit length into account during hashing. will be best used for longer sequences
+    template <>
+    struct hash<int64_seq> {
+        std::size_t operator()(const int64_seq &seq) const {
             std::size_t res = std::hash<uint16_t>()(seq.length);
             for (const auto &b : seq.bits) {
                 boost::hash_combine(res, b);
@@ -188,6 +204,7 @@ namespace std {
             return res;
         }
     };
+    */
 
     template<>
     struct hash<barcode_entry> {
@@ -284,9 +301,11 @@ namespace mutation_tools {
     // generate point mutations for a given int64_seq sequence
     std::unordered_set<int64_seq> generate_point_mutations(const int64_seq &seq) {
         std::unordered_set<int64_seq> mutations;
-        if (seq.bits.empty()) return mutations;
+        if (seq.bits.empty()){
+            return mutations;
+        }
         int sequence_length = seq.length;
-        int64_t original_value = seq.bits[0];  // Assumes one chunk.
+        int64_t original_value = seq.bits[0];  // Assumes one chunk
         for (int pos = 0; pos < sequence_length; ++pos) {
             int64_t original_nuc = (original_value >> (2 * pos)) & 0b11;
             for (int64_t new_nuc = 0; new_nuc < 4; ++new_nuc) {
@@ -301,19 +320,72 @@ namespace mutation_tools {
             }
         }
         return mutations;
+    } 
+
+    //raw pt mutation gen
+    std::unordered_set<int64_t> generate_point_mutations_raw(int64_t original_value, int sequence_length) {
+        std::unordered_set<int64_t> mutations;
+        mutations.reserve(sequence_length * 3); // Pre-reserve for efficiency
+        
+        for (int pos = 0; pos < sequence_length; ++pos) {
+            int64_t original_nuc = (original_value >> (2 * pos)) & 0b11;
+            for (int64_t new_nuc = 0; new_nuc < 4; ++new_nuc) {
+                if (new_nuc != original_nuc) {
+                    int64_t clear_mask = ~(0b11LL << (2 * pos));
+                    int64_t mutated_value = (original_value & clear_mask) | (new_nuc << (2 * pos));
+                    mutations.insert(mutated_value); // Fast int64_t hash and insert
+                }
+            }
+        }
+        return mutations;
     }
 
     // generate mutated barcode candidates across multiple rounds, returning a unique set
-    std::unordered_set<int64_seq> generate_mutated_barcodes(const int64_seq &seq, int mutation_rounds = 1) {
+    std::unordered_set<int64_seq> generate_mutated_barcodes_depr(const int64_seq &seq, int mutation_rounds = 1) {
         if (seq.bits.empty()) return {};
         int sequence_length = seq.length;
         int64_seq initial = seq;
-        std::unordered_set<int64_seq> all_mutations{ 
-            initial 
-        };
-        std::unordered_set<int64_seq> current_round{ 
-            initial
-        };
+        //std::unordered_set<int64_seq> all_mutations{ 
+        //    initial 
+       // };
+        //std::unordered_set<int64_seq> current_round{ 
+        //    initial
+        //};
+
+            // *** HARD-CODED PRE-RESERVATION ***
+        size_t expected_total;
+        if (mutation_rounds == 1) {
+            expected_total = 100;
+        } else if (mutation_rounds == 2) {
+            expected_total = 2000;
+        } else if (mutation_rounds == 3) {
+            expected_total = 60000;
+        } else {
+            expected_total = 1000; // fallback
+        }
+    
+        // Pre-reserve all hash tables
+        std::unordered_set<int64_seq> all_mutations;
+        all_mutations.reserve(expected_total);
+        all_mutations.insert(initial);
+        
+        std::unordered_set<int64_seq> current_round;
+        current_round.reserve(mutation_rounds == 1 ? 100 : 2000);
+        current_round.insert(initial);
+    
+        for (int round = 0; round < mutation_rounds; ++round) {
+            std::unordered_set<int64_seq> next_round;
+            // Hard-coded reservation for next round
+            if (round == 0) {
+                next_round.reserve(100);      // Round 1
+            } else if (round == 1) {
+                next_round.reserve(2000);     // Round 2  
+            } else {
+                next_round.reserve(60000);    // Round 3+
+            }
+        }
+        // *** END HARD-CODED RESERVATION ***
+
         for (int round = 0; round < mutation_rounds; ++round) {
             std::unordered_set<int64_seq> next_round;
             for (const auto &candidate : current_round) {
@@ -331,8 +403,86 @@ namespace mutation_tools {
         return all_mutations;
     }
 
+    //generating mutated barcodes using raw int64_t values for speed
+    std::unordered_set<int64_seq> generate_mutated_barcodes(const int64_seq &seq, int mutation_rounds = 1) {
+        if (seq.bits.empty()) return {};
+        
+        int sequence_length = seq.length;
+        int64_t initial_raw = seq.bits[0]; // Extract raw value once
+        
+        // *** HARD-CODED PRE-RESERVATION ***
+        size_t expected_total;
+        if (mutation_rounds == 1) {
+            expected_total = 100;
+        } else if (mutation_rounds == 2) {
+            expected_total = 2000;
+        } else if (mutation_rounds == 3) {
+            expected_total = 60000;
+        } else {
+            expected_total = 1000; // fallback
+        }
+        
+        // ALL GENERATION USING raw int64_t values
+        std::unordered_set<int64_t> all_mutations_raw;
+        all_mutations_raw.reserve(expected_total);
+        all_mutations_raw.insert(initial_raw);
+        
+        std::unordered_set<int64_t> current_round_raw;
+        current_round_raw.reserve(mutation_rounds == 1 ? 100 : 2000);
+        current_round_raw.insert(initial_raw);
+        
+        // Fast raw mutation generation
+        for (int round = 0; round < mutation_rounds; ++round) {
+            std::unordered_set<int64_t> next_round_raw;
+            
+            // Hard-coded reservation for next round
+            if (round == 0) {
+                next_round_raw.reserve(100); // Round 1
+            } else if (round == 1) {
+                next_round_raw.reserve(2000); // Round 2  
+            } else {
+                next_round_raw.reserve(15000); // Round 3+
+            }
+            
+            for (const auto candidate_raw : current_round_raw) {
+                // Generate mutations directly as raw int64_t - no function call overhead
+                for (int pos = 0; pos < sequence_length; ++pos) {
+                    int64_t original_nuc = (candidate_raw >> (2 * pos)) & 0b11;
+                    for (int64_t new_nuc = 0; new_nuc < 4; ++new_nuc) {
+                        if (new_nuc != original_nuc) {
+                            int64_t clear_mask = ~(0b11LL << (2 * pos));
+                            int64_t mutated_value = (candidate_raw & clear_mask) | (new_nuc << (2 * pos));
+                            
+                            // Fast duplicate check and insert using raw int64_t
+                            if (all_mutations_raw.insert(mutated_value).second) {
+                                next_round_raw.insert(mutated_value);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (next_round_raw.empty()) break;
+            current_round_raw = std::move(next_round_raw);
+        }
+        
+        // Remove the original sequence from raw mutations
+        all_mutations_raw.erase(initial_raw);
+        
+        // *** CONVERT TO int64_seq ONLY AT THE VERY END ***
+        std::unordered_set<int64_seq> final_mutations;
+        final_mutations.reserve(all_mutations_raw.size());
+        
+        // Single conversion pass - create int64_seq objects only here
+        for (const int64_t raw_mutation : all_mutations_raw) {
+            final_mutations.emplace(raw_mutation, sequence_length); // Use emplace for in-place construction
+        }
+        
+        return final_mutations;
+    }
+    
     //generating shifted barcodes
-    std::unordered_set<int64_seq> generate_shifted_barcodes(const int64_seq &seq, int shift) {
+    /*std::unordered_set<int64_seq> generate_shifted_barcodes(const int64_seq &seq, int shift) {
         std::unordered_set<int64_seq> result;
         // 1) Quick exits
         if (seq.bits.empty() || shift <= 0 || shift >= seq.length){
@@ -384,196 +534,71 @@ namespace mutation_tools {
         // 6) Remove the original if it was regenerated
         result.erase(seq);
         return result;
+    }*/
+
+    // Call this exactly the same way as before, but it will reuse its buffer
+    std::unordered_set<int64_seq> generate_shifted_barcodes(const int64_seq &seq, int shift) {
+        // 1) Keep one thread-local set so we only pay the bucket allocations once
+        static thread_local std::unordered_set<int64_seq> result;
+        result.clear();
+
+        // 2) Fast exit if nothing to do
+        if (seq.bits.empty() || shift <= 0 || shift >= seq.length) {
+            return result;
+        }
+
+        // 3) Pre-compute how many combinations we'll get:
+        size_t combos = 1ULL << (2 * shift);        // 4^shift
+        result.reserve(combos * 2);                 // both left + right shifts
+
+        // 4) Extract the original 2-bit code
+        uint64_t orig = seq.bits[0];
+        int L = seq.length;
+        int core_len = L - shift;
+
+        // 5) Split into “core” and “suffix” bits
+        //    - coreR is the top (L-shift) bases
+        //    - suffix is the bottom (shift) bases
+        uint64_t coreR  = orig >> (2 * shift);
+        uint64_t coreL  = orig >> (2 * shift);
+        uint64_t suffix = orig & ((1ULL << (2 * shift)) - 1);
+
+            // 6) Build all left shifts: [ new_prefix | coreR ]
+            for (uint64_t code = 0; code < combos; ++code) {
+                int64_seq cand;
+                cand.length = L;
+                cand.bits   = {
+                    static_cast<int64_t>(  // <-- here
+                    (code << (2 * core_len))
+                    | coreR
+                    )
+                };
+                result.insert(std::move(cand));
+            }
+        
+            // 7) Build all right shifts: [ coreL | new_suffix ]
+            for (uint64_t code = 0; code < combos; ++code) {
+                int64_seq cand;
+                cand.length = L;
+                cand.bits   = {
+                    static_cast<int64_t>(
+                    (coreL << (2 * shift))
+                    | code
+                    )
+                };
+                result.insert(std::move(cand));
+            }
+
+        // 8) Drop the original if it snuck back in
+        result.erase(seq);
+        return result;
     }
 
 };
-
-/*
-template<typename key, typename value> struct bc_multimap:std::unordered_multimap<key, value> {
-    using base = std::unordered_multimap<key, value>;
-    using base::base;
-    // helper to extract key from either a key or a value
-    static inline const key& key_of(key const &k) noexcept { 
-        return k;
-    }
-    static inline const key& key_of(value const &v) noexcept { 
-        return v.barcode; 
-    }
-
-    // check whitelist for this barcode's existence
-    template<typename T> bool check_wl_for(T const &x) const {
-        if constexpr (std::is_same_v<T,int64_seq> || std::is_same_v<T,barcode_entry>) {
-            return this->find(key_of(x)) != this->end();
-        } else {
-            // container of keys
-            for (auto const &y : x) {
-                if (check_wl_for(y)) return true;
-            }
-            return false;
-        }
-    }
-
-    // return the matching barcodes from this wl
-    template<typename T> std::unordered_set<int64_seq> return_matching_barcodes(T const &x) const {
-        std::unordered_set<int64_seq> out;
-        if constexpr (std::is_same_v<T,int64_seq> || std::is_same_v<T,barcode_entry>) {
-            if (check_wl_for(x))
-                out.insert(key_of(x));
-        } else {
-            for (auto const &y : x) {
-                if (check_wl_for(y))
-                    out.insert(key_of(y));
-            }
-        }
-        return out;
-    }
-
-    // insert a barcode entry into this wl
-    template<typename T> void insert_bc_entry(const T &observed, const value &correct) & {
-        this->emplace(key_of(observed), correct);
-    }
-    
-    //insert a barcode entry into this wl, with barcode as key and value
-    template<typename T> void insert_bc_entry(const T &observed) & {
-        value v{};
-        v.barcode = key_of(observed);
-        this->emplace(key_of(observed), std::move(v));
-    }
-    
-    //delete a barcode entry from this wl
-    template<typename T> void remove_bc_entry(const T &observed) {
-        this->erase(key_of(observed));
-    }
-    
-    // return putative correct barcodes for an observed barcode we've seen before
-    template<typename T> std::unordered_set<int64_seq> return_putative_correct_bcs(T const &x) const {
-        std::unordered_set<int64_seq> out;
-        if constexpr (std::is_same_v<T,int64_seq> ||std::is_same_v<T,barcode_entry>) {
-            auto range = this->equal_range(key_of(x));
-            for (auto it = range.first; it != range.second; ++it)
-                out.insert(it->second.barcode);
-        } else {
-            for (auto const &y : x) {
-                auto sub = return_putative_correct_bcs(y);
-                out.insert(sub.begin(), sub.end());
-            }
-        }
-        return out;
-    }
-
-    // add a count to a barcode_entry in this wl
-    template<typename T> void update_bc_count(T const &x, barcode_counts slot = total) const {
-        auto it = this->find(key_of(x));
-        if (it != this->end())
-            it->second.count.increment(slot);
-    }
-
-    // subtract a count from a barcode_entry
-    template<typename T> void subtract_bc_count(T const &x, barcode_counts slot = total) const {
-        auto it = this->find(key_of(x));
-        if (it != this->end())
-            it->second.count.subtract(slot);
-    }
-
-    // get the count for a barcode entry
-    template<typename T> int get_bc_count(T const &x, barcode_counts slot = total) const {
-        auto it = this->find(key_of(x));
-        return it != this->end() ? it->second.count.load(slot) : 0;
-    }
-
-    std::vector<std::tuple<std::string,int,int,int,int,int,int,int>>
-    summarize_counts(const std::unordered_set<key> *filter_keys = nullptr) const {
-            using row = std::tuple<std::string,int,int,int,int,int,int,int>;
-            // barcode, total_count, corrected_count, forw_count, rev_count, forw_concat, rev_concat, filtered
-            std::vector<row> rows;
-
-            // 1) Build the list of keys to process
-            std::vector<key> keys;
-            if (filter_keys) {
-                keys.reserve(filter_keys->size());
-                for (auto const &k : *filter_keys)
-                    keys.push_back(k);
-            } else {
-                // collect distinct keys from the multimap
-                std::unordered_set<key> seen;
-                seen.reserve(this->size());
-                for (auto const &kv : *this)
-                    seen.insert(kv.first);
-                keys.reserve(seen.size());
-                for (auto const &k : seen)
-                    keys.push_back(k);
-            }
-
-            rows.reserve(keys.size());
-
-            // For each key, find its perfect‐match mapping and pull the counts
-            for (auto const &bc : keys) {
-                // get the sub‐range in the multimap
-                auto range = this->equal_range(bc);
-                int tot=0, corr=0, fwd=0, rev=0, fwd_c=0, rev_c=0, filt=0;
-
-                if (range.first != range.second) {
-                    // prefer the exact key if present
-                    auto it = std::find_if(range.first, range.second, [&](auto const &p){ 
-                        return p.first == bc; 
-                    });
-                    if (it == range.second){ 
-                        it = range.first;
-                    }
-                    tot = it->second.count.load(barcode_counts::total);
-                    corr = it->second.count.load(barcode_counts::corrected);
-                    fwd = it->second.count.load(barcode_counts::forw);
-                    rev = it->second.count.load(barcode_counts::rev);
-                    fwd_c = it->second.count.load(barcode_counts::forw_concat);
-                    rev_c = it->second.count.load(barcode_counts::rev_concat);
-                    filt = it->second.count.load(barcode_counts::filtered);
-                }
-                rows.emplace_back(bc.bits_to_sequence(), tot, corr, fwd, rev, fwd_c, rev_c, filt);
-            }
-        return rows;
-    }
-
-    void write_wl_summary(std::ostream &out, const std::string class_id, const std::unordered_set<key> *filter_keys = nullptr) const{
-        static bool header_printed = false;
-        if(!header_printed) {
-            out << "class_id,true_barcode,total_count,corrected_count,forw_count,rev_count,forw_concat_count,rev_concat_count,filtered_count\n";
-            header_printed = true;
-        }
-            auto rows = summarize_counts(filter_keys);
-            for (auto const & tpl : rows) {
-                    auto const & bc = std::get<0>(tpl);
-                    auto tot  = std::get<1>(tpl);
-                    auto corr = std::get<2>(tpl);
-                    auto forw = std::get<3>(tpl);
-                    auto rev  = std::get<4>(tpl);
-                    auto forw_concat = std::get<5>(tpl);
-                    auto rev_concat = std::get<6>(tpl);
-                    auto filtered = std::get<7>(tpl);
-                    // print the row
-                    out << class_id << ',' << bc << ','  << tot << ',' << corr << ',' << forw <<
-                    ',' << rev << ',' << forw_concat << ',' << rev_concat << ',' << filtered << '\n';
-        }
-    }
-
-    void write_wl_summary(const std::string &path = "", const std::unordered_set<key> *filter_keys = nullptr) const {
-    std::ofstream ofs(path);
-        if (!ofs) {
-            throw std::runtime_error("Failed to open output file: " + path);
-        }
-        write_wl_summary(ofs, filter_keys);
-    }
-};
-*/
 
 template<typename key, typename value>
 struct bc_multimap {
 private:
-    // Store unique values - using a set lets us find and reuse identical values
-    std::unordered_set<value> unique_values;
-    
-    // Maps keys to pointers to values in the unique set
-    std::unordered_multimap<key, const value*> associations;
-
     // Helper to extract key from either a key or a value (unchanged)
     static inline const key& key_of(key const &k) noexcept { 
         return k;
@@ -581,26 +606,48 @@ private:
     static inline const key& key_of(value const &v) noexcept { 
         return v.barcode; 
     }
-
 public:
+    // Store unique values - using a set lets us find and reuse identical values
+    std::unordered_set<value> unique_values;
+    // Maps keys to pointers to values in the unique set
+    std::unordered_multimap<key, const value*> associations;
+
     // Size reporting
-    size_t size() const { return associations.size(); }
-    bool empty() const { return associations.empty(); }
-    void clear() { associations.clear(); unique_values.clear(); }
-    
+    size_t size() const { 
+        return associations.size(); 
+    }
+
+    bool empty() const { 
+        return associations.empty(); 
+    }
+
+    void clear() { 
+        associations.clear();
+        unique_values.clear(); 
+    }
+
+    void clear_associations() {
+        associations.clear();
+    }
+
+    const auto& debug_unique_values() const noexcept { 
+        return unique_values; 
+    }
+
+    const auto& debug_associations() const noexcept { 
+        return associations; 
+    }
+
     // ==== Core Insertion Methods ====
-    
     // Insert a barcode entry with an existing value
     template<typename T>
     void insert_bc_entry(const T &observed, const value &correct) {
         // First, insert or find the value in unique_values
         auto [value_it, value_inserted] = unique_values.insert(correct);
         const value* ptr = &(*value_it);
-        
         // Now map the key to the unique value
         associations.emplace(key_of(observed), ptr);
     }
-    
     // Insert with a moved value
     template<typename T>
     void insert_bc_entry(const T &observed, value &&correct) {
@@ -617,7 +664,6 @@ public:
             associations.emplace(key_of(observed), &(*value_it));
         }
     }
-    
     // Use the key as value too
     template<typename T>
     void insert_bc_entry(const T &observed) {
@@ -647,7 +693,6 @@ public:
     }
     
     // ==== Removal Methods ====
-    
     // Remove a key-value entry
     template<typename T>
     void remove_bc_entry(const T &observed) {
@@ -656,7 +701,6 @@ public:
     }
     
     // ==== Lookup Methods ====
-    
     // Check if whitelist contains this key
     template<typename T>
     bool check_wl_for(T const &x) const {
@@ -714,7 +758,6 @@ public:
             const_cast<value*>(it->second)->count.increment(slot);
         }
     }
-    
     // Subtract a count
     template<typename T>
     void subtract_bc_count(T const &x, barcode_counts slot = total) const {
@@ -723,7 +766,6 @@ public:
             const_cast<value*>(it->second)->count.subtract(slot);
         }
     }
-    
     // Get the count for a barcode entry
     template<typename T>
     int get_bc_count(T const &x, barcode_counts slot = total) const {
@@ -736,9 +778,9 @@ public:
     // ==== Summary Methods ====
     
     // Summarize counts
-    std::vector<std::tuple<std::string,int,int,int,int,int,int,int>>
+    std::vector<std::tuple<std::string,int,int,int,int,int,int,int,int>>
     summarize_counts(const std::unordered_set<key> *filter_keys = nullptr) const {
-        using row = std::tuple<std::string,int,int,int,int,int,int,int>;
+        using row = std::tuple<std::string,int,int,int,int,int,int,int,int>;
         std::vector<row> rows;
         
         // Build the list of keys to process
@@ -763,7 +805,7 @@ public:
         // For each key, find its perfect‐match mapping and pull the counts
         for (auto const &bc : keys) {
             auto range = associations.equal_range(bc);
-            int tot=0, corr=0, fwd=0, rev=0, fwd_c=0, rev_c=0, filt=0;
+            int raw=0, tot=0, corr=0, fwd=0, rev=0, fwd_c=0, rev_c=0, filt=0;
             
             if (range.first != range.second) {
                 // Prefer the exact key if present
@@ -775,6 +817,7 @@ public:
                 if (it == range.second)
                     it = range.first;
                 
+                raw = it->second->count.load(barcode_counts::raw);
                 tot = it->second->count.load(barcode_counts::total);
                 corr = it->second->count.load(barcode_counts::corrected);
                 fwd = it->second->count.load(barcode_counts::forw);
@@ -783,7 +826,7 @@ public:
                 rev_c = it->second->count.load(barcode_counts::rev_concat);
                 filt = it->second->count.load(barcode_counts::filtered);
             }
-            rows.emplace_back(bc.bits_to_sequence(), tot, corr, fwd, rev, fwd_c, rev_c, filt);
+            rows.emplace_back(bc.bits_to_sequence(), raw, tot, corr, fwd, rev, fwd_c, rev_c, filt);
         }
         return rows;
     }
@@ -793,7 +836,7 @@ public:
                         const std::unordered_set<key> *filter_keys = nullptr) const {
         static bool header_printed = false;
         if(!header_printed) {
-            out << "class_id,true_barcode,total_count,corrected_count,forw_count,rev_count,"
+            out << "class_id,true_barcode,raw_count,total_count,corrected_count,forw_count,rev_count,"
                 << "forw_concat_count,rev_concat_count,filtered_count\n";
             header_printed = true;
         }
@@ -801,16 +844,17 @@ public:
         auto rows = summarize_counts(filter_keys);
         for (auto const & tpl : rows) {
             auto const & bc = std::get<0>(tpl);
-            auto tot  = std::get<1>(tpl);
-            auto corr = std::get<2>(tpl);
-            auto forw = std::get<3>(tpl);
-            auto rev  = std::get<4>(tpl);
-            auto forw_concat = std::get<5>(tpl);
-            auto rev_concat = std::get<6>(tpl);
-            auto filtered = std::get<7>(tpl);
+            auto raw = std::get<1>(tpl);
+            auto tot  = std::get<2>(tpl);
+            auto corr = std::get<3>(tpl);
+            auto forw = std::get<4>(tpl);
+            auto rev  = std::get<5>(tpl);
+            auto forw_concat = std::get<6>(tpl);
+            auto rev_concat = std::get<7>(tpl);
+            auto filtered = std::get<8>(tpl);
             
             // Print the row
-            out << class_id << ',' << bc << ','  << tot << ',' << corr << ',' << forw 
+            out << class_id << ',' << bc << ','  << raw << "," << tot << ',' << corr << ',' << forw 
                 << ',' << rev << ',' << forw_concat << ',' << rev_concat << ',' << filtered << '\n';
         }
     }
@@ -896,10 +940,16 @@ class whitelist {
         std::unordered_set<int64_seq> true_ref;
         bc_multimap<int64_seq, barcode_entry> true_bcs, global_bcs, filter_bcs;
     
-        void generate_mismatch_barcodes(int shift, int mutation_rounds,bool verbose, int nthreads = 1) {
+        void generate_mismatch_barcodes_(int shift, int mutation_rounds, bool verbose, int nthreads = 1) {
             if (verbose) {
                 #pragma omp critical
-                std::cout << "[generate_mismatch_barcodes] Generating shifted and mutated barcodes for true barcodes...\n";
+                {
+                    std::ostringstream oss;
+                    oss << "[generate_mismatch_barcodes] Generating shifted and mutated barcodes for "
+                        << true_ref.size() << " true barcodes with shift=" << shift
+                        << " and mutation_rounds=" << mutation_rounds << "\n";
+                    std::cout << oss.str();
+                }
             }
 
             // build a single hash‐map
@@ -955,6 +1005,310 @@ class whitelist {
                 }
             }
         }
+
+        // Generate shifted and mutated barcodes for the true_ref set
+        // also implicitly filters mutations that would be generated against the global bcs set
+        // so all barcodes and associations in true bcs are guaranteed to be unique
+        void generate_mismatch_barcodes__(int shift, int mutation_rounds, bool verbose, int nthreads = 1) {
+            if (verbose) {
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "[generate_mismatch_barcodes] Generating shifted and mutated barcodes for "
+                        << true_ref.size() << " true barcodes with shift = " << shift
+                        << " and mutation_rounds = " << mutation_rounds << "\n";
+                    std::cout << oss.str();
+                }
+            }
+
+            // 1) Collect each original barcode_entry* exactly once
+            std::vector<const barcode_entry*> originals;
+            originals.reserve(true_bcs.size());
+            {
+                std::unordered_set<const barcode_entry*> seen;
+                seen.reserve(true_bcs.size());
+                for (auto const &p : true_bcs.associations) {
+                    if (seen.insert(p.second).second)
+                    originals.push_back(p.second);
+                }
+            }
+            // 2) For each original, generate shifts & mutations
+            for (auto const *orig_be : originals) {
+                const auto &orig_bits = orig_be->barcode;
+
+            // SHIFTED
+            auto shifted = mutation_tools::generate_shifted_barcodes(orig_bits, shift);
+            for (auto const &s_bits : shifted) {
+                if (!global_bcs.check_wl_for(s_bits)) {
+                // insert without copying orig_be
+                    true_bcs.insert_bc_entry(s_bits, *orig_be);
+                }
+            }
+
+            // MUTATED
+            auto mutated = mutation_tools::generate_mutated_barcodes(orig_bits, mutation_rounds);
+                for (auto const &m_bits : mutated) {
+                    if (!global_bcs.check_wl_for(m_bits)) {
+                        true_bcs.insert_bc_entry(m_bits, *orig_be);
+                    }
+                }
+            }
+
+            // 3) Optional sanity check (using true_ref instead of originals)
+            size_t missing = 0;
+            for (auto const &orig_bits : true_ref) {
+                if (!true_bcs.check_wl_for(orig_bits)) {
+                    ++missing;
+                    std::cerr << "[ERROR] Original barcode vanished: "
+                            << orig_bits.bits_to_sequence() << "\n";
+                }
+            }
+
+            if (verbose) {
+                if (missing == 0) {
+                    std::cout << "[generate_mismatch_barcodes] All "
+                            << true_ref.size()
+                            << " original barcodes are present\n";
+                } else {
+                    std::cerr << "[generate_mismatch_barcodes] "
+                            << missing << "/"
+                            << true_ref.size()
+                            << " originals missing!\n";
+                }
+            }
+        }
+    
+    void generate_mismatch_barcodes(int shift, int mutation_rounds, bool verbose, int nthreads = 1) {
+        using namespace std::chrono;
+        auto start_total = high_resolution_clock::now();
+        
+        if (verbose) {
+            #pragma omp critical
+            {
+                std::ostringstream oss;
+                oss << "[generate_mismatch_barcodes] Generating shifted and mutated barcodes for "
+                    << true_ref.size() << " true barcodes with shift = " << shift
+                    << " and mutation_rounds = " << mutation_rounds << "\n";
+                std::cout << oss.str();
+            }
+        }
+        
+        // TIMING: Collect original barcode entries
+        auto start_collect = high_resolution_clock::now();
+        
+        std::vector<const barcode_entry*> originals;
+        originals.reserve(true_bcs.size());
+        {
+            std::unordered_set<const barcode_entry*> seen;
+            seen.reserve(true_bcs.size());
+            for (auto const &p : true_bcs.associations) {
+                if (seen.insert(p.second).second)
+                    originals.push_back(p.second);
+            }
+        }
+        
+        auto end_collect = high_resolution_clock::now();
+        double collect_ms = duration<double, std::milli>(end_collect - start_collect).count();
+        
+        if (verbose) {
+            std::cout << "[generate_mismatch_barcodes] Collected " << originals.size() 
+                    << " unique originals in " << collect_ms << " ms\n";
+        }
+        
+        // Memory tracking
+        size_t initial_true_bcs_size = true_bcs.associations.size();
+        size_t initial_memory_estimate = initial_true_bcs_size * 48; // Rough estimate: 48 bytes per association
+        
+        if (verbose) {
+            std::cout << "[generate_mismatch_barcodes] Initial true_bcs size: " << initial_true_bcs_size 
+                    << " associations (~" << (initial_memory_estimate / 1024 / 1024) << " MB)\n";
+        }
+        
+        // TIMING: Generate mutations and shifts
+        auto start_generation = high_resolution_clock::now();
+        
+        size_t total_shifts_generated = 0;
+        size_t total_mutations_generated = 0;
+        size_t shifts_added = 0;
+        size_t mutations_added = 0;
+        size_t shifts_rejected_global = 0;
+        size_t mutations_rejected_global = 0;
+        
+        // Track timing for individual operations
+        double total_shift_generation_ms = 0;
+        double total_mutation_generation_ms = 0;
+        double total_shift_lookup_ms = 0;
+        double total_mutation_lookup_ms = 0;
+        double total_shift_insert_ms = 0;
+        double total_mutation_insert_ms = 0;
+        
+        auto start_loop = high_resolution_clock::now();
+        
+        for (size_t i = 0; i < originals.size(); ++i) {
+            auto const *orig_be = originals[i];
+            const auto &orig_bits = orig_be->barcode;
+            
+            // Time individual barcode processing for first few
+            auto barcode_start = high_resolution_clock::now();
+            
+            // === SHIFTED GENERATION ===
+            auto shift_gen_start = high_resolution_clock::now();
+            auto shifted = mutation_tools::generate_shifted_barcodes(orig_bits, shift);
+            auto shift_gen_end = high_resolution_clock::now();
+            
+            double shift_gen_time = duration<double, std::milli>(shift_gen_end - shift_gen_start).count();
+            total_shift_generation_ms += shift_gen_time;
+            total_shifts_generated += shifted.size();
+            
+            // === SHIFTED LOOKUP & INSERT ===
+            auto shift_lookup_start = high_resolution_clock::now();
+            
+            for (auto const &s_bits : shifted) {
+                bool in_wl = global_bcs.check_wl_for(s_bits) || true_bcs.check_wl_for(s_bits);
+                if (!in_wl) {
+                    auto shift_insert_start = high_resolution_clock::now();
+                    true_bcs.insert_bc_entry(s_bits, *orig_be);
+                    auto shift_insert_end = high_resolution_clock::now();
+                    total_shift_insert_ms += duration<double, std::milli>(shift_insert_end - shift_insert_start).count();
+                    shifts_added++;
+                } else {
+                    shifts_rejected_global++;
+                }
+            }
+            
+            auto shift_lookup_end = high_resolution_clock::now();
+            total_shift_lookup_ms += duration<double, std::milli>(shift_lookup_end - shift_lookup_start).count();
+            
+            // === MUTATION GENERATION ===
+            auto mutation_gen_start = high_resolution_clock::now();
+            auto mutated = mutation_tools::generate_mutated_barcodes(orig_bits, mutation_rounds);
+            auto mutation_gen_end = high_resolution_clock::now();
+            
+            double mutation_gen_time = duration<double, std::milli>(mutation_gen_end - mutation_gen_start).count();
+            total_mutation_generation_ms += mutation_gen_time;
+            total_mutations_generated += mutated.size();
+            
+            // === MUTATION LOOKUP & INSERT ===
+            auto mutation_lookup_start = high_resolution_clock::now();
+            for (auto const &m_bits : mutated) {
+                auto lookup_start = high_resolution_clock::now();
+                bool in_wl = global_bcs.check_wl_for(m_bits) || true_bcs.check_wl_for(m_bits);
+                auto lookup_end = high_resolution_clock::now();
+                total_mutation_lookup_ms += duration<double, std::milli>(lookup_end - lookup_start).count();
+                if (!in_wl) {
+                    auto insert_start = high_resolution_clock::now();
+                    true_bcs.insert_bc_entry(m_bits, *orig_be);
+                    auto insert_end = high_resolution_clock::now();
+                    total_mutation_insert_ms += duration<double, std::milli>(insert_end - insert_start).count();
+                    mutations_added++;
+                } else {
+                    mutations_rejected_global++;
+                }
+            }
+            
+            auto mutation_lookup_end = high_resolution_clock::now();
+            // Detailed timing for first 10 barcodes
+            if (verbose && i < 10) {
+                auto barcode_end = high_resolution_clock::now();
+                double total_time = duration<double, std::milli>(barcode_end - barcode_start).count();
+                std::cout << "[generate_mismatch_barcodes] Barcode " << i + 1 << " (" 
+                        << orig_bits.bits_to_sequence() << "): "
+                        << shifted.size() << " shifts (" << shift_gen_time << "ms gen), "
+                        << mutated.size() << " mutations (" << mutation_gen_time << "ms gen), "
+                        << "total " << total_time << "ms\n";
+            }
+            
+            // Memory usage check every 100000 barcodes
+            if (verbose && i % 1000 == 0 && i > 0) {
+                size_t current_true_bcs_size = true_bcs.associations.size();
+                size_t growth = current_true_bcs_size - initial_true_bcs_size;
+                size_t current_memory_estimate = current_true_bcs_size * 48;
+                
+                std::cout << "[generate_mismatch_barcodes] After " << i << " barcodes: "
+                        << current_true_bcs_size << " associations (+" << growth << "), "
+                        << "~" << (current_memory_estimate / 1024 / 1024) << " MB total\n";
+            }
+        }
+        
+        auto end_loop = high_resolution_clock::now();
+        double loop_ms = duration<double, std::milli>(end_loop - start_loop).count();
+        
+        auto end_generation = high_resolution_clock::now();
+        double generation_ms = duration<double, std::milli>(end_generation - start_generation).count();
+        
+        // Final memory usage
+        size_t final_true_bcs_size = true_bcs.associations.size();
+        size_t total_growth = final_true_bcs_size - initial_true_bcs_size;
+        size_t final_memory_estimate = final_true_bcs_size * 48;
+        
+        // TIMING: Sanity check
+        auto start_sanity = high_resolution_clock::now();
+        
+        size_t missing = 0;
+        for (auto const &orig_bits : true_ref) {
+            if (!true_bcs.check_wl_for(orig_bits)) {
+                ++missing;
+                std::cerr << "[ERROR] Original barcode vanished: "
+                        << orig_bits.bits_to_sequence() << "\n";
+            }
+        }
+        
+        auto end_sanity = high_resolution_clock::now();
+        double sanity_ms = duration<double, std::milli>(end_sanity - start_sanity).count();
+        
+        auto end_total = high_resolution_clock::now();
+        double total_ms = duration<double, std::milli>(end_total - start_total).count();
+        
+        if (verbose) {
+            std::cout << "\n=== MISMATCH GENERATION TIMING REPORT ===\n";
+            std::cout << "Total time: " << total_ms << " ms (" << (total_ms/1000.0) << " s)\n";
+            std::cout << "  - Collection phase: " << collect_ms << " ms (" << (collect_ms/total_ms*100) << "%)\n";
+            std::cout << "  - Generation loop: " << loop_ms << " ms (" << (loop_ms/total_ms*100) << "%)\n";
+            std::cout << "  - Sanity check: " << sanity_ms << " ms (" << (sanity_ms/total_ms*100) << "%)\n";
+            
+            std::cout << "\n=== DETAILED OPERATION BREAKDOWN ===\n";
+            std::cout << "Shift generation: " << total_shift_generation_ms << " ms (" 
+                    << (total_shift_generation_ms/total_ms*100) << "%)\n";
+            std::cout << "Mutation generation: " << total_mutation_generation_ms << " ms (" 
+                    << (total_mutation_generation_ms/total_ms*100) << "%)\n";
+            std::cout << "Shift lookups: " << total_shift_lookup_ms << " ms (" 
+                    << (total_shift_lookup_ms/total_ms*100) << "%)\n";
+            std::cout << "Mutation lookups: " << total_mutation_lookup_ms << " ms (" 
+                    << (total_mutation_lookup_ms/total_ms*100) << "%)\n";
+            std::cout << "Shift insertions: " << total_shift_insert_ms << " ms (" 
+                    << (total_shift_insert_ms/total_ms*100) << "%)\n";
+            std::cout << "Mutation insertions: " << total_mutation_insert_ms << " ms (" 
+                    << (total_mutation_insert_ms/total_ms*100) << "%)\n";
+            
+            std::cout << "\n=== GENERATION STATISTICS ===\n";
+            std::cout << "Processed " << originals.size() << " original barcodes\n";
+            std::cout << "Shifts: generated " << total_shifts_generated << ", added " << shifts_added 
+                    << ", rejected " << shifts_rejected_global << "\n";
+            std::cout << "Mutations: generated " << total_mutations_generated << ", added " << mutations_added 
+                    << ", rejected " << mutations_rejected_global << "\n";
+            std::cout << "Average shifts per barcode: " << (double)total_shifts_generated / originals.size() << "\n";
+            std::cout << "Average mutations per barcode: " << (double)total_mutations_generated / originals.size() << "\n";
+            std::cout << "Time per barcode: " << (loop_ms / originals.size()) << " ms\n";
+            
+            std::cout << "\n=== MEMORY USAGE ===\n";
+            std::cout << "Initial associations: " << initial_true_bcs_size 
+                    << " (~" << (initial_memory_estimate / 1024 / 1024) << " MB)\n";
+            std::cout << "Final associations: " << final_true_bcs_size 
+                    << " (~" << (final_memory_estimate / 1024 / 1024) << " MB)\n";
+            std::cout << "Growth: +" << total_growth << " associations (+~" 
+                    << ((final_memory_estimate - initial_memory_estimate) / 1024 / 1024) << " MB)\n";
+            std::cout << "Memory efficiency: " << (double)total_growth / (total_shifts_generated + total_mutations_generated) * 100 
+                    << "% of generated items were unique and added\n";
+            
+            if (missing == 0) {
+                std::cout << "\n[generate_mismatch_barcodes] All " << true_ref.size() 
+                        << " original barcodes are present\n";
+            } else {
+                std::cerr << "\n[generate_mismatch_barcodes] " << missing << "/" 
+                        << true_ref.size() << " originals missing!\n";
+            }
+        }
+    }
     };
 
     std::unordered_map<std::string, std::reference_wrapper<whitelist::wl_entry>> maps;
@@ -1118,4 +1472,48 @@ class whitelist {
         return out;
     }
 
+};
+
+//needed to include this down here because of the definitions above that I couldn't make work by movign this to the misc utils, though I sure would love for this to be there
+namespace bc_mem_utils {
+    /// Exact byte‐size of barcode_entry type
+    inline constexpr std::size_t get_bc_entry_mem() {
+        return sizeof(barcode_entry);
+    }
+    
+    /// Exact byte‐size of int64_seq key
+    inline constexpr std::size_t get_int64seq_mem() {
+        return sizeof(int64_seq);
+    }
+
+    template<typename Key, typename Value>
+    std::size_t approx_unique(const bc_multimap<Key,Value>& m) {
+        auto const &s = m.unique_values;
+        // buckets array
+        std::size_t buckets = s.bucket_count() * memory_utils::get_pointer_mem();
+        // each node: stored Value + two pointers (next/in‐bucket links)
+        std::size_t nodes   = s.size() * (sizeof(Value) + 2*memory_utils::get_pointer_mem());
+        return buckets + nodes;
+    }
+
+    /// Approximate footprint of the key→pointer associations
+    template<typename Key, typename Value>
+    std::size_t approx_assoc(const bc_multimap<Key,Value>& m) {
+        auto const &mm = m.associations;
+        // buckets array
+        std::size_t buckets = mm.bucket_count() * memory_utils::get_pointer_mem();
+        // each node: Key + Value* + two pointers
+        std::size_t nodes   = mm.size() * (
+            sizeof(Key)
+            + sizeof(const Value*)
+            + 2*memory_utils::get_pointer_mem()
+        );
+        return buckets + nodes;
+    }
+
+    /// Total (unique_values + associations)
+    template<typename Key, typename Value>
+    std::size_t get_full_wl_mem(const bc_multimap<Key,Value>& m) {
+        return approx_unique(m) + approx_assoc(m);
+    }
 };

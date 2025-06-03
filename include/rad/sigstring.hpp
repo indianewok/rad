@@ -15,6 +15,8 @@ struct seq_element {
     std::optional<bool> element_pass;  // Whether element passed validation
     std::optional<std::string> seq;    // Element sequence if available
     std::optional<std::string> qual;   // Element quality scores if available
+    std::optional<std::string> original_seq;  // corrected sequence if available
+
 
     seq_element(
         std::string class_id,
@@ -26,7 +28,8 @@ struct seq_element {
         std::string direction,
         std::optional<bool> element_pass = std::nullopt,
         std::optional<std::string> seq = std::nullopt,
-        std::optional<std::string> qual = std::nullopt
+        std::optional<std::string> qual = std::nullopt,
+        std::optional<std::string> original_seq = std::nullopt
     ) : class_id(std::move(class_id)),
         global_class(std::move(global_class)),
         edit_distance(edit_distance),
@@ -36,7 +39,8 @@ struct seq_element {
         direction(std::move(direction)),
         element_pass(element_pass),
         seq(std::move(seq)),
-        qual(std::move(qual)) {}
+        qual(std::move(qual)),
+        original_seq(std::move(original_seq)) {}
 };
 
 /**
@@ -193,10 +197,9 @@ private:
     }
 
 public:   
-static_alignments align_static_elements(const std::string& query, const std::string& target,
-    bool verbose,
-    int max_edit_distance = -1, const std::string& masked_query = "", 
-    bool primary = true, int expected_start = 1, int expected_end = -1) {
+    static_alignments align_static_elements(const std::string& query, const std::string& target, bool verbose,
+                                        int max_edit_distance = -1, const std::string& masked_query = "", 
+                                        bool primary = true, int expected_start = 1, int expected_end = -1) {
 
         static_alignments alignment;
         alignment.success = false;
@@ -269,7 +272,8 @@ static_alignments align_static_elements(const std::string& query, const std::str
                 alignment.edit_distance = edlibResult.editDistance;
                 // Optionally set alignment.seq, alignment.cigar, etc.
                 alignment.seq = target.substr(cand.first - 1, cand.second - cand.first + 1);
-                // Return immediately without SSW.
+                // Return immediately without SSW
+                edlibFreeAlignResult(edlibResult);
                 return alignment;
             }
         }
@@ -311,17 +315,20 @@ static_alignments align_static_elements(const std::string& query, const std::str
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "SSW alignment: region ["
+                    std::ostringstream oss;
+                    oss << "SSW alignment: region ["
                             << ssw_start << ", " << ssw_end << "], length = "
                             << ssw_length << ", max_matches with indels = " 
                             << ssw_max_matches_ind
                             << " , max_matches = " << ssw_max_matches
                             << ", deviation = " << deviation
                             << ", cigar: " << sswAlign.cigar_string << "\n";
+                    std::cout << oss.str();
                 }
             }
             // Accept candidate if it meets threshold. first case is within the deviation allowed. second case is for concats.
-            if ((ssw_max_matches > min_match_bases && deviation <= 100 && ssw_length >= 10 && ssw_max_matches_ind > 8)||
+            if (
+            (ssw_max_matches > min_match_bases && deviation <= 100 && ssw_length >= 10 && ssw_max_matches_ind >= 8 && ssw_max_matches >= 8)||
             (deviation > 100 && ssw_length >= 10 && ssw_max_matches >= 10)) {
                 alignment.positions.push_back({ssw_start, ssw_end});
                 alignment.edit_distance = compute_edit_distance(sswAlign.cigar_string.c_str());
@@ -333,7 +340,7 @@ static_alignments align_static_elements(const std::string& query, const std::str
     return alignment;
 }
 
-    static_alignments find_poly_tails(const std::string& query, const std::string& sequence, int window_size = 12) {
+    static_alignments find_poly_tails(const std::string& query, const std::string& sequence, int window_size) {
         static_alignments result;
         result.success = false;
         result.edit_distance = 1;
@@ -396,7 +403,12 @@ namespace barcode_correction {
         if (sorted.empty()){
             if(verbose){
                 #pragma omp critical
-                std::cout << "NO_MATCH\n";
+                {
+                    std::ostringstream oss;
+                    oss << "NO_MATCH\n";
+                    std::cout << oss.str();
+
+                }
             }
             return std::nullopt;
         }
@@ -407,31 +419,45 @@ namespace barcode_correction {
 
         if(verbose){
             #pragma omp critical
-            std::cout << "Best edit distance = " << best_dist << ", # of candidates = " << best_set.size() << "\n";
+            {
+                std::ostringstream oss;
+                oss << "Best edit distance = " << best_dist << ", # of candidates = " << best_set.size() << "\n";
+                std::cout << oss.str();
+            }
         }
     
         if (best_set.size() == 1) {
             if(verbose){
                 #pragma omp critical
-                std::cout << "Best candidate = " << best_set.begin()->bits_to_sequence() << "\n";
+                {
+                    std::ostringstream oss;
+                    oss << "Best candidate found: " << best_set.begin()->bits_to_sequence() << "\n";
+                    std::cout << oss.str();
+                }
             }
             return *best_set.begin();
         }
         if(verbose){
             #pragma omp critical
-            std::cout << "Ambiguous best hits:\n";
-            for (auto &s : best_set) {
-              std::cout << "  " << s.bits_to_sequence() << "\n";
-            }
+            {
+                std::ostringstream oss;
+                oss << "Ambiguous best hits found: " << best_set.size() << " candidates with edit distance " << best_dist << "\n";
+                std::cout << oss.str();
+                for (auto &s : best_set) {
+                    std::ostringstream oss;
+                    oss << "  " << s.bits_to_sequence() << "\n";
+                    std::cout << oss.str();
+                }
+            }  
         }
         return std::nullopt;
     }
 
-    // Returns true if we can correct this one barcode element into exactly one “true” whitelist entry.
     std::optional<int64_seq> correct_barcode(const seq_element& elem, const ReadLayout& layout, bool verbose){
         // pick the right whitelist
         auto key = seq_utils::remove_rc(elem.class_id);
         auto &wl = layout.wl_map.maps.at(key).get();
+        
         // extract and reverse‐complement the raw string
         std::string raw = elem.seq.value();
         if (elem.direction == "reverse"){
@@ -440,157 +466,345 @@ namespace barcode_correction {
         // encoded barcode
         int64_seq bc;
         bc.sequence_to_bits(raw);
+        int bc_len = static_cast<int>(bc.length);
         int max_shift_dist = static_cast<int>(bc.length*0.25);
         int max_resolve_dist = static_cast<int>(bc.length*0.2);
         int max_mutation_dist = static_cast<int>(bc.length*0.6);
-        // === filter match ===
-        if(!wl.filter_bcs.empty() && wl.filter_bcs.check_wl_for(bc)){
+        
+        // === filtering for messy barcodes ===
+        if(!wl.filter_bcs.empty() && (wl.filter_bcs.check_wl_for(bc) || seq_utils::int_kmerize(raw, 2) < 4)){
             if(verbose){
                 #pragma omp critical
-                std::cout << "FILTER_CHECK_FOUND\n";
-                std::cout << "NO_CHECK_WORKED\n";
+                {
+                    std::ostringstream oss;
+                    oss << "FILTER_CHECK_FOUND\nNO_CHECK_WORKED\n";
+                    std::cout << oss.str();
+                }
             }
             return std::nullopt;
         }
-        // === exact match ===
-        if (!wl.true_bcs.empty() && wl.true_bcs.check_wl_for(bc)) {
-            auto matched = wl.true_bcs.return_putative_correct_bcs(bc);
+
+        // === exact match in global whitelist ===
+        if(!wl.global_bcs.empty() && wl.global_bcs.check_wl_for(bc)){
+            auto matched = wl.global_bcs.return_putative_correct_bcs(bc);
             if(verbose){
                 #pragma omp critical
-                std::cout << "ORIGINAL_CHECK_FOUND (" << matched.size()
-                        << " candidates)\n";
+                {
+                    std::ostringstream oss;
+                    oss << "GLOBAL_CHECK_FOUND (" << matched.size() << " candidates)\n";
+                    std::cout << oss.str();
+
+                }
             }
             if (matched.size() == 1) {
                 if(verbose){
                     #pragma omp critical
-                    std::cout << "ORIGINAL_CHECK_WORKED\n";    
+                    {
+                        std::ostringstream oss;
+                        oss << "GLOBAL_CHECK_WORKED\n";
+                        std::cout << oss.str();
+                    }
                 }
-              return std::optional<int64_seq>(*matched.begin()); 
+                return std::optional<int64_seq>(*matched.begin());
             }
-            if (auto one = resolve_multiple_hits(bc, matched, max_resolve_dist, verbose)) {
+            if(verbose){
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "GLOBAL_CHECK_MULTIPLE_MATCHED\n";
+                    std::cout << oss.str();
+                }
+            }
+        }
+        
+        // === exact match in true barcodes ===
+        if (!wl.true_bcs.empty() && wl.true_bcs.check_wl_for(bc)) {
+            auto matched = wl.true_bcs.return_putative_correct_bcs(bc);
+            if(verbose){
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "ORIGINAL_CHECK_FOUND (" << matched.size() << " candidates)\n";
+                    std::cout << oss.str();
+                }
+            }
+            if (matched.size() == 1) {
                 if(verbose){
                     #pragma omp critical
-                    std::cout << "ORIGINAL_MATCH_COLLISION_RESOLVED\n";    
+                    {
+                        std::ostringstream oss;
+                        oss << "ORIGINAL_CHECK_WORKED\n";
+                        std::cout << oss.str();
+                    }
                 }
-                
+            return std::optional<int64_seq>(*matched.begin()); 
+            }
+            if (auto one = resolve_multiple_hits(bc, matched, 5, verbose)) {
+                if(verbose){
+                    #pragma omp critical
+                    {
+                        std::ostringstream oss;
+                        oss << "ORIGINAL_MATCH_COLLISION_RESOLVED\n";
+                        std::cout << oss.str();
+                    }
+                }
                 return std::optional<int64_seq>(*one);
             }
             if(verbose){
                 #pragma omp critical
-                std::cout << "ORIGINAL_MATCH_COLLISION_UNRESOLVED\n";
+                {
+                    std::ostringstream oss;
+                    oss << "ORIGINAL_MATCH_COLLISION_UNRESOLVED\n";
+                    std::cout << oss.str();
+                }
             }
         }
+
         if(verbose){
             #pragma omp critical
-            std::cout << "ORIGINAL_MATCH_NOT_FOUND\n";
+            {
+                std::ostringstream oss;
+                oss << "ORIGINAL_MATCH_NOT_FOUND\n";
+                std::cout << oss.str();
+            }
         }
-        // === global whitelist ===
-        {
-            if(!wl.global_bcs.empty() && wl.global_bcs.check_wl_for(bc)){
-                auto matched = wl.global_bcs.return_putative_correct_bcs(bc);
+        
+        // === mutation match - check global first, then true ===
+        auto muts = mutation_tools::generate_mutated_barcodes(bc, 2);
+        // Check mutations against global whitelist first
+        if (!wl.global_bcs.empty() && wl.global_bcs.check_wl_for(muts)) {
+            auto matched = wl.global_bcs.return_putative_correct_bcs(muts);
+            if(verbose){
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "GLOBAL_MUTATION_CHECK_FOUND (" << matched.size() << " candidates)\n";
+                    std::cout << oss.str();
+                }
+            }
+            if (matched.size() == 1) {
+                int64_seq putative_candidate = *matched.begin();
+                putative_candidate.bits_to_sequence();
                 if(verbose){
                     #pragma omp critical
-                    std::cout << "GLOBAL_CHECK_FOUND (" << matched.size() << " candidates)\n";
+                    {
+                        std::ostringstream oss;
+                        oss << "GLOBAL_MUTATION_CHECK_CANDIDATE::" << putative_candidate.bits_to_sequence() << "\n";
+                        std::cout << oss.str();
+                    }
                 }
-                if (matched.size() == 1) {
+                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
+                if(res >= 0 && res <= max_resolve_dist){
                     if(verbose){
                         #pragma omp critical
-                        std::cout << "GLOBAL_CHECK_WORKED\n";    
+                        {
+                            std::ostringstream oss;
+                            oss << "LVDIST::" << res << "\nGLOBAL_MUTATION_CHECK_MATCHED\n";
+                            std::cout << oss.str();
+                        }
                     }
                     return std::optional<int64_seq>(*matched.begin());
                 }
+            }
+            if (auto one = resolve_multiple_hits(bc, matched, max_mutation_dist, verbose)) {
                 if(verbose){
                     #pragma omp critical
-                    std::cout << "GLOBAL_MATCH_COLLISION_UNRESOLVED\n";    
+                    {
+                        std::ostringstream oss;
+                        oss << "GLOBAL_MUTATION_MULTIPLE_MATCHED_RESOLVED\n";
+                        std::cout << oss.str();
+                    }
+                }
+                return std::optional<int64_seq>(*one);
+            }
+            if(verbose){
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "GLOBAL_MUTATION_MULTIPLE_MATCHED_FAIL\n";
+                    std::cout << oss.str();
                 }
             }
         }
-        // === mutation match ===
-        {
-        auto muts = mutation_tools::generate_mutated_barcodes(bc, 2);
-            if (wl.true_bcs.check_wl_for(muts)) {
-                auto matched = wl.true_bcs.return_putative_correct_bcs(muts);
+        // Check mutations against true barcodes 
+        if (!wl.true_bcs.empty() && wl.true_bcs.check_wl_for(muts)) {
+            auto matched = wl.true_bcs.return_putative_correct_bcs(muts);
+            if(verbose){
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "MUTATION_CHECK_FOUND (" << matched.size() << " candidates)\n";
+                    std::cout << oss.str();
+                }
+            }
+            if (matched.size() == 1) {
+                int64_seq putative_candidate = *matched.begin();
+                putative_candidate.bits_to_sequence();
                 if(verbose){
                     #pragma omp critical
-                    std::cout << "MUTATION_CHECK_FOUND (" << matched.size() << " candidates)\n";
+                    {
+                        std::ostringstream oss;
+                        oss << "MUTATION_CHECK_CANDIDATE::" << putative_candidate.bits_to_sequence() << "\n";
+                        std::cout << oss.str();
+                    }
                 }
-                if (matched.size() == 1) {
-                    int64_seq putative_candidate = *matched.begin();
-                    putative_candidate.bits_to_sequence();
+                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
+                if(res >= 0 && res <= max_resolve_dist){
                     if(verbose){
                         #pragma omp critical
-                        std::cout << "MUTATION_CHECK_CANDIDATE::" << putative_candidate.bits_to_sequence() << "\n";
-                    }
-                    int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
-                    if(res >= 0 && res <= max_resolve_dist){
-                        if(verbose){
-                            #pragma omp critical
-                            std::cout << "LVDIST::" << res << "\n";
-                            std::cout << "MUTATION_CHECK_MATCHED\n";    
+                        {
+                            std::ostringstream oss;
+                            oss << "LVDIST::" << res << "\nMUTATION_CHECK_MATCHED\n";
+                            std::cout << oss.str();
                         }
-                        return std::optional<int64_seq>(*matched.begin());
                     }
+                    return std::optional<int64_seq>(*matched.begin());
                 }
-                if (auto one = resolve_multiple_hits(bc, matched, max_mutation_dist, verbose)) {
-                    if(verbose){
-                        #pragma omp critical
-                        std::cout << "WL_MULTIPLE_MATCHED_RESOLVED\n";
-                    }
-                    return std::optional<int64_seq>(*one);
-                }
+            }
+            if (auto one = resolve_multiple_hits(bc, matched, max_mutation_dist, verbose)) {
                 if(verbose){
                     #pragma omp critical
-                    std::cout << "WL_MULTIPLE_MATCHED_FAIL\n";
+                    {
+                        std::ostringstream oss;
+                        oss << "MUTATION_MULTIPLE_MATCHED_RESOLVED\n";
+                        std::cout << oss.str();
+                    }
+                }
+                return std::optional<int64_seq>(*one);
+            }
+            if(verbose){
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "MUTATION_MULTIPLE_MATCHED_FAIL\n";
+                    std::cout << oss.str();
                 }
             }
         }
-        // === shift fuzzy match ===
-        {
+        
+        // === shift fuzzy match - check global first, then true ===
         auto shifts = mutation_tools::generate_shifted_barcodes(bc, max_shift_dist);
-            if (wl.true_bcs.check_wl_for(shifts)) {
-                auto matched = wl.true_bcs.return_putative_correct_bcs(shifts);
+        // Check shifts against global whitelist first
+        if (!wl.global_bcs.empty() && wl.global_bcs.check_wl_for(shifts)) {
+            auto matched = wl.global_bcs.return_putative_correct_bcs(shifts);
+            if(verbose){
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "GLOBAL_SHIFT_CHECK_WORKED (" << matched.size() << " candidates)\n";
+                    std::cout << oss.str();
+                }
+            }
+            if (matched.size() == 1) {
+                int64_seq putative_candidate = *matched.begin();
+                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
                 if(verbose){
                     #pragma omp critical
-                    std::cout << "SHIFT_CHECK_WORKED (" << matched.size()
-                            << " candidates)\n";    
+                    {
+                        std::ostringstream oss;
+                        oss << "GLOBAL_SHIFT_CHECK_CANDIDATE::" << putative_candidate.bits_to_sequence() << "\nLVDIST::" << res << "\n";
+                        std::cout << oss.str();
+                    }
                 }
-                if (matched.size() == 1) {
-                    int64_seq putative_candidate = *matched.begin();
-                    int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
+                if(res >= 0 && res <= 5){
                     if(verbose){
                         #pragma omp critical
-                        std::cout << "SHIFT_CHECK_CANDIDATE::" << putative_candidate.bits_to_sequence() << "\n";
-                        std::cout << "LVDIST::" << res << "\n";    
-                    }
-                    if(res >= 0 && res <= max_resolve_dist){
-                        if(verbose){
-                            #pragma omp critical
-                            std::cout << "SHIFT_CHECK_MATCHED\n";    
+                        {
+                            std::ostringstream oss;
+                            oss << "GLOBAL_SHIFT_CHECK_MATCHED\n";
+                            std::cout << oss.str();
                         }
-                        return std::optional<int64_seq>(*matched.begin());
                     }
+                    return std::optional<int64_seq>(*matched.begin());
                 }
-
-                if (auto one = resolve_multiple_hits(bc, matched, max_resolve_dist, verbose)) {  
-                        if(verbose){
-                            #pragma omp critical
-                            std::cout << "SHIFT_MULTIPLE_MATCHED_RESOLVED\n";
-                        }
-                    return std::optional<int64_seq>(*one);
-                }
+            }
+            if (auto one = resolve_multiple_hits(bc, matched, 5, verbose)) {  
                 if(verbose){
                     #pragma omp critical
-                    std::cout << "SHIFT_MULTIPLE_MATCHED_FAIL\n";
+                    {
+                        std::ostringstream oss;
+                        oss << "GLOBAL_SHIFT_MULTIPLE_MATCHED_RESOLVED\n";
+                        std::cout << oss.str();
+                    }
+                }
+                return std::optional<int64_seq>(*one);
+            }
+            if(verbose){
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "GLOBAL_SHIFT_MULTIPLE_MATCHED_FAIL\n";
+                    std::cout << oss.str();
                 }
             }
         }
+        // Check shifts against true barcodes
+        if (!wl.true_bcs.empty() && wl.true_bcs.check_wl_for(shifts)) {
+            auto matched = wl.true_bcs.return_putative_correct_bcs(shifts);
+            if(verbose){
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "SHIFT_CHECK_WORKED (" << matched.size() << " candidates)\n";
+                    std::cout << oss.str();
+                }
+            }
+            if (matched.size() == 1) {
+                int64_seq putative_candidate = *matched.begin();
+                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
+                if(verbose){
+                    #pragma omp critical
+                    {
+                        std::ostringstream oss;
+                        oss << "SHIFT_CHECK_CANDIDATE::" << putative_candidate.bits_to_sequence() << "\n";
+                        oss << "LVDIST::" << res << "\n";
+                        std::cout << oss.str();
+                    }
+                }
+                if(res >= 0 && res <= 5){
+                    if(verbose){
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "SHIFT_CHECK_MATCHED\n";
+                            std::cout << oss.str();
+                        }
+                    }
+                    return std::optional<int64_seq>(*matched.begin());
+                }
+            }
+            if (auto one = resolve_multiple_hits(bc, matched, 5, verbose)) {  
+                if(verbose){
+                    #pragma omp critical
+                    {
+                        std::ostringstream oss;
+                        oss << "SHIFT_MULTIPLE_MATCHED_RESOLVED\n";
+                        std::cout << oss.str();
+                    }
+                }
+                return std::optional<int64_seq>(*one);
+            }
+            if(verbose){
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "SHIFT_MULTIPLE_MATCHED_FAIL\n";
+                    std::cout << oss.str();
+                }
+            }
+        }
+        
         // === no match ===
         if(verbose){
             #pragma omp critical
-            std::cout << "NO_CHECK_WORKED\n";
+            {
+                std::ostringstream oss;
+                oss << "NO_MATCH_FOUND\n";
+                std::cout << oss.str();
+            }
         }
         return std::nullopt;
-  }
+    }
 
 };
 
@@ -654,7 +868,9 @@ public:
     // Container operations
     size_t size() const { return sig_elements.size(); }
     bool empty() const { return sig_elements.empty(); }
-    void clear() { sig_elements.clear(); }
+    void clear() { 
+        sig_elements.clear(); 
+    }
 
     // Iterators
     auto begin() { return sig_elements.begin(); }
@@ -687,7 +903,9 @@ private:
         if (verbose) {
             #pragma omp critical
             {
-                std::cout << "Processing variable element: " << layout_elem->class_id << std::endl;
+                std::ostringstream oss;
+                oss << "Processing variable element: " << layout_elem->class_id << std::endl;
+                std::cout << oss.str();
             }
         }
         return map_positions(ref_pos, static_refs, read_seq, it, id_index, var_positions, verbose);
@@ -714,10 +932,12 @@ private:
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "Added static reference " << elem->class_id 
+                    std::ostringstream oss;
+                    oss << "Added static reference " << elem->class_id 
                               << " (order: " << elem->order 
                               << ", pos: " << elem->position.first << "-" << elem->position.second 
                               << ") to ordered list." << std::endl;
+                    std::cout << oss.str();
                 }
             }
         }
@@ -732,10 +952,14 @@ private:
     if (verbose) {
         #pragma omp critical
         {
-            std::cout << "Ordered static references for variable element " 
+            std::ostringstream oss;
+            oss << "Ordered static references for variable element " 
                       << var_it->class_id << ": ";
+            std::cout << oss.str();
             for (const auto& elem : ordered_elements) {
-                std::cout << elem->class_id << "(" << elem->order << ") ";
+                std::ostringstream oss_elem;
+                oss_elem << elem->class_id << "(" << elem->order << ") ";
+                std::cout << oss_elem.str();
             }
             std::cout << std::endl;
         }
@@ -757,12 +981,14 @@ private:
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "Found " << ref_pos.primary_start.ref_id 
-                              << " as the primary start reference candidate." << std::endl;
-                    std::cout << "Primary start details: is_start=" << ref_pos.primary_start.is_start 
+                    std::ostringstream oss;
+                    oss << "Found " << ref_pos.primary_start.ref_id 
+                              << " as the primary start reference candidate.\n"
+                              << "Primary start details: is_start=" << ref_pos.primary_start.is_start 
                               << ", offset=" << ref_pos.primary_start.offset 
                               << ", static pos=(" << primary_candidate->position.first << ","
                               << primary_candidate->position.second << ")" << std::endl;
+                    std::cout << oss.str();
                 }
             }
             auto ref_order_pos = std::find_if(ordered_elements.begin(), ordered_elements.end(),
@@ -775,10 +1001,12 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Primary start: Previous element in ordered list is " 
+                        std::ostringstream oss;
+                        oss << "Primary start: Previous element in ordered list is " 
                                   << (*prev)->class_id << " (pos: " 
                                   << (*prev)->position.first << "-" << (*prev)->position.second 
                                   << ", global_class: " << (*prev)->global_class << ")." << std::endl;
+                        std::cout << oss.str();
                     }
                 }
                 if ((*prev)->global_class != "poly_tail" &&
@@ -787,10 +1015,12 @@ private:
                     if (verbose) {
                         #pragma omp critical
                         {
-                            std::cout << "Primary start out-of-order: previous element's end (" 
+                            std::ostringstream oss;
+                            oss << "Primary start out-of-order: previous element's end (" 
                                       << (*prev)->position.second 
                                       << ") > candidate's beginning (" 
                                       << primary_candidate->position.first << ")." << std::endl;
+                            std::cout << oss.str();
                         }
                     }
                 }
@@ -798,7 +1028,9 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Primary start candidate is the first element in the ordered list." << std::endl;
+                        std::ostringstream oss;
+                        oss << "Primary start candidate is the first element in the ordered list." << std::endl;
+                        std::cout << oss.str();
                     }
                 }
             }
@@ -809,7 +1041,9 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Using primary start mapping: calculated start_pos = " << start_pos << std::endl;
+                        std::ostringstream oss;
+                        oss << "Using primary start mapping: calculated start_pos = " << start_pos << std::endl;
+                        std::cout << oss.str();
                     }
                 }
             }
@@ -817,8 +1051,10 @@ private:
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "Primary start reference " << ref_pos.primary_start.ref_id 
+                    std::ostringstream oss;
+                    oss << "Primary start reference " << ref_pos.primary_start.ref_id 
                               << " not found in static_refs." << std::endl;
+                    std::cout << oss.str();
                 }
             }
         }
@@ -842,12 +1078,14 @@ private:
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "Found " << ref_pos.secondary_start.ref_id 
-                              << " as the secondary start reference candidate." << std::endl;
-                    std::cout << "Secondary start details: is_start=" << ref_pos.secondary_start.is_start 
+                    std::ostringstream oss;
+                    oss << "Found " << ref_pos.secondary_start.ref_id 
+                              << " as the secondary start reference candidate."
+                              << "Secondary start details: is_start=" << ref_pos.secondary_start.is_start 
                               << ", offset=" << ref_pos.secondary_start.offset 
                               << ", static pos=(" << secondary_candidate->position.first << ","
                               << secondary_candidate->position.second << ")" << std::endl;
+                    std::cout << oss.str();
                 }
             }
             bool is_ordered = true;
@@ -856,10 +1094,12 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Secondary start: Previous element in ordered list is " 
+                        std::ostringstream oss;
+                        oss << "Secondary start: Previous element in ordered list is " 
                                   << (*prev)->class_id << " (pos: " 
                                   << (*prev)->position.first << "-" << (*prev)->position.second 
                                   << ")." << std::endl;
+                        std::cout << oss.str();
                     }
                 }
                 if ((*prev)->position.second > secondary_candidate->position.first) {
@@ -867,10 +1107,12 @@ private:
                     if (verbose) {
                         #pragma omp critical
                         {
-                            std::cout << "Secondary start out-of-order: previous element's end (" 
+                            std::ostringstream oss;
+                            oss << "Secondary start out-of-order: previous element's end (" 
                                       << (*prev)->position.second 
                                       << ") > candidate's beginning (" 
                                       << secondary_candidate->position.first << ")." << std::endl;
+                            std::cout << oss.str();
                         }
                     }
                 }
@@ -878,7 +1120,9 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Secondary start candidate is the first element in the ordered list." << std::endl;
+                        std::ostringstream oss;
+                        oss << "Secondary start candidate is the first element in the ordered list." << std::endl;
+                        std::cout << oss.str();
                     }
                 }
             }
@@ -889,7 +1133,9 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Using secondary start mapping: calculated start_pos = " << start_pos << std::endl;
+                        std::ostringstream oss;
+                        oss << "Using secondary start mapping: calculated start_pos = " << start_pos << std::endl;
+                        std::cout << oss.str();
                     }
                 }
             } 
@@ -897,15 +1143,19 @@ private:
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "Secondary start reference " << ref_pos.secondary_start.ref_id 
+                    std::ostringstream oss;
+                    oss << "Secondary start reference " << ref_pos.secondary_start.ref_id 
                               << " not found in static_refs." << std::endl;
+                    std::cout << oss.str();
                 }
             }
         if (!ref_pos.secondary_start.add_flags.empty() && ref_pos.secondary_start.add_flags == "left_truncated") {
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "Secondary start flagged as left_truncated; attempting fallback." << std::endl;
+                    std::ostringstream oss;
+                    oss << "Secondary start flagged as left_truncated; attempting fallback." << std::endl;
+                    std::cout << oss.str();
                 }
             }
                 // Look for the nearest static element to the right.
@@ -925,16 +1175,20 @@ private:
                         if (verbose) {
                             #pragma omp critical
                             {
-                                std::cout << "Using left terminal linked fallback: " 
+                                std::ostringstream oss;
+                                oss << "Using left terminal linked fallback: " 
                                             << fallback_candidate->class_id 
                                             << " with start_pos = " << start_pos << std::endl;
+                                std::cout << oss.str();
                             }
                         }
                     } else {
                         if (verbose) {
                             #pragma omp critical
                             {
-                                std::cout << "Fallback static reference for secondary start not found." << std::endl;
+                                std::ostringstream oss;
+                                oss << "Fallback static reference for secondary start not found." << std::endl;
+                                std::cout << oss.str();
                             }
                         }
                     }
@@ -942,7 +1196,9 @@ private:
                     if (verbose) {
                         #pragma omp critical
                         {
-                            std::cout << "No suitable fallback static element found for secondary start." << std::endl;
+                            std::ostringstream oss;
+                            oss << "No suitable fallback static element found for secondary start." << std::endl;
+                            std::cout << oss.str();
                         }
                     }
                 }
@@ -965,12 +1221,14 @@ private:
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "Found " << ref_pos.primary_stop.ref_id 
-                              << " as the primary stop reference candidate." << std::endl;
-                    std::cout << "Primary stop details: is_start=" << ref_pos.primary_stop.is_start 
+                    std::ostringstream oss;
+                    oss << "Found " << ref_pos.primary_stop.ref_id 
+                              << " as the primary stop reference candidate.\n"
+                              << "Primary stop details: is_start=" << ref_pos.primary_stop.is_start 
                               << ", offset=" << ref_pos.primary_stop.offset 
                               << ", static pos=(" << primary_stop_candidate->position.first << ","
                               << primary_stop_candidate->position.second << ")" << std::endl;
+                    std::cout << oss.str();
                 }
             }
             auto ref_order_pos = std::find_if(ordered_elements.begin(), ordered_elements.end(),
@@ -983,10 +1241,12 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Primary stop: Previous element in ordered list is " 
+                        std::ostringstream oss;
+                        oss << "Primary stop: Previous element in ordered list is " 
                                   << (*prev)->class_id << " (pos: " 
                                   << (*prev)->position.first << "-" << (*prev)->position.second 
                                   << ")." << std::endl;
+                        std::cout << oss.str();
                     }
                 }
                 if ((*prev)->position.second > primary_stop_candidate->position.first) {
@@ -994,10 +1254,12 @@ private:
                     if (verbose) {
                         #pragma omp critical
                         {
-                            std::cout << "Primary stop out-of-order: previous element's end (" 
+                            std::ostringstream oss;
+                            oss << "Primary stop out-of-order: previous element's end (" 
                                       << (*prev)->position.second 
                                       << ") > candidate's beginning (" 
                                       << primary_stop_candidate->position.first << ")." << std::endl;
+                            std::cout << oss.str();
                         }
                     }
                 }
@@ -1005,7 +1267,9 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Primary stop candidate is the first element in the ordered list." << std::endl;
+                        std::ostringstream oss;
+                        oss << "Primary stop candidate is the first element in the ordered list." << std::endl;
+                        std::cout << oss.str();
                     }
                 }
             }
@@ -1016,7 +1280,9 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Using primary stop mapping: calculated stop_pos = " << stop_pos << std::endl;
+                        std::ostringstream oss;
+                        oss << "Using primary stop mapping: calculated stop_pos = " << stop_pos << std::endl;
+                        std::cout << oss.str();
                     }
                 }
             }
@@ -1024,8 +1290,10 @@ private:
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "Primary stop reference " << ref_pos.primary_stop.ref_id 
+                    std::ostringstream oss;
+                    oss << "Primary stop reference " << ref_pos.primary_stop.ref_id 
                               << " not found in static_refs." << std::endl;
+                    std::cout << oss.str();
                 }
             }
         }
@@ -1036,9 +1304,11 @@ private:
         if(verbose){
             #pragma omp critical
             {
-                std::cout << "Primary stop mapping failed; attempting secondary stop mapping." << std::endl;
-                std::cout << "Secondary stop reference ID: " << ref_pos.secondary_stop.ref_id << std::endl;
-                std::cout << "Secondary flags: " << ref_pos.secondary_stop.add_flags << std::endl;
+                std::ostringstream oss;
+                oss << "Primary stop mapping failed; attempting secondary stop mapping.\n"
+                          << "Secondary stop reference ID: " << ref_pos.secondary_stop.ref_id
+                          << "\nSecondary flags: " << ref_pos.secondary_stop.add_flags << std::endl;
+                std::cout << oss.str();
             }
         }
         auto range = static_refs.equal_range(ref_pos.secondary_stop.ref_id);
@@ -1059,12 +1329,14 @@ private:
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "Found " << ref_pos.secondary_stop.ref_id 
-                              << " as the secondary stop reference candidate." << std::endl;
-                    std::cout << "Secondary stop details: is_start=" << ref_pos.secondary_stop.is_start 
+                    std::ostringstream oss;
+                    oss << "Found " << ref_pos.secondary_stop.ref_id 
+                              << " as the secondary stop reference candidate."
+                              << "Secondary stop details: is_start=" << ref_pos.secondary_stop.is_start 
                               << ", offset=" << ref_pos.secondary_stop.offset 
                               << ", static pos=(" << secondary_stop_candidate->position.first << ","
                               << secondary_stop_candidate->position.second << ")" << std::endl;
+                    std::cout << oss.str();
                 }
             }
             bool is_ordered = true;
@@ -1073,10 +1345,12 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Secondary stop: Previous element in ordered list is " 
+                        std::ostringstream oss;
+                        oss << "Secondary stop: Previous element in ordered list is " 
                                 << (*prev)->class_id << " (pos: " 
                                 << (*prev)->position.first << "-" << (*prev)->position.second 
                                 << ")." << std::endl;
+                        std::cout << oss.str();
                     }
                 }
                 if ((*prev)->position.second > secondary_stop_candidate->position.first)
@@ -1085,7 +1359,9 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Secondary stop candidate is the first element in the ordered list." << std::endl;
+                        std::ostringstream oss;
+                        oss << "Secondary stop candidate is the first element in the ordered list." << std::endl;
+                        std::cout << oss.str();
                     }
                 }
             }
@@ -1096,7 +1372,9 @@ private:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Using secondary stop mapping: calculated stop_pos = " << stop_pos << std::endl;
+                        std::ostringstream oss;
+                        oss << "Using secondary stop mapping: calculated stop_pos = " << stop_pos << std::endl;
+                        std::cout << oss.str();
                     }
                 }
             }
@@ -1104,15 +1382,19 @@ private:
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "Secondary stop reference " << ref_pos.secondary_stop.ref_id 
+                    std::ostringstream oss;
+                    oss << "Secondary stop reference " << ref_pos.secondary_stop.ref_id 
                               << " not found in static_refs." << std::endl;
+                    std::cout << oss.str();
                 }
             }
             if (!ref_pos.secondary_stop.add_flags.empty() && ref_pos.secondary_stop.add_flags == "right_truncated") {
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Secondary stop flagged as right_truncated; attempting fallback." << std::endl;
+                        std::ostringstream oss;
+                        oss << "Secondary stop flagged as right_truncated; attempting fallback." << std::endl;
+                        std::cout << oss.str();
                     }
                 }
                 // Look for the nearest static element to the left.
@@ -1133,16 +1415,20 @@ private:
                         if (verbose) {
                             #pragma omp critical
                             {
-                                std::cout << "Using right terminal linked fallback: " 
+                                std::ostringstream oss;
+                                oss << "Using right terminal linked fallback: " 
                                             << fallback_candidate->class_id 
                                             << " with stop_pos = " << stop_pos << std::endl;
+                                std::cout << oss.str();
                             }
                         }
                     } else {
                         if (verbose) {
                             #pragma omp critical
                             {
-                                std::cout << "Fallback static reference for secondary stop not found." << std::endl;
+                                std::ostringstream oss;
+                                oss << "Fallback static reference for secondary stop not found." << std::endl;
+                                std::cout << oss.str();
                             }
                         }
                     }
@@ -1150,7 +1436,9 @@ private:
                     if (verbose) {
                         #pragma omp critical
                         {
-                            std::cout << "No suitable fallback static element found for secondary stop." << std::endl;
+                            std::ostringstream oss;
+                            oss << "No suitable fallback static element found for secondary stop." << std::endl;
+                            std::cout << oss.str();
                         }
                     }
                 }
@@ -1163,8 +1451,10 @@ private:
     if (verbose) {
         #pragma omp critical
         {
-            std::cout << "Final calculated positions: " << start_pos << ":" << stop_pos 
+            std::ostringstream oss;
+            oss << "Final calculated positions: " << start_pos << ":" << stop_pos 
                       << " for variable element " << var_it->class_id << std::endl;
+            std::cout << oss.str();
         }
     }
     
@@ -1173,7 +1463,9 @@ private:
         if (verbose) {
             #pragma omp critical
             {
-                std::cout << "Positions validated for variable element " << var_it->class_id << std::endl;
+                std::ostringstream oss;
+                oss << "Positions validated for variable element " << var_it->class_id << std::endl;
+                std::cout << oss.str();
             }
         }
         std::string var_seq = read_seq.substr(var_positions.first - 1, 
@@ -1191,7 +1483,11 @@ private:
     });
     if (verbose) {
         #pragma omp critical
-        std::cout << "Position validation failed for variable element " << var_it->class_id << std::endl;
+        {
+            std::ostringstream oss;
+            oss << "Position validation failed for variable element " << var_it->class_id << std::endl;
+            std::cout << oss.str();
+        }
     }
     return false;
 }
@@ -1240,9 +1536,12 @@ private:
             auto& idx = sig_elements.get<sig_id_tag>();
             idx.modify(idx.find(e.class_id), [](seq_element& x){ x.element_pass = false; });
             if (verbose) {
-                #pragma omp critical
-                std::cout << "  ["<<direction<<"] invalid positions on “"
-                        << e.class_id << "”\n";
+                    #pragma omp critical
+                    {
+                        std::ostringstream oss;
+                        oss << "  ["<< direction << "] invalid positions on ""<< e.class_id << ""\n";
+                        std::cout << oss.str();
+                    }
                 }
                 return false;
             }
@@ -1264,8 +1563,16 @@ private:
                     edit_elem(e2.class_id, [](seq_element &x){ x.element_pass = false; });
                     if (verbose) {
                         #pragma omp critical
-                        std::cout << "Overlap: " 
-                                  << e1.class_id << " vs " << e2.class_id << "\n";
+                        {
+                            std::ostringstream oss;
+                            oss << "  Overlap detected between elements: "
+                                  << e1.class_id << " and " << e2.class_id
+                                  << " at positions (" << e1.position.first << "-" 
+                                  << e1.position.second << ") and ("
+                                  << e2.position.first << "-" 
+                                  << e2.position.second << ")." << std::endl;
+                            std::cout << oss.str();
+                        }
                     }
                 }
             }
@@ -1280,58 +1587,112 @@ private:
         return direction_elements;
     }
 
-    // update barcode counts
-    void update_bc_counts(const SigString &sig, const ReadLayout &layout, bool verbose = false) {
-        auto type = sig.type(); // “forward”, “reverse”, “concatenate”, or “filtered”
-        for (auto const &elem : sig.elements()) {
-            // ||  !elem.element_pass.value_or(false)
-            if (elem.global_class != "barcode" || !elem.seq.has_value()) {
-                continue;
-            }
-        // recover the raw sequence (reverse‐comp if needed)
-        std::string bc_seq = elem.seq.value();
-        if (elem.direction == "reverse" && type != "forward"){
-            bc_seq = seq_utils::revcomp(bc_seq);
+    // Update barcode counts based on the SigString and ReadLayout
+   void update_bc_counts(const SigString &sig, const ReadLayout &layout, bool verbose) {
+    auto type = read_type; // "forward", "reverse", "concatenate", or "filtered"
+    
+    for (auto const &elem : sig.elements()) {
+        if (elem.global_class != "barcode" || !elem.seq.has_value()) {
+            continue;
         }
+        
+        // Get current sequence and original sequence
+        std::string bc_seq = elem.seq.value();
+        std::string original_seq = elem.original_seq.value_or("");
         int64_seq bc(bc_seq);
-
-        // look up the right whitelist
+        
+        // Look up the right whitelist
         auto key = seq_utils::remove_rc(elem.class_id);
         auto &wl = layout.wl_map.maps.at(key).get();
-
-        // always bump the total counter
+        
+        if (verbose) {
+            #pragma omp critical
+            {
+                std::ostringstream oss;
+                oss << "UPDATE_BC_COUNT FOR ELEM.DIR: " << elem.direction << " AND READ_TYPE: " << type << std::endl;
+                std::cout << oss.str();
+            }
+        }
+    
+        // Determine if this was corrected or raw
+        bool is_corrected = false;
+        if (!original_seq.empty() && original_seq != "") {
+            std::string original_for_comparison = original_seq;
+            std::string original_revcomp = seq_utils::revcomp(original_seq);
+            // Check if current sequence matches original (raw) or is different (corrected)
+            if (bc_seq != original_for_comparison && bc_seq != original_revcomp) {
+                is_corrected = true;
+            }
+        }
         if(verbose){
             #pragma omp critical
             {
-                std::cout << "UPDATE_BC_COUNT_TYPE " << type << " FOR ELEM.DIR: " << elem.direction << std::endl;
+                std::ostringstream oss;
+                oss << "Barcode " << bc.bits_to_sequence() 
+                    << " is " << (is_corrected ? "CORRECTED" : "RAW") 
+                    << " from original sequence: " << original_seq << std::endl;
+                std::cout << oss.str();
             }
         }
-        if(type == "filtered" || type != elem.direction){
+
+        if (type == "filtered") {
             wl.true_bcs.update_bc_count(bc, barcode_counts::filtered);
         }
         if (type == "forward" && elem.direction == "forward") {
+            wl.true_bcs.update_bc_count(bc, barcode_counts::total);
+            wl.true_bcs.update_bc_count(bc, barcode_counts::forw);
+            if(is_corrected) {
+                wl.true_bcs.update_bc_count(bc, barcode_counts::corrected);
+            } else {
+                wl.true_bcs.update_bc_count(bc, barcode_counts::raw);
+            }
+        }
+
+        if (type == "reverse" && elem.direction == "reverse") {
+            wl.true_bcs.update_bc_count(bc, barcode_counts::total);
+            wl.true_bcs.update_bc_count(bc, barcode_counts::rev);
+            if(is_corrected) {
+                wl.true_bcs.update_bc_count(bc, barcode_counts::corrected);
+            } else {
+                wl.true_bcs.update_bc_count(bc, barcode_counts::raw);
+            }
+        }
+
+        if (type == "concatenate") {
+            if (elem.direction == "forward") {
                 wl.true_bcs.update_bc_count(bc, barcode_counts::total);
-                wl.true_bcs.update_bc_count(bc, barcode_counts::forw);
-            } else if (type == "reverse" && elem.direction == "reverse") {
-                wl.true_bcs.update_bc_count(bc, barcode_counts::total);
-                wl.true_bcs.update_bc_count(bc, barcode_counts::rev);
-            } else if (type == "concatenate") {
-                if (elem.direction == "forward" && elem.direction == "forward") {
-                    wl.true_bcs.update_bc_count(bc, barcode_counts::total);
-                    wl.true_bcs.update_bc_count(bc, barcode_counts::forw_concat);
+                wl.true_bcs.update_bc_count(bc, barcode_counts::forw_concat);
+                if(is_corrected) {
+                    wl.true_bcs.update_bc_count(bc, barcode_counts::corrected);
+                } else {
+                    wl.true_bcs.update_bc_count(bc, barcode_counts::raw);
                 }
-                if(elem.direction == "reverse" && elem.direction == "reverse"){
-                    wl.true_bcs.update_bc_count(bc, barcode_counts::total);
-                    wl.true_bcs.update_bc_count(bc, barcode_counts::rev_concat);
+            } else if (elem.direction == "reverse") {
+                wl.true_bcs.update_bc_count(bc, barcode_counts::total);
+                wl.true_bcs.update_bc_count(bc, barcode_counts::rev_concat);
+                if(is_corrected) {
+                    wl.true_bcs.update_bc_count(bc, barcode_counts::corrected);
+                } else {
+                    wl.true_bcs.update_bc_count(bc, barcode_counts::raw);
                 }
             }
-            int bc_count = wl.true_bcs.get_bc_count(bc);
-            if(verbose){
-                #pragma omp critical
-                std::cout << "Barcode count for " << bc.bits_to_sequence() << ": " << bc_count << std::endl;
+        }
+        
+        if (verbose) {
+            #pragma omp critical
+            {
+                std::ostringstream oss;
+                int bc_total = wl.true_bcs.get_bc_count(bc, barcode_counts::total);
+                int bc_corrected = wl.true_bcs.get_bc_count(bc, barcode_counts::corrected);
+                oss << "Barcode " << bc.bits_to_sequence() 
+                    << ": total=" << bc_total 
+                    << ", corrected=" << bc_corrected
+                    << ", status=" << (is_corrected ? "CORRECTED" : "RAW") << std::endl;
+                std::cout << oss.str();
             }
         }
     }
+}
 
 public:
     //sigalign_static v2
@@ -1343,7 +1704,9 @@ public:
     if(verbose){
         #pragma omp critical
         {
-            std::cout << "\n=== Starting static alignment for " << sequence_id << " ===" << std::endl;
+            std::ostringstream oss;
+            oss << "\n=== Starting static alignment for " << sequence_id << " ===" << std::endl;
+            std::cout << oss.str();
         }
     }
     int max_distance = -1;
@@ -1355,20 +1718,30 @@ public:
         if(verbose){
             #pragma omp critical
             {
-                std::cout << "Processing static element: " << it->class_id << std::endl;
+                std::ostringstream oss;
+                oss << "Processing static element: " << it->class_id << std::endl;
+                std::cout << oss.str();
                 if(it->aligned_positions){
-                    std::cout << "  Aligned positions: " 
+                    std::ostringstream aligned;
+                    aligned << "  Aligned positions: " 
                               << it->aligned_positions->start_stats.first << ", "
                               << it->aligned_positions->start_stats.second << std::endl;
+                    std::cout << aligned.str();
                 } else {
-                    std::cout << "  No aligned positions available." << std::endl;
+                    std::ostringstream fail;
+                    fail << "  No aligned positions available." << std::endl;
+                    std::cout << fail.str();
                 }
                 if(it->misaligned_positions){
-                    std::cout << "  Misaligned positions: " 
+                    std::ostringstream misaligned;
+                    misaligned << "  Misaligned positions: " 
                               << it->misaligned_positions->start_stats.first << ", "
                               << it->misaligned_positions->start_stats.second << std::endl;
+                    std::cout << misaligned.str();
                 } else {
-                    std::cout << "  No misaligned positions available." << std::endl;
+                    std::ostringstream fail_again;
+                    fail_again << "  No misaligned positions available." << std::endl;
+                    std::cout << fail_again.str();
                 }
             }
         }
@@ -1400,7 +1773,7 @@ public:
 
         // poly-tail solution--importantly, only will look for poly-tails if you tell it to
         if (it->global_class == "poly_tail") {
-            auto result = aligner.find_poly_tails(it->seq, read.seq, 12);
+            auto result = aligner.find_poly_tails(it->seq, read.seq, 14);
             if (result.success) {
                 for (const auto& positions : result.positions) {
                     add_element(seq_element(
@@ -1445,9 +1818,10 @@ public:
         if (verbose) {
             #pragma omp critical
             {
-
-                std::cout << "Expected region for " << it->class_id << ": " 
+                std::ostringstream oss;
+                oss << "Expected region for " << it->class_id << ": " 
                           << expected_start << " - " << expected_end << std::endl;
+                std::cout << oss.str();
             }
         }
 
@@ -1500,7 +1874,9 @@ public:
         if(verbose){
             #pragma omp critical
             {
-                std::cout << "\n=== Starting variable alignment for " << sequence_id << " ===" << std::endl;
+                std::ostringstream oss;
+                oss << "\n=== Starting variable alignment for " << sequence_id << " ===" << std::endl;
+                std::cout << oss.str();
             }
         }
 
@@ -1553,12 +1929,14 @@ public:
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "Found static reference: " << elem.class_id 
+                        std::ostringstream oss;
+                        oss << "Found static reference: " << elem.class_id 
                                   << " at position " << elem.position.first 
                                   << ":" << elem.position.second 
                                   << " with edit distance " << (elem.edit_distance ? std::to_string(elem.edit_distance.value()) : "none")
                                   << " and sequence " << (elem.seq ? elem.seq.value() : "none") 
                                   << std::endl;
+                        std::cout << oss.str();
                     }
                 }
             }
@@ -1595,9 +1973,11 @@ public:
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "Found reference: " << elem.class_id 
+                    std::ostringstream oss;
+                    oss << "Found reference: " << elem.class_id 
                               << " at position " << elem.position.first 
                               << ":" << elem.position.second << std::endl;
+                    std::cout << oss.str();
                 }
             }
         }
@@ -1610,8 +1990,10 @@ public:
         if (verbose) {
             #pragma omp critical
             {
-                std::cout << "Successfully positioned " << positioned_count << " variable elements" << std::endl;
-                std::cout << "Final sigstring elements: " << sig_elements.size() << std::endl;
+                std::ostringstream oss;
+                oss << "Successfully positioned " << positioned_count << " variable elements\n"
+                 << "Final sigstring elements: " << sig_elements.size() << std::endl;
+                std::cout << oss.str();
             }
         }
     }
@@ -1670,11 +2052,15 @@ public:
                 if (start + length >= masked_read.size() || start < 1 || length <= 1 || start + length <= 1) {
                     if(verbose){
                         #pragma omp critical
-                        std::cout << "Skipping a read element due to out-of-bounds parameters." << std::endl;
-                        std::cout << "Start: " << start << ", Length: " << length 
-                                  << ", Read length: " << masked_read.size() << std::endl;
-                        std::cout << "Masked read: " << masked_read << std::endl;
-                        std::cout << "Direction: " << direction << std::endl;
+                        {
+                            std::ostringstream oss;
+                            oss << "Skipping a read element due to out-of-bounds parameters.\n"
+                                    << "Start: " << start << ", Length: " << length 
+                                    << ", Read length: " << masked_read.size() << "\n"
+                                    << "Masked read: " << masked_read << "\n"
+                                    << "Direction: " << direction << std::endl;
+                            std::cout << oss.str();
+                        }
                     }
                     break;  // out of bounds—skip
                 }
@@ -1708,22 +2094,40 @@ public:
                         el.qual = cleaned_qual;
                         if(verbose){
                             #pragma omp critical
-                            std::cout << "Masked qual: " << el.qual.value() << "\n";
+                            {
+                                std::ostringstream oss;
+                                oss << "Masked qual: " << el.qual.value() << "\n";
+                                std::cout << oss.str();
+                            }
                         }
                     } else {
-                        //el.qual.reset();
-                        std::cout << "Masked qual: " << el.qual.value() << "\n";
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "Masked qual: " << el.qual.value() << "\n";
+                            std::cout << oss.str();
+                        }
                     }
                 });
 
                 // verbose logging
                 if (verbose) {
                     #pragma omp critical
-                    std::cout << "Trimmed read for " << e.class_id 
-                              << " -> " << cleaned_seq << "\n";
-                    std::cout << "Masked read: " << masked_read << "\n";
+                    {
+                    std::ostringstream oss;
+                    oss << "Trimmed read for " << e.class_id 
+                              << " -> " << cleaned_seq << "\n"
+                              << "Masked read: " << masked_read << std::endl;
+                    std::cout << oss.str();
+
+                    }
                     if(read.is_fastq) {
-                        std::cout << "Masked qual: " << cleaned_qual << "\n";
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "Masked qual: " << cleaned_qual << std::endl;
+                            std::cout << oss.str();
+                        }
                     }
                 }
                 break;  // only one read element per direction
@@ -1738,7 +2142,9 @@ public:
                 if(verbose){
                     #pragma omp critical
                     {
-                        std::cout << "FILTERED_READ_LENGTH" << std::endl;
+                        std::ostringstream oss;
+                        oss << "FILTERED_READ_LENGTH" << std::endl;
+                        std::cout << oss.str();
                     }
                 }
                 continue;
@@ -1774,10 +2180,12 @@ public:
                     if (verbose) {
                         #pragma omp critical
                         {
-                            std::cout << 
+                            std::ostringstream oss;
+                            oss << 
                             "Filtered element " << 
                             elem.class_id << 
-                            " (invalid positions) in direction " << direction << ".\n";
+                            " (invalid positions) in direction " << direction << std::endl;
+                            std::cout << oss.str();
                         }
                     }
                     // Exit processing for this direction.
@@ -1789,7 +2197,9 @@ public:
                     if(verbose){
                         #pragma omp critical
                         {
-                            std::cout << "Barcode correction for " << elem.seq.value() << std::endl;
+                            std::ostringstream oss;
+                            oss << "Barcode correction for " << elem.seq.value() << std::endl;
+                            std::cout << oss.str();
                         }
                     }
                     auto& wl = layout.wl_map.maps.at(seq_utils::remove_rc(elem.class_id)).get();
@@ -1797,52 +2207,97 @@ public:
                     //but this is not necessary, as the barcode correction function will handle it
                     if(!wl.true_bcs.empty()){
                         auto out = barcode_correction::correct_barcode(elem, layout, verbose);
-                        bool corrected = out.has_value();
-                        if(corrected) {
+                        bool matched = out.has_value();
+                        if(matched) {
+                            int64_seq original_bc;
+                            original_bc.sequence_to_bits(elem.seq.value());
                             int64_seq correct_bc = out.value();
                             seen_bcs[seq_utils::remove_rc(elem.class_id)].insert(out.value());
-                            std::string final_bc = elem.direction == "forward" ? correct_bc.bits_to_sequence() : 
-                            seq_utils::revcomp(correct_bc.bits_to_sequence());
-                            // add to corrected barcode count
-                            if(final_bc !=elem.seq.value()) {
-                                wl.true_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
+                            //fixing this because corrected is only in the forward direction anyways so need to revcomp
+                            //std::string final_bc = elem.direction == "forward" ? correct_bc.bits_to_sequence() : seq_utils::revcomp(correct_bc.bits_to_sequence());
+                            std::string final_bc = correct_bc.bits_to_sequence();
+                            // Check if the corrected barcode exists in true_bcs or global_bcs
+                            bool found_in_true = wl.true_bcs.check_wl_for(correct_bc);
+                            bool found_in_global = wl.global_bcs.check_wl_for(correct_bc);
+                            //first check if the corrected barcode is the same as an original sequence
+                            if(final_bc == elem.seq.value() || final_bc == seq_utils::revcomp(elem.seq.value())) {
+                                if(found_in_true) {
+                                    // Correct barcode found in true_bcs
+                                    //wl.true_bcs.update_bc_count(correct_bc, barcode_counts::raw);
+                                } else if (found_in_global) {
+                                    // Correct barcode found in global_bcs
+                                    wl.global_bcs.update_bc_count(correct_bc, barcode_counts::raw);
+                                }
+                            } else {
+                                bool already_keyed = wl.true_bcs.check_wl_for(original_bc) || wl.global_bcs.check_wl_for(original_bc);         
+                                if (!already_keyed) {
+                                    if (found_in_true) {
+                                        // Correct barcode found in true_bcs
+                                        //wl.true_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
+                                        auto true_range = wl.true_bcs.equal_range(correct_bc);
+                                        if (!wl.true_bcs.check_wl_for(original_bc) && true_range.first != true_range.second) {
+                                            const barcode_entry& correct_entry = (*true_range.first).second;
+                                            #pragma omp critical
+                                            {
+                                                wl.true_bcs.insert_bc_entry(original_bc, correct_entry);
+                                            }
+                                        }
+                                    }
+                                    else if (found_in_global) {
+                                        wl.global_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
+                                        // Correct barcode found in global_bcs
+                                        auto global_range = wl.global_bcs.equal_range(correct_bc);
+                                        if (!wl.true_bcs.check_wl_for(original_bc) && global_range.first != global_range.second) {
+                                            const barcode_entry& correct_entry = (*global_range.first).second;
+                                            #pragma omp critical
+                                            {
+                                                wl.global_bcs.insert_bc_entry(original_bc, correct_entry);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Already keyed, just update count
+                                    if (found_in_true) {
+                                        //wl.true_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
+                                    } else if (found_in_global) {
+                                        wl.global_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
+                                    }
+                                }
                             }
+                            // update original_seq with the original sequence, set the sequence to the final correccted barcode
+                            // and set element pass to be true
                             auto& id_index = sig_elements.get<sig_id_tag>();
                             id_index.modify(
                                 id_index.find(elem.class_id), [&](seq_element &e){
+                                    e.original_seq = e.seq;
                                     e.seq = final_bc;
                                     e.element_pass = true;
                                 }
                             );
                         } else {
+                            // else mark the element as failed
                             auto& id_index = sig_elements.get<sig_id_tag>();
                             id_index.modify(
                                 id_index.find(elem.class_id),
                                 [](seq_element &e) {
-                                    e.element_pass = false; 
+                                        e.element_pass = false; 
                                     }
                                 );
                                 if(elem.seq.has_value()){
-                                    std::string seq = elem.seq.value();
-                                    int64_seq putative_bc(seq);
-                                    if(!wl.filter_bcs.check_wl_for(putative_bc)){
-                                        barcode_entry be;
-                                        be.barcode = putative_bc;
-                                        be.flags = "";
-                                        be.edit_dist = 0;
-                                        be.filtered = true;
-                                      //  #pragma omp critical
-                                      //  {
-                                       //     wl.filter_bcs.insert_bc_entry(be.barcode, be);
-                                       // }
-                                    }
+                                    int64_seq failed_bc;
+                                    failed_bc.sequence_to_bits(elem.seq.value());
+                                    auto filter_range = wl.filter_bcs.equal_range(failed_bc);
+                                        if (!wl.filter_bcs.check_wl_for(failed_bc) && filter_range.first != filter_range.second) {
+                                            const barcode_entry& failed_entry = (*filter_range.first).second;
+                                            #pragma omp critical
+                                            {
+                                                wl.filter_bcs.insert_bc_entry(failed_bc, failed_entry);
+                                            }
+                                        }
                                 }
-                            // adding this in to try to manage if there are multiple barcodes, 
-                            // whether we should set this entire direction to false. 
-                            // right now, we *only* return completely correct barcodes (all multiples are also correct) 
+                            // adding this in to try to manage if there are multiple barcodes, whether we should set this entire direction to false. right now, we *only* return completely correct barcodes (all multiples are also correct) 
                             if(!multiple_barcodes){
-                                // so if multiple barcodes is false, then we set the direction value to false
-                                // and set the pass counts to 0.
+                                // so if multiple barcodes is false, then we set the direction value to false and set the pass counts to 0.
                                 valid_direction = false;
                                 pass_counts[direction] = 0;    
                             }
@@ -1856,11 +2311,6 @@ public:
                             std::string seq = elem.seq.value();
                             int64_seq putative_bc(seq);
                             if(!wl.filter_bcs.check_wl_for(putative_bc)){
-                                barcode_entry be;
-                                be.barcode = putative_bc;
-                                be.flags = "";
-                                be.edit_dist = 0;
-                                be.filtered = true;
                               //  #pragma omp critical
                               //  {
                               //      wl.filter_bcs.insert_bc_entry(be.barcode, be);
@@ -1903,9 +2353,11 @@ public:
                         if (verbose) {
                             #pragma omp critical
                             {
-                                std::cout << "Overlap detected: Filtering variable elements " 
+                                std::ostringstream oss;
+                                oss << "Overlap detected: Filtering variable elements " 
                                           << e1.class_id << " and " << e2.class_id 
-                                          << " in direction " << direction << ".\n";
+                                          << " in direction " << direction << std::endl;
+                                std::cout << oss.str();
                             }
                         }
                     }
@@ -1927,8 +2379,10 @@ public:
             if (verbose) {
                 #pragma omp critical
                 {
-                    std::cout << "\nDirection " << direction << " valid: " << direction_valid[direction] 
-                              << " with " << count << " passing variable elements.\n";
+                    std::ostringstream oss;
+                    oss << "\nDirection " << direction << " valid: " << direction_valid[direction] 
+                              << " with " << count << " passing variable elements." << std::endl;
+                    std::cout << oss.str();
                 }
             }
         }
@@ -1956,18 +2410,21 @@ public:
         if(verbose){
             #pragma omp critical
             {
-                std::cout << "Final read type: "
+                std::ostringstream oss;
+                oss << "Final read type: "
                           << read_type
-                          << ", forward count: "
+                          << ", forward element(s) count: "
                           << forward_count
-                          << ", reverse count: "
+                          << ", reverse element(s) count: "
                           << reverse_count
                           << "\n"
                           << std::endl;
+                std::cout << oss.str();
             }
         }
     }
     // full sigalign implementation (took out const on read layout in sigalign filter->whitelist population)
+    
     static void sigalign_standard(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads = 1, 
         size_t max_reads = -1, bool split_bc = false) {
         //std::string home = std::getenv("HOME");
@@ -2027,7 +2484,7 @@ public:
     }
     
     //metrics per chunk
-    static void sigalign_(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads, 
+    static void sigalign_chunk(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads, 
         size_t max_reads = -1, bool split_bc = false, size_t initial_chunk_size = 5000) {
         std::string sig_path = output_prefix + ".sig";
         std::string csv_path = output_prefix + ".csv";
@@ -2037,6 +2494,7 @@ public:
         sigstring_writing sig_writer(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false);
         sigstring_writing csv_writer(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false);
         sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, /*compress=*/false, /*append=*/false);
+
         parallel_writer writer;
 
         std::ofstream metrics_file(metrics_path);
@@ -2088,9 +2546,9 @@ public:
             
             // Timing variables
             auto start_time = std::chrono::high_resolution_clock::now();
-            auto read_end_time = start_time; // Will be set after read preparation
-            auto process_end_time = start_time; // Will be set after processing
-            auto write_end_time = start_time; // Will be set after writing
+            auto read_end_time = start_time; // set after read preparation
+            auto process_end_time = start_time; // set after processing
+            auto write_end_time = start_time; // set after writing
             
             // Read time ends here (chunk is already loaded)
             read_end_time = std::chrono::high_resolution_clock::now();
@@ -2118,6 +2576,7 @@ public:
             
             if (!to_write.empty()) {
                 writer.write(sig_writer, csv_writer, fastqa_writer, to_write);
+                std::vector<SigString>().swap(to_write); // Clear the vector
             }
             
             // Write time ends here
@@ -2156,30 +2615,6 @@ public:
                           << read_time_ms / 1000.0 << "s read, "
                           << process_time_ms / 1000.0 << "s process, "
                           << write_time_ms / 1000.0 << "s write)" << std::endl;
-            }
-            
-            // Adaptive chunk size logic - but without set_chunk_size
-            if (chunk_id % 10 == 0) { // Every 10 chunks, reconsider the chunk size
-                std::lock_guard<std::mutex> lock(chunk_size_mutex);
-                
-                double io_ratio = (read_time_ms + write_time_ms) / static_cast<double>(total_time_ms);
-                
-                // If IO takes more than 50% of time, increase chunk size
-                if (io_ratio > 0.5 && current_chunk_size < 100000) {
-                    size_t new_chunk_size = current_chunk_size * 1.5;
-                    std::cout << "[sigalign] Suggesting chunk size from " << current_chunk_size << " to " << new_chunk_size 
-                              << " (IO ratio: " << io_ratio << ")" << std::endl;
-                    //current_chunk_size = new_chunk_size;
-                    // Removed: streamer.set_chunk_size(new_chunk_size);
-                } 
-                // If IO takes less than 20% of time, consider decreasing chunk size for better load balancing
-                else if (io_ratio < 0.2 && current_chunk_size > 1000) {
-                    size_t new_chunk_size = current_chunk_size * 0.8;
-                    std::cout << "[sigalign] Suggesting chunk size from " << current_chunk_size << " to " << new_chunk_size 
-                              << " (IO ratio: " << io_ratio << ")" << std::endl;
-                   // current_chunk_size = new_chunk_size;
-                    // Removed: streamer.set_chunk_size(new_chunk_size);
-                }
             }
         };
         
@@ -2228,10 +2663,10 @@ public:
                 << "[sigalign]   [metrics]: " << metrics_path << std::endl;
     }
 
-
-    static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
+    //sigalign enhanced for chunks
+    static void sigalign_enhanced_chunk(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
                        bool verbose, int num_threads, size_t max_reads = -1, bool split_bc = false, 
-                       size_t initial_chunk_size = 50000) {
+                       size_t initial_chunk_size = 10000) {
     std::string sig_path = output_prefix + ".sig";
     std::string csv_path = output_prefix + ".csv";
     std::string fastq_output_path = output_prefix + ".fq";
@@ -2449,53 +2884,11 @@ public:
                     << "s, queue:" << queue_time_ms / 1000.0 
                     << "s) - Load: " << thread_load << "%" << std::endl;
         }
-        
-        // Adaptive chunk size evaluation
-        if (chunk_id % 10 == 0) {
-            std::lock_guard<std::mutex> lock(chunk_size_mutex);
-            
-            // Calculate I/O vs processing ratio for this thread
-            double io_ratio = (read_time_ms + queue_time_ms) / static_cast<double>(std::max(1UL, static_cast<unsigned long>(total_time_ms)));
-            
-            // Calculate a load-balanced chunk size adjustment
-            double load_factor = 1.0;
-            {
-                std::lock_guard<std::mutex> metrics_lock(metrics_mutex);
-                double min_load = 100.0;
-                double max_load = 0.0;
-                for (int i = 0; i < num_threads; i++) {
-                    double thread_util = (thread_metrics[i].total_active_time_ms / std::max(1.0, static_cast<double>(global_elapsed))) * 100.0;
-                    if (thread_util > 0) {
-                        min_load = std::min(min_load, thread_util);
-                        max_load = std::max(max_load, thread_util);
-                    }
-                }
-                // If there's a big difference in thread load, adjust chunk size
-                if (max_load > 0 && min_load < max_load * 0.7) {
-                    load_factor = 0.8;  // Decrease chunk size to balance load
-                } else if (max_load < 80.0) {
-                    load_factor = 1.2;  // Increase chunk size if all threads underutilized
-                }
-            }
-            
-            // Adjust chunk size based on I/O ratio and load balance
-            if ((io_ratio > 0.5 || load_factor > 1.1) && current_chunk_size < 200000) {
-                size_t new_chunk_size = current_chunk_size * 1.5;
-                std::cout << "[sigalign] Suggesting chunk size from " << current_chunk_size << " to " << new_chunk_size 
-                        << " (IO ratio: " << io_ratio << ", load factor: " << load_factor << ")" << std::endl;
-                // Uncomment if your chunk_streaming class supports dynamic chunk size adjustment
-                // current_chunk_size = new_chunk_size;
-                // streamer.set_chunk_size(new_chunk_size);
-            } 
-            else if ((io_ratio < 0.2 || load_factor < 0.9) && current_chunk_size > 5000) {
-                size_t new_chunk_size = current_chunk_size * 0.8;
-                std::cout << "[sigalign] Suggesting chunk size from " << current_chunk_size << " to " << new_chunk_size 
-                        << " (IO ratio: " << io_ratio << ", load factor: " << load_factor << ")" << std::endl;
-                // Uncomment if your chunk_streaming class supports dynamic chunk size adjustment
-                // current_chunk_size = new_chunk_size;
-                // streamer.set_chunk_size(new_chunk_size);
-            }
-        }
+        to_write.clear();
+        std::vector<SigString>().swap(to_write);
+        auto& mutable_chunk = const_cast<std::vector<read_streaming::sequence>&>(chunk);
+        mutable_chunk.clear();
+        mutable_chunk.shrink_to_fit();
     };
     
     // Start processing
@@ -2598,10 +2991,8 @@ public:
     
 }
     
-    //metrics parallelized over reads
-    static void sigalign_reads(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
-                                   bool verbose, int num_threads, size_t max_reads = -1, bool split_bc = false, 
-                                   size_t chunk_size = 50000) {
+     //metrics parallelized over reads
+    static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads, size_t chunk_size, size_t max_reads) {
     // Output file paths
     std::string sig_path = output_prefix + ".sig";
     std::string csv_path = output_prefix + ".csv";
@@ -2643,7 +3034,7 @@ public:
     // Process chunks sequentially
     while (true) {
         chunk_id++;
-        
+
         // Start timing
         auto start_time = std::chrono::high_resolution_clock::now();
         
@@ -2664,16 +3055,18 @@ public:
         }
         
         // If no more sequences, break
-        if (chunk.empty()) break;
-        
+        if (chunk.empty()){
+            break;
+        }
         // Read time ends here
         auto read_end_time = std::chrono::high_resolution_clock::now();
         
-        // Process the sequences in parallel
         std::vector<SigString> results;
-        results.resize(chunk.size());  // Pre-allocate space for results
+        results.resize(chunk.size()); 
+        // Pre-allocate space for results
         std::atomic<size_t> passed_count{0};
         
+        // Process the sequences in parallel
         #pragma omp parallel num_threads(num_threads)
         {
             // Thread-local vector to collect passed SigStrings
@@ -2733,7 +3126,7 @@ public:
                     << read_time_ms << "\t" << process_time_ms << "\t" << queue_time_ms << "\t" << total_time_ms << "\n";
         
         // Print progress
-        std::cout << "Chunk " << chunk_id << ": processed " << chunk.size() << " reads in " 
+        std::cout << "[chunk_stats] " << chunk_id << ": processed " << chunk.size() << " reads in " 
                   << total_time_ms / 1000.0 << " seconds ("
                   << read_time_ms / 1000.0 << "s read, "
                   << process_time_ms / 1000.0 << "s process, "
@@ -2742,6 +3135,7 @@ public:
         
         // Free memory explicitly
         std::vector<read_streaming::sequence>().swap(chunk);
+        //std::vector<read_streaming::sequence>().clear();
         std::vector<SigString>().swap(results);
     }
     
@@ -2835,107 +3229,120 @@ public:
         return ss.str().empty() ? "" : ss.str();
     }
    
-    //to fastqa
+    // FASTQ format
     std::string to_fastqa() const {
-        // decide which directions to emit
-        std::vector<std::string> dirs;
-        if (read_type == "concatenate") {
-            dirs = { "forward", "reverse" };
-        } else {
-            dirs = { 
-                read_type 
-            };
-        }
-    
-        std::string all_records;
-    
-        // for each requested direction, build one record
-        for (auto const &dir : dirs) {
-            // collect barcodes in insertion order, collapsing RC if needed
-            std::vector<std::string> bc_keys;
-            std::unordered_map<std::string, std::string> bc_map;
-            std::unordered_map<std::string, std::string> bc_dir;
-    
-            std::string umi, read_seq, read_qual;
-    
-            for (auto const &elem : sig_elements) {
-                if (!elem.seq.has_value()){
-                    continue;
-                }
-    
-                // only take elements in this direction
-                if (elem.direction != dir) 
-                    continue;
-    
-                // barcode
-                if (elem.global_class == "barcode") {
-                    auto key = seq_utils::remove_rc(elem.class_id);
-                    bool is_fwd = (dir == "forward");
-    
-                    auto it = bc_map.find(key);
-                    if (it == bc_map.end()) {
-                        bc_keys.push_back(key);
-                        bc_map[key] = elem.seq.value();
-                        bc_dir[key] = dir;
-                    }
-                    else if (is_fwd && bc_dir[key] == "reverse") {
-                        bc_map[key] = elem.seq.value();
-                        bc_dir[key] = dir;
-                    }
-                    continue;
-                }
-    
-                // umi 
-                if (elem.global_class == "umi") {
-                    if(elem.seq.has_value()){
-                        umi = elem.seq.value();
-                    }
-                    continue;
-                }
-    
-                // read and qual
-                if (elem.global_class == "read") {
-                    read_seq = elem.seq.value();
-                    if (elem.qual.has_value()) {
-                        read_qual = elem.qual.value();
-                    }
-                    continue;
-                }
-    
-                if (elem.global_class == "poly_tail" || elem.global_class == "start" || elem.global_class == "stop")
-                    {
-                        continue;
-                }
-            }
-    
-            // add CB tag
-            std::string cb_tag;
-            for (size_t i = 0; i < bc_keys.size(); ++i) {
-                if (i) cb_tag += '-';
-                cb_tag += bc_map[bc_keys[i]];
-            }
-            // 
-            bool is_fastq = !read_qual.empty();
-            std::stringstream ss;
-            ss << (is_fastq ? '@' : '>') << sequence_id;
-            if (!cb_tag.empty()){
-                ss << " CB:Z:" << cb_tag;
-            }
-            if (!umi.empty()){
-                    ss << " UB:Z:" << umi;
-            }
-
-            ss << "\n" << read_seq << "\n";
-
-            if (is_fastq){
-                ss << "+\n" << read_qual << "\n";
-            }
-    
-            all_records += ss.str();
-        }
-        return all_records;
+    std::vector<std::string> dirs;
+    if (read_type == "concatenate") {
+        dirs = { 
+            "forward", 
+            "reverse" 
+        };
+    } else {
+        dirs = { 
+            read_type 
+        };
     }
-    
+
+    std::string all_records;
+    for (const auto& dir : dirs) {
+        std::vector<std::string> bc_keys;
+        std::unordered_map<std::string, std::string> bc_map;
+        std::unordered_map<std::string, std::string> bc_dir;
+        std::unordered_map<std::string, std::string> cr_map;
+
+        std::string umi, read_seq, read_qual;
+        for (const auto& elem : sig_elements) {
+            if (!elem.seq.has_value()) continue;
+            if (elem.direction != dir) continue;
+
+            if (elem.global_class == "barcode") {
+                auto key = seq_utils::remove_rc(elem.class_id);
+                bool is_fwd = (dir == "forward");
+
+                if (bc_map.find(key) == bc_map.end()) {
+                    bc_keys.push_back(key);
+                    bc_map[key] = elem.seq.value();
+                    bc_dir[key] = dir;
+                    if (elem.original_seq.has_value()) {
+                        cr_map[key] = elem.original_seq.value();
+                    }
+                } else if (is_fwd && bc_dir[key] == "reverse") {
+                    bc_map[key] = elem.seq.value();
+                    bc_dir[key] = dir;
+                    if (elem.original_seq.has_value()) {
+                        cr_map[key] = elem.original_seq.value();
+                    }
+                }
+                continue;
+            }
+
+            if (elem.global_class == "umi") {
+                if (elem.seq.has_value()) {
+                    umi = elem.seq.value();
+                }
+                continue;
+            }
+
+            if (elem.global_class == "read") {
+                read_seq = elem.seq.value();
+                if (elem.qual.has_value()) {
+                    read_qual = elem.qual.value();
+                }
+                continue;
+            }
+
+            if (elem.global_class == "poly_tail" || elem.global_class == "start" || elem.global_class == "stop") {
+                continue;
+            }
+        }
+
+        std::string cb_tag, cr_tag;
+        for (size_t i = 0; i < bc_keys.size(); ++i) {
+            const auto& key = bc_keys[i];
+            if (i) {
+                cb_tag += '-';
+                if (!cr_tag.empty()) cr_tag += '-';
+            }
+            cb_tag += bc_map[key];
+            if (cr_map.find(key) != cr_map.end()) {
+                cr_tag += cr_map[key];
+            }
+        }
+
+        bool is_fastq = !read_qual.empty();
+        bool is_concatenate = (read_type == "concatenate");
+        bool is_forward = (dir == "forward");
+        std::stringstream ss;
+        //generating modified sequence id for rad
+        ss << (is_fastq ? '@' : '>') << sequence_id << (is_forward ? "-F" : "-R") << (is_concatenate ? "-CT" : "");
+        //adding barcode tag
+        if (!cb_tag.empty()) ss << "\tCB:Z:" << cb_tag;
+        //adding corrected read tag for SAM
+        if (!cr_tag.empty() && (cb_tag != cr_tag)){
+            ss << "\tCR:Z:" << cr_tag;
+        } else {
+            // Ensure CR tag is present even if empty
+            ss << "\tCR:Z:"; 
+        }
+        //adding transcript tag for SAM
+        if (!umi.empty()) ss << "\tUB:Z:" << umi;
+
+        if(is_forward){
+            ss << "\tTS:A:+";
+        } else {
+            ss << "\tTS:A:-";
+        }
+
+        ss << "\n" << read_seq << "\n";
+        if (is_fastq) {
+            ss << "+\n" << read_qual << "\n";
+        }
+        all_records += ss.str();
+    }
+
+    return all_records;
+}
+
     // CSV conversion
     std::string to_csv(bool write_header = false) const {
         std::stringstream ss;

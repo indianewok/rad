@@ -30,7 +30,7 @@ find_package(ZLIB REQUIRED)
 if(POLICY CMP0167)
     cmake_policy(SET CMP0167 OLD)     
 endif()
-find_package(Boost REQUIRED COMPONENTS filesystem system)
+find_package(Boost REQUIRED COMPONENTS filesystem system iostreams)
 
 # --------------------------------------------------------------------------
 # third part libraries
@@ -67,11 +67,12 @@ target_include_directories(rad_lib INTERFACE
 )
 
 target_link_libraries(rad_lib INTERFACE
-    Boost::boost
-    Boost::filesystem
-    Boost::system
-    ZLIB::ZLIB
     OpenMP::OpenMP_CXX
+    Boost::filesystem
+    Boost::iostreams
+    Boost::system
+    Boost::boost
+    ZLIB::ZLIB
     edlib
     ssw
     dl

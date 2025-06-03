@@ -13,6 +13,7 @@
 #include <functional>
 #include <getopt.h>
 #include <iostream>
+#include <mach/mach.h>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -41,7 +42,9 @@
 #include <boost/dll/runtime_symbol_info.hpp>
 #include <boost/multi_index/ordered_index.hpp>
 #include <boost/multi_index/sequenced_index.hpp>
+#include <boost/iostreams/filtering_stream.hpp>
 #include <boost/multi_index/composite_key.hpp>
+#include <boost/iostreams/filter/gzip.hpp>
 #include <boost/multi_index_container.hpp>
 
 // ————————————————————————————————————————————————————————————————

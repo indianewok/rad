@@ -801,6 +801,7 @@ public:
         }
     }
 
+    // load whitelist
     void load_wl(std::optional<std::string> wl_path,std::optional<int> shift, std::optional<int> mut, bool verbose, int nthreads) {
         using namespace std::chrono;
         auto t0 = high_resolution_clock::now();
@@ -842,7 +843,7 @@ public:
             }
 
             std::string path = whitelist_utils::kit_to_path(spec);
-            std::cout << "[load_wl] [" <<elem.class_id<< "] [" << spec << "] @ "<< path<<"\n";
+            std::cout << "[load_wl] [" << elem.class_id << "] [" << spec << "] @ "<< path<<"\n";
 
             // import into the pool if not already
             auto pit = wl_map.lists.find(path);
@@ -853,15 +854,17 @@ public:
                 // import & possibly generate mismatches
                 whitelist::wl_entry entry = wl_map.import_whitelist(spec, verbose, default_length);
                 if (entry.true_bcs.size() <= 15000) {
-                    entry.generate_mismatch_barcodes(shift.value_or(2), mut.value_or(2), verbose, nthreads);
+                    entry.generate_mismatch_barcodes(
+                        shift.value_or(2), 
+                        mut.value_or(2),
+                    verbose, nthreads);
                 }
 
                 // build filter_bcs from static_seqs
                 entry.filter_bcs.clear();
                 size_t def_len = default_length;
                 if (auto lit = layout.find(elem.class_id);
-                    lit != layout.end() && lit->expected_length)
-                {
+                    lit != layout.end() && lit->expected_length){
                     def_len = *lit->expected_length;
                 }
                 for (auto const &s : static_seqs) {
@@ -892,30 +895,153 @@ public:
                 auto &E = mit->second.get();
                 std::cout << "[load_wl]"
                         << " ["<<elem.class_id<<":"<<key<<"]"
-                        << ": global ="<<E.global_bcs.size()
-                        << ", true ="  <<E.true_bcs.size()
-                        << ", filter ="<<E.filter_bcs.size()
+                        << ": global = "<<E.global_bcs.size()
+                        << ", true = "  <<E.true_bcs.size()
+                        << ", filter = "<<E.filter_bcs.size()
                         << "\n";
             }
+             // inline helper to get MB from bytes
         }
 
         // final prune: for each alias, remove true_bcs from global_bcs
+        // final prune: remove overlaps between true and global
+        /*for (auto & [key, entry_ref] : wl_map.maps) {
+            auto &E = entry_ref.get();
+            
+            if (verbose) {
+                std::cout << "[load_wl] [" << key << "] Starting contamination cleanup..." << std::endl;
+                std::cout << "[load_wl] [" << key << "] Initial counts:" << std::endl;
+                std::cout << "  - true_bcs unique_values: " << E.true_bcs.unique_values.size() << std::endl;
+                std::cout << "  - true_bcs associations: " << E.true_bcs.associations.size() << std::endl;
+                std::cout << "  - global_bcs unique_values: " << E.global_bcs.unique_values.size() << std::endl;
+                std::cout << "  - global_bcs associations: " << E.global_bcs.associations.size() << std::endl;
+            }
+            
+            // Step 1: Collect actual TRUE barcode sequences (not associations)
+            std::unordered_set<int64_seq> true_barcode_sequences;
+            for (const auto& entry : E.true_bcs.unique_values) {
+                true_barcode_sequences.insert(entry.barcode);
+            }
+            
+            // Step 2: Find how many true entries exist in global and remove them
+            std::unordered_set<int64_seq> true_entries_in_global;
+            for (const auto& true_bc : true_barcode_sequences) {
+                if (E.global_bcs.check_wl_for(true_bc)) {
+                    true_entries_in_global.insert(true_bc);
+                }
+            }
+            
+            if (verbose) {
+                std::cout << "[load_wl] [" << key << "] Found " << true_entries_in_global.size() 
+                        << " true barcode sequences contaminating global whitelist:" << std::endl;
+                for (const auto& contaminating_bc : true_entries_in_global) {
+                    std::cout << "  - " << contaminating_bc.bits_to_sequence() << std::endl;
+                }
+            }
+            
+            // Remove these actual sequences from global_bcs
+            for (const auto& true_bc : true_entries_in_global) {
+                E.global_bcs.remove_bc_entry(true_bc);
+            }
+            
+            // Step 3: Collect global barcode sequences
+            std::unordered_set<int64_seq> global_barcode_sequences;
+            for (const auto& entry : E.global_bcs.unique_values) {
+                global_barcode_sequences.insert(entry.barcode);
+            }
+            
+            // Step 4: Find true associations that point to global sequences
+            std::vector<int64_seq> true_associations_to_remove;
+            std::unordered_set<int64_seq> global_entries_in_true_associations;
+            
+            for (const auto& [assoc_key, entry_ptr] : E.true_bcs.associations) {
+                if (global_barcode_sequences.count(entry_ptr->barcode)) {
+                    true_associations_to_remove.push_back(assoc_key);
+                    global_entries_in_true_associations.insert(entry_ptr->barcode);
+                }
+            }
+            
+            if (verbose) {
+                std::cout << "[load_wl] [" << key << "] Found " << true_associations_to_remove.size() 
+                        << " true associations pointing to global barcodes:" << std::endl;
+                std::cout << "[load_wl] [" << key << "] These associations point to " 
+                        << global_entries_in_true_associations.size() << " distinct global barcodes:" << std::endl;
+                for (const auto& global_bc : global_entries_in_true_associations) {
+                    std::cout << "  - " << global_bc.bits_to_sequence() << std::endl;
+                }
+                
+                if (true_associations_to_remove.size() > 10) {
+                    std::cout << "[load_wl] [" << key << "] First 10 contaminating association keys:" << std::endl;
+                    for (size_t i = 0; i < 10; ++i) {
+                        std::cout << "  - " << true_associations_to_remove[i].bits_to_sequence() 
+                                << " -> points to global barcode" << std::endl;
+                    }
+                    std::cout << "  - ... and " << (true_associations_to_remove.size() - 10) 
+                            << " more" << std::endl;
+                } else {
+                    std::cout << "[load_wl] [" << key << "] All contaminating association keys:" << std::endl;
+                    for (const auto& assoc_key : true_associations_to_remove) {
+                        std::cout << "  - " << assoc_key.bits_to_sequence() 
+                                << " -> points to global barcode" << std::endl;
+                    }
+                }
+            }
+            
+            // Remove contaminating associations from true_bcs
+            for (const auto& key_to_remove : true_associations_to_remove) {
+                E.true_bcs.remove_bc_entry(key_to_remove);
+            }
+            
+            if (verbose) {
+                std::cout << "[load_wl] [" << key << "] Cleanup complete. Final counts:" << std::endl;
+                std::cout << "  - true_bcs unique_values: " << E.true_bcs.unique_values.size() << std::endl;
+                std::cout << "  - true_bcs associations: " << E.true_bcs.associations.size() << std::endl;
+                std::cout << "  - global_bcs unique_values: " << E.global_bcs.unique_values.size() << std::endl;
+                std::cout << "  - global_bcs associations: " << E.global_bcs.associations.size() << std::endl;
+                std::cout << "[load_wl] [" << key << "] Summary:" << std::endl;
+                std::cout << "  - Removed " << true_entries_in_global.size() 
+                        << " true barcodes from global whitelist" << std::endl;
+                std::cout << "  - Removed " << true_associations_to_remove.size() 
+                        << " contaminating associations from true whitelist" << std::endl;
+                std::cout << "  - Affected " << global_entries_in_true_associations.size() 
+                        << " distinct global barcodes" << std::endl;
+                std::cout << std::endl;
+            }
+        */
+
+        // this is a final pruning making sure there is 0 overlap between the two whitelists (global vs. true)
+
         for (auto & [key, entry_ref] : wl_map.maps) {
             auto &E = entry_ref.get();
+            //E.global_bcs.clear_associations();
             std::unordered_set<int64_seq> to_remove;
             to_remove.reserve(E.true_bcs.size());
-            for (auto const & [bc,be] : E.true_bcs)
+            for (auto const & [bc,be] : E.true_bcs){
                 to_remove.insert(bc);
-            for (auto const &bc : to_remove)
+            }
+
+            for (auto const &bc : to_remove){
                 E.global_bcs.remove_bc_entry(bc);
+            }
 
             // final report
             std::cout << "[load_wl]"
-                    << " ["<<key<<"]"
-                    << ": global ="<<E.global_bcs.size()
-                    << ", true ="  <<E.true_bcs.size()
-                    << ", filter ="<<E.filter_bcs.size()
+                    << " [" << key << "]"
+                    << ": global = "<< E.global_bcs.size()
+                    << ", true = "  << E.true_bcs.size()
+                    << ", filter = "<< E.filter_bcs.size()
                     << "\n";
+            for (auto const &kv : wl_map.maps) {
+                auto const &E = kv.second.get();
+            
+                std::printf(
+                    "[%s] unique_set = %.2fMiB, associations = %.2fMiB, total = %.2fMiB\n",
+                        kv.first.c_str(),
+                        memory_utils::to_mib(bc_mem_utils::approx_unique(E.true_bcs)),
+                        memory_utils::to_mib(bc_mem_utils::approx_assoc(E.true_bcs)),
+                        memory_utils::to_mib(bc_mem_utils::get_full_wl_mem(E.true_bcs))
+                );
+            }
         }
 
         auto t3 = high_resolution_clock::now();
@@ -1176,10 +1302,7 @@ private:
         position_map[it->class_id] = positions;
     }
 
-    void process_reads(
-        Layout_Struct::index<dir_order_tag>::type::iterator start,
-        Layout_Struct::index<dir_order_tag>::type::iterator end
-    ) {
+    void process_reads(Layout_Struct::index<dir_order_tag>::type::iterator start, Layout_Struct::index<dir_order_tag>::type::iterator end) {
         auto& ordered = by_order();
         // First find the read in this direction
         auto read_it = start;
@@ -1210,9 +1333,7 @@ private:
         }
     }
     
-    void find_read_positions(
-        const ReadElement& read, 
-        const ReadElement& prev) {
+    void find_read_positions(const ReadElement& read, const ReadElement& prev) {
         auto& ordered = by_order();
         ReferencePositions positions;
         positions.primary_start = {prev.class_id, false, 1, ""};

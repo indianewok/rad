@@ -17,6 +17,85 @@ namespace basic_stats {
         }
         return std::sqrt(sum / (x.size() - 1));
     }
+
+    double kmer_match_prob(int str1_len, int str2_len, int k) {
+        if (k > str1_len || k > str2_len || k <= 0) {
+            return 0.0;
+        }
+        // Number of k-mers in each string
+        int n1 = str1_len - k + 1;  // k-mers in string1
+        int n2 = str2_len - k + 1;  // k-mers in string2
+        // Total possible k-mers (4^k for DNA)
+        double total_possible_kmers = std::pow(4.0, k);
+        // Expected number of matches
+        double expected_matches = (static_cast<double>(n1) * n2) / total_possible_kmers;
+        // Probability of at least one match (1 - P(no matches))
+        return 1.0 - std::exp(-expected_matches);
+    }
+
+    int min_match_len(int str1_len, int str2_len, double max_prob) {
+        if (str1_len <= 0 || str2_len <= 0) {
+            return -1; // Invalid input
+        }
+        // Start with k=1 and find first k where probability drops below threshold
+        for (int k = 1; k <= std::min(str1_len, str2_len); ++k) {
+            double prob = kmer_match_prob(str1_len, str2_len, k);
+            if (prob < max_prob) {
+                return k;
+            }
+        }
+        // If we never reach the threshold, return the maximum possible k
+        return std::min(str1_len, str2_len);
+    }
+
+};
+
+namespace memory_utils {
+
+    inline double to_mib(std::size_t bytes) {
+        return double(bytes) / 1024.0 / 1024.0;
+    }
+    
+    // pointer mem size
+    inline constexpr std::size_t get_pointer_mem() {
+        return sizeof(void*);
+    }
+
+    inline void get_rss() {
+        #if defined(__APPLE__)
+            // macOS: ask the Mach kernel for our task’s resident size
+            mach_task_basic_info info;
+            mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+            if (task_info(mach_task_self(),
+                          MACH_TASK_BASIC_INFO,
+                          reinterpret_cast<task_info_t>(&info),
+                          &count) == KERN_SUCCESS) {
+                double rss_gb = double(info.resident_size) / (1024.0 * 1024.0 * 1024.0);
+                std::cout << "[memory_utils] RSS: " << rss_gb << " GiB\n";
+            } else {
+                std::cerr << "[memory_utils] RSS: failed to get task_info\n";
+            }
+        #elif defined(__linux__)
+            // Linux: read our own /proc/self/statm
+            long page_size = sysconf(_SC_PAGESIZE);
+            if (page_size <= 0) {
+                std::cerr << "[memory_utils] RSS: sysconf(_SC_PAGESIZE) failed\n";
+                return;
+            }
+            std::ifstream statm("/proc/self/statm");
+            if (!statm) {
+                std::cerr << "[memory_utils] RSS: cannot open /proc/self/statm\n";
+                return;
+            }
+            long total_pages = 0, resident_pages = 0;
+            statm >> total_pages >> resident_pages;
+            double rss_bytes = double(resident_pages) * double(page_size);
+            double rss_gb = rss_bytes / (1024.0 * 1024.0 * 1024.0);
+            std::cout << "[memory_utils] RSS: " << rss_gb << " GiB\n";
+        #else
+            std::cout << "[memory_utils] RSS: unsupported platform\n";
+        #endif
+    }
 };
 
 namespace path_utils {
@@ -123,6 +202,31 @@ namespace seq_utils {
         return results;
     }
 
+    int int_kmerize(const std::string& sequence, int k) {
+        if (k <= 0 || k > static_cast<int>(sequence.length())) {
+            return 0;
+        }
+        std::unordered_set<std::string> unique_kmers;
+        for (int i = 0; i <= static_cast<int>(sequence.length()) - k; ++i) {
+            std::string kmer = sequence.substr(i, k);
+            unique_kmers.insert(kmer);
+        }
+        return static_cast<int>(unique_kmers.size());
+    }
+
+    std::vector<std::string> kmerize(const std::string& sequence, int k) {
+        std::vector<std::string> kmers;
+        if (k <= 0 || k > static_cast<int>(sequence.length())) {
+            return kmers;  // Return empty vector if invalid k
+        }
+        kmers.reserve(sequence.length() - k + 1);
+        // Generate all k-mers
+        for (size_t i = 0; i <= sequence.length() - k; ++i) {
+            kmers.push_back(sequence.substr(i, k));
+        }
+        return kmers;
+    }
+    
     std::vector<std::string> circ_kmerize(const std::string& seq, size_t k = 16) {
         if (k == 0) 
             throw std::invalid_argument("k must be > 0");
