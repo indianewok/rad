@@ -5,51 +5,57 @@ static void usage(const char* prog) {
     std::cerr
       << "Usage: " << prog
       << " -l LAYOUT -q FASTQ [-k KIT] [-g GLOBAL_WL] [-c CUSTOM_WL] [-o PREFIX] [-d DIR] [-b] [-t THREADS] [-v] [-D] [-h]\n"
-      << "  -l, --layout            layout key (five_prime, three_prime, splitseq) or a custom path\n"
-      << "  -q, --fastq             input FASTQ file\n"
-      << "  -k, --kit               use this kit's default whitelist\n"
-      << "  -g, --global_whitelist  path to a single custom global whitelist (i.e, all barcodes that could potentially appear in this dataset) CSV\n"
-      << "  -c, --custom_whitelist  path to a single custom whitelist CSV (i.e, barcodes that you've already found in short-read matched data)\n"
-      << "  -m, --mutation          mutation space of each barcode (default: 2)\n"
-      << "  -s, --shift             shift space of each barcode (default: 2)\n"
-      << "  -n, --max_reads         maximum number of reads to process (default: all)\n"
-      << "  -z, --chunk_size        chunk size for processing reads (default: 5000)\n"
-      << "  -o, --output            filename prefix  (default: output)\n"
-      << "  -d, --dir               output directory (default: current directory)\n"
-      << "  -b, --bc_split          write reads into per-barcode FASTQ files\n"
-      << "  -t, --threads           number of threads (default: 1)\n"
-      << "  -v, --verbose           verbose mode\n"
-      << "  -D, --max_verbose       max verbose level (debug only)\n"
-      << "  -h, --help              prints this menu\n";
+      << "  -l, --layout                      layout key (five_prime, three_prime, splitseq) or a custom path\n"
+      << "  -q, --fastq                       input FASTQ file\n"
+      << "  -k, --kit                         use this kit's default whitelist\n"
+      << "  -g, --global_whitelist            path to a single custom global whitelist CSV(i.e, all barcodes that could potentially appear in this dataset)\n"
+      << "  -c, --custom_whitelist            path to a single custom whitelist CSV (i.e, barcodes that you've already found in short-read matched data)\n"
+      << "  -M, --whitelist_mutation          mutation space of each barcode in the user-passed whitelist (default: 2)\n"
+      << "  -m, --generated_mutation          mutation space of each barcode in the user-passed whitelist (default: 2)\n"
+      << "  -S, --whitelist_shift             shift space of each barcode generated on the fly during runtime (default: 2)\n"
+      << "  -s, --generated_shift             shift space of each barcode generated on the fly during runtime (default: 3)\n"
+      << "  -n, --max_reads                   maximum number of reads to process (default: all)\n"
+      << "  -z, --chunk_size                  chunk size for processing reads (default: 5000)\n"
+      << "  -o, --output                      filename prefix  (default: output)\n"
+      << "  -d, --dir                         output directory (default: current directory)\n"
+      << "  -w, --write_dbg                   writes all debug .sig files, metrics.tsv, and .csv (debug only)\n"
+      << "  -b, --bc_split                    write reads into per-barcode FASTQ files\n"
+      << "  -t, --threads                     number of threads (default: 1)\n"
+      << "  -v, --verbose                     verbose mode\n"
+      << "  -D, --max_verbose                 max verbose level (debug only)\n"
+      << "  -h, --help                        prints this menu\n";
 }
 
 int main(int argc, char* argv[]) {
     std::string layout_key, fastq_path, custom_kit, global_whitelist_path, custom_whitelist_path, output_prefix, output_dir;
-    bool verbose = false, max_verbose = false, split_bc = false;
-    std::optional<int> shift, mut;
+    bool verbose = false, max_verbose = false, split_bc = false, write_debug = false;
+    std::optional<int> wl_shift, wl_mut, gen_shift, gen_mut;
     int nthreads = 1;
     size_t max_reads = -1;  // -1 means unlimited
     size_t chunk_size = 5000;  // Default chunk size
 
-    const char* optstring = "l:q:k:g:c:m:s:n:z:o:d:bt:vDh";
+    const char* optstring = "l:q:k:g:c:M:m:S:s:n:z:o:d:w:bt:vDh";
     struct option longopts[] = {
-        {"layout",            required_argument, nullptr, 'l'},
-        {"fastq",             required_argument, nullptr, 'q'},
-        {"kit",               required_argument, nullptr, 'k'},
-        {"global_whitelist",  required_argument, nullptr, 'g'},
-        {"custom_whitelist",  required_argument, nullptr, 'c'},
-        {"mutation",          required_argument, nullptr, 'm'},
-        {"shift",             required_argument, nullptr, 's'},
-        {"max_reads",         required_argument, nullptr, 'n'},
-        {"chunk_size",        required_argument, nullptr, 'z'},
-        {"output",            required_argument, nullptr, 'o'},
-        {"dir",               required_argument, nullptr, 'd'},
-        {"bc_split",          no_argument,       nullptr, 'b'},
-        {"threads",           required_argument, nullptr, 't'},
-        {"verbose",           no_argument,       nullptr, 'v'},
-        {"max_verbose",       no_argument,       nullptr, 'D'},
-        {"help",              no_argument,       nullptr, 'h'},
-        {nullptr, 0, nullptr, 0}
+        {"layout",                      required_argument, nullptr, 'l'},
+        {"fastq",                       required_argument, nullptr, 'q'},
+        {"kit",                         required_argument, nullptr, 'k'},
+        {"global_whitelist",            required_argument, nullptr, 'g'},
+        {"custom_whitelist",            required_argument, nullptr, 'c'},
+        {"whitelist_mutation",          required_argument, nullptr, 'M'},
+        {"generated_mutation",          required_argument, nullptr, 'm'},
+        {"whitelist_shift",             required_argument, nullptr, 'S'},
+        {"generated_shift",             required_argument, nullptr, 's'},
+        {"max_reads",                   required_argument, nullptr, 'n'},
+        {"chunk_size",                  required_argument, nullptr, 'z'},
+        {"output",                      required_argument, nullptr, 'o'},
+        {"dir",                         required_argument, nullptr, 'd'},
+        {"write_dbg",                   required_argument, nullptr, 'w'},
+        {"bc_split",                    no_argument,       nullptr, 'b'},
+        {"threads",                     required_argument, nullptr, 't'},
+        {"verbose",                     no_argument,       nullptr, 'v'},
+        {"max_verbose",                 no_argument,       nullptr, 'D'},
+        {"help",                        no_argument,       nullptr, 'h'},
+        {nullptr, 0,nullptr, 0}
     };
 
     int c;
@@ -60,12 +66,15 @@ int main(int argc, char* argv[]) {
           case 'k': custom_kit             = optarg;            break;
           case 'g': global_whitelist_path  = optarg;            break;
           case 'c': custom_whitelist_path  = optarg;            break;
-          case 'm': mut   = std::stoi(optarg);                  break;
-          case 's': shift = std::stoi(optarg);                  break;
-          case 'n': max_reads              = std::stoull(optarg); break;
-          case 'z': chunk_size             = std::stoull(optarg); break;
+          case 'M': wl_mut   = std::stoi(optarg);               break;
+          case 'S': wl_shift = std::stoi(optarg);               break;
+          case 'm': gen_mut   = std::stoi(optarg);              break;
+          case 's': gen_shift = std::stoi(optarg);              break;
+          case 'n': max_reads            = std::stoull(optarg); break;
+          case 'z': chunk_size           = std::stoull(optarg); break;
           case 'o': output_prefix          = optarg;            break;
           case 'd': output_dir             = optarg;            break;
+          case 'w': write_debug            = true;              break;
           case 'b': split_bc               = true;              break;
           case 't': nthreads               = std::stoi(optarg); break;
           case 'v': verbose                = true;              break;
@@ -113,35 +122,27 @@ int main(int argc, char* argv[]) {
     std::string base = output_prefix.empty() ? "output" : output_prefix;
     boost::filesystem::path outbase = outdir / base;
 
-    // Per-barcode split folder
-    /*
-    boost::filesystem::path bc_dir;
-    if (split_bc) {
-        bc_dir = outdir / (base + "_bc_split");
-        if (!boost::filesystem::exists(bc_dir) && !boost::filesystem::create_directories(bc_dir)) {
-            std::cerr << "[ERROR] Cannot create barcode-split directory: "
-                      << bc_dir.string() << "\n";
-            return 1;
-        }
-    }*/
 
     if (verbose) {
         std::cout << "============= Configuration =============\n"
-                  << "  Layout key/path    : " << layout_key               << "\n"
-                  << "  FASTQ input        : " << fastq_path               << "\n"
-                  << "  custom kit         : " << (custom_kit.empty() ? "[none]" : custom_kit) << "\n"
-                  << "  global whitelist   : " << (global_whitelist_path.empty()? "[none]" : global_whitelist_path) << "\n"
-                  << "  custom whitelist   : " << (custom_whitelist_path.empty()? "[none]" : custom_whitelist_path) << "\n"
-                  << "  mutation space     : " << (mut ? std::to_string(*mut) : "default(2)") << "\n"
-                  << "  shift space        : " << (shift ? std::to_string(*shift) : "default(2)") << "\n"
-                  << "  max reads          : " << (max_reads == -1 ? "all" : std::to_string(max_reads)) << "\n"
-                  << "  chunk size         : " << chunk_size               << "\n"
-                  << "  output directory   : " << outdir.string()          << "\n"
-                  << "  filename base      : " << base                     << "\n"
-                  << "  barcode split      : " << std::boolalpha << split_bc << "\n"
-                  << "  threads            : " << nthreads                 << "\n"
-                  << "  verbose            : " << std::boolalpha << verbose << "\n"
-                  << "  max_threads avail. : " << omp_get_max_threads()    << "\n\n";
+                  << "  Layout key/path              : " << layout_key               << "\n"
+                  << "  FASTQ input                  : " << fastq_path               << "\n"
+                  << "  custom kit                   : " << (custom_kit.empty() ? "[none]" : custom_kit) << "\n"
+                  << "  global whitelist             : " << (global_whitelist_path.empty()? "[none]" : global_whitelist_path) << "\n"
+                  << "  custom whitelist             : " << (custom_whitelist_path.empty()? "[none]" : custom_whitelist_path) << "\n"
+                  << "  whitelist mutation space     : " << (wl_mut ? std::to_string(*wl_mut) : "default(2)") << "\n"
+                  << "  generated mutation space     : " << (gen_mut ? std::to_string(*gen_mut) : "default(2)") << "\n"
+                  << "  whitelist shift space        : " << (wl_shift ? std::to_string(*wl_shift) : "default(2)") << "\n"
+                  << "  generated shift space        : " << (gen_shift ? std::to_string(*gen_shift) : "default(3)") << "\n"
+                  << "  max reads                    : " << (max_reads == -1 ? "all" : std::to_string(max_reads)) << "\n"
+                  << "  chunk size                   : " << chunk_size               << "\n"
+                  << "  output directory             : " << outdir.string()          << "\n"
+                  << "  write debug files            : " << std::boolalpha << write_debug << "\n"
+                  << "  filename base                : " << base                     << "\n"
+                  << "  barcode split                : " << std::boolalpha << split_bc << "\n"
+                  << "  threads                      : " << nthreads                 << "\n"
+                  << "  verbose                      : " << std::boolalpha << verbose << "\n"
+                  << "  max_threads avail.           : " << omp_get_max_threads()    << "\n\n";
     }
 
     std::cout << "[main] Starting main processing...\n";
@@ -214,13 +215,13 @@ int main(int argc, char* argv[]) {
 
         if (whitelist_path) {
             if (verbose) std::cout << "[main] Loading custom kit & whitelist...\n";
-            read_layout.load_wl(whitelist_path.value(), shift, mut, verbose, nthreads);
+            read_layout.load_wl(whitelist_path.value(), wl_shift, wl_mut, verbose, nthreads);
         } else if (!custom_kit.empty()) {
             if (verbose) std::cout << "[main] Loading kit whitelist...\n";
-            read_layout.load_wl(std::nullopt, shift, mut, verbose, nthreads);
+            read_layout.load_wl(std::nullopt, wl_shift, wl_mut, verbose, nthreads);
         } else {
             if (verbose) std::cout << "[main] Loading all whitelists...\n";
-            read_layout.load_wl(std::nullopt, shift, mut, verbose, nthreads);
+            read_layout.load_wl(std::nullopt, wl_shift, wl_mut, verbose, nthreads);
         }
 
         // Demultiplex with chunk_size parameter
@@ -230,8 +231,8 @@ int main(int argc, char* argv[]) {
         
         // if max reads is -1, it's unlimited--if not, then we default to the max number of reads that are user-specified
         size_t max_reads_param = (max_reads == -1) ? -1 : max_reads;
-        
-        SigString::sigalign(fastq_path, read_layout, outbase.string(), max_verbose, nthreads, chunk_size, max_reads_param);
+        // main function
+        SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut, gen_shift, max_verbose, nthreads, chunk_size, max_reads_param, write_debug);
         
         auto sig_time = std::chrono::steady_clock::now() - sigalign_start;
         std::cout << "[sigalign] Time: "

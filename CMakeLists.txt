@@ -62,7 +62,7 @@ target_include_directories(rad_lib INTERFACE
     include                          
     include/kseq
     include/edlib
-    include/progressbar
+    include/parallel_hashmap
     include/csv-parser/single_include
 )
 

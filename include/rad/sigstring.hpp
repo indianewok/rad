@@ -5,13 +5,14 @@
  * @brief Represents a processed element with alignment information
  */
 struct seq_element {
-    std::string class_id;          // Unique identifier for the element
-    std::string global_class;      // Global classification
-    std::optional<int> edit_distance;  //Edit distance from alignment
-    std::pair<int, int> position;  // Start and stop positions
-    std::string type;              // Element type
-    int order;                     // Position in layout
-    std::string direction;         // Orientation
+    std::string class_id;               // Unique identifier for the element
+    std::string global_class;           // Global classification
+    std::optional<int> edit_distance;    //Edit distance from alignment
+    std::pair<int, int> position;       // Start and stop positions
+    std::string type;                   // Element type
+    int order;                          // Position in layout
+    std::string direction;              // Orientation
+    std::string flags;
     std::optional<bool> element_pass;  // Whether element passed validation
     std::optional<std::string> seq;    // Element sequence if available
     std::optional<std::string> qual;   // Element quality scores if available
@@ -25,6 +26,7 @@ struct seq_element {
         std::pair<int, int> position,
         std::string type,
         int order,
+        std::string flags,
         std::string direction,
         std::optional<bool> element_pass = std::nullopt,
         std::optional<std::string> seq = std::nullopt,
@@ -36,6 +38,7 @@ struct seq_element {
         position(position),
         type(std::move(type)),
         order(order),
+        flags(std::move(flags)),
         direction(std::move(direction)),
         element_pass(element_pass),
         seq(std::move(seq)),
@@ -396,84 +399,241 @@ public:
 };
 
 namespace barcode_correction {
-    // returns the best candidate compared to the query candidate
-    std::optional<int64_seq> resolve_multiple_hits(const int64_seq& query,
-         const std::unordered_set<int64_seq>& candidates, int max_dist, bool verbose){
-        auto sorted = mutation_tools::int64_lvdist(query, candidates, max_dist);
-        if (sorted.empty()){
-            if(verbose){
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << "NO_MATCH\n";
-                    std::cout << oss.str();
-
+    // barcode correction result(s)
+    // Count-based quality check for barcodes, looking at total summated counts to curb against false positives and spurious corrections
+    bool passes_quality_check(const int64_seq& candidate, const whitelist::wl_entry* wl, 
+                              const std::string& whitelist_source, bool verbose, bool raw_match = false) {
+        
+            // Get the appropriate whitelist reference
+            const auto& whitelist = (whitelist_source == "global") ? wl->global_bcs : wl->true_bcs;
+            
+            int raw_count = whitelist.get_bc_count(candidate, barcode_counts::raw);
+            int total_count = whitelist.get_bc_count(candidate, barcode_counts::total);
+            int filtered_count = whitelist.get_bc_count(candidate, barcode_counts::filtered);
+            int corrected_count = whitelist.get_bc_count(candidate, barcode_counts::corrected);
+        
+            // KEY FIX: If this barcode has no history (total_count = 0), always pass
+            // This handles the case where we're correcting to a barcode that doesn't exist yet
+            if (total_count == 0) {
+                if (verbose) {
+                    #pragma omp critical
+                    {
+                        std::ostringstream oss;
+                        oss << "Quality check for " << candidate.bits_to_sequence()
+                            << " [" << whitelist_source << "]: total=0 (new barcode) -> PASS" << std::endl;
+                        std::cout << oss.str();
+                    }
                 }
+                return true;
             }
-            return std::nullopt;
-        }
-         // lowest edit distance
-        auto it = sorted.begin();
-        int best_dist = it->first;
-        const auto& best_set = it->second;
 
-        if(verbose){
-            #pragma omp critical
-            {
-                std::ostringstream oss;
-                oss << "Best edit distance = " << best_dist << ", # of candidates = " << best_set.size() << "\n";
-                std::cout << oss.str();
+            // For barcodes with sufficient history, check correction ratio
+            double correction_ratio = static_cast<double>(corrected_count) / total_count;
+            // Quality checks
+            bool low_filtered = filtered_count <= raw_count;
+            bool correction_limit = true;
+            if(total_count > 10){
+                correction_limit = correction_ratio <= 0.5;  // Max 50% corrected
             }
-        }
+            bool overall_pass = correction_limit;
+        return overall_pass;
+    }
     
-        if (best_set.size() == 1) {
-            if(verbose){
+    // Resolves multiple hits for a barcode candidate against a set of candidates, fails if there is no true winner
+    std::pair<std::optional<int64_seq>, std::optional<int>> resolve_multiple_hits(
+                    const int64_seq& query, const std::unordered_set<int64_seq>& candidates, 
+                    int max_dist, bool verbose,const std::string& wl_type, const whitelist::wl_entry* wl = nullptr) {
+
+            auto sorted = mutation_tools::int64_lvdist(query, candidates, max_dist);
+            const auto& target_whitelist = (wl_type == "global") ? wl->global_bcs : wl->true_bcs;
+
+            if (sorted.empty()) {
+                if (verbose) {
+                    #pragma omp critical
+                    {
+                        std::ostringstream oss;
+                        oss << "NO_MATCH\n";
+                        std::cout << oss.str();
+                    }
+                }
+                return {std::nullopt, std::nullopt};
+            }
+            // Get the lowest edit distance
+
+            auto it = sorted.begin();
+            int best_dist = it->first;
+            const auto& best_set = it->second;
+
+            if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
-                    oss << "Best candidate found: " << best_set.begin()->bits_to_sequence() << "\n";
+                    oss << "Best edit distance = " << best_dist << ", # of candidates = " << best_set.size() << "\n";
                     std::cout << oss.str();
                 }
             }
-            return *best_set.begin();
-        }
-        if(verbose){
-            #pragma omp critical
-            {
-                std::ostringstream oss;
-                oss << "Ambiguous best hits found: " << best_set.size() << " candidates with edit distance " << best_dist << "\n";
-                std::cout << oss.str();
-                for (auto &s : best_set) {
+            if (best_set.size() == 1) {
+                if (verbose) {
+                    #pragma omp critical
+                    {
+                        std::ostringstream oss;
+                        oss << "Best candidate found: " << best_set.begin()->bits_to_sequence() << "\n";
+                        std::cout << oss.str();
+                    }
+                }
+                return {*best_set.begin(), best_dist};
+            }
+            
+            // Multiple candidates with same edit distance
+            if (verbose) {
+                #pragma omp critical
+                {
                     std::ostringstream oss;
-                    oss << "  " << s.bits_to_sequence() << "\n";
+                    oss << "Ambiguous best hits found: " << best_set.size() 
+                        << " candidates with edit distance " << best_dist;
+                    if (wl != nullptr) {
+                        oss << ". Attempting count-based tie breaking...";
+                    }
+                    oss << "\n";
                     std::cout << oss.str();
                 }
-            }  
-        }
-        return std::nullopt;
+            }
+            
+            // If whitelist is provided, attempt count-based tie breaking
+            if (wl != nullptr) {
+                struct candidate_info {
+                    int64_seq barcode;
+                    int raw_count;
+                    int corrected_count;
+                    int concat_count;
+                    double score;
+                };
+
+                std::vector<candidate_info> candidate_infos;
+                candidate_infos.reserve(best_set.size());
+                // Collect count information for each candidate
+                for (const auto& candidate : best_set) {
+                    candidate_info info;
+                    info.barcode = candidate;
+                    info.raw_count = target_whitelist.get_bc_count(candidate, barcode_counts::raw);
+                    info.corrected_count = target_whitelist.get_bc_count(candidate, barcode_counts::corrected);
+                    int forw_concat = target_whitelist.get_bc_count(candidate, barcode_counts::forw_concat);
+                    int rev_concat = target_whitelist.get_bc_count(candidate, barcode_counts::rev_concat);
+                    info.concat_count = forw_concat + rev_concat;
+                    // Calculate ranking score: Higher raw counts = better, lower corrected/concat = better
+                    info.score = (info.raw_count * 2.0) - (info.corrected_count * 1.0) - (info.concat_count * 0.5);
+                    candidate_infos.push_back(info);
+                    
+                    if (verbose) {
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "  Candidate: " << candidate.bits_to_sequence() 
+                                << " [" << wl_type << "] raw = " << info.raw_count 
+                                << " corrected = " << info.corrected_count 
+                                << " concat = " << info.concat_count 
+                                << " score = " << info.score << std::endl;
+                            std::cout << oss.str();
+                        }
+                    }
+                }
+
+                // Sort by score (highest first), then by raw count as tiebreaker
+                std::sort(candidate_infos.begin(), candidate_infos.end(), 
+                        [](const candidate_info& a, const candidate_info& b) {
+                            if (a.score != b.score) {
+                                return a.score > b.score;
+                            }
+                            if (a.raw_count != b.raw_count) {
+                                return a.raw_count > b.raw_count;
+                            }
+                            if (a.corrected_count != b.corrected_count) {
+                                return a.corrected_count < b.corrected_count;
+                            }
+                            return a.concat_count < b.concat_count;
+                        });
+
+                // Check if we have a clear winner
+                const auto& winner = candidate_infos[0];
+                bool has_clear_winner = true;
+                if (candidate_infos.size() > 1 && candidate_infos[1].score == winner.score) {
+                    has_clear_winner = false;
+                    if (verbose) {
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "Multiple candidates with same top score (" << winner.score 
+                                << "), cannot resolve tie" << std::endl;
+                            std::cout << oss.str();
+                        }
+                    }
+                }
+                if (has_clear_winner) {
+                    if (verbose) {
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "Count-based tie breaking resolved. Winner: " 
+                                << winner.barcode.bits_to_sequence() 
+                                << " [score=" << winner.score 
+                                << " raw=" << winner.raw_count 
+                                << " corrected=" << winner.corrected_count 
+                                << " concat=" << winner.concat_count << "]" << std::endl;
+                            std::cout << oss.str();
+                        }
+                    }
+                    return {winner.barcode, best_dist};
+                }
+
+                // Count-based tie breaking failed
+                if (verbose) {
+                    #pragma omp critical
+                    {
+                        std::ostringstream oss;
+                        oss << "Could not resolve ambiguous hits using count information" << std::endl;
+                        std::cout << oss.str();
+                    }
+                }
+            } else {
+                // No whitelist provided - show candidates as before
+                if (verbose) {
+                    #pragma omp critical
+                    {
+                        std::ostringstream oss;
+                        for (const auto& s : best_set) {
+                            oss << "  " << s.bits_to_sequence() << "\n";
+                        }
+                        std::cout << oss.str();
+                    }
+                }
+            }
+    
+        // Return the minimum distance even if we couldn't resolve the ambiguity
+        return {std::nullopt, best_dist};
     }
 
-    std::optional<int64_seq> correct_barcode(const seq_element& elem, const ReadLayout& layout, bool verbose){
+// Enhanced correct_barcode function with quality checking
+    std::optional<int64_seq> correct_barcode(const seq_element& elem, const ReadLayout& layout, bool verbose, int mut_dist, int shift_dist) {
         // pick the right whitelist
         auto key = seq_utils::remove_rc(elem.class_id);
         auto &wl = layout.wl_map.maps.at(key).get();
+        int max_dist = 4;
         
         // extract and reverse‐complement the raw string
+        // encoded barcode and reverse complement
         std::string raw = elem.seq.value();
-        if (elem.direction == "reverse"){
+        if (elem.direction == "reverse") {
             raw = seq_utils::revcomp(raw);
         }
-        // encoded barcode
-        int64_seq bc;
+        int64_seq bc, rc_bc;;
         bc.sequence_to_bits(raw);
+        rc_bc.sequence_to_bits(seq_utils::revcomp(raw));
         int bc_len = static_cast<int>(bc.length);
-        int max_shift_dist = static_cast<int>(bc.length*0.25);
-        int max_resolve_dist = static_cast<int>(bc.length*0.2);
-        int max_mutation_dist = static_cast<int>(bc.length*0.6);
         
         // === filtering for messy barcodes ===
-        if(!wl.filter_bcs.empty() && (wl.filter_bcs.check_wl_for(bc) || seq_utils::int_kmerize(raw, 2) < 4)){
-            if(verbose){
+        bool filtered_hit = !wl.filter_bcs.empty() && (wl.filter_bcs.check_wl_for(bc) || wl.filter_bcs.check_wl_for(rc_bc));
+        if (filtered_hit || seq_utils::int_kmerize(raw, 2) < 4) {
+            if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
@@ -485,34 +645,80 @@ namespace barcode_correction {
         }
 
         // === exact match in global whitelist ===
-        if(!wl.global_bcs.empty() && wl.global_bcs.check_wl_for(bc)){
+        if (!wl.global_bcs.empty() && wl.global_bcs.check_wl_for(bc)) {
             auto matched = wl.global_bcs.return_putative_correct_bcs(bc);
-            if(verbose){
+            if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
                     oss << "GLOBAL_CHECK_FOUND (" << matched.size() << " candidates)\n";
                     std::cout << oss.str();
-
                 }
             }
+            
             if (matched.size() == 1) {
-                if(verbose){
-                    #pragma omp critical
-                    {
-                        std::ostringstream oss;
-                        oss << "GLOBAL_CHECK_WORKED\n";
-                        std::cout << oss.str();
+                int64_seq candidate = *matched.begin();
+                if (passes_quality_check(candidate, &wl, "global", verbose) || bc == candidate || rc_bc == candidate) {
+                    if (verbose) {
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "GLOBAL_CHECK_WORKED\n";
+                            std::cout << oss.str();
+                        }
                     }
+                    return candidate;
+                } else {
+                    if (verbose) {
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "GLOBAL_CHECK_QUALITY_FAILED - falling through to true whitelist\n";
+                            std::cout << oss.str();
+                        }
+                    }
+                    // Fall through to true whitelist check
                 }
-                return std::optional<int64_seq>(*matched.begin());
-            }
-            if(verbose){
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << "GLOBAL_CHECK_MULTIPLE_MATCHED\n";
-                    std::cout << oss.str();
+            } else {
+                // Use enhanced resolution with count-based tie breaking for global
+                auto [resolved, min_dist] = resolve_multiple_hits(bc, matched, max_dist, verbose, "global", &wl);
+                if (resolved.has_value()) {
+                    // Quality check the resolved candidate
+                    if (passes_quality_check(resolved.value(), &wl, "global", verbose)) {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "GLOBAL_CHECK_MULTIPLE_RESOLVED\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        return resolved;
+                    } else {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "GLOBAL_CHECK_MULTIPLE_RESOLVED_QUALITY_FAILED - falling through to true whitelist\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        // Fall through to true whitelist check
+                    }
+                } else {
+                    if (verbose) {
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "GLOBAL_CHECK_MULTIPLE_UNRESOLVED";
+                            if (min_dist.has_value()) {
+                                oss << " (min_dist=" << min_dist.value() << ")";
+                            }
+                            oss << " - falling through to true whitelist\n";
+                            std::cout << oss.str();
+                        }
+                    }
+                    // Fall through to true whitelist check
                 }
             }
         }
@@ -520,7 +726,7 @@ namespace barcode_correction {
         // === exact match in true barcodes ===
         if (!wl.true_bcs.empty() && wl.true_bcs.check_wl_for(bc)) {
             auto matched = wl.true_bcs.return_putative_correct_bcs(bc);
-            if(verbose){
+            if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
@@ -528,39 +734,76 @@ namespace barcode_correction {
                     std::cout << oss.str();
                 }
             }
+            
             if (matched.size() == 1) {
-                if(verbose){
-                    #pragma omp critical
-                    {
-                        std::ostringstream oss;
-                        oss << "ORIGINAL_CHECK_WORKED\n";
-                        std::cout << oss.str();
+                int64_seq candidate = *matched.begin();
+                // Quality check: if this fails on true whitelist, we reject the barcode entirely
+                if (passes_quality_check(candidate, &wl, "true", verbose) || bc == candidate || rc_bc == candidate) {
+                    if (verbose) {
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "ORIGINAL_CHECK_WORKED\n";
+                            std::cout << oss.str();
+                        }
                     }
-                }
-            return std::optional<int64_seq>(*matched.begin()); 
-            }
-            if (auto one = resolve_multiple_hits(bc, matched, 5, verbose)) {
-                if(verbose){
-                    #pragma omp critical
-                    {
-                        std::ostringstream oss;
-                        oss << "ORIGINAL_MATCH_COLLISION_RESOLVED\n";
-                        std::cout << oss.str();
+                    return candidate;
+                } else {
+                    if (verbose) {
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "ORIGINAL_CHECK_QUALITY_FAILED - rejecting barcode\n";
+                            std::cout << oss.str();
+                        }
                     }
+                    return std::nullopt; // Fail the barcode
                 }
-                return std::optional<int64_seq>(*one);
-            }
-            if(verbose){
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << "ORIGINAL_MATCH_COLLISION_UNRESOLVED\n";
-                    std::cout << oss.str();
+            } else {
+                // Use enhanced resolution with count-based tie breaking for true
+                auto [resolved, min_dist] = resolve_multiple_hits(bc, matched, max_dist, verbose, "true", &wl);
+                if (resolved.has_value()) {
+                    // Quality check the resolved candidate
+                    if (passes_quality_check(resolved.value(), &wl, "true", verbose)) {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "ORIGINAL_MATCH_COLLISION_RESOLVED\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        return resolved;
+                    } else {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "ORIGINAL_MATCH_COLLISION_RESOLVED_QUALITY_FAILED - rejecting barcode\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        return std::nullopt; // Fail the barcode
+                    }
+                } else {
+                    if (verbose) {
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "ORIGINAL_MATCH_COLLISION_UNRESOLVED";
+                            if (min_dist.has_value()) {
+                                oss << " (min_dist=" << min_dist.value() << ")";
+                            }
+                            oss << "\n";
+                            std::cout << oss.str();
+                        }
+                    }
+                    return std::nullopt; // Fail the barcode
                 }
             }
         }
 
-        if(verbose){
+        if (verbose) {
             #pragma omp critical
             {
                 std::ostringstream oss;
@@ -570,11 +813,11 @@ namespace barcode_correction {
         }
         
         // === mutation match - check global first, then true ===
-        auto muts = mutation_tools::generate_mutated_barcodes(bc, 2);
+        auto muts = mutation_tools::generate_mutated_barcodes(bc, mut_dist);
         // Check mutations against global whitelist first
         if (!wl.global_bcs.empty() && wl.global_bcs.check_wl_for(muts)) {
             auto matched = wl.global_bcs.return_putative_correct_bcs(muts);
-            if(verbose){
+            if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
@@ -582,10 +825,10 @@ namespace barcode_correction {
                     std::cout << oss.str();
                 }
             }
+            
             if (matched.size() == 1) {
                 int64_seq putative_candidate = *matched.begin();
-                putative_candidate.bits_to_sequence();
-                if(verbose){
+                if (verbose) {
                     #pragma omp critical
                     {
                         std::ostringstream oss;
@@ -593,43 +836,63 @@ namespace barcode_correction {
                         std::cout << oss.str();
                     }
                 }
-                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
-                if(res >= 0 && res <= max_resolve_dist){
-                    if(verbose){
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << "LVDIST::" << res << "\nGLOBAL_MUTATION_CHECK_MATCHED\n";
-                            std::cout << oss.str();
+                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_dist);
+                if (res >= 0) {
+                    // Quality check
+                    if (passes_quality_check(putative_candidate, &wl, "global", verbose)) {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "LVDIST::" << res << "\nGLOBAL_MUTATION_CHECK_MATCHED\n";
+                                std::cout << oss.str();
+                            }
                         }
+                        return putative_candidate;
+                    } else {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "GLOBAL_MUTATION_CHECK_QUALITY_FAILED - falling through to true whitelist\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        // Fall through to true whitelist
                     }
-                    return std::optional<int64_seq>(*matched.begin());
                 }
-            }
-            if (auto one = resolve_multiple_hits(bc, matched, max_mutation_dist, verbose)) {
-                if(verbose){
-                    #pragma omp critical
-                    {
-                        std::ostringstream oss;
-                        oss << "GLOBAL_MUTATION_MULTIPLE_MATCHED_RESOLVED\n";
-                        std::cout << oss.str();
+            } else {
+                // Use enhanced resolution for global mutations
+                auto [resolved, min_dist] = resolve_multiple_hits(bc, matched, max_dist, verbose, "global", &wl);
+                if (resolved.has_value()) {
+                    if (passes_quality_check(resolved.value(), &wl, "global", verbose)) {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "GLOBAL_MUTATION_MULTIPLE_MATCHED_RESOLVED\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        return resolved;
+                    } else {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "GLOBAL_MUTATION_MULTIPLE_RESOLVED_QUALITY_FAILED - falling through to true whitelist\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        // Fall through to true whitelist
                     }
-                }
-                return std::optional<int64_seq>(*one);
-            }
-            if(verbose){
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << "GLOBAL_MUTATION_MULTIPLE_MATCHED_FAIL\n";
-                    std::cout << oss.str();
                 }
             }
         }
-        // Check mutations against true barcodes 
+        // Check mutations against true barcodes
         if (!wl.true_bcs.empty() && wl.true_bcs.check_wl_for(muts)) {
             auto matched = wl.true_bcs.return_putative_correct_bcs(muts);
-            if(verbose){
+            if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
@@ -637,10 +900,10 @@ namespace barcode_correction {
                     std::cout << oss.str();
                 }
             }
+            
             if (matched.size() == 1) {
                 int64_seq putative_candidate = *matched.begin();
-                putative_candidate.bits_to_sequence();
-                if(verbose){
+                if (verbose) {
                     #pragma omp critical
                     {
                         std::ostringstream oss;
@@ -648,46 +911,66 @@ namespace barcode_correction {
                         std::cout << oss.str();
                     }
                 }
-                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
-                if(res >= 0 && res <= max_resolve_dist){
-                    if(verbose){
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << "LVDIST::" << res << "\nMUTATION_CHECK_MATCHED\n";
-                            std::cout << oss.str();
+                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_dist);
+                if (res >= 0) {
+                    // Quality check - if fails on true whitelist, reject entirely
+                    if (passes_quality_check(putative_candidate, &wl, "true", verbose)) {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "LVDIST::" << res << "\nMUTATION_CHECK_MATCHED\n";
+                                std::cout << oss.str();
+                            }
                         }
+                        return putative_candidate;
+                    } else {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "MUTATION_CHECK_QUALITY_FAILED - rejecting barcode\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        return std::nullopt;
                     }
-                    return std::optional<int64_seq>(*matched.begin());
                 }
-            }
-            if (auto one = resolve_multiple_hits(bc, matched, max_mutation_dist, verbose)) {
-                if(verbose){
-                    #pragma omp critical
-                    {
-                        std::ostringstream oss;
-                        oss << "MUTATION_MULTIPLE_MATCHED_RESOLVED\n";
-                        std::cout << oss.str();
+            } else {
+                // Use enhanced resolution for true mutations
+                auto [resolved, min_dist] = resolve_multiple_hits(bc, matched, max_dist, verbose, "true", &wl);
+                if (resolved.has_value()) {
+                    if (passes_quality_check(resolved.value(), &wl, "true", verbose)) {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "MUTATION_MULTIPLE_MATCHED_RESOLVED\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        return resolved;
+                    } else {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "MUTATION_MULTIPLE_RESOLVED_QUALITY_FAILED - rejecting barcode\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        return std::nullopt;
                     }
-                }
-                return std::optional<int64_seq>(*one);
-            }
-            if(verbose){
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << "MUTATION_MULTIPLE_MATCHED_FAIL\n";
-                    std::cout << oss.str();
                 }
             }
         }
         
         // === shift fuzzy match - check global first, then true ===
-        auto shifts = mutation_tools::generate_shifted_barcodes(bc, max_shift_dist);
+        auto shifts = mutation_tools::generate_shifted_barcodes(bc, shift_dist);
         // Check shifts against global whitelist first
         if (!wl.global_bcs.empty() && wl.global_bcs.check_wl_for(shifts)) {
             auto matched = wl.global_bcs.return_putative_correct_bcs(shifts);
-            if(verbose){
+            if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
@@ -695,10 +978,11 @@ namespace barcode_correction {
                     std::cout << oss.str();
                 }
             }
+            
             if (matched.size() == 1) {
                 int64_seq putative_candidate = *matched.begin();
-                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
-                if(verbose){
+                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_dist);
+                if (verbose) {
                     #pragma omp critical
                     {
                         std::ostringstream oss;
@@ -706,42 +990,62 @@ namespace barcode_correction {
                         std::cout << oss.str();
                     }
                 }
-                if(res >= 0 && res <= 5){
-                    if(verbose){
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << "GLOBAL_SHIFT_CHECK_MATCHED\n";
-                            std::cout << oss.str();
+                if (res >= 0) {
+                    // Quality check
+                    if (passes_quality_check(putative_candidate, &wl, "global", verbose)) {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "GLOBAL_SHIFT_CHECK_MATCHED\n";
+                                std::cout << oss.str();
+                            }
                         }
+                        return putative_candidate;
+                    } else {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "GLOBAL_SHIFT_CHECK_QUALITY_FAILED - falling through to true whitelist\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        // Fall through to true whitelist
                     }
-                    return std::optional<int64_seq>(*matched.begin());
                 }
-            }
-            if (auto one = resolve_multiple_hits(bc, matched, 5, verbose)) {  
-                if(verbose){
-                    #pragma omp critical
-                    {
-                        std::ostringstream oss;
-                        oss << "GLOBAL_SHIFT_MULTIPLE_MATCHED_RESOLVED\n";
-                        std::cout << oss.str();
+            } else {
+                // Use enhanced resolution for global shifts
+                auto [resolved, min_dist] = resolve_multiple_hits(bc, matched, max_dist, verbose, "global", &wl);
+                if (resolved.has_value()) {
+                    if (passes_quality_check(resolved.value(), &wl, "global", verbose)) {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "GLOBAL_SHIFT_MULTIPLE_MATCHED_RESOLVED\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        return resolved;
+                    } else {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "GLOBAL_SHIFT_MULTIPLE_RESOLVED_QUALITY_FAILED - falling through to true whitelist\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        // Fall through to true whitelist
                     }
-                }
-                return std::optional<int64_seq>(*one);
-            }
-            if(verbose){
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << "GLOBAL_SHIFT_MULTIPLE_MATCHED_FAIL\n";
-                    std::cout << oss.str();
                 }
             }
         }
         // Check shifts against true barcodes
         if (!wl.true_bcs.empty() && wl.true_bcs.check_wl_for(shifts)) {
             auto matched = wl.true_bcs.return_putative_correct_bcs(shifts);
-            if(verbose){
+            if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
@@ -749,10 +1053,11 @@ namespace barcode_correction {
                     std::cout << oss.str();
                 }
             }
+            
             if (matched.size() == 1) {
                 int64_seq putative_candidate = *matched.begin();
-                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_mutation_dist);
-                if(verbose){
+                int res = mutation_tools::int64_lvdist(bc, putative_candidate, max_dist);
+                if (verbose) {
                     #pragma omp critical
                     {
                         std::ostringstream oss;
@@ -761,41 +1066,60 @@ namespace barcode_correction {
                         std::cout << oss.str();
                     }
                 }
-                if(res >= 0 && res <= 5){
-                    if(verbose){
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << "SHIFT_CHECK_MATCHED\n";
-                            std::cout << oss.str();
+                if (res >= 0) {
+                    // Quality check - if fails on true whitelist, reject entirely
+                    if (passes_quality_check(putative_candidate, &wl, "true", verbose)) {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "SHIFT_CHECK_MATCHED\n";
+                                std::cout << oss.str();
+                            }
                         }
+                        return putative_candidate;
+                    } else {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "SHIFT_CHECK_QUALITY_FAILED - rejecting barcode\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        return std::nullopt;
                     }
-                    return std::optional<int64_seq>(*matched.begin());
                 }
-            }
-            if (auto one = resolve_multiple_hits(bc, matched, 5, verbose)) {  
-                if(verbose){
-                    #pragma omp critical
-                    {
-                        std::ostringstream oss;
-                        oss << "SHIFT_MULTIPLE_MATCHED_RESOLVED\n";
-                        std::cout << oss.str();
+            } else {
+                // Use enhanced resolution for true shifts
+                auto [resolved, min_dist] = resolve_multiple_hits(bc, matched, max_dist, verbose,"true", &wl);
+                if (resolved.has_value()) {
+                    if (passes_quality_check(resolved.value(), &wl, "true", verbose)) {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "SHIFT_MULTIPLE_MATCHED_RESOLVED\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        return resolved;
+                    } else {
+                        if (verbose) {
+                            #pragma omp critical
+                            {
+                                std::ostringstream oss;
+                                oss << "SHIFT_MULTIPLE_RESOLVED_QUALITY_FAILED - rejecting barcode\n";
+                                std::cout << oss.str();
+                            }
+                        }
+                        return std::nullopt;
                     }
-                }
-                return std::optional<int64_seq>(*one);
-            }
-            if(verbose){
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << "SHIFT_MULTIPLE_MATCHED_FAIL\n";
-                    std::cout << oss.str();
                 }
             }
         }
-        
         // === no match ===
-        if(verbose){
+        if (verbose) {
             #pragma omp critical
             {
                 std::ostringstream oss;
@@ -1587,115 +1911,122 @@ private:
         return direction_elements;
     }
 
-    // Update barcode counts based on the SigString and ReadLayout
-   void update_bc_counts(const SigString &sig, const ReadLayout &layout, bool verbose) {
-    auto type = read_type; // "forward", "reverse", "concatenate", or "filtered"
+    //  update_bc_counts with whitelist selection and global filtering
+    void update_bc_counts(SigString &sig, const ReadLayout &layout, bool verbose, bool skip_global_writes = true) {
+        auto type = sig.read_type; // "forward", "reverse", "concatenate", or "filtered"
+        bool has_global_only_barcodes = false;
     
-    for (auto const &elem : sig.elements()) {
-        if (elem.global_class != "barcode" || !elem.seq.has_value()) {
-            continue;
-        }
-        
-        // Get current sequence and original sequence
-        std::string bc_seq = elem.seq.value();
-        std::string original_seq = elem.original_seq.value_or("");
-        int64_seq bc(bc_seq);
-        
-        // Look up the right whitelist
-        auto key = seq_utils::remove_rc(elem.class_id);
-        auto &wl = layout.wl_map.maps.at(key).get();
-        
-        if (verbose) {
-            #pragma omp critical
-            {
-                std::ostringstream oss;
-                oss << "UPDATE_BC_COUNT FOR ELEM.DIR: " << elem.direction << " AND READ_TYPE: " << type << std::endl;
-                std::cout << oss.str();
+        for (auto const &elem : sig.elements()) {
+            if (elem.global_class != "barcode" || !elem.seq.has_value()) {
+                continue;
             }
-        }
-    
-        // Determine if this was corrected or raw
-        bool is_corrected = false;
-        if (!original_seq.empty() && original_seq != "") {
-            std::string original_for_comparison = original_seq;
-            std::string original_revcomp = seq_utils::revcomp(original_seq);
-            // Check if current sequence matches original (raw) or is different (corrected)
-            if (bc_seq != original_for_comparison && bc_seq != original_revcomp) {
-                is_corrected = true;
-            }
-        }
-        if(verbose){
-            #pragma omp critical
-            {
-                std::ostringstream oss;
-                oss << "Barcode " << bc.bits_to_sequence() 
-                    << " is " << (is_corrected ? "CORRECTED" : "RAW") 
-                    << " from original sequence: " << original_seq << std::endl;
-                std::cout << oss.str();
-            }
-        }
-
-        if (type == "filtered") {
-            wl.true_bcs.update_bc_count(bc, barcode_counts::filtered);
-        }
-        if (type == "forward" && elem.direction == "forward") {
-            wl.true_bcs.update_bc_count(bc, barcode_counts::total);
-            wl.true_bcs.update_bc_count(bc, barcode_counts::forw);
-            if(is_corrected) {
-                wl.true_bcs.update_bc_count(bc, barcode_counts::corrected);
-            } else {
-                wl.true_bcs.update_bc_count(bc, barcode_counts::raw);
-            }
-        }
-
-        if (type == "reverse" && elem.direction == "reverse") {
-            wl.true_bcs.update_bc_count(bc, barcode_counts::total);
-            wl.true_bcs.update_bc_count(bc, barcode_counts::rev);
-            if(is_corrected) {
-                wl.true_bcs.update_bc_count(bc, barcode_counts::corrected);
-            } else {
-                wl.true_bcs.update_bc_count(bc, barcode_counts::raw);
-            }
-        }
-
-        if (type == "concatenate") {
-            if (elem.direction == "forward") {
-                wl.true_bcs.update_bc_count(bc, barcode_counts::total);
-                wl.true_bcs.update_bc_count(bc, barcode_counts::forw_concat);
-                if(is_corrected) {
-                    wl.true_bcs.update_bc_count(bc, barcode_counts::corrected);
-                } else {
-                    wl.true_bcs.update_bc_count(bc, barcode_counts::raw);
-                }
-            } else if (elem.direction == "reverse") {
-                wl.true_bcs.update_bc_count(bc, barcode_counts::total);
-                wl.true_bcs.update_bc_count(bc, barcode_counts::rev_concat);
-                if(is_corrected) {
-                    wl.true_bcs.update_bc_count(bc, barcode_counts::corrected);
-                } else {
-                    wl.true_bcs.update_bc_count(bc, barcode_counts::raw);
+            
+            // Get current sequence and original sequence
+            std::string bc_seq = elem.seq.value();
+            std::string original_seq = elem.original_seq.value_or("");
+            int64_seq bc(bc_seq);
+            
+            // Look up the right whitelist
+            auto key = seq_utils::remove_rc(elem.class_id);
+            auto &wl = layout.wl_map.maps.at(key).get();
+            
+            // Determine if this was corrected or raw
+            bool is_corrected = false;
+            if (!original_seq.empty() && original_seq != "") {
+                std::string original_for_comparison = original_seq;
+                std::string original_revcomp = seq_utils::revcomp(original_seq);
+                if (bc_seq != original_for_comparison && bc_seq != original_revcomp) {
+                    is_corrected = true;
                 }
             }
-        }
-        
-        if (verbose) {
-            #pragma omp critical
-            {
-                std::ostringstream oss;
-                int bc_total = wl.true_bcs.get_bc_count(bc, barcode_counts::total);
-                int bc_corrected = wl.true_bcs.get_bc_count(bc, barcode_counts::corrected);
-                oss << "Barcode " << bc.bits_to_sequence() 
-                    << ": total=" << bc_total 
-                    << ", corrected=" << bc_corrected
-                    << ", status=" << (is_corrected ? "CORRECTED" : "RAW") << std::endl;
-                std::cout << oss.str();
+
+            // === select the right wl ===
+            bool found_in_true = wl.true_bcs.check_wl_for(bc);
+            bool found_in_global = wl.global_bcs.check_wl_for(bc);
+            // Simple selection: true or global
+            auto* target_whitelist = &wl.filter_bcs;
+            std::string whitelist_used = "filtered";
+            if (found_in_true) {
+                target_whitelist = &wl.true_bcs;
+                whitelist_used = "true";
+            } else if (found_in_global) {
+                target_whitelist = &wl.global_bcs;
+                whitelist_used = "global";
+                has_global_only_barcodes = true;
             }
+
+            if (verbose) {
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "Updating " << bc.bits_to_sequence() << " in " << whitelist_used 
+                        << " whitelist (" << (is_corrected ? "CORRECTED" : "RAW") << ")" << std::endl;
+                    std::cout << oss.str();
+                }
+            }
+            // === update counts in selected wl ===
+            if (type == "filtered" || type != elem.direction && type != "concatenate") {
+                target_whitelist->update_bc_count(bc, barcode_counts::filtered);
+            }
+
+            if (type == "forward" && elem.direction == "forward") {
+                target_whitelist->update_bc_count(bc, barcode_counts::total);
+                target_whitelist->update_bc_count(bc, barcode_counts::forw);
+                if (is_corrected) {
+                    target_whitelist->update_bc_count(bc, barcode_counts::corrected);
+                } else {
+                    target_whitelist->update_bc_count(bc, barcode_counts::raw);
+                }
+            }
+
+            if (type == "reverse" && elem.direction == "reverse") {
+                target_whitelist->update_bc_count(bc, barcode_counts::total);
+                target_whitelist->update_bc_count(bc, barcode_counts::rev);
+                if (is_corrected) {
+                    target_whitelist->update_bc_count(bc, barcode_counts::corrected);
+                } else {
+                    target_whitelist->update_bc_count(bc, barcode_counts::raw);
+                }
+            }
+
+            if (type == "concatenate") {
+                if (elem.direction == "forward") {
+                    target_whitelist->update_bc_count(bc, barcode_counts::total);
+                    target_whitelist->update_bc_count(bc, barcode_counts::forw_concat);
+                    if (is_corrected) {
+                        target_whitelist->update_bc_count(bc, barcode_counts::corrected);
+                    } else {
+                        target_whitelist->update_bc_count(bc, barcode_counts::raw);
+                    }
+                }
+
+                if (elem.direction == "reverse") {
+                    target_whitelist->update_bc_count(bc, barcode_counts::total);
+                    target_whitelist->update_bc_count(bc, barcode_counts::rev_concat);
+                    if (is_corrected) {
+                        target_whitelist->update_bc_count(bc, barcode_counts::corrected);
+                    } else {
+                        target_whitelist->update_bc_count(bc, barcode_counts::raw);
+                    }
+                }
+            }
+        }
+        // === handle global filters ===
+        if (skip_global_writes && has_global_only_barcodes && sig.read_type != "filtered") {
+            if (verbose) {
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << "Read " << sig.sequence_id << " has global-only barcodes."
+                        << "Setting read_type to 'skipped' due to skip_global_writes = true" << std::endl;
+                    std::cout << oss.str();
+                }
+            }
+            sig.set_type("skipped");
         }
     }
-}
-
 public:
-    //sigalign_static v2
+    //sigalign_static
    void sigalign_static(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose) {
     aligner_tools aligner;
     auto& type_index = layout.by_type();
@@ -1756,6 +2087,7 @@ public:
                     : std::make_pair(static_cast<int>(read_length), static_cast<int>(read_length)),
                 "static",
                 it->order,
+                "",
                 it->direction,
                 std::nullopt,
                 std::nullopt
@@ -1783,6 +2115,7 @@ public:
                         positions,
                         "static",
                         it->order,
+                        "",
                         it->direction,
                         true,
                         mutable_seq.substr(positions.first - 1,
@@ -1854,6 +2187,7 @@ public:
                         adjusted_positions,
                         "static",
                         it->order,
+                        "",
                         it->direction,
                         true,
                         mutable_seq.substr(adj_start - 1,
@@ -1896,6 +2230,7 @@ public:
                 {-1, -1},
                 "variable",
                 it->order,
+                "",
                 it->direction,
                 std::nullopt,
                 std::nullopt
@@ -1998,7 +2333,8 @@ public:
         }
     }
     // contains per-unit barcode correction
-    void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose) {
+    void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, 
+                         int gen_mut, int gen_shift, bool verbose) {
         // make a resever for the qual that doesn't interfere w/ASCII characters
         constexpr char qual_mask = '\x7F';
         auto direction_elements = group_directionally();
@@ -2006,6 +2342,7 @@ public:
         std::map<std::string, bool> direction_valid;
         std::map<std::string, int> pass_counts, static_counts;
         std::unordered_map<std::string, std::unordered_set<int64_seq>> seen_bcs;
+        bool skip_global_writes = false;
         aligner_tools aligner;
 
         // Process each direction separately.
@@ -2064,7 +2401,7 @@ public:
                     }
                     break;  // out of bounds—skip
                 }
-    
+
                 // extract, then strip all 'N's
                 std::string window = masked_read.substr(start, length);
                 std::string window_qual = read.is_fastq ? masked_qual.substr(start, length) : "";
@@ -2096,7 +2433,7 @@ public:
                             #pragma omp critical
                             {
                                 std::ostringstream oss;
-                                oss << "Masked qual: " << el.qual.value() << "\n";
+                                oss << "Masked qual: " << cleaned_qual << "\n";
                                 std::cout << oss.str();
                             }
                         }
@@ -2191,8 +2528,7 @@ public:
                     // Exit processing for this direction.
                     break;
                 }
-
-                //barcode correction here
+                //barcode correction here!!!
                 if (elem.global_class == "barcode") {
                     if(verbose){
                         #pragma omp critical
@@ -2206,7 +2542,7 @@ public:
                     //had originally included a check for global barcode class not empty (&& !wl.true_bcs.empty())
                     //but this is not necessary, as the barcode correction function will handle it
                     if(!wl.true_bcs.empty()){
-                        auto out = barcode_correction::correct_barcode(elem, layout, verbose);
+                        auto out = barcode_correction::correct_barcode(elem, layout, verbose, gen_mut, gen_shift);
                         bool matched = out.has_value();
                         if(matched) {
                             int64_seq original_bc;
@@ -2214,64 +2550,51 @@ public:
                             int64_seq correct_bc = out.value();
                             seen_bcs[seq_utils::remove_rc(elem.class_id)].insert(out.value());
                             //fixing this because corrected is only in the forward direction anyways so need to revcomp
-                            //std::string final_bc = elem.direction == "forward" ? correct_bc.bits_to_sequence() : seq_utils::revcomp(correct_bc.bits_to_sequence());
                             std::string final_bc = correct_bc.bits_to_sequence();
                             // Check if the corrected barcode exists in true_bcs or global_bcs
                             bool found_in_true = wl.true_bcs.check_wl_for(correct_bc);
                             bool found_in_global = wl.global_bcs.check_wl_for(correct_bc);
                             //first check if the corrected barcode is the same as an original sequence
-                            if(final_bc == elem.seq.value() || final_bc == seq_utils::revcomp(elem.seq.value())) {
-                                if(found_in_true) {
-                                    // Correct barcode found in true_bcs
-                                    //wl.true_bcs.update_bc_count(correct_bc, barcode_counts::raw);
-                                } else if (found_in_global) {
-                                    // Correct barcode found in global_bcs
-                                    wl.global_bcs.update_bc_count(correct_bc, barcode_counts::raw);
+                            bool already_keyed = wl.true_bcs.check_wl_for(original_bc) || wl.global_bcs.check_wl_for(original_bc);         
+                            if (!already_keyed) {
+                                if (found_in_true &! found_in_global) {
+                                    auto true_range = wl.true_bcs.equal_range(correct_bc);
+                                    if (!wl.true_bcs.check_wl_for(original_bc) && true_range.first != true_range.second) {
+                                        const barcode_entry& correct_entry = (*true_range.first);
+                                        #pragma omp critical
+                                        {
+                                            wl.true_bcs.insert_bc_entry(original_bc, correct_entry);
+                                        }
+                                    }
                                 }
-                            } else {
-                                bool already_keyed = wl.true_bcs.check_wl_for(original_bc) || wl.global_bcs.check_wl_for(original_bc);         
-                                if (!already_keyed) {
-                                    if (found_in_true) {
-                                        // Correct barcode found in true_bcs
-                                        //wl.true_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
-                                        auto true_range = wl.true_bcs.equal_range(correct_bc);
-                                        if (!wl.true_bcs.check_wl_for(original_bc) && true_range.first != true_range.second) {
-                                            const barcode_entry& correct_entry = (*true_range.first).second;
-                                            #pragma omp critical
-                                            {
-                                                wl.true_bcs.insert_bc_entry(original_bc, correct_entry);
-                                            }
+                                else if (found_in_global &! found_in_true) {
+                                    // Correct barcode found in global_bcs
+                                    auto global_range = wl.global_bcs.equal_range(correct_bc);
+                                    if (!wl.true_bcs.check_wl_for(original_bc) && global_range.first != global_range.second) {
+                                        const barcode_entry& correct_entry = (*global_range.first);
+                                        #pragma omp critical
+                                        {
+                                            wl.global_bcs.insert_bc_entry(original_bc, correct_entry);
                                         }
-                                    }
-                                    else if (found_in_global) {
-                                        wl.global_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
-                                        // Correct barcode found in global_bcs
-                                        auto global_range = wl.global_bcs.equal_range(correct_bc);
-                                        if (!wl.true_bcs.check_wl_for(original_bc) && global_range.first != global_range.second) {
-                                            const barcode_entry& correct_entry = (*global_range.first).second;
-                                            #pragma omp critical
-                                            {
-                                                wl.global_bcs.insert_bc_entry(original_bc, correct_entry);
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // Already keyed, just update count
-                                    if (found_in_true) {
-                                        //wl.true_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
-                                    } else if (found_in_global) {
-                                        wl.global_bcs.update_bc_count(correct_bc, barcode_counts::corrected);
                                     }
                                 }
                             }
                             // update original_seq with the original sequence, set the sequence to the final correccted barcode
                             // and set element pass to be true
                             auto& id_index = sig_elements.get<sig_id_tag>();
+                            std::string final_wl;
+                            if(found_in_true &! found_in_global){
+                                final_wl = "true";
+                            } else {
+                                final_wl = "global";
+                            }
+
                             id_index.modify(
                                 id_index.find(elem.class_id), [&](seq_element &e){
                                     e.original_seq = e.seq;
                                     e.seq = final_bc;
                                     e.element_pass = true;
+                                    e.flags = final_wl;
                                 }
                             );
                         } else {
@@ -2281,20 +2604,39 @@ public:
                                 id_index.find(elem.class_id),
                                 [](seq_element &e) {
                                         e.element_pass = false; 
+                                        e.flags = "filter";
                                     }
                                 );
-                                if(elem.seq.has_value()){
-                                    int64_seq failed_bc;
-                                    failed_bc.sequence_to_bits(elem.seq.value());
-                                    auto filter_range = wl.filter_bcs.equal_range(failed_bc);
-                                        if (!wl.filter_bcs.check_wl_for(failed_bc) && filter_range.first != filter_range.second) {
-                                            const barcode_entry& failed_entry = (*filter_range.first).second;
-                                            #pragma omp critical
-                                            {
-                                                wl.filter_bcs.insert_bc_entry(failed_bc, failed_entry);
-                                            }
+                            if(elem.seq.has_value()){
+                                int64_seq failed_bc, rc_failed_bc;
+                                failed_bc.sequence_to_bits(elem.seq.value());
+                                rc_failed_bc.sequence_to_bits(seq_utils::revcomp(elem.seq.value()));
+                                
+                                #pragma omp critical
+                                {
+                                    // Check if neither the barcode nor its reverse complement are already keys
+                                    if (!wl.filter_bcs.check_wl_for(failed_bc) && !wl.filter_bcs.check_wl_for(rc_failed_bc)) {
+                                        if(verbose){
+                                            std::ostringstream oss;
+                                            oss << "Barcode failed for " << failed_bc.bits_to_sequence() 
+                                                << "\nno direct match found for this key, adding as a new barcode\n";
+                                            std::cout << oss.str();
+                                        }                       
+                                        barcode_entry failed_entry;
+                                        failed_entry.barcode = failed_bc;
+                                        failed_entry.edit_dist = 10;
+                                        failed_entry.filtered = true;
+                                        failed_entry.flags = "failed";  
+                                        // Double-check that it's still not present
+                                        auto failed_range = wl.filter_bcs.equal_range(failed_bc);
+                                        auto rc_failed_range = wl.filter_bcs.equal_range(rc_failed_bc);
+                                        if((failed_range.first == failed_range.second) && (rc_failed_range.first == rc_failed_range.second)) {
+                                            // Entry doesn't exist - insert it
+                                            wl.filter_bcs.insert_bc_entry(failed_bc, failed_entry);
                                         }
+                                    }
                                 }
+                            }
                             // adding this in to try to manage if there are multiple barcodes, whether we should set this entire direction to false. right now, we *only* return completely correct barcodes (all multiples are also correct) 
                             if(!multiple_barcodes){
                                 // so if multiple barcodes is false, then we set the direction value to false and set the pass counts to 0.
@@ -2303,7 +2645,7 @@ public:
                             }
                             continue;
                         }
-                    } else {
+                    } /*else {
                         //this branch is for generating a purely standalone whitelist that will occur IFF there is no default whitelist
                         //--default whitelist generation has yet to happen considering just dumping them into the true_bcs. 
                         //will probably pull this out and write a standalone sorting function internally here.
@@ -2311,13 +2653,13 @@ public:
                             std::string seq = elem.seq.value();
                             int64_seq putative_bc(seq);
                             if(!wl.filter_bcs.check_wl_for(putative_bc)){
-                              //  #pragma omp critical
-                              //  {
-                              //      wl.filter_bcs.insert_bc_entry(be.barcode, be);
-                             //   }
+                                #pragma omp critical
+                                {
+                                    wl.filter_bcs.insert_bc_entry(be.barcode, be);
+                               }
                             }
                         }
-                    }
+                    }*/
                 }
             }
 
@@ -2328,9 +2670,10 @@ public:
             }
 
             // If the direction failed the per-element check, record zero passing variable elements.
+            //removed pass_counts [direction] = 0 because we could blind ourselves to concatenates
             if (!valid_direction) {
                 direction_valid[direction] = false;
-                pass_counts[direction] = 0;
+                //pass_counts[direction] = 0;
                 continue;
             }
 
@@ -2423,600 +2766,38 @@ public:
             }
         }
     }
-    // full sigalign implementation (took out const on read layout in sigalign filter->whitelist population)
-    
-    static void sigalign_standard(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads = 1, 
-        size_t max_reads = -1, bool split_bc = false) {
-        //std::string home = std::getenv("HOME");
-        //std::string desktop_path = home + "/Desktop/";
-        std::string sig_path = output_prefix + ".sig";
-        std::string csv_path = output_prefix + ".csv";
-        std::string fastq_output_path = output_prefix + ".fq";
+     
+    //metrics parallelized over reads
+    static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
+                         std::optional<int> gen_mut, std::optional<int> gen_shift, bool verbose, 
+                         int num_threads, size_t chunk_size, size_t max_reads, bool write_debug) {
 
-        sigstring_writing sig_writer(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false);
-        sigstring_writing csv_writer(csv_path, sigstring_writing::format::CSV, /*compress=*/true, /*append=*/false);
-        sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, /*compress=*/true, /*append=*/false);
-
-        // csv writer will emit exactly what to_csv(true) produces
-        {
-            SigString header("",0);
-            csv_writer(std::vector<SigString>{header});
-        }
-
-        // Define the chunk processing function
-        using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
-        chunk_streaming<read_streaming::sequence,ChunkFunc> streamer(100000);
-    
-        // Set up the chunk processing function to process each chunk of reads
-        ChunkFunc process_func = [&](auto const &chunk, auto const & /*unused_file*/) {
-            // collect SigString objects
-            std::vector<SigString> to_write;
-            to_write.reserve(chunk.size());
-            for (auto const& read : chunk) {
-                SigString sig(read.id, read.seq.length());
-                sig.sigalign_static(read, layout, verbose);
-                sig.sigalign_variable(read, layout, verbose);
-                sig.sigalign_filter(read, layout, verbose);
-
-                if (sig.read_type != "filtered") {
-                    to_write.push_back(std::move(sig));
-                }
-            }
-    
-            if (!to_write.empty()) {
-                #pragma omp critical
-                {
-                    sig_writer(to_write);
-                    csv_writer(to_write);
-                    fastqa_writer(to_write);
-                }
-            }
-        };
-
-        // Process the chunks
-        streamer.process_chunks(fastq_path, process_func, num_threads, static_cast<int64_t>(max_reads));
-
-        std::cout <<
-                   "[sigalign] Output written to:\n"
-                << "[sigalign] [sigstring]: " << sig_path << "\n"
-                << "[sigalign]       [csv]: " << csv_path << "\n"
-                << "[sigalign]     [fastq]: " << fastq_output_path << std::endl;
-    }
-    
-    //metrics per chunk
-    static void sigalign_chunk(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads, 
-        size_t max_reads = -1, bool split_bc = false, size_t initial_chunk_size = 5000) {
-        std::string sig_path = output_prefix + ".sig";
-        std::string csv_path = output_prefix + ".csv";
-        std::string fastq_output_path = output_prefix + ".fq";
-        std::string metrics_path = output_prefix + ".metrics.tsv";
-        
-        sigstring_writing sig_writer(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false);
-        sigstring_writing csv_writer(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false);
-        sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, /*compress=*/false, /*append=*/false);
-
-        parallel_writer writer;
-
-        std::ofstream metrics_file(metrics_path);
-        metrics_file << "chunk_id\tthread_id\tchunk_size\tread_time_ms\tprocess_time_ms\twrite_time_ms\ttotal_time_ms\n";
-        
-        // csv writer will emit exactly what to_csv(true) produces
-        {
-            SigString header("",0);
-            csv_writer(std::vector<SigString>{header});
-        }
-        
-        // Atomic counters for tracking
-        std::atomic<size_t> total_chunks{0};
-        std::atomic<size_t> total_reads{0};
-        std::atomic<size_t> total_passed_reads{0};
-        
-        // Fixed: Use regular doubles with mutex protection instead of atomic<double>
-        double total_read_time = 0;
-        double total_process_time = 0;
-        double total_write_time = 0;
-        std::mutex timing_mutex;
-        
-        // Timing metrics per thread
-        struct ThreadMetrics {
-            size_t chunks_processed = 0;
-            size_t reads_processed = 0;
-            double avg_chunk_size = 0;
-            double avg_processing_time_ms = 0;
-            double avg_read_time_ms = 0;
-            double avg_write_time_ms = 0;
-        };
-        std::vector<ThreadMetrics> thread_metrics(num_threads);
-        
-        // Adaptive chunk size - start with initial value and adjust
-        std::atomic<size_t> current_chunk_size{initial_chunk_size};
-        std::mutex chunk_size_mutex;
-        
-        // Define the chunk processing function
-        using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
-        chunk_streaming<read_streaming::sequence,ChunkFunc> streamer(initial_chunk_size);
-    
-        // Set up the chunk processing function to process each chunk of reads
-        ChunkFunc process_func = [&](auto const &chunk, auto const & /*unused_file*/) {
-            // Get thread ID for metrics
-            int thread_id = omp_get_thread_num();
-            size_t chunk_id = total_chunks.fetch_add(1) + 1;
-            size_t chunk_size = chunk.size();
-            total_reads += chunk_size;
-            
-            // Timing variables
-            auto start_time = std::chrono::high_resolution_clock::now();
-            auto read_end_time = start_time; // set after read preparation
-            auto process_end_time = start_time; // set after processing
-            auto write_end_time = start_time; // set after writing
-            
-            // Read time ends here (chunk is already loaded)
-            read_end_time = std::chrono::high_resolution_clock::now();
-            
-            // collect SigString objects
-            std::vector<SigString> to_write;
-            to_write.reserve(chunk.size());
-            
-            // Process reads
-            for (auto const& read : chunk) {
-                SigString sig(read.id, read.seq.length());
-                sig.sigalign_static(read, layout, verbose);
-                sig.sigalign_variable(read, layout, verbose);
-                sig.sigalign_filter(read, layout, verbose);
-                if (sig.read_type != "filtered") {
-                    to_write.push_back(std::move(sig));
-                }
-            }
-            
-            size_t passed_reads = to_write.size();
-            total_passed_reads += passed_reads;
-            
-            // Process time ends here
-            process_end_time = std::chrono::high_resolution_clock::now();
-            
-            if (!to_write.empty()) {
-                writer.write(sig_writer, csv_writer, fastqa_writer, to_write);
-                std::vector<SigString>().swap(to_write); // Clear the vector
-            }
-            
-            // Write time ends here
-            write_end_time = std::chrono::high_resolution_clock::now();
-            
-            // Calculate timing information
-            auto read_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(read_end_time - start_time).count();
-            auto process_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(process_end_time - read_end_time).count();
-            auto write_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(write_end_time - process_end_time).count();
-            auto total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(write_end_time - start_time).count();
-            
-            // Update thread metrics
-            ThreadMetrics& metrics = thread_metrics[thread_id];
-            metrics.chunks_processed++;
-            metrics.reads_processed += chunk_size;
-            metrics.avg_chunk_size = ((metrics.avg_chunk_size * (metrics.chunks_processed - 1)) + chunk_size) / metrics.chunks_processed;
-            metrics.avg_processing_time_ms = ((metrics.avg_processing_time_ms * (metrics.chunks_processed - 1)) + process_time_ms) / metrics.chunks_processed;
-            metrics.avg_read_time_ms = ((metrics.avg_read_time_ms * (metrics.chunks_processed - 1)) + read_time_ms) / metrics.chunks_processed;
-            metrics.avg_write_time_ms = ((metrics.avg_write_time_ms * (metrics.chunks_processed - 1)) + write_time_ms) / metrics.chunks_processed;
-            
-            // Update global timing with mutex protection
-            {
-                std::lock_guard<std::mutex> lock(timing_mutex);
-                total_read_time += read_time_ms;
-                total_process_time += process_time_ms;
-                total_write_time += write_time_ms;
-            }
-            
-            // Log metrics to file
-            #pragma omp critical
-            {
-                metrics_file << chunk_id << "\t" << thread_id << "\t" << chunk_size << "\t"
-                            << read_time_ms << "\t" << process_time_ms << "\t" << write_time_ms << "\t" << total_time_ms << "\n";
-                std::cout << chunk_id << " [thread " << thread_id << "] processed " << chunk_size 
-                          << " reads in " << total_time_ms / 1000.0 << " seconds ("
-                          << read_time_ms / 1000.0 << "s read, "
-                          << process_time_ms / 1000.0 << "s process, "
-                          << write_time_ms / 1000.0 << "s write)" << std::endl;
-            }
-        };
-        
-        // Start time tracking
-        auto processing_start = std::chrono::high_resolution_clock::now();
-        
-        // Process the chunks - Cannot set chunk size
-        // Removed: streamer.set_chunk_size(initial_chunk_size);
-        streamer.process_chunks(fastq_path, process_func, num_threads, static_cast<int64_t>(max_reads));
-        
-        // End time tracking
-        auto processing_end = std::chrono::high_resolution_clock::now();
-        auto total_runtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(processing_end - processing_start).count();
-        
-        // Close metrics file
-        metrics_file.close();
-        
-        // Print summary statistics
-        std::cout << "\n[sigalign] Performance Summary:" << std::endl;
-        std::cout << "────────────────────────────────────────────────────" << std::endl;
-        std::cout << "[sigalign] Total runtime: " << total_runtime_ms / 1000.0 << " seconds" << std::endl;
-        std::cout << "[sigalign] Total chunks processed: " << total_chunks << std::endl;
-        std::cout << "[sigalign] Total reads processed: " << total_reads << std::endl;
-        std::cout << "[sigalign] Reads passing filter: " << total_passed_reads << " (" 
-                  << (total_reads > 0 ? (total_passed_reads * 100.0 / total_reads) : 0) << "%)" << std::endl;
-        std::cout << "[sigalign] Final target chunk size: " << current_chunk_size << std::endl;
-        std::cout << "[sigalign] Timing breakdown:" << std::endl;
-        std::cout << "  - Read time: " << total_read_time / 1000.0 << " seconds (" 
-                  << (total_read_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
-        std::cout << "  - Process time: " << total_process_time / 1000.0 << " seconds (" 
-                  << (total_process_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
-        std::cout << "  - Write time: " << total_write_time / 1000.0 << " seconds (" 
-                  << (total_write_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
-        
-        std::cout << "\n[sigalign] Thread Performance:" << std::endl;
-        for (int i = 0; i < num_threads; i++) {
-            std::cout << "  Thread " << i << ": " << thread_metrics[i].chunks_processed << " chunks, " 
-                      << thread_metrics[i].reads_processed << " reads, avg chunk size: " << thread_metrics[i].avg_chunk_size 
-                      << ", avg processing time: " << thread_metrics[i].avg_processing_time_ms << " ms" << std::endl;
-        }
-        
-        std::cout << "\n[sigalign] Output written to:\n"
-                << "[sigalign] [sigstring]: " << sig_path << "\n"
-                << "[sigalign]       [csv]: " << csv_path << "\n"
-                << "[sigalign]     [fastq]: " << fastq_output_path << "\n"
-                << "[sigalign]   [metrics]: " << metrics_path << std::endl;
-    }
-
-    //sigalign enhanced for chunks
-    static void sigalign_enhanced_chunk(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
-                       bool verbose, int num_threads, size_t max_reads = -1, bool split_bc = false, 
-                       size_t initial_chunk_size = 10000) {
-    std::string sig_path = output_prefix + ".sig";
-    std::string csv_path = output_prefix + ".csv";
-    std::string fastq_output_path = output_prefix + ".fq";
-    std::string metrics_path = output_prefix + ".metrics.tsv";
-    std::string thread_metrics_path = output_prefix + ".thread_metrics.tsv";
-    
-    // Initialize writers - use non-compressed output initially
-    sigstring_writing sig_writer(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false);
-    sigstring_writing csv_writer(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false);
-    sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, /*compress=*/false, /*append=*/false);
-    
-    // Initialize parallel writer with enhanced metrics
-    parallel_writer writer;
-    
-    // Write CSV header
-    {
-        SigString header("", 0);
-        csv_writer(std::vector<SigString>{header});
-    }
-    
-    // Metrics files
-    std::ofstream metrics_file(metrics_path);
-    metrics_file << "chunk_id\tthread_id\tchunk_size\tread_time_ms\tprocess_time_ms\t"
-                 << "write_queue_time_ms\twrite_time_ms\ttotal_time_ms\tpassed_reads\tthread_load\n";
-                 
-    std::ofstream thread_metrics_file(thread_metrics_path);
-    thread_metrics_file << "thread_id\ttotal_chunks\ttotal_reads\ttotal_passed\ttotal_process_time_ms\tavg_load_pct\n";
-    
-    // Counters and metrics
-    std::atomic<size_t> total_chunks{0};
-    std::atomic<size_t> total_reads{0};
-    std::atomic<size_t> total_passed_reads{0};
-    
-    // Thread-specific metrics
-    struct ThreadMetrics {
-        size_t chunks_processed = 0;
-        size_t reads_processed = 0;
-        size_t passed_reads = 0;
-        double total_process_time_ms = 0;
-        double total_read_time_ms = 0;
-        double total_queue_time_ms = 0;
-        double total_write_time_ms = 0;
-        double total_active_time_ms = 0;  // Time spent actively processing
-        double cpu_load_pct = 0;          // Average CPU load percentage
-    };
-    
-    // Vector to store per-thread metrics
-    std::vector<ThreadMetrics> thread_metrics(num_threads);
-    std::mutex metrics_mutex;
-    
-    // Global timing metrics
-    double total_read_time = 0;
-    double total_process_time = 0;
-    double total_queue_time = 0;
-    double total_write_time = 0;
-    std::mutex timing_mutex;
-    
-    // Chunk size adaptation
-    std::atomic<size_t> current_chunk_size{initial_chunk_size};
-    std::mutex chunk_size_mutex;
-    
-    // Start time of the entire process
-    auto global_start_time = std::chrono::high_resolution_clock::now();
-    
-    // Thread activity tracking
-    std::vector<std::atomic<bool>> thread_active(num_threads);
-    for (int i = 0; i < num_threads; i++) {
-        thread_active[i] = false;
-    }
-    
-    // Thread to periodically sample thread activity
-    std::atomic<bool> sampling_active{true};
-    std::thread activity_sampler([&]() {
-        const int sample_interval_ms = 100; // Sample every 100ms
-        std::vector<size_t> activity_counts(num_threads, 0);
-        size_t total_samples = 0;
-        
-        while (sampling_active) {
-            // Sample thread activity
-            for (int i = 0; i < num_threads; i++) {
-                if (thread_active[i]) {
-                    activity_counts[i]++;
-                }
-            }
-            total_samples++;
-            
-            // Sleep for the sample interval
-            std::this_thread::sleep_for(std::chrono::milliseconds(sample_interval_ms));
-        }
-        
-        // Calculate CPU load percentages and store in thread metrics
-        {
-            std::lock_guard<std::mutex> lock(metrics_mutex);
-            for (int i = 0; i < num_threads; i++) {
-                if (total_samples > 0) {
-                    thread_metrics[i].cpu_load_pct = 
-                        (static_cast<double>(activity_counts[i]) / total_samples) * 100.0;
-                }
-            }
-        }
-    });
-    
-    // Define the chunk processing function
-    using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
-    chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(initial_chunk_size);
-    
-    // Set up the chunk processing function
-    ChunkFunc process_func = [&](auto const &chunk, auto const & /*unused_file*/) {
-        // Get thread ID and increment chunk counter
-        int thread_id = omp_get_thread_num();
-        size_t chunk_id = total_chunks.fetch_add(1) + 1;
-        size_t chunk_size = chunk.size();
-        total_reads += chunk_size;
-        
-        // Set thread as active
-        thread_active[thread_id] = true;
-        
-        // Timing variables
-        auto start_time = std::chrono::high_resolution_clock::now();
-        auto read_end_time = start_time;  // Chunk is already loaded at this point
-        auto process_start_time = read_end_time;
-        auto process_end_time = start_time;
-        auto queue_end_time = start_time;
-        auto write_end_time = start_time;
-        
-        // Read time is essentially 0 for chunk-based processing
-        read_end_time = std::chrono::high_resolution_clock::now();
-        
-        // Process the chunk - create SigString objects
-        std::vector<SigString> to_write;
-        to_write.reserve(chunk_size);
-        
-        process_start_time = std::chrono::high_resolution_clock::now();
-        
-        // Process each read in the chunk
-        for (const auto& read : chunk) {
-            SigString sig(read.id, read.seq.length());
-            sig.sigalign_static(read, layout, verbose);
-            sig.sigalign_variable(read, layout, verbose);
-            sig.sigalign_filter(read, layout, verbose);
-            
-            if (sig.read_type != "filtered") {
-                to_write.push_back(std::move(sig));
-            }
-        }
-        
-        size_t passed_reads = to_write.size();
-        total_passed_reads += passed_reads;
-        
-        // Process time ends
-        process_end_time = std::chrono::high_resolution_clock::now();
-        
-        // Queue for writing and measure queue time
-        auto write_start = process_end_time;
-        if (!to_write.empty()) {
-            writer.write(sig_writer, csv_writer, fastqa_writer, to_write);
-        }
-        
-        // Queue time ends (time to add to write queue)
-        queue_end_time = std::chrono::high_resolution_clock::now();
-        
-        // Set thread as inactive
-        thread_active[thread_id] = false;
-        
-        // Calculate timing information
-        auto read_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(read_end_time - start_time).count();
-        auto process_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(process_end_time - process_start_time).count();
-        auto queue_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time - process_end_time).count();
-        auto total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time - start_time).count();
-        
-        // Global elapsed time for calculating load
-        auto global_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            queue_end_time - global_start_time).count();
-        
-        // Calculate thread load as percentage of time this thread was active
-        double thread_load = (total_time_ms / static_cast<double>(global_elapsed)) * 100.0;
-        if (thread_load > 100.0) thread_load = 100.0;  // Cap at 100%
-        
-        // Update thread metrics
-        {
-            std::lock_guard<std::mutex> lock(metrics_mutex);
-            ThreadMetrics& metrics = thread_metrics[thread_id];
-            metrics.chunks_processed++;
-            metrics.reads_processed += chunk_size;
-            metrics.passed_reads += passed_reads;
-            metrics.total_process_time_ms += process_time_ms;
-            metrics.total_read_time_ms += read_time_ms;
-            metrics.total_queue_time_ms += queue_time_ms;
-            metrics.total_active_time_ms += total_time_ms;
-        }
-        
-        // Update global timing with mutex protection
-        {
-            std::lock_guard<std::mutex> lock(timing_mutex);
-            total_read_time += read_time_ms;
-            total_process_time += process_time_ms;
-            total_queue_time += queue_time_ms;
-        }
-        
-        // Log metrics to file
-        {
-            std::lock_guard<std::mutex> lock(metrics_mutex);
-            metrics_file << chunk_id << "\t" << thread_id << "\t" << chunk_size << "\t"
-                        << read_time_ms << "\t" << process_time_ms << "\t" << queue_time_ms << "\t"
-                        << 0 << "\t" << total_time_ms << "\t" << passed_reads << "\t" << thread_load << "\n";
-        }
-        
-        // Log progress
-        {
-            std::lock_guard<std::mutex> lock(metrics_mutex);
-            std::cout << "Chunk " << chunk_id << " [thread " << thread_id << "]: processed " 
-                    << chunk_size << " reads (" << passed_reads << " passed) in " 
-                    << total_time_ms / 1000.0 << "s (read:" << read_time_ms / 1000.0 
-                    << "s, process:" << process_time_ms / 1000.0 
-                    << "s, queue:" << queue_time_ms / 1000.0 
-                    << "s) - Load: " << thread_load << "%" << std::endl;
-        }
-        to_write.clear();
-        std::vector<SigString>().swap(to_write);
-        auto& mutable_chunk = const_cast<std::vector<read_streaming::sequence>&>(chunk);
-        mutable_chunk.clear();
-        mutable_chunk.shrink_to_fit();
-    };
-    
-    // Start processing
-    auto processing_start = std::chrono::high_resolution_clock::now();
-    
-    // Process chunks
-    streamer.process_chunks(fastq_path, process_func, num_threads, static_cast<int64_t>(max_reads));
-    
-    // Stop the activity sampler
-    sampling_active = false;
-    if (activity_sampler.joinable()) {
-        activity_sampler.join();
-    }
-    
-    // Wait for writer to finish
-    writer.stop();
-    
-    // End time tracking
-    auto processing_end = std::chrono::high_resolution_clock::now();
-    auto total_runtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(processing_end - processing_start).count();
-    
-    // Write per-thread metrics
-    for (int i = 0; i < num_threads; i++) {
-        const auto& metrics = thread_metrics[i];
-        double avg_load = (metrics.total_active_time_ms / std::max(1.0, static_cast<double>(total_runtime_ms))) * 100.0;
-        
-        thread_metrics_file << i << "\t" 
-                          << metrics.chunks_processed << "\t"
-                          << metrics.reads_processed << "\t"
-                          << metrics.passed_reads << "\t"
-                          << metrics.total_process_time_ms << "\t"
-                          << avg_load << "\n";
-    }
-    
-    // Close metrics files
-    metrics_file.close();
-    thread_metrics_file.close();
-    
-    // Print summary statistics
-    std::cout << "\n[sigalign] Performance Summary:" << std::endl;
-    std::cout << "────────────────────────────────────────────────────" << std::endl;
-    std::cout << "[sigalign] Total runtime: " << total_runtime_ms / 1000.0 << " seconds" << std::endl;
-    std::cout << "[sigalign] Total chunks processed: " << total_chunks << std::endl;
-    std::cout << "[sigalign] Total reads processed: " << total_reads << std::endl;
-    std::cout << "[sigalign] Reads passing filter: " << total_passed_reads << " (" 
-              << (total_reads > 0 ? (total_passed_reads * 100.0 / total_reads) : 0) << "%)" << std::endl;
-    std::cout << "[sigalign] Final target chunk size: " << current_chunk_size << std::endl;
-    
-    // Timing breakdown
-    std::cout << "[sigalign] Timing breakdown:" << std::endl;
-    std::cout << "  - Read time: " << total_read_time / 1000.0 << " seconds (" 
-              << (total_read_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
-    std::cout << "  - Process time: " << total_process_time / 1000.0 << " seconds (" 
-              << (total_process_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
-    std::cout << "  - Queue time: " << total_queue_time / 1000.0 << " seconds (" 
-              << (total_queue_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
-    std::cout << "  - Write time: " << total_write_time / 1000.0 << " seconds (" 
-              << (total_write_time * 100.0 / total_runtime_ms) << "%)" << std::endl;
-    
-    // Thread performance summary
-    std::cout << "\n[sigalign] Thread Performance:" << std::endl;
-    double max_load = 0.0;
-    double min_load = 100.0;
-    double avg_load = 0.0;
-    
-    for (int i = 0; i < num_threads; i++) {
-        const auto& metrics = thread_metrics[i];
-        double thread_load = (metrics.total_active_time_ms / std::max(1.0, static_cast<double>(total_runtime_ms))) * 100.0;
-        
-        max_load = std::max(max_load, thread_load);
-        if (metrics.chunks_processed > 0) {
-            min_load = std::min(min_load, thread_load);
-        }
-        avg_load += thread_load;
-        
-        std::cout << "  Thread " << i << ": " 
-                  << metrics.chunks_processed << " chunks, " 
-                  << metrics.reads_processed << " reads (" 
-                  << metrics.passed_reads << " passed), "
-                  << "avg process time: " << (metrics.total_process_time_ms / std::max(1UL, metrics.chunks_processed)) << " ms, "
-                  << "CPU load: " << thread_load << "%, "
-                  << "sampled load: " << metrics.cpu_load_pct << "%" << std::endl;
-    }
-    
-    avg_load /= num_threads;
-    
-    std::cout << "\n[sigalign] Thread Load Balance:" << std::endl;
-    std::cout << "  Average thread load: " << avg_load << "%" << std::endl;
-    std::cout << "  Min thread load: " << min_load << "%" << std::endl;
-    std::cout << "  Max thread load: " << max_load << "%" << std::endl;
-    std::cout << "  Load imbalance: " << (max_load - min_load) << "%" << std::endl;
-    
-    // File output information
-    std::cout << "\n[sigalign] Output written to:\n"
-              << "[sigalign] [sigstring]: " << sig_path << "\n"
-              << "[sigalign]       [csv]: " << csv_path << "\n"
-              << "[sigalign]     [fastq]: " << fastq_output_path << "\n"
-              << "[sigalign]   [metrics]: " << metrics_path << "\n"
-              << "[sigalign] [thread metrics]: " << thread_metrics_path << std::endl;
-    
-}
-    
-     //metrics parallelized over reads
-    static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, bool verbose, int num_threads, size_t chunk_size, size_t max_reads) {
     // Output file paths
-    std::string sig_path = output_prefix + ".sig";
-    std::string csv_path = output_prefix + ".csv";
+    std::string sig_path, csv_path, metrics_path;
     std::string fastq_output_path = output_prefix + ".fq";
-    std::string metrics_path = output_prefix + ".metrics.tsv";
-    
+    bool compress_fastq = true;
     // Initialize writers
-    sigstring_writing sig_writer(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false);
-    sigstring_writing csv_writer(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false);
-    sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, /*compress=*/true, /*append=*/false);
-    
+    std::unique_ptr<std::ofstream> metrics_file_ptr;
+    std::unique_ptr<sigstring_writing> sig_writer, csv_writer, metrics_file;
+    sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, compress_fastq, /*append=*/false);
     // Initialize the parallel writer
     parallel_writer writer;
     
-    // Write CSV header
-    {
-        SigString header("", 0);
-        csv_writer(std::vector<SigString>{header});
+    if(write_debug){
+        sig_path = output_prefix + ".sig";
+        csv_path = output_prefix + ".csv";
+        metrics_path = output_prefix + ".metrics.tsv";
+        sig_writer = std::make_unique<sigstring_writing>(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false);
+        csv_writer = std::make_unique<sigstring_writing>(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false);
+        // Write CSV header
+        {
+            SigString header("", 0);
+            (*csv_writer)(std::vector<SigString>{header});
+        }
+        // Open metrics file
+        metrics_file_ptr = std::make_unique<std::ofstream>(metrics_path);
+        *metrics_file_ptr << "chunk_id\tseqs_in_chunk\tseqs_passed\tread_time_ms\tprocess_time_ms\tqueue_time_ms\ttotal_time_ms\n";    
     }
-    
-    // Open metrics file
-    std::ofstream metrics_file(metrics_path);
-    metrics_file << "chunk_id\tseqs_in_chunk\tseqs_passed\tread_time_ms\tprocess_time_ms\tqueue_time_ms\ttotal_time_ms\n";
-    
     // Initialize file and reader
     file_streaming files(fastq_path);
     read_streaming reader(files);
@@ -3079,18 +2860,19 @@ public:
                 SigString sig(read.id, read.seq.length());
                 sig.sigalign_static(read, layout, verbose);
                 sig.sigalign_variable(read, layout, verbose);
-                sig.sigalign_filter(read, layout, verbose);
+                sig.sigalign_filter(read, layout, gen_mut.value_or(2), gen_shift.value_or(3), verbose);
                 
                 if (sig.read_type != "filtered") {
+                    //counting everything that's not filtered, but could be skipped
                     thread_results.push_back(std::move(sig));
                 }
             }
-            
+
             // Merge thread results into global results vector
             #pragma omp critical
             {
                 for (auto& sig : thread_results) {
-                    results[passed_count++] = std::move(sig);
+                       results[passed_count++] = std::move(sig);
                 }
             }
         }
@@ -3104,7 +2886,11 @@ public:
         
         // Queue results for writing (non-blocking)
         if (!results.empty()) {
-            writer.write(sig_writer, csv_writer, fastqa_writer, results);
+            if(write_debug && sig_writer && csv_writer){
+                writer.write_all(*sig_writer, *csv_writer, fastqa_writer, results);
+            } else {
+                writer.write(fastqa_writer, results);
+            }
         }
         
         // Queue time ends here
@@ -3122,8 +2908,11 @@ public:
         total_queue_time += queue_time_ms;
         
         // Log metrics
-        metrics_file << chunk_id << "\t" << chunk.size() << "\t" << passed_count << "\t"
-                    << read_time_ms << "\t" << process_time_ms << "\t" << queue_time_ms << "\t" << total_time_ms << "\n";
+        if(write_debug && metrics_file_ptr){
+            *metrics_file_ptr << chunk_id << "\t" << chunk.size() << "\t" << passed_count << "\t"
+            << read_time_ms << "\t" << process_time_ms << "\t" << queue_time_ms << "\t" << total_time_ms << "\n";
+        }
+
         
         // Print progress
         std::cout << "[chunk_stats] " << chunk_id << ": processed " << chunk.size() << " reads in " 
@@ -3141,11 +2930,12 @@ public:
     
     // Wait for writer to finish all queued writes
     writer.stop();
-    
     // Close metrics file
-    metrics_file.close();
-    
-    // Calculate total time
+    if (write_debug && metrics_file_ptr) {
+        metrics_file_ptr->close();
+    }
+
+   // Calculate total time
     double total_time = total_read_time + total_process_time + total_queue_time;
     
     // Print summary
@@ -3164,11 +2954,16 @@ public:
     std::cout << "  - Queue time: " << total_queue_time / 1000.0 << " seconds (" 
               << (total_queue_time * 100.0 / total_time) << "%)" << std::endl;
     
-    std::cout << "\n[sigalign] Output written to:\n"
+    if(write_debug){
+            std::cout << "\n[sigalign] Output written to:\n"
             << "[sigalign] [sigstring]: " << sig_path << "\n"
             << "[sigalign]       [csv]: " << csv_path << "\n"
-            << "[sigalign]     [fastq]: " << fastq_output_path << "\n"
+            << "[sigalign]     [fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n"
             << "[sigalign]   [metrics]: " << metrics_path << std::endl;
+    } else {
+        std::cout << "\n[sigalign] Output written to:\n"
+                  << "[sigalign]     [fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n";
+    }
 }
     
     // sigstring format
@@ -3232,6 +3027,9 @@ public:
     // FASTQ format
     std::string to_fastqa() const {
     std::vector<std::string> dirs;
+    if(read_type == "skipped"){
+        return ""; // Skip if read type is "skipped"
+    }
     if (read_type == "concatenate") {
         dirs = { 
             "forward", 

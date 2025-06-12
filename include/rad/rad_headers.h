@@ -51,7 +51,7 @@
 // External libraries
 // ————————————————————————————————————————————————————————————————
 #include "csv-parser/single_include/csv.hpp"
-#include "progressbar/progressbar.hpp"
+#include "parallel_hashmap/phmap.h"
 #include "edlib/include/edlib.h"
 #include "gzstream/gzstream.h"
 #include "ssw/ssw_cpp.h"

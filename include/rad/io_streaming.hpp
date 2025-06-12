@@ -288,7 +288,7 @@ class parallel_writer {
         }
         
         template<typename T>
-        void write(sigstring_writing& sig_writer, sigstring_writing& csv_writer, sigstring_writing& fastqa_writer, std::vector<T>& data) {
+        void write_all(sigstring_writing& sig_writer, sigstring_writing& csv_writer, sigstring_writing& fastqa_writer, std::vector<T>& data) {
             // Check if empty
             if (data.empty()) return;
             
@@ -336,6 +336,42 @@ class parallel_writer {
             queue_cv.notify_one();
         }
         
+        template<typename T>
+        void write(sigstring_writing& fastqa_writer, std::vector<T>& data) {
+            // Check if empty
+            if (data.empty()) return;
+            // Create a type-erased job using std::function
+            auto job_function = [
+                fastq_ptr=&fastqa_writer,
+                data_vec=std::move(data) // Move the data
+            ]() mutable {
+                (*fastq_ptr)(data_vec);
+                // Clear data to free memory
+                std::vector<T>().swap(data_vec);
+            };
+            // Create a job
+            auto job = std::make_shared<WriteJob>();
+            job->func = std::move(job_function);
+            job->chunk_id = next_chunk_id++;
+            job->size = data.size();
+            // Control queue size to limit memory usage
+            constexpr size_t MAX_QUEUE_SIZE = 10;
+            // Add job to the queue
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                // Wait if queue gets too large (backpressure)
+                queue_cv.wait(lock, [this, MAX_QUEUE_SIZE]() {
+                    return queue_size < MAX_QUEUE_SIZE || !running;
+                });
+                if (!running) return;
+                // Add job to queue
+                job->queued_time = std::chrono::high_resolution_clock::now();
+                write_queue.push_back(job);
+                queue_size++;
+            }
+            queue_cv.notify_one();
+        }
+
         void stop() {
             if (!running) return;
             
