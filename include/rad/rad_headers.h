@@ -13,7 +13,9 @@
 #include <functional>
 #include <getopt.h>
 #include <iostream>
+#ifdef __APPLE__
 #include <mach/mach.h>
+#endif
 #include <map>
 #include <memory>
 #include <numeric>
