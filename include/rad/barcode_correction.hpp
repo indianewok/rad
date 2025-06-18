@@ -91,7 +91,7 @@ class int64_seq {
     public:
         uint16_t length;            // Total number of bases in the sequence.
         std::vector<int64_t> bits;  // Each int64_t encodes a chunk (2 bits per nucleotide, up to 32 bases per chunk).
-        int64_seq() : length(0), bits{0} {}
+        int64_seq() : length(0), bits{} {}
 
         explicit int64_seq(int64_t raw_bits, uint16_t seq_length) : length(seq_length) {
             bits.reserve(1);
@@ -127,7 +127,7 @@ class int64_seq {
               results.push_back(result);
             }
             bits = results;
-          }
+        }
     
         std::string bits_to_sequence() const {
             int n = bits.size();
@@ -166,7 +166,7 @@ class int64_seq {
         }
 
         bool is_valid() const noexcept {
-            return !bits.empty() && !(bits.size() == 1 && bits[0] == 0 && length == 0);
+            return length > 0 && !bits.empty();
         }
     };
 
@@ -174,14 +174,12 @@ class int64_seq {
 struct barcode_entry {
     int64_seq barcode;         // barcode sequence
     mutable counter count;     // atomic counter for count
-    int edit_dist;             // edit distance from a correct barcode
     bool filtered;             // flag for filtering
-    std::string flags;        // additional flags
+    std::string flags;         // additional flags
     
     barcode_entry()
       : barcode(0,1), 
        count(0),
-       edit_dist(0), 
        filtered(false), 
        flags("")
        { }
@@ -219,6 +217,7 @@ namespace std {
 }
 
 namespace mutation_tools {
+
     // Myers's bit-parallel algorithm for edit distance, followed from the edlib comments for making a better version for shorter strings
     // and taking int64 values as input 
     // p:  bitmask where bit j=1 means pattern[j] matches '1'
@@ -275,6 +274,7 @@ namespace mutation_tools {
         return results;
     }
 
+    // calculating levenshtein distance between one query and a set of multiple barcodes (wrapper for vectors of barcode_entries versus unordered sets)
     std::map<int, std::unordered_set<int64_seq>> int64_lvdist(const int64_seq &query, const std::vector<barcode_entry> &targets, int max_dist = 4) {
         std::map<int, std::unordered_set<int64_seq>> results;
         if (query.bits.empty()){
@@ -292,6 +292,7 @@ namespace mutation_tools {
         return results;
     }
 
+    // calculating levenshtein distance between one query and a target sequence (int64_seq)
     int int64_lvdist(const int64_seq &query, const int64_seq &target, int max_dist = 4) {
         int result = -1;
         if (query.bits.empty() || target.bits.empty()){
@@ -533,45 +534,108 @@ namespace mutation_tools {
         return result;
     }
 
-};
+    //detect homopolymers in a sequence
+    bool detect_hp(const std::string& sequence, int max_hp) {
+    if (sequence.empty() || max_hp <= 0) {
+        return false;
+    }
+    
+    int seq_len = static_cast<int>(sequence.length());
+    
+    // Check leading homopolymer
+    if (seq_len >= max_hp) {
+        char first_base = std::toupper(sequence[0]);
+        int leading_count = 1;
+        
+        for (int i = 1; i < seq_len && i < max_hp; ++i) {
+            if (std::toupper(sequence[i]) == first_base) {
+                leading_count++;
+            } else {
+                break;
+            }
+        }
+        
+        if (leading_count >= max_hp) {
+            return true;
+        }
+    }
+    
+    // Check trailing homopolymer
+    if (seq_len >= max_hp) {
+        char last_base = std::toupper(sequence[seq_len - 1]);
+        int trailing_count = 1;
+        
+        for (int i = seq_len - 2; i >= 0 && i >= seq_len - max_hp; --i) {
+            if (std::toupper(sequence[i]) == last_base) {
+                trailing_count++;
+            } else {
+                break;
+            }
+        }
+        
+        if (trailing_count >= max_hp) {
+            return true;
+        }
+    }
+    
+    return false;
+}
 
-/*
+    // Overload for int64_seq objects
+    bool detect_hp(const int64_seq& sequence, int max_hp) {
+        if (!sequence.is_valid() || max_hp <= 0) {
+            return false;
+        }
+        
+        std::string seq_str = sequence.bits_to_sequence();
+        return detect_hp(seq_str, max_hp);
+    }
+};
 template<typename key, typename value>
 struct bc_multimap {
 private:
-    // Helper to extract key from either a key or a value (unchanged)
-    static inline const key& key_of(key const &k) noexcept { 
-        return k;
+    static inline const key& key_of(const key &k) noexcept { 
+        return k; 
     }
-    
-    static inline const key& key_of(value const &v) noexcept { 
+    static inline const key& key_of(const value &v) noexcept { 
         return v.barcode; 
     }
-public:
-    // Store unique values - using a set lets us find and reuse identical values
-    std::deque<value> unique_values;
-    //boost::container::stable_vector<value> unique_values;
-    // Maps keys to pointers to values in the unique set
-    std::unordered_set<value> unique_values;  // Stable value storage
-    std::unordered_multimap<key, const value*> associations;
-    bc_multimap() {
-        //trying to get the rehashing to stop crashing out for filtered barcodes
-        unique_values.reserve(100000);
-        associations.reserve(500000);
-    } 
 
-    // Size reporting
+public:
+    // Stable value storage where barcode entries are stored singularly
+    phmap::parallel_node_hash_set<value> unique_values;
+
+    // pointer map of associations, split up into 16 submaps/shards
+    //if there's read-write, each submap gets its own mutex to avoid rehash failures
+    using pointer_map = phmap::parallel_node_hash_map<key, phmap::flat_hash_set<const value*>, phmap::Hash<key>,
+                        phmap::EqualTo<key>, std::allocator<std::pair<const key, phmap::flat_hash_set<const value*>>>,
+                        4, std::mutex>; 
+
+    pointer_map associations;
+
+    bc_multimap() {
+        associations.reserve(500000);
+    }
+
     size_t size() const { 
         return associations.size(); 
+    }
+
+    size_t association_size() const { 
+        return associations.size(); 
+    }
+
+    size_t unique_val_size() const { 
+        return unique_values.size(); 
     }
 
     bool empty() const { 
         return associations.empty(); 
     }
 
-    void clear() { 
+    void clear() {
         associations.clear();
-        unique_values.clear(); 
+        unique_values.clear();
     }
 
     void clear_associations() {
@@ -586,511 +650,57 @@ public:
         return associations; 
     }
 
+    size_t validate_association_keys() const noexcept {
+       size_t corrupted = 0;
+       try {
+           for (const auto& [k, value_set] : associations) {
+               try {
+                   // Quick access to key data
+                   volatile auto len = k.length;
+                   volatile auto bits_empty = k.bits.empty();
+               } catch (...) {
+                   corrupted++;
+               }
+           }
+       } catch (...) {
+           return SIZE_MAX; // Can't iterate at all
+       }
+       return corrupted;
+   }
+
+    size_t validate_association_values() const noexcept {
+       size_t nulls = 0;
+       try {
+           for (const auto& [k, value_set] : associations) {
+               for (const value* ptr : value_set) {
+                   if (ptr == nullptr) {
+                       nulls++;
+                   }
+               }
+           }
+       } catch (...) {
+           return SIZE_MAX; // Can't iterate at all
+       }
+       return nulls;
+   }
+
     // ==== Core Insertion Methods ====
-    
-    // Insert a barcode entry with an existing value
     template<typename T>
     void insert_bc_entry(const T &observed, const value &correct) {
-        std::lock_guard<std::mutex> lock(insertion_mutex);
-        if (associations.find(key_of(observed)) != associations.end()) {
+        const key &k = key_of(correct);
+        if (!k.is_valid()) return;
+        
+        // validate observed key as well:
+        const key& obs_key = key_of(observed);
+        if (!obs_key.is_valid() || obs_key.bits.empty()) {
             return;
         }
-        // Instead of set.insert(), use find + push_back
-        auto it = std::find(unique_values.begin(), unique_values.end(), correct);
-        const value* ptr;
-        if (it != unique_values.end()) {
-            ptr = &(*it);  // Found existing
-        } else {
-            unique_values.push_back(correct);
-            ptr = &unique_values.back();  // Stable pointer guaranteed!
-        }
-        associations.emplace(key_of(observed), ptr);
-    }
-
-    
-//WORKING BLOCK
-    template<typename T>
-    void insert_bc_entry(const T &observed, const value &correct) {
-        // First, insert or find the value in unique_values
-        auto [value_it, value_inserted] = unique_values.insert(correct);
-        const value* ptr = &(*value_it);
-        // Now map the key to the unique value
-        associations.emplace(key_of(observed), ptr);
-    }
-    // Insert with a moved value
-    template<typename T>
-    void insert_bc_entry(const T &observed, value &&correct) {
-        // When moving, we need to handle things a bit differently
-        // First check if an equivalent value already exists
-        auto find_it = unique_values.find(correct);
         
-        if (find_it != unique_values.end()) {
-            // Use existing value
-            associations.emplace(key_of(observed), &(*find_it));
-        } else {
-            // Insert the moved value
-            auto [value_it, inserted] = unique_values.insert(std::move(correct));
-            associations.emplace(key_of(observed), &(*value_it));
-        }
-    }
-    // Use the key as value too
-    template<typename T>
-    void insert_bc_entry(const T &observed) {
-        value v{};
-        v.barcode = key_of(observed);
-        insert_bc_entry(observed, std::move(v));
-    }
-
-   // Insert a barcode entry with an existing value
-template<typename T>
-void insert_bc_entry(const T &observed, const value &correct) {
-    std::lock_guard<std::mutex> lock(insertion_mutex);
-    
-    // Check if already exists to avoid duplicate insertions
-    if (associations.find(key_of(observed)) != associations.end()) {
-        return; // Already exists, skip insertion
-    }
-    
-    // First, insert or find the value in unique_values
-    auto [value_it, value_inserted] = unique_values.insert(correct);
-    const value* ptr = &(*value_it);
-    // Now map the key to the unique value
-    associations.emplace(key_of(observed), ptr);
-}
-
-// Insert with a moved value
-template<typename T>
-void insert_bc_entry(const T &observed, value &&correct) {
-    std::lock_guard<std::mutex> lock(insertion_mutex);
-    
-    // Check if already exists to avoid duplicate insertions
-    if (associations.find(key_of(observed)) != associations.end()) {
-        return; // Already exists, skip insertion
-    }
-    
-    // When moving, we need to handle things a bit differently
-    // First check if an equivalent value already exists
-    auto find_it = unique_values.find(correct);
-    if (find_it != unique_values.end()) {
-        // Use existing value
-        associations.emplace(key_of(observed), &(*find_it));
-    } else {
-        // Insert the moved value
-        auto [value_it, inserted] = unique_values.insert(std::move(correct));
-        associations.emplace(key_of(observed), &(*value_it));
-    }
-}
-
-// Use the key as value too
-template<typename T>
-void insert_bc_entry(const T &observed) {
-    std::lock_guard<std::mutex> lock(insertion_mutex);
-    
-    // Check if already exists to avoid duplicate insertions
-    if (associations.find(key_of(observed)) != associations.end()) {
-        return; // Already exists, skip insertion
-    }
-    
-    value v{};
-    v.barcode = key_of(observed);
-    
-    // Don't call the other insert_bc_entry since we already have the lock
-    // Do the insertion directly here
-    auto [value_it, value_inserted] = unique_values.insert(std::move(v));
-    const value* ptr = &(*value_it);
-    associations.emplace(key_of(observed), ptr);
-}
-    
-// In-place construction
-    template<typename T, typename... Args>
-    void emplace_bc_entry(const T &observed, Args&&... args) {
-        // Construct the value with the provided arguments
-        value v{std::forward<Args>(args)...};
-        insert_bc_entry(observed, std::move(v));
-    }
-    
-    // Direct emplace method for compatibility with the original implementation
-    template<typename K, typename V>
-    void emplace(K&& k, V&& v) {
-        // First, insert or find the value in unique_values
-        // Use perfect forwarding to preserve move semantics if possible
-        auto [value_it, value_inserted] = unique_values.insert(std::forward<V>(v));
-        const value* ptr = &(*value_it);
-        
-        // Now map the key to the unique value
-        associations.emplace(std::forward<K>(k), ptr);
-    }
-
-
-    // ==== Removal Methods ====
-    // Remove a key-value entry
-    template<typename T>
-    void remove_bc_entry(const T &observed) {
-        associations.erase(key_of(observed));
-        // A periodic cleanup could remove orphaned values if needed
-    }
-    
-    // ==== Lookup Methods ====
-    // Check if whitelist contains this key
-    template<typename T>
-    bool check_wl_for(T const &x) const {
-        if constexpr (std::is_same_v<T,key> || std::is_same_v<T,value>) {
-            return associations.find(key_of(x)) != associations.end();
-        } else {
-            // container of keys
-            for (auto const &y : x) {
-                if (check_wl_for(y)) return true;
-            }
-            return false;
-        }
-    }
-    
-    // Return matching barcodes
-    template<typename T>
-    std::unordered_set<key> return_matching_barcodes(T const &x) const {
-        std::unordered_set<key> out;
-        if constexpr (std::is_same_v<T,key> || std::is_same_v<T,value>) {
-            if (check_wl_for(x))
-                out.insert(key_of(x));
-        } else {
-            for (auto const &y : x) {
-                if (check_wl_for(y))
-                    out.insert(key_of(y));
-            }
-        }
-        return out;
-    }
-    
-    // Return putative correct barcodes
-    template<typename T>
-    std::unordered_set<key> return_putative_correct_bcs(T const &x) const {
-        std::unordered_set<key> out;
-        if constexpr (std::is_same_v<T,key> || std::is_same_v<T,value>) {
-            auto range = associations.equal_range(key_of(x));
-            for (auto it = range.first; it != range.second; ++it)
-                out.insert(it->second->barcode);
-        } else {
-            for (auto const &y : x) {
-                auto sub = return_putative_correct_bcs(y);
-                out.insert(sub.begin(), sub.end());
-            }
-        }
-        return out;
-    }
-   
-
-template<typename key, typename value>
-struct bc_multimap {
-private:
-    static inline const key& key_of(const key &k) noexcept { return k; }
-    static inline const key& key_of(const value &v) noexcept { return v.barcode; }
-
-public:
-    phmap::flat_hash_set<value> unique_values;  // Stable value storage
-    phmap::flat_hash_map<key, const value*> associations;  // Observed → correct barcode associations
-
-    bc_multimap() {
-        associations.reserve(500000);
-    }
-
-    size_t size() const { return associations.size(); }
-    bool empty() const { return associations.empty(); }
-
-    void clear() {
-        associations.clear();
-        unique_values.clear();
-    }
-
-    void clear_associations() {
-        associations.clear();
-    }
-
-    const auto& debug_unique_values() const noexcept { return unique_values; }
-    const auto& debug_associations() const noexcept { return associations; }
-
-    template<typename T>
-    void insert_bc_entry(const T &observed, const value &correct) {
-        const key &k = key_of(correct);
-        if (!k.is_valid()) return;
+        // add to unique_values (thread-safe)
         auto [it, inserted] = unique_values.emplace(correct);
         const value* ptr = &(*it);
-        associations.emplace(key_of(observed), ptr);
-    }
-
-    template<typename T>
-    void insert_bc_entry(const T &observed, value &&correct) {
-        const key &k = key_of(correct);
-        if (!k.is_valid()) return;
-        auto [it, inserted] = unique_values.emplace(std::move(correct));
-        const value* ptr = &(*it);
-        associations.emplace(key_of(observed), ptr);
-    }
-
-    template<typename T>
-    void insert_bc_entry(const T &observed) {
-        value v{};
-        v.barcode = key_of(observed);
-        insert_bc_entry(observed, std::move(v));
-    }
-
-    template<typename T, typename... Args>
-    void emplace_bc_entry(const T &observed, Args&&... args) {
-        value v{std::forward<Args>(args)...};
-        insert_bc_entry(observed, std::move(v));
-    }
-
-    template<typename K, typename V>
-    void emplace(K&& k, V&& v) {
-        const key &kk = key_of(k);
-        const key &vk = key_of(v);
-        if (!kk.is_valid() || !vk.is_valid() || !(kk == vk)) return;
-        insert_bc_entry(std::forward<K>(k), std::forward<V>(v));
-    }
-
-    template<typename T>
-    void remove_bc_entry(const T &observed) {
-        associations.erase(key_of(observed));
-    }
-
-    template<typename T>
-    bool check_wl_for(const T &x) const {
-        if constexpr (std::is_same_v<T, key> || std::is_same_v<T, value>) {
-            const auto& k = key_of(x);
-            if (!k.is_valid()) return false;
-            return associations.find(k) != associations.end();
-        } else {
-            for (const auto &y : x) {
-                const auto& ky = key_of(y);
-                if (!ky.is_valid()) continue;
-                if (check_wl_for(y)) return true;
-            }
-            return false;
-        }
-    }
-
-    template<typename T>
-    std::unordered_set<key> return_matching_barcodes(const T &x) const {
-        std::unordered_set<key> out;
-        if constexpr (std::is_same_v<T, key> || std::is_same_v<T, value>) {
-            if (check_wl_for(x)) out.insert(key_of(x));
-        } else {
-            for (const auto &y : x) {
-                if (check_wl_for(y)) out.insert(key_of(y));
-            }
-        }
-        return out;
-    }
-
-    template<typename T>
-    std::unordered_set<key> return_putative_correct_bcs(const T &x) const {
-        std::unordered_set<key> out;
-        if constexpr (std::is_same_v<T, key> || std::is_same_v<T, value>) {
-            const auto& k = key_of(x);
-            if (!k.is_valid()) return out;
-            auto range = associations.equal_range(k);
-            for (auto it = range.first; it != range.second; ++it) {
-                out.insert(it->second->barcode);
-            }
-        } else {
-            for (const auto &y : x) {
-                auto sub = return_putative_correct_bcs(y);
-                out.insert(sub.begin(), sub.end());
-            }
-        }
-        return out;
-    }
-
-    template<typename T>
-    void update_bc_count(T const &x, barcode_counts slot = total) const {
-        auto range = associations.equal_range(key_of(x));
-        for (auto it = range.first; it != range.second; ++it) {
-            const_cast<value*>(it->second)->count.increment(slot);
-        }
-    }
-
-    template<typename T>
-    void subtract_bc_count(T const &x, barcode_counts slot = total) const {
-        auto range = associations.equal_range(key_of(x));
-        for (auto it = range.first; it != range.second; ++it) {
-            const_cast<value*>(it->second)->count.subtract(slot);
-        }
-    }
-
-    template<typename T>
-    int get_bc_count(T const &x, barcode_counts slot = total) const {
-        auto range = associations.equal_range(key_of(x));
-        if (range.first != range.second)
-            return range.first->second->count.load(slot);
-        return 0;
-    }
-
-    std::vector<std::tuple<std::string,int,int,int,int,int,int,int,int>>
-    summarize_counts(const std::unordered_set<key> *filter_keys = nullptr) const {
-        using row = std::tuple<std::string,int,int,int,int,int,int,int,int>;
-        std::vector<row> rows;
-        std::vector<key> keys;
-        if (filter_keys) {
-            keys.reserve(filter_keys->size());
-            for (auto const &k : *filter_keys)
-                keys.push_back(k);
-        } else {
-            std::unordered_set<key> seen;
-            seen.reserve(associations.size());
-            for (auto const &kv : associations)
-                seen.insert(kv.first);
-            keys.reserve(seen.size());
-            for (auto const &k : seen)
-                keys.push_back(k);
-        }
-
-        rows.reserve(keys.size());
-        for (auto const &bc : keys) {
-            auto range = associations.equal_range(bc);
-            int raw=0, tot=0, corr=0, fwd=0, rev=0, fwd_c=0, rev_c=0, filt=0;
-
-            if (range.first != range.second) {
-                auto it = range.first;
-                for (; it != range.second; ++it) {
-                    if (it->first == bc) break;
-                }
-                if (it == range.second) it = range.first;
-
-                
-                raw = it->second->count.load(barcode_counts::raw);
-                tot = it->second->count.load(barcode_counts::total);
-                corr = it->second->count.load(barcode_counts::corrected);
-                fwd = it->second->count.load(barcode_counts::forw);
-                rev = it->second->count.load(barcode_counts::rev);
-                fwd_c = it->second->count.load(barcode_counts::forw_concat);
-                rev_c = it->second->count.load(barcode_counts::rev_concat);
-                filt = it->second->count.load(barcode_counts::filtered);
-                
-            }
-            rows.emplace_back(bc.bits_to_sequence(), raw, tot, corr, fwd, rev, fwd_c, rev_c, filt);
-        }
-        return rows;
-    }
-
-    void write_wl_summary(std::ostream &out, const std::string class_id, const std::unordered_set<key> *filter_keys = nullptr, bool write_header = true) const {
-        static bool header_printed = false;
-        if(write_header && header_printed) header_printed = false;
-        if(!header_printed) {
-            out << "class_id,true_barcode,raw_count,total_count,corrected_count,forw_count,rev_count,"
-                << "forw_concat_count,rev_concat_count,filtered_count\n";
-            header_printed = true;
-        }
-        auto rows = summarize_counts(filter_keys);
-        for (auto const & tpl : rows) {
-            auto const & bc = std::get<0>(tpl);
-            auto raw = std::get<1>(tpl);
-            auto tot  = std::get<2>(tpl);
-            auto corr = std::get<3>(tpl);
-            auto forw = std::get<4>(tpl);
-            auto rev  = std::get<5>(tpl);
-            auto forw_concat = std::get<6>(tpl);
-            auto rev_concat = std::get<7>(tpl);
-            auto filtered = std::get<8>(tpl);
-            out << class_id << ',' << bc << ','  << raw << "," << tot << ',' << corr << ',' << forw 
-                << ',' << rev << ',' << forw_concat << ',' << rev_concat << ',' << filtered << '\n';
-        }
-    }
-
-    void write_wl_summary(const std::string &path = "", const std::unordered_set<key> *filter_keys = nullptr) const {
-        std::ofstream ofs(path);
-        if (!ofs) throw std::runtime_error("Failed to open output file: " + path);
-        write_wl_summary(ofs, filter_keys);
-    }
-
-    class iterator {
-    public:
-        using OuterIter = typename phmap::flat_hash_map<key, const value*>::iterator;
-        OuterIter outer, outer_end;
-        iterator(OuterIter o, OuterIter oe) : outer(o), outer_end(oe) {}
-
-        iterator& operator++() {
-            ++outer;
-            return *this;
-        }
-
-        bool operator!=(const iterator& other) const {
-            return outer != other.outer;
-        }
-
-        std::pair<const key&, const value&> operator*() const {
-            return { outer->first, *(outer->second) };
-        }
-    };
-
-    iterator begin() { return iterator(associations.begin(), associations.end()); }
-    iterator end() { return iterator(associations.end(), associations.end()); }
-
-    std::vector<const value*> get_unique_entries() const {
-        std::unordered_set<const value*> seen;
-        std::vector<const value*> originals;
-        for (auto it = associations.begin(); it != associations.end(); ++it) {
-            if (seen.insert(it->second).second) {
-                originals.push_back(it->second);
-            }
-        }
-        return originals;
-    }
-
-};
-*/
-template<typename key, typename value>
-struct bc_multimap {
-private:
-    static inline const key& key_of(const key &k) noexcept { return k; }
-    static inline const key& key_of(const value &v) noexcept { return v.barcode; }
-
-public:
-    // Your preferred concurrent structure
-    phmap::parallel_node_hash_set<value> unique_values;  // Stable value storage  
-    phmap::parallel_node_hash_map<key, phmap::flat_hash_set<const value*>> associations;  // Key -> set of value pointers
-
-    bc_multimap() {
-        associations.reserve(500000);
-    }
-
-    size_t size() const { 
-        return associations.size(); 
-    }
-
-    bool empty() const { 
-        return associations.empty(); 
-    }
-
-    void clear() {
-        associations.clear();
-        unique_values.clear();
-    }
-
-    void clear_associations() {
-        associations.clear();
-    }
-
-    const auto& debug_unique_values() const noexcept { 
-        return unique_values; 
-    }
-
-    const auto& debug_associations() const noexcept { 
-        return associations; 
-    }
-
-public:
-    // ==== Core Insertion Methods ====
-    
-    template<typename T>
-    void insert_bc_entry(const T &observed, const value &correct) {
-        const key &k = key_of(correct);
-        if (!k.is_valid()) return;
-
-        // First, add to unique_values (thread-safe)
-        auto [it, inserted] = unique_values.emplace(correct);
-        const value* ptr = &(*it);
-
+        
         // Then add to associations
-        const key& obs_key = key_of(observed);
         associations.lazy_emplace_l(obs_key,
             [&](auto& kv_pair) { 
                 kv_pair.second.insert(ptr);
@@ -1106,19 +716,26 @@ public:
     template<typename T>
     void insert_bc_entry(const T &observed, value &&correct) {
         const key &k = key_of(correct);
-        if (!k.is_valid()) return;
-
+        //validate key:
+        if (!k.is_valid()){
+            return;
+        }
+        // validate observed:
+        const key& obs_key = key_of(observed);
+        if (!obs_key.is_valid() || obs_key.bits.empty()) {
+            return;
+        }
+        
         // Add to unique_values (thread-safe)
         auto [it, inserted] = unique_values.emplace(std::move(correct));
         const value* ptr = &(*it);
-
+        
         // Add to associations
-        const key& obs_key = key_of(observed);
         associations.lazy_emplace_l(obs_key,
-            [&](auto& kv_pair) { 
+            [&](auto& kv_pair) {
                 kv_pair.second.insert(ptr);
             },
-            [&](const auto& ctor) { 
+            [&](const auto& ctor) {
                 phmap::flat_hash_set<const value*> new_set;
                 new_set.insert(ptr);
                 ctor(obs_key, std::move(new_set));
@@ -1130,6 +747,9 @@ public:
     void insert_bc_entry(const T &observed) {
         value v{};
         v.barcode = key_of(observed);
+        if (!v.barcode.is_valid()){
+            return;
+        }
         insert_bc_entry(observed, std::move(v));
     }
 
@@ -1139,7 +759,7 @@ public:
         insert_bc_entry(observed, std::move(v));
     }
 
-    // For multimap-like interface compatibility
+    //For multimap-like interface compatibility
     template<typename K, typename V>
     void emplace(K&& k, V&& v) {
         insert_bc_entry(std::forward<K>(k), std::forward<V>(v));
@@ -1172,6 +792,7 @@ public:
             const auto& k = key_of(x);
             if (!k.is_valid()) return false;
             return associations.find(k) != associations.end();
+            
         } else {
             for (const auto &y : x) {
                 const auto& ky = key_of(y);
@@ -1181,7 +802,7 @@ public:
             return false;
         }
     }
-
+    
     // Multimap-like find (returns iterator to first match)
     auto find(const key& k) const {
         return associations.find(k);
@@ -1192,14 +813,15 @@ public:
         auto it = associations.find(k);
         return (it != associations.end()) ? it->second.size() : 0;
     }
-
+    
+    // Iterator for value set (const_iterator wrapper)
     // Multimap-like equal_range - returns range of iterators spanning all values for key
     struct value_iterator {
         typename phmap::flat_hash_set<const value*>::const_iterator inner_it;
         typename phmap::flat_hash_set<const value*>::const_iterator inner_end;
         
         value_iterator(typename phmap::flat_hash_set<const value*>::const_iterator it,
-                      typename phmap::flat_hash_set<const value*>::const_iterator end)
+                    typename phmap::flat_hash_set<const value*>::const_iterator end)
             : inner_it(it), inner_end(end) {}
         
         const value& operator*() const { return **inner_it; }
@@ -1222,13 +844,18 @@ public:
     std::pair<value_iterator, value_iterator> equal_range(const key& k) const {
         auto it = associations.find(k);
         if (it != associations.end()) {
-            return {value_iterator(it->second.begin(), it->second.end()),
-                   value_iterator(it->second.end(), it->second.end())};
+            const auto& val_set = it->second;
+            return {
+                value_iterator(val_set.begin(), val_set.end()),
+                value_iterator(val_set.end(), val_set.end())
+            };
         }
-        // Return empty range
-        static phmap::flat_hash_set<const value*> empty_set;
-        return {value_iterator(empty_set.end(), empty_set.end()),
-               value_iterator(empty_set.end(), empty_set.end())};
+
+        static const phmap::flat_hash_set<const value*> empty_set;
+        return {
+            value_iterator(empty_set.end(), empty_set.end()),
+            value_iterator(empty_set.end(), empty_set.end())
+        };
     }
 
     template<typename T>
@@ -1249,11 +876,15 @@ public:
         std::unordered_set<key> out;
         if constexpr (std::is_same_v<T, key> || std::is_same_v<T, value>) {
             const auto& k = key_of(x);
-            if (!k.is_valid()) return out;
+            if (!k.is_valid()){
+                return out;
+            }
             auto it = associations.find(k);
             if (it != associations.end()) {
                 for (const value* ptr : it->second) {
-                    out.insert(ptr->barcode);
+                    if (ptr) {
+                        out.insert(ptr->barcode);
+                    }
                 }
             }
         } else {
@@ -1314,7 +945,7 @@ public:
     // ==== Iterator Support ====
     class iterator {
     public:
-        using OuterIter = typename phmap::parallel_node_hash_map<key, phmap::flat_hash_set<const value*>>::iterator;
+        using OuterIter = typename pointer_map::iterator;
         using InnerIter = typename phmap::flat_hash_set<const value*>::iterator;
         
         OuterIter outer, outer_end;
@@ -1363,9 +994,13 @@ public:
             return pair_proxy(outer->first, **inner);
         }
     };
-
-    iterator begin() { return iterator(associations.begin(), associations.end()); }
-    iterator end() { return iterator(associations.end(), associations.end()); }
+    
+    iterator begin() { 
+        return iterator(associations.begin(), associations.end()); 
+    }
+    iterator end() { 
+        return iterator(associations.end(), associations.end()); 
+    }
 
     // ==== Summary and Output Methods ====
     std::vector<std::tuple<std::string,int,int,int,int,int,int,int,int>>
@@ -1439,6 +1074,7 @@ public:
         if (!ofs) throw std::runtime_error("Failed to open output file: " + path);
         write_wl_summary(ofs, "", filter_keys);
     }
+
 };
 
 class whitelist {
@@ -1759,7 +1395,6 @@ class whitelist {
                 if (seq.bits.empty()) continue;
                 barcode_entry be;
                 be.barcode = seq;
-                be.edit_dist = 0;
                 be.filtered = false;
                 be.flags = "flag";
                 out.true_bcs.emplace(seq, std::move(be));
@@ -1780,7 +1415,6 @@ class whitelist {
                 if (seq.bits.empty()) continue;
                 barcode_entry be;
                 be.barcode = seq;
-                be.edit_dist = 0;
                 be.filtered = false;
                 be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
@@ -1791,7 +1425,6 @@ class whitelist {
                     if (seq.bits.empty()) continue;
                     barcode_entry be{};
                     be.barcode   = seq;
-                    be.edit_dist = 0;
                     be.filtered  = false;
                     be.flags     = "";
                     out.global_bcs.emplace(seq, be);
@@ -1804,7 +1437,6 @@ class whitelist {
                 if (seq.bits.empty()) continue;
                 barcode_entry be;
                 be.barcode = seq;
-                be.edit_dist = 0;
                 be.filtered = false;
                 be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
@@ -1814,7 +1446,6 @@ class whitelist {
                 if (seq.bits.empty()) continue;
                 barcode_entry be;
                 be.barcode = seq;
-                be.edit_dist = 0;
                 be.filtered = false;
                 be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
@@ -1887,4 +1518,95 @@ namespace bc_mem_utils {
     std::size_t get_full_wl_mem(const bc_multimap<Key, Value>& m) {
         return approx_unique(m) + approx_assoc(m);
     }
+
+       template<typename Key, typename Value>
+    void print_submap_distribution(const bc_multimap<Key, Value>& m) {
+        const auto& associations = m.debug_associations();
+        
+        if (associations.empty()) {
+            std::cout << "No associations to analyze\n";
+            return;
+        }
+        
+        // Get number of submaps
+        size_t num_submaps = associations.subcnt();
+        std::vector<size_t> submap_sizes(num_submaps, 0);
+        size_t total_entries = 0;
+        
+        try {
+            // Since subsize() isn't available, count manually by iterating
+            for (const auto& [k, value_set] : associations) {
+                // Calculate which submap this key belongs to
+                auto hash_val = associations.hash_function()(k);
+                size_t submap_idx = hash_val & (num_submaps - 1);  // Assuming power of 2 submaps
+                submap_sizes[submap_idx]++;
+                total_entries++;
+            }
+        } catch (...) {
+            std::cout << "Error analyzing submap distribution\n";
+            return;
+        }
+        
+        std::cout << "Submap distribution (" << total_entries << " total, " 
+                  << num_submaps << " submaps):\n";
+        
+        // Auto-size the grid
+        size_t grid_cols = static_cast<size_t>(std::ceil(std::sqrt(num_submaps)));
+        size_t grid_rows = static_cast<size_t>(std::ceil(static_cast<double>(num_submaps) / grid_cols));
+        
+        // Print as grid
+        for (size_t row = 0; row < grid_rows; ++row) {
+            for (size_t col = 0; col < grid_cols; ++col) {
+                size_t idx = row * grid_cols + col;
+                if (idx < num_submaps) {
+                    double percentage = (static_cast<double>(submap_sizes[idx]) / total_entries) * 100.0;
+                    std::cout << std::fixed << std::setprecision(1) << std::setw(6) << percentage << "%";
+                } else {
+                    std::cout << "      ";
+                }
+                if (col < grid_cols - 1) std::cout << " ";
+            }
+            std::cout << "\n";
+        }
+        
+        // Print raw counts and balance
+        std::cout << "Raw counts: [";
+        for (size_t i = 0; i < num_submaps; ++i) {
+            std::cout << submap_sizes[i];
+            if (i < num_submaps - 1) std::cout << ", ";
+        }
+        std::cout << "]\n";
+        
+        if (num_submaps > 1) {
+            auto [min_it, max_it] = std::minmax_element(submap_sizes.begin(), submap_sizes.end());
+            double min_pct = (*min_it * 100.0) / total_entries;
+            double max_pct = (*max_it * 100.0) / total_entries;
+            double balance_ratio = (*min_it > 0) ? static_cast<double>(*max_it) / (*min_it) : 0.0;
+            
+            std::cout << "Balance: min=" << std::fixed << std::setprecision(1) << min_pct 
+                      << "%, max=" << max_pct << "%, ratio=" << std::setprecision(2) << balance_ratio << "\n";
+        }
+    }
+
+    template<typename Key, typename Value>
+    void print_memory_report(const bc_multimap<Key, Value>& m, const std::string& name = "") {
+        if (!name.empty()) std::cout << "=== " << name << " ===\n";
+        
+        std::cout << "Counts: " << m.unique_val_size() << " unique, " 
+                  << m.association_size() << " associations\n";
+        
+        std::cout << "Memory: " << (approx_unique(m) / 1024) << "KB unique, "
+                  << (approx_assoc(m) / 1024) << "KB assoc, "
+                  << (get_full_wl_mem(m) / 1024) << "KB total\n";
+        
+        size_t bad_keys = m.validate_association_keys();
+        size_t null_vals = m.validate_association_values();
+        if (bad_keys > 0 || null_vals > 0) {
+            std::cout << "Issues: " << bad_keys << " bad keys, " << null_vals << " null values\n";
+        }
+        
+        print_submap_distribution(m);
+        std::cout << "\n";
+    }
+
 };

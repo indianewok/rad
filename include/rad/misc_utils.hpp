@@ -125,6 +125,26 @@ namespace path_utils {
   
       throw std::runtime_error("Cannot locate 'resources' folder up the tree or in CWD");
     }
+
+    // returns either ".fa" or ".fq" based on the file extension it's passed originally
+    inline std::string get_fastqa_type(const std::string& file_path) {
+        bfs::path p(file_path);
+        // Get the extension
+        std::string ext = p.extension().string();
+        // Handle .gz files - check the extension of the stem
+        if (ext == ".gz") {
+            ext = p.stem().extension().string();
+        }
+        // Convert to lowercase
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext == ".fa" || ext == ".fasta") {
+            return ".fa";
+        }
+        if (ext == ".fq" || ext == ".fastq") {
+            return ".fq";
+        }
+        return ".fq"; //default to fq
+    }
 };
 
 namespace seq_utils {

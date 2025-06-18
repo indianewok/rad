@@ -402,7 +402,7 @@ namespace barcode_correction {
     // barcode correction result(s)
     // Count-based quality check for barcodes, looking at total summated counts to curb against false positives and spurious corrections
     bool passes_quality_check(const int64_seq& candidate, const whitelist::wl_entry* wl, 
-                              const std::string& whitelist_source, bool verbose, bool raw_match = false) {
+                              const std::string& whitelist_source, bool verbose) {
         
             // Get the appropriate whitelist reference
             const auto& whitelist = (whitelist_source == "global") ? wl->global_bcs : wl->true_bcs;
@@ -430,10 +430,9 @@ namespace barcode_correction {
             // For barcodes with sufficient history, check correction ratio
             double correction_ratio = static_cast<double>(corrected_count) / total_count;
             // Quality checks
-            bool low_filtered = filtered_count <= raw_count;
             bool correction_limit = true;
-            if(total_count > 10){
-                correction_limit = correction_ratio <= 0.5;  // Max 50% corrected
+            if(total_count >= 10){
+                correction_limit = correction_ratio <= 0.5;  // Max 50% corrected--HARDCODED
             }
             bool overall_pass = correction_limit;
         return overall_pass;
@@ -520,7 +519,9 @@ namespace barcode_correction {
                     int forw_concat = target_whitelist.get_bc_count(candidate, barcode_counts::forw_concat);
                     int rev_concat = target_whitelist.get_bc_count(candidate, barcode_counts::rev_concat);
                     info.concat_count = forw_concat + rev_concat;
+
                     // Calculate ranking score: Higher raw counts = better, lower corrected/concat = better
+
                     info.score = (info.raw_count * 2.0) - (info.corrected_count * 1.0) - (info.concat_count * 0.5);
                     candidate_infos.push_back(info);
                     
@@ -607,8 +608,7 @@ namespace barcode_correction {
                     }
                 }
             }
-    
-        // Return the minimum distance even if we couldn't resolve the ambiguity
+        // Return the minimum distance even if we can't resolve ambiguity
         return {std::nullopt, best_dist};
     }
 
@@ -622,17 +622,20 @@ namespace barcode_correction {
         // extract and reverse‐complement the raw string
         // encoded barcode and reverse complement
         std::string raw = elem.seq.value();
+
         if (elem.direction == "reverse") {
             raw = seq_utils::revcomp(raw);
         }
-        int64_seq bc, rc_bc;;
+
+        int64_seq bc, rc_bc;
         bc.sequence_to_bits(raw);
         rc_bc.sequence_to_bits(seq_utils::revcomp(raw));
         int bc_len = static_cast<int>(bc.length);
-        
+
         // === filtering for messy barcodes ===
         bool filtered_hit = !wl.filter_bcs.empty() && (wl.filter_bcs.check_wl_for(bc) || wl.filter_bcs.check_wl_for(rc_bc));
-        if (filtered_hit || seq_utils::int_kmerize(raw, 2) < 4) {
+        bool seq_hit = !wl.filter_bcs.empty() && (seq_utils::int_kmerize(raw, 2) < 4 || mutation_tools::detect_hp(raw, 7));
+        if (filtered_hit || seq_hit) {
             if (verbose) {
                 #pragma omp critical
                 {
@@ -2025,6 +2028,7 @@ private:
             sig.set_type("skipped");
         }
     }
+
 public:
     //sigalign_static
    void sigalign_static(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose) {
@@ -2428,21 +2432,23 @@ public:
                 edit_elem(e.class_id, [cleaned_seq, cleaned_qual, &read, verbose](seq_element &el) {
                     *el.seq = cleaned_seq;
                     if (read.is_fastq) {
-                        el.qual = cleaned_qual;
-                        if(verbose){
-                            #pragma omp critical
-                            {
-                                std::ostringstream oss;
-                                oss << "Masked qual: " << cleaned_qual << "\n";
-                                std::cout << oss.str();
+                            el.qual = cleaned_qual;
+                            if(verbose){
+                                #pragma omp critical
+                                {
+                                    std::ostringstream oss;
+                                    oss << "Masked qual: " << cleaned_qual << "\n";
+                                    std::cout << oss.str();
+                                }
+                        } else {
+                            if(verbose){
+                                #pragma omp critical
+                                {
+                                    std::ostringstream oss;
+                                    oss << "Masked qual: " << el.qual.value() << "\n";
+                                    std::cout << oss.str();
+                                }
                             }
-                        }
-                    } else {
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << "Masked qual: " << el.qual.value() << "\n";
-                            std::cout << oss.str();
                         }
                     }
                 });
@@ -2541,6 +2547,17 @@ public:
                     auto& wl = layout.wl_map.maps.at(seq_utils::remove_rc(elem.class_id)).get();
                     //had originally included a check for global barcode class not empty (&& !wl.true_bcs.empty())
                     //but this is not necessary, as the barcode correction function will handle it
+                    //size_t bad_keys = wl.true_bcs.validate_association_keys();
+                    //size_t null_values = wl.true_bcs.validate_association_values();
+                    if(verbose){
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            //oss << "Found " << bad_keys << " in true_bcs." << std::endl;
+                            std::cout << oss.str();
+                        }
+                    }
+
                     if(!wl.true_bcs.empty()){
                         auto out = barcode_correction::correct_barcode(elem, layout, verbose, gen_mut, gen_shift);
                         bool matched = out.has_value();
@@ -2561,6 +2578,7 @@ public:
                                     auto true_range = wl.true_bcs.equal_range(correct_bc);
                                     if (!wl.true_bcs.check_wl_for(original_bc) && true_range.first != true_range.second) {
                                         const barcode_entry& correct_entry = (*true_range.first);
+                                        //const barcode_entry* correct_entry = &(*true_range.first);
                                         #pragma omp critical
                                         {
                                             wl.true_bcs.insert_bc_entry(original_bc, correct_entry);
@@ -2572,6 +2590,7 @@ public:
                                     auto global_range = wl.global_bcs.equal_range(correct_bc);
                                     if (!wl.true_bcs.check_wl_for(original_bc) && global_range.first != global_range.second) {
                                         const barcode_entry& correct_entry = (*global_range.first);
+                                        //const barcode_entry* correct_entry = &(*global_range.first);
                                         #pragma omp critical
                                         {
                                             wl.global_bcs.insert_bc_entry(original_bc, correct_entry);
@@ -2624,7 +2643,6 @@ public:
                                         }                       
                                         barcode_entry failed_entry;
                                         failed_entry.barcode = failed_bc;
-                                        failed_entry.edit_dist = 10;
                                         failed_entry.filtered = true;
                                         failed_entry.flags = "failed";  
                                         // Double-check that it's still not present
@@ -2773,16 +2791,23 @@ public:
                          int num_threads, size_t chunk_size, size_t max_reads, bool write_debug) {
 
     // Output file paths
-    std::string sig_path, csv_path, metrics_path;
-    std::string fastq_output_path = output_prefix + ".fq";
+    std::string sig_path, csv_path, metrics_path, file_out;
+    file_out = path_utils::get_fastqa_type(fastq_path);
+    std::string fastq_output_path = output_prefix + file_out;
     bool compress_fastq = true;
     // Initialize writers
     std::unique_ptr<std::ofstream> metrics_file_ptr;
     std::unique_ptr<sigstring_writing> sig_writer, csv_writer, metrics_file;
     sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, compress_fastq, /*append=*/false);
+    
+
+    auto& wl = layout.wl_map.maps.at("barcode").get();
+
+
     // Initialize the parallel writer
     parallel_writer writer;
     
+
     if(write_debug){
         sig_path = output_prefix + ".sig";
         csv_path = output_prefix + ".csv";
@@ -2921,7 +2946,21 @@ public:
                   << process_time_ms / 1000.0 << "s process, "
                   << queue_time_ms / 1000.0 << "s queue), "
                   << passed_count << " passed (" << (double)passed_count / chunk.size() * 100.0 << "%)" << std::endl;
-        
+        /*
+        if(chunk_id % 10 == 0){
+            size_t bad_keys = wl.true_bcs.validate_association_keys();
+            size_t null_values = wl.true_bcs.validate_association_values();
+            std::cout << "Found " << bad_keys << " bad keys and " << null_values << " null values in true_bcs, which has " 
+                      << wl.true_bcs.unique_val_size() << " unique values and currently " << 
+                      wl.true_bcs.association_size() << " associations." << std::endl;
+        }
+        */
+       
+        if(chunk_id % 100 == 0){
+            bc_mem_utils::print_memory_report(wl.true_bcs, "true_bcs");
+        }
+
+
         // Free memory explicitly
         std::vector<read_streaming::sequence>().swap(chunk);
         //std::vector<read_streaming::sequence>().clear();
@@ -2962,7 +3001,7 @@ public:
             << "[sigalign]   [metrics]: " << metrics_path << std::endl;
     } else {
         std::cout << "\n[sigalign] Output written to:\n"
-                  << "[sigalign]     [fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n";
+                  << "[sigalign][fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n";
     }
 }
     

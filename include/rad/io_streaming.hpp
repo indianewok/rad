@@ -763,13 +763,9 @@ namespace io_bc_split_utils {
     /**
      * @brief Parallel barcode splitter using kseq with chunk_streaming
      */
-    size_t split_fastqa_file(const std::string& input_fastq_path, 
-                             const std::string& output_dir_path,
-                             int num_threads,
-                             const std::string& whitelist_path = "",
-                             bool verbose = false,
-                             size_t chunk_size = 50000,
-                             int compression_level = 1) {
+    size_t split_fastqa_file(const std::string& input_fastq_path, const std::string& output_dir_path,
+                             int num_threads, const std::string& whitelist_path = "", bool verbose = false,
+                             size_t chunk_size = 50000, int compression_level = 1) {
         
         if (verbose) {
             std::cout << "[split_fastqas] Starting parallel barcode splitting for: " << input_fastq_path << std::endl;

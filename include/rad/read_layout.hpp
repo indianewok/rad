@@ -872,9 +872,20 @@ public:
                     for (auto const &kmer : seq_utils::circ_kmerize(s, def_len)) {
                         int64_seq bits(kmer);
                         entry.filter_bcs.insert_bc_entry(bits);
+                        auto mutations = mutation_tools::generate_mutated_barcodes(bits, 2);
+                        for (auto const &mut_bits : mutations) {
+                            if(entry.filter_bcs.check_wl_for(mut_bits)){
+                                entry.filter_bcs.insert_bc_entry(mut_bits);
+                            }
+                        }
+                        auto shifts = mutation_tools::generate_shifted_barcodes(bits, 2);
+                        for (auto const &shift_bits : shifts) {
+                            if(!entry.filter_bcs.check_wl_for(shift_bits)){
+                                entry.filter_bcs.insert_bc_entry(shift_bits);   
+                            }
+                        }
                     }
                 }
-
                 auto t2 = high_resolution_clock::now();
                 double ms = duration<double, std::milli>(t2 - t1).count();
                 std::cout << "[load_wl] loaded in " << (ms/1000.0) << " s\n";
@@ -926,6 +937,15 @@ public:
                     << "\n";
             for (auto const &kv : wl_map.maps) {
                 auto const &E = kv.second.get();
+                
+                size_t bad_keys = E.true_bcs.validate_association_keys();
+                size_t null_values = E.true_bcs.validate_association_values();
+
+                std::cout << "Bad keys: " << bad_keys << ", Null values: " << null_values << std::endl;
+                    //E.true_bcs.get_health_report("true_bcs").print();
+
+                    //E.true_bcs.full_cleanup("true_bcs").print();
+                    //E.global_bcs.full_cleanup("global_bcs");
             
                 std::printf(
                     "[%s] unique_set = %.2fMiB, associations = %.2fMiB, total = %.2fMiB\n",
