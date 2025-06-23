@@ -12,6 +12,7 @@
 #include <fstream>
 #include <functional>
 #include <getopt.h>
+#include <iomanip>
 #include <iostream>
 #ifdef __APPLE__
 #include <mach/mach.h>
