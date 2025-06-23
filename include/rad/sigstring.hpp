@@ -648,7 +648,7 @@ namespace barcode_correction {
         }
 
         // === exact match in global whitelist ===
-        if (!wl.global_bcs.empty() && wl.global_bcs.check_wl_for(bc)) {
+        if (!wl.global_bcs.empty() && (wl.global_bcs.check_wl_for(bc) || wl.global_bcs.check_wl_for(rc_bc))) {
             auto matched = wl.global_bcs.return_putative_correct_bcs(bc);
             if (verbose) {
                 #pragma omp critical

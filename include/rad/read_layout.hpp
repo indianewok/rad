@@ -950,6 +950,7 @@ public:
                 std::printf(
                     "[%s] unique_set = %.2fMiB, associations = %.2fMiB, total = %.2fMiB\n",
                         kv.first.c_str(),
+                    
                         memory_utils::to_mib(bc_mem_utils::approx_unique(E.true_bcs)),
                         memory_utils::to_mib(bc_mem_utils::approx_assoc(E.true_bcs)),
                         memory_utils::to_mib(bc_mem_utils::get_full_wl_mem(E.true_bcs))
