@@ -1,1524 +1,1202 @@
-#include "include/rad/barcode_correction_old.hpp"
-#include <iostream>
-#include <string>
-#include <vector>
-#include <algorithm>
-#include <chrono>
-#include "edlib/edlib/include/edlib.h"
-#include "include/ssw/ssw_cpp.h"
-//#include "rapidfuzz/rapidfuzz/rapidfuzz_all.hpp"
+#include "include/rad/rad_headers.h"
 
-// Trim whitespace from a string
-std::string trim(const std::string& s) {
-    auto start = s.find_first_not_of(" \t\n\r\f\v");
-    if (start == std::string::npos) {
-        return ""; // String is all whitespace
-    }
-    
-    auto end = s.find_last_not_of(" \t\n\r\f\v");
-    return s.substr(start, end - start + 1);
-}
-
-// Load barcodes from file
-std::vector<std::string> load_barcodes(const std::string& filename) {
-    std::vector<std::string> barcodes;
-    std::ifstream file(filename);
-    
-    if (!file.is_open()) {
-        std::cerr << "Error: Could not open file " << filename << std::endl;
-        return barcodes;
-    }
-    
+std::unordered_set<int64_seq> load_simple_wl(const std::string& filepath) {
+    std::unordered_set<int64_seq> barcodes;
     std::string line;
-    // Skip header if present
-    if (std::getline(file, line) && (line.find("Barcode") == 0 || line.find("barcode") == 0)) {
-        // Skipped header
-    } else {
-        // This wasn't a header, process it as a barcode
-        size_t delimiter_pos = line.find_first_of(",\t\r");
-        if (delimiter_pos != std::string::npos) {
-            std::string barcode = trim(line.substr(0, delimiter_pos));
-            if (!barcode.empty()) {
-                barcodes.push_back(barcode);
-            }
-        } else if (!line.empty()) {
-            barcodes.push_back(trim(line));
-        }
-    }
     
-    // Read remaining lines
-    while (std::getline(file, line)) {
-        if (line.empty()) continue;
+    // Check if file is gzipped
+    if (filepath.size() >= 3 && filepath.substr(filepath.size() - 3) == ".gz") {
+        // Handle gzipped file
+        gzFile file = gzopen(filepath.c_str(), "rb");
+        if (!file) {
+            std::cerr << "Error: Could not open gzipped file " << filepath << std::endl;
+            return barcodes;
+        }
         
-        size_t delimiter_pos = line.find_first_of(",\t\r");
-        if (delimiter_pos != std::string::npos) {
-            std::string barcode = trim(line.substr(0, delimiter_pos));
-            if (!barcode.empty()) {
-                barcodes.push_back(barcode);
+        char buffer[1024];
+        std::string current_line;
+        
+        while (gzgets(file, buffer, sizeof(buffer))) {
+            current_line = buffer;
+            
+            // Remove newline if present
+            if (!current_line.empty() && current_line.back() == '\n') {
+                current_line.pop_back();
             }
-        } else {
-            barcodes.push_back(trim(line));
+            if (!current_line.empty() && current_line.back() == '\r') {
+                current_line.pop_back();
+            }
+            
+            // Trim whitespace and skip empty lines
+            current_line.erase(0, current_line.find_first_not_of(" \t"));
+            current_line.erase(current_line.find_last_not_of(" \t") + 1);
+            
+            if (!current_line.empty()) {
+                barcodes.emplace(current_line);
+            }
+        }
+        
+        gzclose(file);
+    } else {
+        // Handle regular text file
+        std::ifstream file(filepath);
+        if (!file.is_open()) {
+            std::cerr << "Error: Could not open file " << filepath << std::endl;
+            return barcodes;
+        }
+        
+        while (std::getline(file, line)) {
+            // Trim whitespace and skip empty lines
+            line.erase(0, line.find_first_not_of(" \t\r\n"));
+            line.erase(line.find_last_not_of(" \t\r\n") + 1);
+            
+            if (!line.empty()) {
+                barcodes.emplace(line);
+            }
         }
     }
     
-    file.close();
     return barcodes;
 }
 
-// Load barcodes and convert to bit representation
-std::unordered_map<int64_t, std::string> load_bit_barcodes(const std::string& filename) {
-    std::unordered_map<int64_t, std::string> barcode_map;
-    std::ifstream file(filename);
-    
-    if (!file.is_open()) {
-        std::cerr << "Error: Could not open file " << filename << std::endl;
-        return barcode_map;
+// long bit-parallel algo for two strings of different lengths (up to 64)
+int bit_ld_variable(int64_t pattern, int64_t text, int pattern_len, int text_len, int max_dist) {
+    // Validate inputs
+    if (pattern_len <= 0 || text_len <= 0 || pattern_len > 32 || text_len > 32) {
+        return -1;
     }
     
-    std::string line;
-    // Skip header if present
-    if (std::getline(file, line) && (line.find("Barcode") == 0 || line.find("barcode") == 0)) {
-        // Skipped header
-    } else {
-        // Process this line as it's not a header
-        size_t delimiter_pos = line.find_first_of(",\t\r");
-        std::string barcode = delimiter_pos != std::string::npos ? 
-                              trim(line.substr(0, delimiter_pos)) : 
-                              trim(line);
+    // Build pattern equality vectors for the actual pattern length
+    int64_t Peq[4] = {0, 0, 0, 0};
+    for (int i = 0; i < pattern_len; i++) {
+        int nuc = (pattern >> (2 * i)) & 3;
+        Peq[nuc] |= (1LL << i);
+    }
+    
+    // Initialize with pattern length
+    int64_t pattern_mask = (1LL << pattern_len) - 1; // Mask for valid pattern bits
+    int64_t Pv = pattern_mask; // All 1s for pattern length
+    int64_t Mv = 0; // All 0s
+    int score = pattern_len; // Start with pattern length (all insertions)
+    
+    // Process each character in the text
+    for (int j = 0; j < text_len; j++) {
+        int text_nuc = (text >> (2 * j)) & 3; // Extract nucleotide from text
+        int64_t Eq = Peq[text_nuc] & pattern_mask; // Get equality vector, masked to pattern length
         
-        if (!barcode.empty()) {
-            int64_seq seq(barcode);
-            if (!seq.bits.empty()) {
-                barcode_map[seq.bits[0]] = barcode;
-            }
-        }
-    }
-    
-    // Read remaining lines
-    while (std::getline(file, line)) {
-        if (line.empty()) continue;
+        // Myers core computation
+        int64_t Xv = Eq | Mv;
+        int64_t Xh = (((Eq & Pv) + Pv) ^ Pv) | Eq;
+        int64_t Ph = Mv | ~(Xh | Pv);
+        int64_t Mh = Pv & Xh;
         
-        size_t delimiter_pos = line.find_first_of(",\t\r");
-        std::string barcode = delimiter_pos != std::string::npos ? 
-                              trim(line.substr(0, delimiter_pos)) : 
-                              trim(line);
+        // Apply pattern mask to keep only valid bits
+        Ph &= pattern_mask;
+        Mh &= pattern_mask;
         
-        if (!barcode.empty()) {
-            int64_seq seq(barcode);
-            if (!seq.bits.empty()) {
-                barcode_map[seq.bits[0]] = barcode;
-            }
-        }
-    }
-    
-    file.close();
-    return barcode_map;
-}
-
-// Edlib comparison
-void edlib_compare(const std::string& query, const std::vector<std::string>& barcodes, int k = 3) {
-    std::cout << "\n=== Edlib Comparison for '" << query << "' ===" << std::endl;
-    
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
-    // Set up custom equality for DNA bases
-    const int numEq = 13;
-    EdlibEqualityPair customEqualities[numEq] = {
-        {'A','a'}, {'C','c'}, {'T','t'}, {'G','g'},
-        {'A','x'}, {'C','x'}, {'T','x'}, {'G','x'},
-        {'N','A'}, {'N','C'}, {'N','T'}, {'N','G'},
-        {'N','x'}
-    };
-
-    
-    EdlibAlignConfig config = edlibNewAlignConfig(k, // max edit distance
-                                           EDLIB_MODE_HW, // global alignment
-                                           EDLIB_TASK_DISTANCE, // just get edit distance
-                                           customEqualities, numEq);
-    
-    // Store results: <barcode, edit_distance>
-    std::vector<std::pair<std::string, int>> results;
-    std::string padded_barcode;
-    // Process each barcode
-    for (const auto& barcode : barcodes) {
-        padded_barcode = "NNN" + barcode + "NNN";
-        EdlibAlignResult result = edlibAlign(query.c_str(), query.length(),
-                                            padded_barcode.c_str(), padded_barcode.length(),
-                                            config);
+        // Update score based on the last position of the pattern
+        if (Ph & (1LL << (pattern_len - 1))) score++;
+        if (Mh & (1LL << (pattern_len - 1))) score--;
         
-        if (result.status == EDLIB_STATUS_OK && result.editDistance >= 0) {
-            results.push_back({padded_barcode, result.editDistance});
-        }
-        
-        edlibFreeAlignResult(result);
-    }
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double elapsed = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    
-    // Sort by edit distance
-    std::sort(results.begin(), results.end(), 
-              [](const auto& a, const auto& b) { return a.second < b.second; });
-    
-    // Group by edit distance
-    std::unordered_map<int, std::vector<std::string>> grouped;
-    for (const auto& [barcode, dist] : results) {
-        grouped[dist].push_back(barcode);
-    }
-    
-    // Print results
-    std::cout << "Found " << results.size() << " matches with edit distance <= " << k << std::endl;
-    std::cout << "Time taken: " << elapsed << " ms" << std::endl;
-    std::cout << "Putative time for ~10K unique sequences: " 
-              << (elapsed * 10000 / results.size()) << " ms" << std::endl;
-
-}
-
-// Edlib comparison with multiple queries
-void edlib_compare_batch(const std::vector<std::string>& queries, 
-                         const std::vector<std::string>& barcodes, 
-                         int k = 3, bool verbose = false) {
-    std::cout << "\n=== Edlib Batch Comparison (" << queries.size() << " queries) ===" << std::endl;
-    
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
-    // Set up custom equality for DNA bases
-    const int numEq = 13;
-    EdlibEqualityPair customEqualities[numEq] = {
-        {'A','a'}, {'C','c'}, {'T','t'}, {'G','g'},
-        {'A','x'}, {'C','x'}, {'T','x'}, {'G','x'},
-        {'N','A'}, {'N','C'}, {'N','T'}, {'N','G'},
-        {'N','x'}
-    };
-    
-    EdlibAlignConfig config = edlibNewAlignConfig(k, // max edit distance
-                                         EDLIB_MODE_HW, // global alignment
-                                         EDLIB_TASK_DISTANCE, // just get edit distance
-                                         customEqualities, numEq);
-    
-    // Store results for each query: <query, vector<barcode, edit_distance>>
-    std::vector<std::pair<std::string, std::vector<std::pair<std::string, int>>>> all_results;
-    int total_matches = 0;
-    
-    // Process each query barcode
-    for (const auto& query : queries) {
-        std::vector<std::pair<std::string, int>> query_results;
-        std::string padded_barcode;
-        
-        // Compare against each reference barcode
-        for (const auto& barcode : barcodes) {
-            padded_barcode = barcode;
-            EdlibAlignResult result = edlibAlign(query.c_str(), query.length(),
-                                              padded_barcode.c_str(), padded_barcode.length(),
-                                              config);
-            
-            if (result.status == EDLIB_STATUS_OK && result.editDistance >= 0) {
-                query_results.push_back({padded_barcode, result.editDistance});
-                total_matches++;
-            }
-            
-            edlibFreeAlignResult(result);
-        }
-        
-        // Sort by edit distance
-        std::sort(query_results.begin(), query_results.end(), 
-                [](const auto& a, const auto& b) { return a.second < b.second; });
-        
-        all_results.push_back({query, query_results});
-    }
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double elapsed = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    
-    // Print overall results
-    std::cout << "Processed " << queries.size() << " queries against " << barcodes.size() << " barcodes" << std::endl;
-    std::cout << "Found " << total_matches << " total matches with edit distance <= " << k << std::endl;
-    std::cout << "Time taken: " << elapsed << " ms" << std::endl;
-    std::cout << "Average time per query: " << (elapsed / queries.size()) << " ms" << std::endl;
-    std::cout << "Putative time for ~10K unique sequences: " 
-              << ((elapsed / queries.size())*10000) << " ms" << std::endl;
-}
-
-// RapidFuzz comparison
-void rapidfuzz_compare(const std::string& query, const std::vector<std::string>& barcodes, double threshold = 70.0) {
-    std::cout << "\n=== RapidFuzz Comparison for '" << query << "' ===" << std::endl;
-    
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
-    // Store results: <barcode, score>
-    std::vector<std::pair<std::string, double>> results;
-    
-    // Process each barcode
-    for (const auto& barcode : barcodes) {
-        // Calculate the partial ratio score (0-100, higher is better match)
-        auto score_alignment = rapidfuzz::fuzz::partial_ratio_alignment(query, barcode, 0.8);
-    
-        // Extract the score from the alignment result
-        double score = score_alignment.score;
-        results.push_back({barcode, score});
-    }
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double elapsed = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    
-    // Sort by score (descending)
-    std::sort(results.begin(), results.end(), 
-              [](const auto& a, const auto& b) { return a.second > b.second; });
-    
-    // Group by score ranges (100, 95-99, 90-94, etc.)
-    std::unordered_map<int, std::vector<std::string>> grouped;
-    for (const auto& [barcode, score] : results) {
-        int bucket = static_cast<int>(score) / 5 * 5; // Round down to nearest 5
-        grouped[bucket].push_back(barcode);
-    }
-    
-    // Print results
-    std::cout << "Found " << results.size() << " matches with score >= " << threshold << std::endl;
-    std::cout << "Time taken: " << elapsed << " ms" << std::endl;
-    
-    // Show scores by range (descending)
-    std::vector<int> score_buckets;
-    for (const auto& [bucket, _] : grouped) {
-        score_buckets.push_back(bucket);
-    }
-    std::sort(score_buckets.begin(), score_buckets.end(), std::greater<int>());
-    
-    for (int bucket : score_buckets) {
-        auto& matches = grouped[bucket];
-        std::cout << "Score " << bucket << "-" << (bucket + 4) << " (" << matches.size() << " matches):" << std::endl;
-        
-        if (matches.size() <= 10) {
-            // Print all matches if fewer than 10
-            for (const auto& barcode : matches) {
-                // Find the exact score for this barcode
-                auto it = std::find_if(results.begin(), results.end(), 
-                                     [&barcode](const auto& p) { return p.first == barcode; });
-                double exact_score = it->second;
-                std::cout << "  " << barcode << " (score: " << exact_score << ")" << std::endl;
-            }
-        } else {
-            // Print first 5 and last 5 if more than 10
-            for (int j = 0; j < 5; ++j) {
-                auto it = std::find_if(results.begin(), results.end(), 
-                                     [&](const auto& p) { return p.first == matches[j]; });
-                double exact_score = it->second;
-                std::cout << "  " << matches[j] << " (score: " << exact_score << ")" << std::endl;
-            }
-            std::cout << "  ... (" << (matches.size() - 10) << " more) ..." << std::endl;
-            for (int j = matches.size() - 5; j < matches.size(); ++j) {
-                auto it = std::find_if(results.begin(), results.end(), 
-                                     [&](const auto& p) { return p.first == matches[j]; });
-                double exact_score = it->second;
-                std::cout << "  " << matches[j] << " (score: " << exact_score << ")" << std::endl;
-            }
-        }
-    }
-}
-
-//in-house edit distance tool
-// Code for fast edit distance calculation for short sequences modified from
-// s2 is always assumed to be the shorter string (barcode)
-uint edit_distance(const std::string& s1, const std::string& s2, uint &end, int max_editd){
-    std::size_t len1 = s1.size()+1, len2 = s2.size()+1;
-    const char * s1_c = s1.c_str(); const char * s2_c = s2.c_str();
-    std::vector<uint> dist_holder(len1*len2);
-    //initialise the edit distance matrix.
-    //penalise for gaps at the start and end of the shorter sequence (j)
-    //but not for shifting the start/end of the longer sequence (i,0)
-    dist_holder[0]=0; //[0][0]
-    for(unsigned int j = 1; j < len2; ++j) dist_holder[j] = j; //[0][j];
-    for(unsigned int i = 1; i < len1; ++i) dist_holder[i*len2] = 0; //[i][0]; 
-    int best=len2;
-    end=len1-1;
-    //loop over the distance matrix elements and calculate running distance
-    for (unsigned int j = 1; j < len2; ++j) {
-      bool any_below_threshold = false; // flag used for early exit
-      for (unsigned int i = 1; i < len1; ++i) {
-        int sub = (s1_c[i - 1] == s2_c[j - 1]) ? 0 : 1; // are the bases the same?
-        // if yes, no need to increment distance
-        if (sub == 0) {
-          dist_holder[i * len2 + j] = dist_holder[(i - 1) * len2 + (j - 1)];
-        }
-        // otherwise add insertion, deletion or substitution
-        else {
-          // clang-format off
-          dist_holder[i*len2+j] = std::min({ //j+i*len2  //set[i][j]
-            dist_holder[(i-1)*len2+j] + 1, //[i-1][j]
-            dist_holder[i*len2+(j-1)] + 1, //[i][j-1]
-            dist_holder[(i-1)*len2+(j-1)] + 1}); // ((s1_c[i - 1] == s2_c[j - 1]) ? 0 : 1) });
-          // clang-format on
-        }
-        if (dist_holder[i * len2 + j] <= max_editd) {
-          any_below_threshold = true;
-        }
-        // if this is the last row in j
-        if (j == (len2 - 1) && dist_holder[i * len2 + j] < best) {
-          // check if this is the best running score
-          best = dist_holder[i * len2 + j];
-          end = i; // update the end position of alignment
-        }
-      }
-      // early exit to save time.
-      if(!any_below_threshold) {
-        return(100);
-      }
-    }
-    return best; // return edit distance
-}
-
-std::vector<std::string> generate_all_shifted_barcodes(
-    const std::string &barcode,
-    int shift
-) {
-    std::vector<std::string> out;
-    int L = (int)barcode.size();
-    if (shift <= 0 || shift >= L) {
-        // nothing to shift, or shift >= length → no valid variants
-        return out;
-    }
-
-    // Core for left‑shifts: drop last `shift` bases
-    std::string coreR = barcode.substr(0, L - shift);
-    // Core for right‑shifts: drop first  `shift` bases
-    std::string coreL = barcode.substr(shift);
-
-    const char bases[4] = {'A','C','G','T'};
-    std::string buf(shift, ' ');
-
-    // 1) Build left‑shifted variants: all prefixes + coreR
-    std::function<void(int)> dfs_left = [&](int pos) {
-        if (pos == shift) {
-            out.push_back(buf + coreR);
-            return;
-        }
-        for (char b : bases) {
-            buf[pos] = b;
-            dfs_left(pos + 1);
-        }
-    };
-    dfs_left(0);
-
-    // 2) Build right‑shifted variants: coreL + all suffixes
-    std::function<void(int)> dfs_right = [&](int pos) {
-        if (pos == shift) {
-            out.push_back(coreL + buf);
-            return;
-        }
-        for (char b : bases) {
-            buf[pos] = b;
-            dfs_right(pos + 1);
-        }
-    };
-    dfs_right(0);
-
-    return out;
-}
-
-std::unordered_set<int64_seq> generate_int64_shifted_barcodes(
-    const int64_seq &seq,
-    int shift
-) {
-    std::unordered_set<int64_seq> result;
-    // 1) Quick exits
-    if (seq.bits.empty() || shift <= 0 || shift >= seq.length)
-        return result;
-
-    // 2) Get the string
-    std::string barcode = seq.bits_to_sequence();
-    int L = (int)barcode.size();
-
-    // 3) Compute cores
-    std::string coreR = barcode.substr(0, L - shift);  // for left shifts
-    std::string coreL = barcode.substr(shift);         // for right shifts
-
-    const char bases[4] = {'A','C','G','T'};
-    std::string buf(shift, ' ');
-
-    // 4) Build left shifts
-    std::function<void(int)> dfs_left = [&](int pos) {
-        if (pos == shift) {
-            // Make a fresh int64_seq from the new string
-            int64_seq cand;
-            cand.sequence_to_bits(buf + coreR);
-            result.insert(std::move(cand));
-            return;
-        }
-        for (char b : bases) {
-            buf[pos] = b;
-            dfs_left(pos + 1);
-        }
-    };
-    dfs_left(0);
-
-    // 5) Build right shifts
-    std::function<void(int)> dfs_right = [&](int pos) {
-        if (pos == shift) {
-            int64_seq cand;
-            cand.sequence_to_bits(coreL + buf);
-            result.insert(std::move(cand));
-            return;
-        }
-        for (char b : bases) {
-            buf[pos] = b;
-            dfs_right(pos + 1);
-        }
-    };
-    dfs_right(0);
-
-    // 6) Remove the original if it was regenerated
-    result.erase(seq);
-    return result;
-}
-
-//this one works the fastest 
-/*
-int bit_ld(int64_t p, int64_t t, int n = 16) {
-    int64_t np = ~p;
-    int64_t HMASK = (1LL << (n - 1));        // Mask to check the high-order bit of the current column
-    int64_t VP = (1LL << n) - 1;               // Vertical positive (all ones initially)
-    int64_t VN = 0;                          // Vertical negative (all zeros initially)
-    int score = n;                           // Initialize the score to n
-
-    for (int j = 0; j < n; ++j) {
-        int64_t Bj;
-        // Select Bj based on the bit in t at position j.
-        if ((t & (1LL << j)) != 0)
-            Bj = p;
-        else
-            Bj = np;
-
-        int64_t D0 = ((VP + (Bj & VP)) ^ VP) | Bj | VN;
-        int64_t HN = VP & D0;
-        int64_t HP = VN | ~(VP | D0);
-
-        if ((HP & HMASK) != 0)
-            score += 1;
-        else if ((HN & HMASK) != 0)
-            score -= 1;
-
-        int64_t X = (HP << 1) | 1;
-        VN = X & D0;
-        VP = (HN << 1) | ~(X | D0);
-    }
-    return score;
-}
-*/
-
-// Myers’s bit‑parallel edit distance with an early cutoff.
-// p:  bitmask where bit j=1 means pattern[j] matches '1'
-// t:  bitmask for text only used to select p or np per column
-// n:  number of columns (<=64)
-// max_dist: as soon as even the best possible remaining score exceeds max_dist,
-//           we return max_dist+1 as a sentinel.
-int bit_ld_cutoff(int64_t p, int64_t t, int n , int max_dist = INT_MAX) {
-    int64_t np    = ~p;
-    int64_t HMASK = 1LL << (n - 1);        // mask for the high bit of the window
-    int64_t VP    = (1LL << n) - 1;        // all 1s
-    int64_t VN    = 0;                     // all 0s
-    int     score = n;                     // start at n
-    for (int j = 0; j < n; ++j) {
-        // select the Peq mask for column j
-        int64_t Bj = ((t >> j) & 1) ? p : np;
-        // Myers core
-        int64_t D0 = (((VP + (Bj & VP)) ^ VP) | Bj | VN);
-        int64_t HN = VP & D0;
-        int64_t HP = VN | ~(VP | D0);
-        // update score
-        if (HP & HMASK) {
-            score++;
-        }
-        else if (HN & HMASK) {
-            score--;
-        }
-        // early cutoff bound: even if we subtract 1 in every remaining column,
-        // our bestPossible = score - (n - j - 1)
-        int remaining = n - j - 1;
-        if (score - remaining > max_dist)
-            return max_dist + 1;
-        // advance VP, VN
-        int64_t X = (HP << 1) | 1;
-        VN = X & D0;
-        VP = (HN << 1) | ~(X | D0);
-    }
-    return score;
-}
-
-// Compute the Myers bit‑parallel edit distance between pattern P and text T.
-// P may contain 'A','C','G','T','N' (where 'N' matches anything).
-// T may also contain 'A','C','G','T','N' (treat 'N' in text as wildcard).
-// Returns the full edit distance (insertions, deletions, substitutions).
-// Requires P.size() <= 64.
-//this one works great!
-int bit_lev_wildcard_v1(const std::string &P, const std::string &T) {
-    int m = (int)P.size();
-    int n = (int)T.size();
-    assert(m <= 64 && "Pattern too long for 64‑bit bit‑parallel algorithm");
-
-    // 1) Build Peq: for each possible character (A,C,G,T,'N'), a mask of positions in P.
-    //    For 'N' in P, we set that bit for *every* concrete base, so it always matches.
-    //    Similarly, when we look up Peq[T[i]], if T[i]=='N' we'll treat it as all-ones (wildcard).
-    uint64_t Peq[128] = {0};
-    for (int i = 0; i < m; ++i) {
-        char c = P[i];
-        uint64_t bit = (1ULL << i);
-        if (c == 'N') {
-            // wildcard in pattern: set this bit for all four bases
-            Peq['A'] |= bit;
-            Peq['C'] |= bit;
-            Peq['G'] |= bit;
-            Peq['T'] |= bit;
-        } else {
-            Peq[(int)c] |= bit;
-        }
-    }
-    // Make sure that if text has 'N', we treat it as matching everything:
-    // we'll handle that below by substituting Eq = all_ones when T[i]=='N'.
-
-    uint64_t VP = ~0ULL;              // VP = all 1s for m positions
-    uint64_t VN = 0ULL;               // VN = all 0s
-    int      currDist = m;            // initial distance = m (all deletions)
-
-    uint64_t mask_msb = (1ULL << (m - 1));   // mask for the "leftmost" bit
-
-    for (int j = 0; j < n; ++j) {
-        char c = T[j];
-        // 2) Lookup Eq mask for this text character:
-        uint64_t Eq;
-        if (c == 'N') {
-            // wildcard in text matches any pattern position
-            Eq = (m == 64 ? ~0ULL : ((1ULL << m) - 1));
-        } else {
-            Eq = Peq[(int)c];
-        }
-
-        // 3) Myers bit‑parallel update
-        uint64_t X  = Eq | VN;
-        uint64_t D0 = (((X & VP) + VP) ^ VP) | X;
-        uint64_t HN = VP & D0;
-        uint64_t HP = VN | ~(VP | D0);
-
-        // 4) Update distance based on the msb
-        if (HP & mask_msb) {
-            currDist++;
-        } else if (HN & mask_msb) {
-            currDist--;
-        }
-
-        // 5) Advance VP, VN for next character
-        uint64_t HP_shift = (HP << 1) | 1ULL;
-        VN = HP_shift & D0;
-        VP = (HN << 1) | ~(HP_shift | D0);
-    }
-
-    return currDist;
-}
-
-int bit_ld(int64_t p, int64_t t, int n = 16) {
-    // 1) Build a one‑bit mask: bit j == 1 if and only if
-    //    the jᵗʰ base in p equals the jᵗʰ base in t.
-    int64_t Peq = 0;
-    for (int j = 0; j < n; ++j) {
-        // Extract the 2 bits for base j (LSB = position 0)
-        int shift = 2 * j;
-        int bp = (p >> shift) & 0b11;
-        int bt = (t >> shift) & 0b11;
-        if (bp == bt) {
-            Peq |= (1LL << j);
-        }
-    }
-
-    // 2) Run Myers’s bit‑parallel loop over that equality mask.
-    int64_t p_eq  = Peq;
-    int64_t np_eq = ~p_eq;                      // complement mask
-    int64_t HMASK = 1LL << (n - 1);             // test the "leftmost" column
-    int64_t VP    = (1LL << n) - 1;             // vertical positive = all 1s
-    int64_t VN    = 0;                          // vertical negative = all 0s
-    int     score = n;                          // start with distance = n
-
-    for (int j = 0; j < n; ++j) {
-        // Bj is always the equality mask
-        int64_t Bj = p_eq;
-
-        // Core Myers update
-        int64_t D0 = ((VP + (Bj & VP)) ^ VP) | Bj | VN;
-        int64_t HN = VP & D0;
-        int64_t HP = VN | ~(VP | D0);
-
-        // Update score based on the leftmost bit of HP/HN
-        if (HP & HMASK)        score += 1;
-        else if (HN & HMASK)   score -= 1;
-
-        // Shift for next iteration
-        int64_t X  = (HP << 1) | 1;
-        VN         = X & D0;
-        VP         = (HN << 1) | ~(X | D0);
-    }
-
-    // Now score is the edit distance in [0..n]
-    return score;
-}
-
-// Reversed variant: iterate from left-most position to right (i.e. j goes from n-1 downto 0)
-// and use a left mask that corresponds to the most–significant bit.
-int bit_ld_rev(int n, int64_t p, int64_t t) {
-    int64_t np = ~p;
-    // LMASK set to check the leftmost column of the n–bit window.
-    int64_t LMASK = (1LL << (n - 1));
-    int64_t VP = (1LL << n) - 1;
-    int64_t VN = 0;
-    int score = n;
-    
-    for (int j = n - 1; j >= 0; --j) {
-        int64_t Bj = ((t & (1LL << j)) != 0) ? p : np;
-        int64_t D0 = ((VP + (Bj & VP)) ^ VP) | Bj | VN;
-        int64_t HN = VP & D0;
-        int64_t HP = VN | ~(VP | D0);
-        
-        if ((HP & LMASK) != 0)
-            score += 1;
-        else if ((HN & LMASK) != 0)
-            score -= 1;
-        
-        int64_t X = (HP << 1) | 1;
-        VN = X & D0;
-        VP = (HN << 1) | ~(X | D0);
-    }
-    return score;
-}
-
-int bit_ld_rev_debug(int n, int64_t p, int64_t t) {
-    int64_t np = ~p;
-    int64_t LMASK = (1LL << (n - 1));  // left-most mask
-    int64_t VP = (1LL << n) - 1;
-    int64_t VN = 0;
-    int score = n;
-    
-    std::cout << "n = " << n << ", LMASK = " << std::bitset<64>(LMASK) << std::endl;
-    std::cout << "Initial VP = " << std::bitset<64>(VP)
-              << ", VN = " << std::bitset<64>(VN)
-              << ", score = " << score << std::endl;
-              
-    for (int j = n - 1; j >= 0; --j) {
-        int64_t Bj = ((t & (1LL << j)) != 0) ? p : np;
-        int64_t D0 = ((VP + (Bj & VP)) ^ VP) | Bj | VN;
-        int64_t HN = VP & D0;
-        int64_t HP = VN | ~(VP | D0);
-        
-        // Print intermediate state for this column.
-        std::cout << "j = " << j << ": " 
-                  << "Bj = " << std::bitset<64>(Bj) << ", "
-                  << "D0 = " << std::bitset<64>(D0) << ", "
-                  << "HP = " << std::bitset<64>(HP) << ", "
-                  << "HN = " << std::bitset<64>(HN);
-        
-        if ((HP & LMASK) != 0) {
-            score += 1;
-            std::cout << " -> score +1";
-        }
-        else if ((HN & LMASK) != 0) {
-            score -= 1;
-            std::cout << " -> score -1";
-        }
-        std::cout << ", score now = " << score << std::endl;
-        
-        int64_t X = (HP << 1) | 1;
-        VN = X & D0;
-        VP = (HN << 1) | ~(X | D0);
-        
-        std::cout << "After shift: VP = " << std::bitset<64>(VP)
-                  << ", VN = " << std::bitset<64>(VN) << std::endl;
-    }
-    return score;
-}
-
-int bit_ld_window(int n, int64_t p, int64_t t, int offset, int L) {
-    // Compute the starting bit (from the left): highest index = n - 1 minus offset.
-    int start = 0;
-    // The end index for the window:
-    int end = 31;
-    if (end < 0) {  // Adjust if the window exceeds available bits.
-        end = 0;
-        L = end - start + 1;
-    }
-    
-    int64_t np = ~p;
-    // Use a mask that checks the column corresponding to the end of the window.
-    int64_t MASK = (1LL << end);
-    // Setup DP vectors for the window length L.
-    int64_t VP = (1LL << L) - 1;  // L ones.
-    int64_t VN = 0;
-    int score = L;  // Initial score equals the window length.
-    
-    // Process columns from j = start downto j = end.
-    for (int j = start; j >= end; --j) {
-        int64_t Bj = ((t & (1LL << j)) != 0) ? p : np;
-        int64_t D0 = ((VP + (Bj & VP)) ^ VP) | Bj | VN;
-        int64_t HN = VP & D0;
-        int64_t HP = VN | ~(VP | D0);
-        
-        if ((HP & MASK) != 0)
-            score += 1;
-        else if ((HN & MASK) != 0)
-            score -= 1;
-        
-        int64_t X = (HP << 1) | 1;
-        VN = X & D0;
-        VP = (HN << 1) | ~(X | D0);
-    }
-    return score;
-}
-
-int bit_ld_debug(int n, int64_t p, int64_t t) {
-    int64_t np = ~p;
-    int64_t HMASK = (1LL << (n - 1));        // Mask to check the most-significant bit (leftmost)
-    int64_t VP = (1LL << n) - 1;               // VP: n ones (all bits set for positions 0 to n-1)
-    int64_t VN = 0;                          // VN: starts at zero
-    int score = n;                           // Start the score at n
-    
-    std::cout << "n = " << n 
-              << ", HMASK = " << std::bitset<64>(HMASK) << "\n";
-    std::cout << "Initial VP = " << std::bitset<64>(VP)
-              << ", VN = " << std::bitset<64>(VN)
-              << ", score = " << score << "\n";
-    
-    for (int j = 0; j < n; ++j) {
-        int64_t Bj;
-        // Select Bj based on the j-th bit of t (bit j, counting from LSB as 0)
-        if ((t & (1LL << j)) != 0)
-            Bj = p;
-        else
-            Bj = np;
-        
-        int64_t D0 = ((VP + (Bj & VP)) ^ VP) | Bj | VN;
-        int64_t HN = VP & D0;
-        int64_t HP = VN | ~(VP | D0);
-        
-        std::cout << "j = " << j << ": ";
-        std::cout << "Bj = " << std::bitset<64>(Bj) << ", ";
-        std::cout << "D0 = " << std::bitset<64>(D0) << ", ";
-        std::cout << "HP = " << std::bitset<64>(HP) << ", ";
-        std::cout << "HN = " << std::bitset<64>(HN);
-        
-        // Update score based on the leftmost bit (i.e., HMASK).
-        if ((HP & HMASK) != 0) {
-            score += 1;
-            std::cout << " -> score +1";
-        }
-        else if ((HN & HMASK) != 0) {
-            score -= 1;
-            std::cout << " -> score -1";
-        }
-        std::cout << ", score now = " << score << "\n";
-        
-        int64_t X = (HP << 1) | 1;
-        VN = X & D0;
-        VP = (HN << 1) | ~(X | D0);
-        
-        std::cout << "    After shift: VP = " << std::bitset<64>(VP)
-                  << ", VN = " << std::bitset<64>(VN) << "\n";
-    }
-    
-    return score;
-}
-
-// Returns edit distance ≤ max_dist, or max_dist+1 if it exceeds max_dist early.
-int bit_lev_wildcard(
-    const std::string &P,
-    const std::string &T,
-    int max_dist = 3
-) {
-    int m = (int)P.size();
-    int n = (int)T.size();
-    assert(m <= 64 && "Pattern too long for 64‑bit bit‑parallel algorithm");
-
-    // 1) Build Peq masks once
-    uint64_t Peq[128] = {0};
-    for (int i = 0; i < m; ++i) {
-        char c = P[i];
-        uint64_t bit = 1ULL << i;
-        if (c == 'N') {
-            Peq['A'] |= bit;
-            Peq['C'] |= bit;
-            Peq['G'] |= bit;
-            Peq['T'] |= bit;
-        } else {
-            Peq[(int)c] |= bit;
-        }
-    }
-
-    // 2) Initialize Myers state
-    uint64_t VP   = ~0ULL;            // all 1s in low m bits
-    uint64_t VN   = 0ULL;             // all 0s
-    int      dist = m;               // start = m (all deletions)
-    uint64_t MSK  = 1ULL << (m - 1);  // mask for the “leftmost” bit
-
-    // 3) Scan the text with early cutoff
-    for (int j = 0; j < n; ++j) {
-        // lookup Eq mask, treating 'N' in text as wildcard
-        uint64_t Eq = (T[j] == 'N')
-          ? ((m == 64) ? ~0ULL : ((1ULL << m) - 1))
-          : Peq[(int)T[j]];
-
-        // Myers bit‑parallel update
-        uint64_t X  = Eq | VN;
-        uint64_t D0 = (((X & VP) + VP) ^ VP) | X;
-        uint64_t HN = VP & D0;
-        uint64_t HP = VN | ~(VP | D0);
-
-        // update distance
-        if      (HP & MSK) dist++;
-        else if (HN & MSK) dist--;
-
-        // **correct early cutoff**: even if we subtract 1 in every remaining column,
-        // can we still get ≤ max_dist?
-        int remaining = n - j - 1;
-        if (dist - remaining > max_dist) {
+        // Early exit optimization
+        // Best possible score is current score minus remaining text characters
+        // (assuming all remaining are matches, which would decrease score by 1 each)
+        int remaining_text = text_len - j - 1;
+        int best_possible = score - remaining_text;
+        if (best_possible > max_dist) {
             return -1;
         }
-
-        // shift for next character
-        uint64_t HPs = (HP << 1) | 1ULL;
-        VN = HPs & D0;
-        VP = (HN << 1) | ~(HPs | D0);
+        
+        // Update for next iteration
+        Ph <<= 1;
+        Pv = ((Mh << 1) | ~(Xv | Ph)) & pattern_mask;
+        Mv = Ph & Xv;
     }
-
-    // final result
-    return (dist > max_dist ? -1 : dist);
+    
+    return score;
 }
 
-
-std::vector<std::pair<int64_seq, std::tuple<int,int,int>>> find_candidates(
-    const int64_seq &query, 
-    const std::unordered_set<int64_seq> &candidateSet, 
-    int max_dist = 4)
-{
-    std::vector<std::pair<int64_seq, std::tuple<int,int,int>>> results;
-
-    // If the query's bit vector is empty, return an empty result.
-    if (query.bits.empty()) return results;
-    // Use the query's length and its encoded value (assumed stored in bits[0]).
-    int n = query.length;
-    int64_t q_bits = query.bits[0];
-    // Loop over each candidate.
-    for (const auto &candidate : candidateSet) {
-        std::string barcode = query.bits_to_sequence();
-        //std::cout << "Query barcode: " << barcode << "\n";
-        //query.print_int64_seq();
-    
-        std::string cand_barcode = candidate.bits_to_sequence();
-        //std::cout << "Candidate barcode: " << cand_barcode << "\n";
-        //candidate.print_int64_seq();
-        // Candidate must have been encoded.
-        if (candidate.bits.empty()) continue;
-
-        // Optionally only compare candidates of equal length.
-        if (candidate.length != n) continue;
-
-        int64_t c_bits = candidate.bits[0];
-        //bit_distance
-        //int bit_dist = bit_ld(q_bits, c_bits);
-        //string distance
-        std::string pad_cand_bc = "NN" + cand_barcode + "NN";
-        std::string pad_bc = "NN" + barcode + "NN";
-
-        int bit_dist = bit_lev_wildcard(barcode, pad_cand_bc, 3);
-        int bit_dist_rev = 0; // ensuring printing
-        int bit_dist_window = 100;
-
-        // If any one distance is within the threshold, store this candidate.
-        if (bit_dist_rev <= max_dist || bit_dist_window <= max_dist) {
-            results.push_back({ candidate, std::make_tuple(bit_dist, 0, 100) });
+// calculating levenshtein distance between one query and a set of multiple strings of different lengths (naively, with no wildcard-based spacing)
+std::map<int, std::unordered_set<int64_seq>> int64_lvdist_long(const int64_seq &query, const std::unordered_set<int64_seq> &targets, int max_dist = 4) {
+    std::map<int, std::unordered_set<int64_seq>> results;
+    if (query.bits.empty()){
+        return results;
+    }
+    for (const auto &target : targets) {
+        if (target.bits.empty()){
+            continue;
+        }
+        int dist = mutation_tools::bit_partial_match(query.bits[0], target.bits[0], query.length, target.length, max_dist);
+        if(dist >= 0){
+            results[dist].insert(target);
         }
     }
     return results;
 }
 
-//cite flexiplex--looks like the biggest issue is that the short-distance edlib 
-uint edit_distance_wildcard(const std::string& s1, const std::string& s2, uint &end, int max_editd){
-    std::size_t len1 = s1.size()+1, len2 = s2.size()+1;
-    const char * s1_c = s1.c_str(); const char * s2_c = s2.c_str();
-    std::vector<uint> dist_holder(len1*len2);
-    //initialise the edit distance matrix.
-    //penalise for gaps at the start and end of the shorter sequence (j)
-    //but not for shifting the start/end of the longer sequence (i,0)
-    dist_holder[0]=0; //[0][0]
-    for(uint j = 1; j < len2; ++j) dist_holder[j] = j; //[0][j];
-    for(uint i = 1; i < len1; ++i) dist_holder[i*len2] = 0; //[i][0];
-    int best=len2;
-    end=len1-1;
-    //loop over the distance matrix elements and calculate running distance
-    for (uint j = 1; j < len2; ++j) {
-        bool any_below_threshold = false; // flag used for early exit
-        for (uint i = 1; i < len1; ++i) {
-            // Modify the substitution cost to handle wildcards
-            int sub = 1; // Default: different bases cost 1
-            
-            char c1 = s1_c[i - 1];
-            char c2 = s2_c[j - 1];
-            
-            // wildcard match goes here
-            if (c1 == c2 || c1 == 'N' || c2 == 'N') {
-                sub = 0; // No cost
-            }
-            
-            // If bases match (or wildcards), no cost
-            if (sub == 0) {
-                dist_holder[i * len2 + j] = dist_holder[(i - 1) * len2 + (j - 1)];
-            }
-            // Otherwise add insertion, deletion or substitution
-            else {
-                dist_holder[i*len2+j] = std::min({
-                    dist_holder[(i-1)*len2+j] + 1,     // deletion
-                    dist_holder[i*len2+(j-1)] + 1,     // insertion
-                    dist_holder[(i-1)*len2+(j-1)] + 1  // substitution
-                });
-            }
-            
-            if (dist_holder[i * len2 + j] <= max_editd) {
-                any_below_threshold = true;
-            }
-            
-            // if this is the last row in j
-            if (j == (len2 - 1) && dist_holder[i * len2 + j] < best) {
-                // check if this is the best running score
-                best = dist_holder[i * len2 + j];
-                end = i; // update the end position of alignment
-            }
-        }
-        // early exit to save time.
-        if(!any_below_threshold) {
-            return(100);
-        }
+//lvdist for long sequences, different length, whole whitelist
+std::map<int, std::unordered_set<int64_seq>> int64_lvdist_partial(const int64_seq &query, const std::unordered_set<int64_seq> &targets, int max_dist = 4) {
+    std::map<int, std::unordered_set<int64_seq>> results;
+    if (query.bits.empty()){
+        return results;
     }
-    return best; // return edit distance
-}
-
-uint edit_distance_wildcard_2row(const std::string &s1, const std::string &s2, uint &end, int max_editd) {
-    // s1: padded barcode; s2: query
-    const std::size_t n = s1.size();
-    const std::size_t m = s2.size();
-    
-    std::vector<uint> prev(m + 1), curr(m + 1);
-    // initialize first row; note: for insertion penalties in s2, you might need to adjust these
-    for (size_t j = 0; j <= m; ++j) {
-        prev[j] = j;
-    }
-    uint best = m;
-    end = 0;
-    // Process rows: each row corresponds to a character in s1.
-    for (size_t i = 1; i <= n; ++i) {
-        // gap penalty for s1's position: same as before (0 cost for left edge)
-        curr[0] = 0; 
-        bool anyBelowThreshold = false;
-        for (size_t j = 1; j <= m; ++j) {
-            int sub_cost = 1;
-            char c1 = s1[i - 1];
-            char c2 = s2[j - 1];
-            if(c1 == c2 || c1 == 'N' || c2 == 'N') {
-                sub_cost = 0;
-            }
-            // Calculate using deletion (from previous row), insertion (current row, previous column),
-            // and substitution.
-            curr[j] = std::min({ prev[j] + 1,          // deletion
-                                 curr[j - 1] + 1,      // insertion
-                                 prev[j - 1] + sub_cost // substitution
-                               });
-            if (curr[j] <= (uint)max_editd) {
-                anyBelowThreshold = true;
-            }
-            // If this is the last column, update the best score and record the alignment end position.
-            if (j == m && curr[j] < best) {
-                best = curr[j];
-                end = i;
-            }
+    for (const auto &target : targets) {
+        if (target.bits.empty()){
+            continue;
         }
         
-        // Early exit: if no cell in the current row is within threshold, there’s no need to continue.
-        if (!anyBelowThreshold) {
-            return 100;
-        }
-        prev.swap(curr);
-    }
-    return best;
-}
-
-// Test function for find_candidates
-void test_find_candidates() {
-    // Define a test barcode (the query)
-    std::string test_barcode = "AACAGTTATTACTTCT";
-    int64_seq query(test_barcode);
-    
-
-    // Define candidate barcode strings.
-    std::vector<std::string> candidateStrings = {
-        "AACAGTTATTACTTCT",   // exact match
-        "AACAGTTATTACTTCA",   // one substitution at end
-        "AACAGCTATTACTTCT",   // one substitution in middle
-        "AACAGTTATTACTTCG",   // substitution at last base
-        "TTCAGTTATTACTTCT",   // substitution at beginning
-        "AACAGTTATTGCTTCT",   // one substitution inside
-        "AACAGTTATTACTTAT",   // substitution at last base
-        "AACAGTTATTACTTCC",   // substitution at end
-        "AACAGTTATTACTTGT",   // substitution at end
-        "AACAGTTATTACTTC",    // deletion: missing last base
-        "AACAGTTATTACTTCTA",   // insertion: extra base at end
-        "TTAGGTTATTACTTCT",    // multiple errors
-        "AAAACAGTTATTACTTCT"  // two extra bases at beginning
-    };
-
-    // Expected best edit distances for each candidate.
-    std::vector<int> candidate_dist = {
-        0,  // "AACAGTTATTACTTCT" exact match: 0 edits.
-        1,  // "AACAGTTATTACTTCA" expected edit distance 1.
-        1,  // "AACAGCTATTACTTCT" expected edit distance 1.
-        1,  // "AACAGTTATTACTTCG" expected edit distance 1.
-        2,  // "TTCAGTTATTACTTCT" expected edit distance 2.
-        1,  // "AACAGTTATTGCTTCT" expected edit distance 1.
-        1,  // "AACAGTTATTACTTAT" expected edit distance 1.
-        1,  // "AACAGTTATTACTTCC" expected edit distance 1.
-        1,  // "AACAGTTATTACTTGT" expected edit distance 1.
-        1,  // "AACAGTTATTACTTC"  expected edit distance 1 (due to deletion).
-        1,   // "AACAGTTATTACTTCTA" expected edit distance 1 (due to insertion).
-        4,   // "TTAGGTTATTACTTCT" expected edit distance 4.
-        2    // "AAAACAGTTATTACTTCT" edit distance 2
-    };
-    
-    // Build an unordered_set of int64_seq from candidateStrings.
-    std::unordered_set<int64_seq> candidateSet;
-    for (const auto &s : candidateStrings) {
-        int64_seq candidate(s);
-        if (candidate.length == query.length) // enforce same length
-            candidateSet.insert(candidate);
-    }
-    
-    int max_dist = 3;  // Set maximum edit distance threshold.
-    auto candidates = find_candidates(query, candidateSet, max_dist);
-    
-    // Print the test results.
-    std::cout << "\n=== Test find_candidates() ===" << std::endl;
-    std::cout << "Query barcode: " << test_barcode << std::endl;
-    std::cout << "Candidates within edit distance " << max_dist << ":" << std::endl;
-    
-    // Instead of using pointer arithmetic, use a standard index-based loop
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        const auto &pair = candidates[i];
-        auto [d, d_rev, d_win] = pair.second;
-        // Compute the "best" (lowest) distance among the three.
-        int best = std::min({d, d_rev});
-        std::cout << "Candidate: " << pair.first.bits_to_sequence() 
-                  << ", Distances: (" << d << ", " << d_rev << ")"
-                  << ", Best: " << best << std::endl;
-    }
-}
-
-void test_find_candidates_batch(
-    const std::unordered_map<int64_t, std::string>& queryMap,
-    const std::unordered_map<int64_t, std::string>& candidateMap, 
-    int max_dist = 3)
-{
-    // Build the candidate set from candidateMap.
-    std::unordered_set<int64_seq> candidateSet;
-    for (const auto& pair : candidateMap) {
-        int64_seq candidate(pair.second);
-        if (!candidate.bits.empty())
-            candidateSet.insert(candidate);
-    }
-    
-    // Container for results for each query.
-    std::vector<std::vector<std::pair<std::string, std::tuple<int,int,int>>>> all_results;
-    all_results.reserve(queryMap.size());
-    
-    std::cout << "\n=== Batch find_candidates() Test (using unordered_map for queries and candidates) ===" << std::endl;
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
-    // Process each query in the queryMap.
-    for (const auto &qPair : queryMap) {
-        int64_seq query(qPair.second);
-        auto candidate_matches = find_candidates(query, candidateSet, 3);
-        
-        std::vector<std::pair<std::string, std::tuple<int,int,int>>> query_results;
-        for (const auto &match : candidate_matches) {
-            query_results.push_back({ match.first.bits_to_sequence(), match.second });
-        }
-        // Sort results by the “best” distance (lowest among the three in the tuple).
-        std::sort(query_results.begin(), query_results.end(), 
-                  [](const auto &a, const auto &b) {
-                      int best_a = std::min({ std::get<0>(a.second), std::get<1>(a.second), std::get<2>(a.second) });
-                      int best_b = std::min({ std::get<0>(b.second), std::get<1>(b.second), std::get<2>(b.second) });
-                      return best_a < best_b;
-                  });
-        
-        all_results.push_back(query_results);
-    }
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double elapsed = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    
-    // Print summary.
-    size_t total_matches = 0;
-    for (const auto& results : all_results) {
-        total_matches += results.size();
-    }
-    std::cout << "Processed " << queryMap.size() << " queries against candidate data." << std::endl;
-    std::cout << "Found a total of " << total_matches 
-              << " candidate matches with edit distance <= " << 3 
-              << " in " << elapsed << " ms." << std::endl;
-    std::cout << "Average time per query: " << elapsed / queryMap.size() << " ms." << std::endl;
-    
-    // For each query, print only the best candidates.
-    const size_t max_to_print = 5;
-    size_t query_index = 0;
-    for (const auto &qPair : queryMap) {
-        const auto &results = all_results[query_index];
-        if (results.empty()) {
-            std::cout  << "";
+        int dist;
+        if (query.length <= target.length) {
+            // Query is shorter or equal, search query in target
+            dist = mutation_tools::bit_partial_match(query.bits[0], target.bits[0], query.length, target.length, max_dist);
         } else {
-            // Use the best (lowest) edit distance among the first candidate's tuple.
-            std::cout << "\nQuery (" << query_index << "): " << qPair.second << std::endl;
-
-            int best_distance = std::min({ std::get<0>(results.front().second), 
-                                           std::get<1>(results.front().second), 
-                                           std::get<2>(results.front().second) });
-            // Filter the best candidates that achieve this distance.
-            std::vector<std::pair<std::string, std::tuple<int,int,int>>> best_candidates;
-            std::copy_if(results.begin(), results.end(), std::back_inserter(best_candidates),
-                         [best_distance](const std::pair<std::string, std::tuple<int,int,int>> &r) {
-                             int best_val = std::min({ std::get<0>(r.second), std::get<1>(r.second), std::get<2>(r.second) });
-                             return best_val == best_distance;
-                         });
-            std::cout << "Best edit distance = " << best_distance << "; ";
-            if (best_candidates.size() > max_to_print) {
-                std::cout << "showing first " << max_to_print << " of " << best_candidates.size() << " candidates:" << std::endl;
-                for (size_t i = 0; i < max_to_print; ++i) {
-                    auto [d, d_rev, d_win] = best_candidates[i].second;
-                    std::cout << "  Candidate: " << best_candidates[i].first 
-                              << ", Distances: (" << d << ", " << d_rev << ", " << d_win << ")" << std::endl;
-                }
-                std::cout << "  ... (" << best_candidates.size() - max_to_print << " more with edit distance " 
-                          << best_distance << ")" << std::endl;
-            } else {
-                for (const auto &cand : best_candidates) {
-                    auto [d, d_rev, d_win] = cand.second;
-                    std::cout << "  Candidate: " << cand.first 
-                              << ", Distances: (" << d << ", " << d_rev << ", " << d_win << ")" << std::endl;
-                }
-            }
+            // Target is shorter, search target in query
+            dist = mutation_tools::bit_partial_match(target.bits[0], query.bits[0], target.length, query.length, max_dist);
         }
-        ++query_index;
+        
+        if(dist >= 0){
+            results[dist].insert(target);
+        }
     }
+    return results;
 }
 
-void levenshtein_compare(const std::string& query, const std::vector<std::string>& barcodes, int max_dist = 4){
-    std::cout << "\n=== Levenshtein Edit Distance Comparison for '" << query << "' ===" << std::endl;
-    
-    auto start_time = std::chrono::high_resolution_clock::now();
-    std::vector<std::pair<std::string, int>> results;
-    std::vector<std::string> padded_barcodes;
-    for (const auto& barcode : barcodes) {
-        padded_barcodes.push_back("NNN" + barcode + "NNN");
-    }
-    for (size_t i = 0; i < padded_barcodes.size(); ++i) {
-        uint end = 22;
-        int dist = edit_distance_wildcard(padded_barcodes[i], query, end, 4);
-        if (dist <= max_dist) {
-            // Push the original barcode instead of the padded version.
-            results.push_back({barcodes[i], dist});
-        }
-    }
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double elapsed = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    
-    // Sort by edit distance
-    std::sort(results.begin(), results.end(), 
-              [](const auto& a, const auto& b) { return a.second < b.second; });
-    
-    // Group by edit distance
-    std::unordered_map<int, std::vector<std::string>> grouped;
-    for (const auto& [barcode, dist] : results) {
-        grouped[dist].push_back(barcode);
-    }
-
-    std::cout << "Found " << results.size() << " matches with edit distance <= " << max_dist << std::endl;
-    std::cout << "Time taken: " << elapsed << " ms" << std::endl;
-    
-}
-
-void levenshtein_compare_opt(const std::string& query, const std::vector<std::string>& barcodes, int max_dist = 4){
-    std::cout << "\n=== Levenshtein Edit Distance Comparison, TWO ROW for '" << query << "' ===" << std::endl;
-    
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    std::vector<std::pair<std::string, int>> results;
-    std::vector<std::string> padded_barcodes;
-    for (const auto& barcode : barcodes) {
-        padded_barcodes.push_back("NNN" + barcode + "NNN");
-    }
-    for (const auto& barcode : padded_barcodes) {
-        uint end = 22;
-        int dist = edit_distance_wildcard_2row(barcode, query, end, 4);
-        if (dist <= max_dist) {
-            results.push_back({barcode, dist});
-        }
-    }
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double elapsed = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    
-    // Sort by edit distance
-    std::sort(results.begin(), results.end(), 
-              [](const auto& a, const auto& b) { return a.second < b.second; });
-    
-    // Group by edit distance
-    std::unordered_map<int, std::vector<std::string>> grouped;
-    for (const auto& [barcode, dist] : results) {
-        grouped[dist].push_back(barcode);
-    }
-
-    std::cout << "Found " << results.size() << " matches with edit distance <= " << max_dist << std::endl;
-    std::cout << "Time taken: " << elapsed << " ms" << std::endl;
-    
-}
-
-//function that returns the unique best match if available.
-std::string levenshtein_compare_sort_(const std::string& query, const std::vector<std::string>& barcodes, int max_dist = 4) {
-    std::cout << "\n=== Levenshtein Edit Distance Comparison for '" << query << "' ===" << std::endl;
-    auto start_time = std::chrono::high_resolution_clock::now();
-    // Store each candidate barcode (original, unpadded) with its computed edit distance.
-    std::vector<std::pair<std::string, int>> results;
-    std::vector<std::string> padded_barcodes;
-    for (const auto& barcode : barcodes) {
-        padded_barcodes.push_back("NNN" + barcode + "NNN");
-    }
-    uint end = 22;
-    // Compute distances.
-    for (size_t i = 0; i < padded_barcodes.size(); ++i) {
-        int dist = edit_distance_wildcard(padded_barcodes[i], query, end, 4);
-        if (dist <= max_dist) {
-            results.push_back({barcodes[i], dist});
-        }
-    }
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double distance_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    
-    // Sort the results by edit distance (lowest first).
-    std::sort(results.begin(), results.end(), 
-              [](const auto& a, const auto& b) { return a.second < b.second; });
-    
-    // Group the results by edit distance.
-    std::unordered_map<int, std::vector<std::string>> grouped;
-    for (const auto& [barcode, dist] : results) {
-        grouped[dist].push_back(barcode);
-    }
-    
-    // Determine the unique best result:
-    // Find the smallest edit distance and check if its group has exactly one candidate.
-    auto search_time = std::chrono::high_resolution_clock::now();
-    int best_distance = -1;
-    std::string best_result = "";
-    for (const auto& kv : grouped) {
-        if (best_distance == -1 || kv.first < best_distance) {
-            best_distance = kv.first;
-        }
-    }
-    if (best_distance != -1 && grouped[best_distance].size() == 1) {
-        best_result = grouped[best_distance][0];
-        std::cout << "Unique best result (edit distance " << best_distance << "): " << best_result << std::endl;
-    } else if (best_distance != -1) {
-        std::cout << "Ambiguous best results at edit distance " << best_distance 
-                  << " (" << grouped[best_distance].size() << " candidates)." << std::endl;
-    } else {
-        std::cout << "No candidate barcodes found within the maximum edit distance." << std::endl;
-    }
-
-    auto end_find = std::chrono::high_resolution_clock::now();
-    double find_time = std::chrono::duration<double, std::milli>(end_find - search_time).count();
-
-    std::cout << "Found " << results.size() << " matches with edit distance <= " << max_dist << std::endl;
-    std::cout << "Time taken for levenshtein distances: " << distance_time << " ms" << std::endl;
-    std::cout << "Time taken for finding best match: " << find_time << " ms" << std::endl;
-    std::cout << "Total run time: " << distance_time + find_time << " ms" << std::endl;
-
-    return best_result;
-}
-
-void levenshtein_compare_batch(
-    const std::vector<std::string>& queries, 
-    const std::vector<std::string>& barcodes, 
-    int max_dist = 4) {
-    
-    // Open the output CSV file
-    std::ofstream output_file("/Users/cmv/Desktop/lv_output.csv");
-    if(!output_file.is_open()) {
-        std::cerr << "Error: Could not open output file for writing." << std::endl;
+void print_lvdist_results(const std::map<int, std::unordered_set<int64_seq>>& results, const std::string& query_seq = "") {
+    if (results.empty()) {
+        std::cout << "No matches found.\n";
         return;
     }
-    // Write CSV header
-    output_file << "query,matched,edit_dist\n";
     
-    // Store results for all queries: query_index -> [(barcode, distance)]
-    std::vector<std::vector<std::pair<std::string, int>>> all_results(queries.size());
-    size_t total_matches = 0;
-    
-    std::cout << "\n=== Batch Levenshtein Edit Distance Comparison for " << queries.size() << " queries ===" << std::endl;
-    auto start_time = std::chrono::high_resolution_clock::now();
-    std::vector<std::string> padded_barcodes;
-
-    for (const auto& barcode : barcodes) {
-        padded_barcodes.push_back(barcode);
+    if (!query_seq.empty()) {
+        std::cout << "Query: " << query_seq << "\n";
     }
-
-    for (size_t q = 0; q < queries.size(); ++q) {
-        const std::string& query = queries[q];
-        auto& results = all_results[q];
-        for (size_t i = 0; i < barcodes.size(); ++i) {
-            uint end = 16;
-            int dist = edit_distance_wildcard(padded_barcodes[i], query, end, max_dist);
-            if (dist <= max_dist) {
-                results.push_back({barcodes[i], dist});
+    std::cout << "Partial match results:\n";
+    
+    int total_matches = 0;
+    for (const auto& [distance, sequences] : results) {
+        std::cout << "Distance " << distance << " (" << sequences.size() << " matches):\n";
+        for (const auto& seq : sequences) {
+            if(distance <= 2){
+                std::cout << "  " << seq.bits_to_sequence() << "\n";
             }
         }
-
-        std::sort(results.begin(), results.end(),
-                  [](const auto& a, const auto& b) { return a.second < b.second; });
-    }    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double elapsed = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-
-    // Write all results to the CSV file
-    for (size_t q = 0; q < queries.size(); ++q) {
-        const std::string& query = queries[q];
-        const auto& results = all_results[q];
-        
-        total_matches += results.size();
-        
-        for (const auto& [barcode, dist] : results) {
-            {
-                output_file << query << "," << barcode << "," << dist << "\n";
-            }
-        }
+        total_matches += sequences.size();
     }
     
-    output_file.close();
-    
-    std::cout << "Found " << total_matches << " total matches with edit distance <= " << max_dist << std::endl;
-    std::cout << "Time taken: " << elapsed << " ms" << std::endl;
-    std::cout << "Average time per query: " << elapsed / queries.size() << " ms" << std::endl;
-    std::cout << "Results written to: " << "/Users/cmv/Desktop/lv_output.csv" << std::endl;
+    std::cout << "Total matches: " << total_matches << "\n\n";
 }
 
-// Test file for barcode_correction functionalities
-int main() {
-    std::string barcode_file = "/Users/cmv/Desktop/la1_barcodes.csv";
-    std::string barcode_to_correct_file = "/Users/cmv/Desktop/barcodes_to_correct.csv";
-    // Load barcodes
-    std::cout << "Loading barcodes from " << barcode_file << "..." << std::endl;
-    auto barcodes = load_barcodes(barcode_file);
-    auto putative_barcodes = load_barcodes(barcode_to_correct_file);
-    std::cout << "Loaded " << putative_barcodes.size() << " barcodes to correct." << std::endl;
-    auto bit_barcodes = load_bit_barcodes(barcode_file);
-    std::cout << "Loaded " << barcodes.size() << " barcodes." << std::endl;
-    std::cout << "Loaded " << bit_barcodes.size() << " barcodes and converted to bits." << std::endl;
-    auto bit_barcodes_to_correct = load_bit_barcodes(barcode_to_correct_file);
-    std::cout << "Loaded " << bit_barcodes_to_correct.size() << " barcodes to correct." << std::endl;
-    if (barcodes.empty()) {
-        std::cerr << "No barcodes loaded. Exiting." << std::endl;
-        return 1;
-    }    
-
-    // --- Test 1: Encode/Decode a 16-base read ---
-    std::string read = "AACAGTTATTACTTCT"; // 16 bases
-    int64_seq encoded(read);
-    std::string decoded = encoded.bits_to_sequence();
+// reference edit distance testing
+int reference_edit_distance(const std::string& s1, const std::string& s2) {
+    int m = s1.length();
+    int n = s2.length();
     
-    std::cout << "Original read: " << read << "\n";
-    std::cout << "Decoded read:  " << decoded << "\n";
-    std::cout << "Encoded representation:\n";
-    encoded.print_int64_seq();
-
-    // --- Test 2: Barcode Mutation ---
-    // Use a poly-A barcode of 16 bases and generate mutations with 2 rounds.
-    std::string barcode = "AACAGTTATTACTTCT"; // 16 bases (all A's)
-    int64_seq int64_barcode(barcode);
+    std::vector<std::vector<int>> dp(m + 1, std::vector<int>(n + 1));
     
-    std::cout << "\nSequence: " << barcode << "\n";
-    int64_barcode.print_int64_seq();
+    for (int i = 0; i <= m; i++) dp[i][0] = i;
+    for (int j = 0; j <= n; j++) dp[0][j] = j;
     
-    // Generate recursive mutations (2 rounds) for the first chunk of the poly-A barcode.
-    // (Assuming your poly-A fits in one int64_t, since 16 < 32)
-
-    auto start_mutations = std::chrono::high_resolution_clock::now();
-    int rounds = 2;
-    std::vector<int64_t> recursive_mutations = generate_mutated_barcodes(int64_barcode, rounds);
-    auto stop_mutations = std::chrono::high_resolution_clock::now();
-    double time_mutations = std::chrono::duration<double, std::milli>(stop_mutations - start_mutations).count();
-
-    std::cout << "\n============= Recursive mutations for " << barcode << ": =============\n";
-    std::cout << "\nGenerated " << recursive_mutations.size() << " barcodes after " << rounds << " rounds of mutation.";
-    std::cout << "\nTime elapsed for generating mutations: " << time_mutations << " milliseconds.\n";
-    auto seconds_per_million = time_mutations*1000;
-    auto minutes_per_million = seconds_per_million/60;
-    std::cout << "Assuming that this time holds, generating mutations for a dataset of ~1M unique barcodes single-threaded will take: " << 
-    //time mutations by 1000 is 1 million barcodes divided by 1000 milliseconds to seconds conversion
-    seconds_per_million <<
-     " seconds (" <<
-     minutes_per_million << " minutes)\n";
-
-    auto seconds_per_barcode = time_mutations/1000;
-    auto seconds_per_rageseq = seconds_per_barcode*7092;
-    std::cout << "For a much more reasonable estimate, generating mutations for a dataset of 7092 barcodes single-threaded will take: " << seconds_per_rageseq << " seconds.\n\n";
-
-    auto start_map_scan = std::chrono::high_resolution_clock::now();
-    for (auto m : recursive_mutations) {
-        int64_seq temp;
-        temp.length = 16;
-        temp.bits.push_back(m);
-        auto it = bit_barcodes.find(m);
-        if (it != bit_barcodes.end()) {
-            temp.print_int64_seq();
+    for (int i = 1; i <= m; i++) {
+        for (int j = 1; j <= n; j++) {
+            if (s1[i-1] == s2[j-1]) {
+                dp[i][j] = dp[i-1][j-1];
+            } else {
+                dp[i][j] = 1 + std::min({dp[i-1][j], dp[i][j-1], dp[i-1][j-1]});
+            }
         }
     }
-    auto stop_map_scan = std::chrono::high_resolution_clock::now();
-    double total_map_scan = std::chrono::duration<double, std::milli>(stop_map_scan - start_map_scan).count();
-    std::cout << "Time elapsed for scanning " << recursive_mutations.size() << " sequences: " << total_map_scan << " milliseconds.\n";
-    std::cout << "Average time scanning per sequence: " << total_map_scan/recursive_mutations.size() << " ms. \n";
     
-    // --- Test 3: Barcode Shifting ---
-    // Generate shifted barcode candidates for a selected barcode with shift of (?)
-    //int shift = 6;
-    auto start_shifting = std::chrono::high_resolution_clock::now();
-    //std::vector<int64_t> shifted_candidates = generate_shifted_barcodes(int64_barcode, shift);
-    int shift = 4;
-    auto shifted_candidates = generate_int64_shifted_barcodes(int64_barcode, shift);
+    return dp[m][n];
+}
+
+// testing the debug function
+void debug_sequence_encoding(const std::string& seq) {
+    int64_seq encoded(seq);
+    std::string decoded = encoded.bits_to_sequence();
     
-    auto stop_shifting = std::chrono::high_resolution_clock::now();
-    double time_shifting = std::chrono::duration<double, std::milli>(stop_shifting - start_shifting).count();
+    std::cout << "Original: " << seq << "\n";
+    std::cout << "Decoded:  " << decoded << "\n";
+    std::cout << "Length:   " << encoded.length << "\n";
+    std::cout << "Bits:     " << std::bitset<64>(encoded.bits[0]) << "\n";
+    std::cout << "Bits hex: 0x" << std::hex << encoded.bits[0] << std::dec << "\n";
+    std::cout << "Match:    " << (seq == decoded ? "YES" : "NO") << "\n\n";
+}
 
-    std::cout << "\n============= Shifting mutations for " << barcode << ": =============\n";
-    std::cout << "\nGenerated " << shifted_candidates.size() << " barcodes via " << shift << " shifted bases.";
-    std::cout << "\nTime elapsed for generating shifted_candidates: " << time_shifting << " milliseconds.\n\n";
-
-    auto start_shift_scan = std::chrono::high_resolution_clock::now();
-    for (auto s : shifted_candidates) {
-        std::string shifted_barcode = s.bits_to_sequence();
-        std::cout << "Shifted candidate: " <<  shifted_barcode << "\n";
+void test_bit_ld(const std::string& seq1, const std::string& seq2) {
+    int64_seq s1(seq1);
+    int64_seq s2(seq2);
+    
+    std::cout << "=== Direct bit_ld test ===\n";
+    std::cout << "Seq1: " << seq1 << "\n";
+    std::cout << "Seq2: " << seq2 << "\n";
+    
+    // Check if lengths match
+    if (s1.length != s2.length) {
+        std::cout << "ERROR: Length mismatch! " << s1.length << " vs " << s2.length << "\n\n";
+        return;
     }
-    auto stop_shift_scan = std::chrono::high_resolution_clock::now();
-    double total_shift_scan = std::chrono::duration<double, std::milli>(stop_shift_scan - start_shift_scan).count();
-    std::cout << "Time elapsed for scanning " << shifted_candidates.size() << " sequences: " << total_shift_scan << " milliseconds.\n";
-    std::cout << "Average time scanning per sequence: " << total_shift_scan/shifted_candidates.size() << " ms. \n";
+    
+    int ref_dist = reference_edit_distance(seq1, seq2);
+    int bit_dist = mutation_tools::bit_ld(s1.bits[0], s2.bits[0], s1.length, 10);
+    int wrapper_dist = mutation_tools::int64_lvdist(s1, s2, 10);
+    
+    std::cout << "Reference distance: " << ref_dist << "\n";
+    std::cout << "bit_ld distance:    " << bit_dist << "\n";
+    std::cout << "Wrapper distance:   " << wrapper_dist << "\n";
+    std::cout << "Match: " << (ref_dist == bit_dist && ref_dist == wrapper_dist ? "YES" : "NO") << "\n\n";
+}
 
-    // Parse optional parameters
-    int max_edit_distance = 3;
-    double min_similarity = 70.0;
-    // Run comparisons
-    edlib_compare(barcode, barcodes, 4);
-   // rapidfuzz_compare(barcode, barcodes, min_similarity);
-    levenshtein_compare(barcode, barcodes, 4);
-    //levenshtein_compare_sort_(barcode, barcodes, 4);
-    test_find_candidates();
-    //test_find_candidates_batch(bit_barcodes_to_correct, bit_barcodes, 4);
-    //levenshtein_compare_opt(barcode, barcodes, 4);
-    //levenshtein_compare_batch(putative_barcodes, barcodes,  4);
-    //edlib_compare_batch(putative_barcodes, barcodes, 4, false);
+void test_bit_ld_variable(const std::string& seq1, const std::string& seq2) {
+    int64_seq s1(seq1);
+    int64_seq s2(seq2);
+    
+    std::cout << "=== Direct bit_ld test ===\n";
+    std::cout << "Seq1: " << seq1 << " (length: " << s1.length << ")\n";
+    std::cout << "Seq2: " << seq2 << " (length: " << s2.length << ")\n";
+    
+    // Calculate reference distance (works for any lengths)
+    int ref_dist = reference_edit_distance(seq1, seq2);
+    std::cout << "Reference distance: " << ref_dist << "\n";
+    
+    // Test the bit-parallel algorithm for variable lengths
+    int dist = bit_ld_variable(s1.bits[0], s2.bits[0], s1.length, s2.length, 10);
+    std::cout << "bit_ld_variable:    " << dist << "\n";
+    
+    // Only test the original bit_ld if lengths are equal
+    if (s1.length == s2.length) {
+        int bit_dist = mutation_tools::bit_ld(s1.bits[0], s2.bits[0], s1.length, 10);
+        int wrapper_dist = mutation_tools::int64_lvdist(s1, s2, 10);
+        
+        std::cout << "bit_ld distance:    " << bit_dist << "\n";
+        std::cout << "Wrapper distance:   " << wrapper_dist << "\n";
+        
+        bool all_match = (ref_dist == bit_dist && ref_dist == wrapper_dist && ref_dist == dist);
+        std::cout << "All algorithms match: " << (all_match ? "YES" : "NO") << "\n";
+        
+        if (!all_match) {
+            std::cout << "MISMATCH DETAILS:\n";
+            std::cout << "  Reference vs bit_ld: " << (ref_dist == bit_dist ? "OK" : "FAIL") << "\n";
+            std::cout << "  Reference vs wrapper: " << (ref_dist == wrapper_dist ? "OK" : "FAIL") << "\n";
+            std::cout << "  Reference vs bit_ld_variable: " << (ref_dist == dist ? "OK" : "FAIL") << "\n";
+        }
+    } else {
+        // Different lengths - only compare reference with bit_ld_variable
+        bool match = (ref_dist == dist);
+        std::cout << "Variable-length match: " << (match ? "YES" : "NO") << "\n";
+        
+        if (!match) {
+            std::cout << "MISMATCH: Reference=" << ref_dist << ", bit_ld_variable=" << dist << "\n";
+        }
+        
+        std::cout << "Note: Original bit_ld and wrapper only work with equal-length sequences\n";
+    }
+    
+    std::cout << "\n";
+}
+
+void test_bit_ld_partial(const std::string & full_seq, const std::string & path) {
+    int64_seq full(full_seq);
+    std::unordered_set<int64_seq> targets = load_simple_wl(path);
+    std::cout << "=== Partial bit_ld test ===\n";
+    std::cout << "Full sequence: " << full_seq << " (length: " << full.length << ")\n";
+    std::cout << "Targets loaded: " << targets.size() << "\n";  
+
+    // Run the partial bit_ld distance calculation
+    std::cout << "Calculating partial distances...\n";
+    auto results = int64_lvdist_partial(full, targets);
+    print_lvdist_results(results, full_seq);
+}
+
+void test_bit_ld_partial_timing(const std::string & full_seq, const std::string & path) {
+    auto start_total = std::chrono::high_resolution_clock::now();
+    
+    int64_seq full(full_seq);
+    
+    auto start_load = std::chrono::high_resolution_clock::now();
+    std::unordered_set<int64_seq> targets = load_simple_wl(path);
+    auto end_load = std::chrono::high_resolution_clock::now();
+    auto load_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_load - start_load);
+    
+    std::cout << "=== Partial bit_ld test ===\n";
+    std::cout << "Full sequence: " << full_seq << " (length: " << full.length << ")\n";
+    std::cout << "Targets loaded: " << targets.size() << " (took " << load_time.count() << "ms)\n";  
+    
+    // Run the partial bit_ld distance calculation
+    std::cout << "Calculating partial distances...\n";
+    auto start_calc = std::chrono::high_resolution_clock::now();
+    auto results = int64_lvdist_partial(full, targets, 1);
+    auto end_calc = std::chrono::high_resolution_clock::now();
+    auto calc_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_calc - start_calc);
+    
+    auto end_total = std::chrono::high_resolution_clock::now();
+    auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_total - start_total);
+    
+    std::cout << "Calculation completed in " << calc_time.count() << "ms\n";
+    std::cout << "Total time: " << total_time.count() << "ms\n\n";
+    
+    print_lvdist_results(results, full_seq);
+}
+
+// Helper function to run comprehensive tests
+void run_comprehensive_tests() {
+    std::cout << "=== ACTUAL DATA TESTS ===\n";
+    test_bit_ld_variable("AAGCCAAGAAGATCTG", "CGATCTAAGCCAAGAAGATCTGGTGTCG");   // identical match, subsequence
+    test_bit_ld_variable("TAAGCCAAGAAGATCT", "CGATCTAAGCCAAGAAGATCTGGTGTCG");   // identical match, subsequence, part 2
+    test_bit_ld_variable("AAACCCAAGAAGATCT", "CGATCTAAGCCAAGAAGATCTGGTGTCG");   // original barcode
+    test_bit_ld_variable("CGATCTAAGCCAAGAAGATCTGGTGTCG","AAACCCAAGAAGATCT");   // original barcode
+    test_bit_ld_partial_timing("CGATCTAAGCCAAGAAGATCTGGTGTCG", "/Users/cmv/Desktop/rad_paper/cellranger_whitelists/3M-february-2018-3v3.txt.gz"); // partial match test with file
+    test_bit_ld_variable("AAACCCACAGATCGTT","AAACCCAAAGATCTTTCGTGTATTTT");
+    test_bit_ld_variable("AAACCCAAGAAGATCT","AAACCCAAAGATCTTTCGTGTATTTT");
+
+}
+
+struct BitTrie {
+    struct TrieNode {
+        TrieNode* children[4];  // A=0, T=1, C=2, G=3
+        bool is_end;
+        int64_seq sequence;     // Store the complete sequence at leaf nodes
+        
+        TrieNode() : is_end(false) {
+            for (int i = 0; i < 4; i++) {
+                children[i] = nullptr;
+            }
+        }
+        
+        ~TrieNode() {
+            for (int i = 0; i < 4; i++) {
+                delete children[i];
+            }
+        }
+    };
+    
+    TrieNode* root;
+    
+    BitTrie() {
+        root = new TrieNode();
+    }
+    
+    ~BitTrie() {
+        delete root;
+    }
+    
+    // Insert a sequence using its bit encoding
+    void insert(const int64_seq& seq) {
+        if (seq.bits.empty() || seq.length > 32) return;
+        
+        TrieNode* current = root;
+        int64_t bits = seq.bits[0];
+        
+        // Traverse from least significant bits (position 0) to most significant
+        for (int pos = 0; pos < seq.length; pos++) {
+            int nucleotide = (bits >> (2 * pos)) & 3;  // Extract 2 bits
+            
+            if (current->children[nucleotide] == nullptr) {
+                current->children[nucleotide] = new TrieNode();
+            }
+            current = current->children[nucleotide];
+        }
+        
+        current->is_end = true;
+        current->sequence = seq;
+    }
+    
+    // Exact search for a sequence
+    bool search(const int64_seq& seq) {
+        TrieNode* node = find_node(seq);
+        return node != nullptr && node->is_end;
+    }
+    
+    // Find all sequences with exact prefix match
+    std::vector<int64_seq> prefix_search(const int64_seq& prefix) {
+        std::vector<int64_seq> results;
+        TrieNode* prefix_node = find_node(prefix);
+        
+        if (prefix_node != nullptr) {
+            collect_all_sequences(prefix_node, results);
+        }
+        
+        return results;
+    }
+    
+    // Approximate search allowing up to max_mismatches
+    std::vector<std::pair<int64_seq, int>> approximate_search(const int64_seq& query, int max_mismatches) {
+        std::vector<std::pair<int64_seq, int>> results;
+        if (query.bits.empty() || query.length > 32) return results;
+        
+        approximate_search_helper(root, query.bits[0], query.length, 0, 0, max_mismatches, results);
+        return results;
+    }
+    
+private:
+    // Helper to find a node for exact sequence
+    TrieNode* find_node(const int64_seq& seq) {
+        if (seq.bits.empty() || seq.length > 32) return nullptr;
+        
+        TrieNode* current = root;
+        int64_t bits = seq.bits[0];
+        
+        for (int pos = 0; pos < seq.length; pos++) {
+            int nucleotide = (bits >> (2 * pos)) & 3;
+            
+            if (current->children[nucleotide] == nullptr) {
+                return nullptr;
+            }
+            current = current->children[nucleotide];
+        }
+        
+        return current;
+    }
+    
+    // Collect all sequences in subtree
+    void collect_all_sequences(TrieNode* node, std::vector<int64_seq>& results) {
+        if (node->is_end) {
+            results.push_back(node->sequence);
+        }
+        
+        for (int i = 0; i < 4; i++) {
+            if (node->children[i] != nullptr) {
+                collect_all_sequences(node->children[i], results);
+            }
+        }
+    }
+    
+    // Recursive approximate search with mismatch counting
+    void approximate_search_helper(TrieNode* node, int64_t query_bits, int query_len, 
+                                 int pos, int mismatches, int max_mismatches,
+                                 std::vector<std::pair<int64_seq, int>>& results) {
+        
+        // If we've reached the end of the query
+        if (pos == query_len) {
+            if (node->is_end) {
+                results.emplace_back(node->sequence, mismatches);
+            }
+            return;
+        }
+        
+        // Early termination if too many mismatches
+        if (mismatches > max_mismatches) {
+            return;
+        }
+        
+        int query_nucleotide = (query_bits >> (2 * pos)) & 3;
+        
+        // Try all possible nucleotides at this position
+        for (int nuc = 0; nuc < 4; nuc++) {
+            if (node->children[nuc] != nullptr) {
+                int new_mismatches = mismatches + (nuc != query_nucleotide ? 1 : 0);
+                approximate_search_helper(node->children[nuc], query_bits, query_len,
+                                        pos + 1, new_mismatches, max_mismatches, results);
+            }
+        }
+    }
+    
+public:
+    // Build trie from a set of sequences
+    static BitTrie build_from_set(const std::unordered_set<int64_seq>& sequences) {
+        BitTrie trie;
+        for (const auto& seq : sequences) {
+            trie.insert(seq);
+        }
+        return trie;
+    }
+    
+    // Get statistics about the trie
+    void print_stats() {
+        int total_nodes = count_nodes(root);
+        int leaf_nodes = count_leaves(root);
+        std::cout << "Trie stats: " << total_nodes << " total nodes, " 
+                  << leaf_nodes << " leaf nodes\n";
+    }
+    
+private:
+    int count_nodes(TrieNode* node) {
+        if (node == nullptr) return 0;
+        
+        int count = 1;
+        for (int i = 0; i < 4; i++) {
+            count += count_nodes(node->children[i]);
+        }
+        return count;
+    }
+    
+    int count_leaves(TrieNode* node) {
+        if (node == nullptr) return 0;
+        if (node->is_end) return 1;
+        
+        int count = 0;
+        for (int i = 0; i < 4; i++) {
+            count += count_leaves(node->children[i]);
+        }
+        return count;
+    }
+};
+
+// Test function using entire whitelist
+// Test function using entire whitelist with k-mer approach
+void test_bit_trie(const std::string& query_seq, const std::string& whitelist_path, int max_mismatches = 2, int kmer_size = 16) {
+    auto start_total = std::chrono::high_resolution_clock::now();
+    
+    // Load whitelist
+    std::cout << "=== BitTrie Test ===\n";
+    std::cout << "Query: " << query_seq << "\n";
+    std::cout << "Loading whitelist from: " << whitelist_path << "\n";
+    
+    auto start_load = std::chrono::high_resolution_clock::now();
+    auto whitelist = load_simple_wl(whitelist_path);
+    auto end_load = std::chrono::high_resolution_clock::now();
+    auto load_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_load - start_load);
+    
+    std::cout << "Loaded " << whitelist.size() << " sequences (" << load_time.count() << "ms)\n";
+    
+    // Build trie
+    std::cout << "Building trie...\n";
+    auto start_build = std::chrono::high_resolution_clock::now();
+    BitTrie trie = BitTrie::build_from_set(whitelist);
+    auto end_build = std::chrono::high_resolution_clock::now();
+    auto build_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_build - start_build);
+    
+    std::cout << "Trie built (" << build_time.count() << "ms)\n";
+    trie.print_stats();
+    
+    // Test k-mer searches
+    auto kmers = seq_utils::kmerize(query_seq, kmer_size);
+    std::cout << "\nGenerated " << kmers.size() << " k-mers of size " << kmer_size << "\n";
+    
+    for (const auto& kmer : kmers) {
+        std::cout << "Testing k-mer: " << kmer << "\n";
+        int64_seq kmer_seq(kmer);
+        
+        // Exact search for this k-mer
+        auto start_exact = std::chrono::high_resolution_clock::now();
+        bool exact_found = trie.search(kmer_seq);
+        auto end_exact = std::chrono::high_resolution_clock::now();
+        auto exact_time = std::chrono::duration_cast<std::chrono::microseconds>(end_exact - start_exact);
+        
+        std::cout << "  Exact search: " << (exact_found ? "Found" : "Not found")
+                  << " (" << exact_time.count() << "μs)\n";
+        
+        // Approximate search for this k-mer
+        auto start_approx = std::chrono::high_resolution_clock::now();
+        auto approx_results = trie.approximate_search(kmer_seq, max_mismatches);
+        auto end_approx = std::chrono::high_resolution_clock::now();
+        auto approx_time = std::chrono::duration_cast<std::chrono::microseconds>(end_approx - start_approx);
+        
+        std::cout << "  Approximate search: " << approx_results.size() << " matches"
+                  << " (" << approx_time.count() << "μs)\n";
+        
+        // Show first few approximate matches
+        if (!approx_results.empty()) {
+            std::map<int, int> dist_counts;
+            for (const auto& [seq, dist] : approx_results) {
+                dist_counts[dist]++;
+            }
+            std::cout << "    By distance: ";
+            for (const auto& [dist, count] : dist_counts) {
+                std::cout << "d" << dist << "=" << count << " ";
+            }
+            std::cout << "\n";
+        }
+        std::cout << "\n";
+    }
+    
+    auto end_total = std::chrono::high_resolution_clock::now();
+    auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_total - start_total);
+    std::cout << "Total time: " << total_time.count() << "ms\n";
+    std::cout << "Breakdown: Load=" << load_time.count() << "ms, Build=" << build_time.count() 
+              << "ms\n\n";
+}
+
+
+// Add this to your existing code - Levenshtein Automaton implementation
+// Enhanced Myers algorithm with automaton-style optimizations
+
+class LevenshteinAutomaton {
+private:
+    std::string query;
+    int max_edit_distance;
+    int query_length;
+    
+public:
+    LevenshteinAutomaton(const std::string& query_str, int max_dist) 
+        : query(query_str), max_edit_distance(max_dist), query_length(query_str.length()) {}
+    
+    // Test if a target string is accepted (within edit distance)
+    bool accepts(const std::string& target) const {
+        return get_edit_distance(target) >= 0;
+    }
+    
+    // Get exact edit distance if within threshold, -1 otherwise
+    int get_edit_distance(const std::string& target) const {
+        int target_len = target.length();
+        
+        // Early termination based on length difference
+        if (std::abs(target_len - query_length) > max_edit_distance) {
+            return -1;
+        }
+        
+        // Use two vectors for DP computation
+        std::vector<int> prev_row(target_len + 1);
+        std::vector<int> curr_row(target_len + 1);
+        
+        // Initialize first row (all insertions)
+        for (int j = 0; j <= target_len; j++) {
+            prev_row[j] = j;
+        }
+        
+        // Process each character of query
+        for (int i = 1; i <= query_length; i++) {
+            curr_row[0] = i; // Deletion cost
+            int min_in_row = i;
+            
+            for (int j = 1; j <= target_len; j++) {
+                int cost = (query[i-1] == target[j-1]) ? 0 : 1;
+                
+                curr_row[j] = std::min({
+                    prev_row[j] + 1,      // deletion
+                    curr_row[j-1] + 1,    // insertion
+                    prev_row[j-1] + cost  // substitution/match
+                });
+                
+                min_in_row = std::min(min_in_row, curr_row[j]);
+            }
+            
+            // Early termination: if minimum in row exceeds max distance
+            if (min_in_row > max_edit_distance) {
+                return -1;
+            }
+            
+            std::swap(prev_row, curr_row);
+        }
+        
+        return (prev_row[target_len] <= max_edit_distance) ? prev_row[target_len] : -1;
+    }
+};
+
+
+class MyersAutomaton {
+private:
+    std::string query;
+    int64_t query_bits;
+    int query_length;
+    int max_edit_distance;
+    
+    // Pre-computed pattern equality vectors (Myers optimization)
+    int64_t Peq[4];
+    int64_t pattern_mask;
+    
+public:
+    MyersAutomaton(const std::string& query_str, int max_dist) 
+        : query(query_str), max_edit_distance(max_dist) {
+        
+        int64_seq query_seq(query_str);
+        query_bits = query_seq.bits[0];
+        query_length = query_seq.length;
+        
+        // Pre-build pattern equality vectors (do this once, reuse many times)
+        Peq[0] = Peq[1] = Peq[2] = Peq[3] = 0;
+        for (int i = 0; i < query_length; i++) {
+            int nuc = (query_bits >> (2 * i)) & 3;
+            Peq[nuc] |= (1LL << i);
+        }
+        
+        pattern_mask = (1LL << query_length) - 1;
+    }
+    
+    // Ultra-fast acceptance test using your Myers algorithm
+    bool accepts(const int64_seq& target) const {
+        return get_edit_distance_fast(target) >= 0;
+    }
+    
+    // Your Myers algorithm, but optimized for automaton use
+    int get_edit_distance_fast(const int64_seq& target) const {
+        if (target.bits.empty() || target.length > 32) return -1;
+        
+        int target_len = target.length;
+        int64_t target_bits = target.bits[0];
+        
+        // Early termination based on length difference (automaton optimization)
+        if (std::abs(target_len - query_length) > max_edit_distance) {
+            return -1;
+        }
+        
+        // Your Myers bit-parallel core (but optimized for partial matching)
+        int64_t Pv = pattern_mask;
+        int64_t Mv = 0;
+        int score = query_length;
+        int min_score = query_length; // Track minimum across all positions
+        
+        for (int j = 0; j < target_len; j++) {
+            int target_nuc = (target_bits >> (2 * j)) & 3;
+            int64_t Eq = Peq[target_nuc] & pattern_mask; // Use pre-computed Peq!
+            
+            // Myers core computation (your existing code)
+            int64_t Xv = Eq | Mv;
+            int64_t Xh = (((Eq & Pv) + Pv) ^ Pv) | Eq;
+            int64_t Ph = Mv | ~(Xh | Pv);
+            int64_t Mh = Pv & Xh;
+            
+            Ph &= pattern_mask;
+            Mh &= pattern_mask;
+            
+            if (Ph & (1LL << (query_length - 1))) score++;
+            if (Mh & (1LL << (query_length - 1))) score--;
+            
+            min_score = std::min(min_score, score);
+            
+            // Automaton-style early termination
+            if (min_score == 0) return 0; // Perfect match found
+            
+            // Enhanced early termination: if impossible to get within max_dist
+            int remaining = target_len - j - 1;
+            if (score - remaining > max_edit_distance) {
+                return -1; // Impossible to reach acceptable distance
+            }
+            
+            Ph <<= 1;
+            Pv = ((Mh << 1) | ~(Xv | Ph)) & pattern_mask;
+            Mv = Ph & Xv;
+        }
+        
+        return (min_score <= max_edit_distance) ? min_score : -1;
+    }
+    
+    // Batch processing optimized for large whitelists
+    std::vector<std::pair<int64_seq, int>> find_all_matches(const std::vector<int64_seq>& targets) const {
+        std::vector<std::pair<int64_seq, int>> matches;
+        matches.reserve(targets.size() / 100); // Rough estimate
+        
+        for (const auto& target : targets) {
+            int dist = get_edit_distance_fast(target);
+            if (dist >= 0) {
+                matches.emplace_back(target, dist);
+                
+                // Optional: early exit if you only need a few matches
+                // if (matches.size() >= some_limit) break;
+            }
+        }
+        
+        return matches;
+    }
+};
+
+// Debug function to understand the differences
+void debug_myers_vs_hybrid_difference(const std::string& query_seq, const std::string& whitelist_path, int max_dist = 2) {
+    std::cout << "=== DEBUG: Myers vs Hybrid Differences ===\n";
+    std::cout << "Query: " << query_seq << " (length: " << query_seq.length() << ")\n";
+    std::cout << "Max distance: " << max_dist << "\n\n";
+    
+    // Load a small sample for detailed analysis
+    auto whitelist = load_simple_wl(whitelist_path);
+    std::vector<int64_seq> sample;
+    
+    // Take first 100 sequences for detailed analysis
+    int count = 0;
+    for (const auto& seq : whitelist) {
+        sample.push_back(seq);
+        if (++count >= 100) break;
+    }
+    
+    std::cout << "Analyzing first " << sample.size() << " sequences...\n\n";
+    
+    int64_seq query_bits(query_seq);
+    MyersAutomaton hybrid(query_seq, max_dist);
+    
+    std::vector<std::string> myers_only;
+    std::vector<std::string> hybrid_only;
+    std::vector<std::string> both_match;
+    
+    for (const auto& target : sample) {
+        std::string target_str = target.bits_to_sequence();
+        
+        // Test Pure Myers
+        int myers_dist = mutation_tools::bit_partial_match(
+            query_bits.bits[0], target.bits[0], 
+            query_bits.length, target.length, max_dist
+        );
+        
+        // Test Hybrid
+        int hybrid_dist = hybrid.get_edit_distance_fast(target);
+        
+        bool myers_match = (myers_dist >= 0);
+        bool hybrid_match = (hybrid_dist >= 0);
+        
+        if (myers_match && hybrid_match) {
+            both_match.push_back(target_str + " (M:" + std::to_string(myers_dist) + ", H:" + std::to_string(hybrid_dist) + ")");
+        } else if (myers_match && !hybrid_match) {
+            myers_only.push_back(target_str + " (M:" + std::to_string(myers_dist) + ", len:" + std::to_string(target.length) + ")");
+        } else if (!myers_match && hybrid_match) {
+            hybrid_only.push_back(target_str + " (H:" + std::to_string(hybrid_dist) + ", len:" + std::to_string(target.length) + ")");
+        }
+    }
+    
+    std::cout << "Results:\n";
+    std::cout << "Both match: " << both_match.size() << "\n";
+    std::cout << "Myers only: " << myers_only.size() << "\n";
+    std::cout << "Hybrid only: " << hybrid_only.size() << "\n\n";
+    
+    // Show examples of differences
+    if (!myers_only.empty()) {
+        std::cout << "Examples where ONLY Myers matches (partial matching):\n";
+        for (size_t i = 0; i < std::min((size_t)5, myers_only.size()); i++) {
+            std::cout << "  " << myers_only[i] << "\n";
+        }
+        std::cout << "\n";
+    }
+    
+    if (!hybrid_only.empty()) {
+        std::cout << "Examples where ONLY Hybrid matches (should be rare):\n";
+        for (size_t i = 0; i < std::min((size_t)5, hybrid_only.size()); i++) {
+            std::cout << "  " << hybrid_only[i] << "\n";
+        }
+        std::cout << "\n";
+    }
+    
+    if (!both_match.empty()) {
+        std::cout << "Examples where both match:\n";
+        for (size_t i = 0; i < std::min((size_t)5, both_match.size()); i++) {
+            std::cout << "  " << both_match[i] << "\n";
+        }
+        std::cout << "\n";
+    }
+    
+    // Analyze length distribution of mismatches
+    if (!myers_only.empty()) {
+        std::cout << "Length analysis of Myers-only matches:\n";
+        std::map<int, int> length_counts;
+        
+        for (const auto& target : sample) {
+            int myers_dist = mutation_tools::bit_partial_match(
+                query_bits.bits[0], target.bits[0], 
+                query_bits.length, target.length, max_dist
+            );
+            int hybrid_dist = hybrid.get_edit_distance_fast(target);
+            
+            if (myers_dist >= 0 && hybrid_dist < 0) {
+                length_counts[target.length]++;
+            }
+        }
+        
+        for (const auto& [length, count] : length_counts) {
+            int length_diff = std::abs(static_cast<int>(length) - static_cast<int>(query_seq.length()));
+            std::cout << "  Length " << length << " (diff=" << length_diff << "): " << count << " sequences\n";
+        }
+    }
+}
+
+// Fixed hybrid implementation that matches Myers behavior
+class MyersAutomatonFixed {
+private:
+    std::string query;
+    int64_t query_bits;
+    int query_length;
+    int max_edit_distance;
+    
+    int64_t Peq[4];
+    int64_t pattern_mask;
+    
+public:
+    MyersAutomatonFixed(const std::string& query_str, int max_dist) 
+        : query(query_str), max_edit_distance(max_dist) {
+        
+        int64_seq query_seq(query_str);
+        query_bits = query_seq.bits[0];
+        query_length = query_seq.length;
+        
+        // Pre-build pattern equality vectors
+        Peq[0] = Peq[1] = Peq[2] = Peq[3] = 0;
+        for (int i = 0; i < query_length; i++) {
+            int nuc = (query_bits >> (2 * i)) & 3;
+            Peq[nuc] |= (1LL << i);
+        }
+        
+        pattern_mask = (1LL << query_length) - 1;
+    }
+    
+    // Modified to match the partial matching behavior of Pure Myers
+    int get_edit_distance_fast(const int64_seq& target) const {
+        if (target.bits.empty() || target.length > 32) return -1;
+        
+        int target_len = target.length;
+        int64_t target_bits = target.bits[0];
+        
+        // Remove the length difference check to match partial matching behavior
+        // if (std::abs(target_len - query_length) > max_edit_distance) {
+        //     return -1;
+        // }
+        
+        // Use the EXACT same logic as bit_partial_match
+        int64_t Pv = pattern_mask;
+        int64_t Mv = 0;
+        int score = query_length;
+        int min_score = query_length; // This is the key - track minimum across ALL positions
+        
+        for (int j = 0; j < target_len; j++) {
+            int target_nuc = (target_bits >> (2 * j)) & 3;
+            int64_t Eq = Peq[target_nuc] & pattern_mask;
+            
+            // Myers core computation (identical to your bit_partial_match)
+            int64_t Xv = Eq | Mv;
+            int64_t Xh = (((Eq & Pv) + Pv) ^ Pv) | Eq;
+            int64_t Ph = Mv | ~(Xh | Pv);
+            int64_t Mh = Pv & Xh;
+            
+            Ph &= pattern_mask;
+            Mh &= pattern_mask;
+            
+            if (Ph & (1LL << (query_length - 1))) score++;
+            if (Mh & (1LL << (query_length - 1))) score--;
+            
+            min_score = std::min(min_score, score); // Key: partial matching behavior
+            
+            if (min_score == 0) return 0; // Perfect match found
+            
+            Ph <<= 1;
+            Pv = ((Mh << 1) | ~(Xv | Ph)) & pattern_mask;
+            Mv = Ph & Xv;
+        }
+        
+        return (min_score <= max_edit_distance) ? min_score : -1;
+    }
+};
+
+// Test function comparing all three approaches
+void test_myers_automaton_hybrid(const std::string& query_seq, const std::string& whitelist_path, int max_dist = 2) {
+    auto start_total = std::chrono::high_resolution_clock::now();
+    
+    std::cout << "=== Three-Way Algorithm Comparison ===\n";
+    std::cout << "Query: " << query_seq << "\n";
+    std::cout << "Max distance: " << max_dist << "\n";
+    
+    // Load whitelist
+    auto start_load = std::chrono::high_resolution_clock::now();
+    auto whitelist = load_simple_wl(whitelist_path);
+    auto end_load = std::chrono::high_resolution_clock::now();
+    auto load_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_load - start_load);
+    
+    std::cout << "Loaded " << whitelist.size() << " sequences (" << load_time.count() << "ms)\n";
+    
+    // Convert to vector for consistent testing
+    std::vector<int64_seq> whitelist_vec(whitelist.begin(), whitelist.end());
+    std::vector<std::string> whitelist_strings;
+    for (const auto& seq : whitelist_vec) {
+        whitelist_strings.push_back(seq.bits_to_sequence());
+    }
+    
+    // Test 1: Pure Myers (your current approach)
+    std::cout << "\n--- Testing Pure Myers ---\n";
+    int64_seq query_bits(query_seq);
+    std::vector<std::pair<std::string, int>> myers_matches;
+    
+    auto start_myers = std::chrono::high_resolution_clock::now();
+    
+    for (const auto& target_seq : whitelist_vec) {
+        int dist = mutation_tools::bit_partial_match(
+            query_bits.bits[0], target_seq.bits[0], 
+            query_bits.length, target_seq.length, max_dist
+        );
+        if (dist >= 0) {
+            myers_matches.emplace_back(target_seq.bits_to_sequence(), dist);
+        }
+    }
+    
+    auto end_myers = std::chrono::high_resolution_clock::now();
+    auto myers_time = std::chrono::duration_cast<std::chrono::microseconds>(end_myers - start_myers);
+    
+    std::cout << "Myers found " << myers_matches.size() << " matches in " 
+              << myers_time.count() << "μs\n";
+    
+    // Test 2: Myers Automaton Hybrid
+    std::cout << "\n--- Testing Myers Automaton Hybrid ---\n";
+    MyersAutomaton hybrid(query_seq, max_dist);
+    
+    auto start_hybrid = std::chrono::high_resolution_clock::now();
+    auto hybrid_matches = hybrid.find_all_matches(whitelist_vec);
+    auto end_hybrid = std::chrono::high_resolution_clock::now();
+    auto hybrid_time = std::chrono::duration_cast<std::chrono::microseconds>(end_hybrid - start_hybrid);
+    
+    std::cout << "Hybrid found " << hybrid_matches.size() << " matches in " 
+              << hybrid_time.count() << "μs\n";
+    
+    // Test 3: Traditional DP Automaton (for comparison)
+    std::cout << "\n--- Testing Traditional DP Automaton ---\n";
+    LevenshteinAutomaton traditional(query_seq, max_dist);
+    std::vector<std::pair<std::string, int>> traditional_matches;
+    
+    auto start_traditional = std::chrono::high_resolution_clock::now();
+    
+    for (const auto& target : whitelist_strings) {
+        int dist = traditional.get_edit_distance(target);
+        if (dist >= 0) {
+            traditional_matches.emplace_back(target, dist);
+        }
+    }
+    
+    auto end_traditional = std::chrono::high_resolution_clock::now();
+    auto traditional_time = std::chrono::duration_cast<std::chrono::microseconds>(end_traditional - start_traditional);
+    
+    std::cout << "Traditional found " << traditional_matches.size() << " matches in " 
+              << traditional_time.count() << "μs\n";
+    
+    // Performance comparison
+    std::cout << "\n--- Performance Comparison ---\n";
+    std::cout << "Pure Myers:      " << (myers_time.count() / 1000.0) << "ms\n";
+    std::cout << "Myers Hybrid:    " << (hybrid_time.count() / 1000.0) << "ms\n";
+    std::cout << "Traditional DP:  " << (traditional_time.count() / 1000.0) << "ms\n";
+    
+    double hybrid_speedup = (double)myers_time.count() / hybrid_time.count();
+    double traditional_speedup = (double)traditional_time.count() / hybrid_time.count();
+    
+    std::cout << "Hybrid vs Pure Myers: " << hybrid_speedup << "x speedup\n";
+    std::cout << "Hybrid vs Traditional: " << traditional_speedup << "x speedup\n";
+    
+    // Verify results match
+    std::sort(myers_matches.begin(), myers_matches.end());
+    
+    std::vector<std::pair<std::string, int>> hybrid_string_matches;
+    for (const auto& match : hybrid_matches) {
+        hybrid_string_matches.emplace_back(match.first.bits_to_sequence(), match.second);
+    }
+    std::sort(hybrid_string_matches.begin(), hybrid_string_matches.end());
+    
+    bool results_match = (myers_matches.size() == hybrid_string_matches.size());
+    std::cout << "Results match Myers: " << (results_match ? "YES" : "NO") << "\n";
+    
+    auto end_total = std::chrono::high_resolution_clock::now();
+    auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_total - start_total);
+    std::cout << "Total test time: " << total_time.count() << "ms\n\n";
+}
+
+// Add this function to test the hybrid approach
+void run_hybrid_automaton_tests() {
+    std::cout << "\n" << std::string(60, '=') << "\n";
+    std::cout << "MYERS AUTOMATON HYBRID PERFORMANCE TESTS\n";
+    std::cout << std::string(60, '=') << "\n";
+    
+    std::string whitelist_path = "/Users/cmv/Desktop/rad_paper/cellranger_whitelists/3M-february-2018-3v3.txt.gz";
+    
+    // Test with your typical barcode
+    test_myers_automaton_hybrid("AAACCCAAGAAGATCT", whitelist_path, 2);
+}
+
+int main() {
+    std::cout << "Testing barcode edit distance functions...\n\n";
+    
+    // Test 1: Single sequence distance
+    std::cout << "=== Test 1: Single Sequence Distance ===\n";
+    int64_seq query("TATCATCGATCGATCG");
+    int64_seq target1("TATCATCGATCGATCG");  // exact match
+    int64_seq target2("TATCATCGATCGATCC");  // 1 substitution
+    int64_seq target3("TATCGTCGATCGATCG");  // 1 substitution
+    int64_seq target4("TATCTTCGATCGATCG");  // 1 substitution
+    
+    std::cout << "Query: " << query.bits_to_sequence() << "\n";
+    std::cout << "Distance to " << target1.bits_to_sequence() << ": " 
+              << mutation_tools::int64_lvdist(query, target1, 4) << "\n";
+    std::cout << "Distance to " << target2.bits_to_sequence() << ": " 
+              << mutation_tools::int64_lvdist(query, target2, 4) << "\n";
+    std::cout << "Distance to " << target3.bits_to_sequence() << ": " 
+              << mutation_tools::int64_lvdist(query, target3, 4) << "\n";
+    std::cout << "Distance to " << target4.bits_to_sequence() << ": " 
+              << mutation_tools::int64_lvdist(query, target4, 4) << "\n";
+    
+    // Test 2: Multiple sequence distance with barcode_entry vector
+    std::cout << "\n=== Test 2: Multiple Sequence Distance ===\n";
+    int64_seq query2("TAAAACCCGGGTTTAG");
+    std::vector<barcode_entry> targets;
+    
+    // Create some test barcodes
+    barcode_entry be1; be1.barcode = int64_seq("TAAAACCCGGGTTTAG");  // exact
+    barcode_entry be2; be2.barcode = int64_seq("TAAAACCCGGGTTCAG");  // 1 diff
+    barcode_entry be3; be3.barcode = int64_seq("TAAAACCCGGGTCCAG");  // 2 diff
+    barcode_entry be4; be4.barcode = int64_seq("TAAAACCCGGGCCCAG");  // 3 diff
+    
+    targets.push_back(be1);
+    targets.push_back(be2);
+    targets.push_back(be3);
+    targets.push_back(be4);
+    
+    std::cout << "Query: " << query2.bits_to_sequence() << "\n";
+    auto results = mutation_tools::int64_lvdist(query2, targets, 5);
+    
+    for (const auto& [dist, barcodes] : results) {
+        std::cout << "Distance " << dist << ": " << barcodes.size() << " barcode(s)\n";
+        for (const auto& bc : barcodes) {
+            std::cout << "  - " << bc.bits_to_sequence() << "\n";
+        }
+    }
+    
+    // Test 3: Multiple sequence distance with unordered_set
+    std::cout << "\n=== Test 3: Unordered Set Distance ===\n";
+    int64_seq query3("ATCG");
+    std::unordered_set<int64_seq> target_set = {
+        int64_seq("ATCG"),  // distance 0
+        int64_seq("ATCC"),  // distance 1
+        int64_seq("TTCG"),  // distance 1
+        int64_seq("ATGG"),  // distance 1
+        int64_seq("GGGG"),  // distance 3
+    };
+    
+    std::cout << "Query: " << query3.bits_to_sequence() << "\n";
+    auto results3 = mutation_tools::int64_lvdist(query3, target_set, 5);
+    
+    for (const auto& [dist, barcodes] : results3) {
+        std::cout << "Distance " << dist << ": " << barcodes.size() << " barcode(s)\n";
+        for (const auto& bc : barcodes) {
+            std::cout << "  - " << bc.bits_to_sequence() << "\n";
+        }
+    }
+    
+
+    std::cout << "=== DEBUGGING BARCODE DISTANCE CALCULATION ===\n\n";
+    
+    // First, let's check if encoding/decoding works correctly
+    std::cout << "=== Step 1: Check sequence encoding/decoding ===\n";
+    debug_sequence_encoding("ATCG");
+    debug_sequence_encoding("TATCGTCGATCGATCG");
+    debug_sequence_encoding("TAAAACCCGGGTTCAG");
+    
+    // Test your problematic cases
+    std::cout << "=== Step 2: Test problematic cases ===\n";
+    
+    // Case 1: These should be 1 substitution but showing 0
+    test_bit_ld("AATCGTCGATCGATCG", "TATCGTCGATCGATCG");  // A->T at position 0
+    test_bit_ld("AATCGTCGATCGATCG", "TATCTTCGATCGATCG");  // A->T at pos 0, G->T at pos 5
+    
+    // Case 2: These should be 1, 2, 3 but showing 2
+    test_bit_ld("TAAAACCCGGGTTCAG", "TAAAACCCGGGTTCAG");  // exact match (should be 0)
+    test_bit_ld("TAAAACCCGGGTTCAG", "TAAAACCCGGGTTCAG");  // 1 diff
+    test_bit_ld("TAAAACCCGGGTTCAG", "TAAAACCCGGGTCCAG");  // 2 diff
+    test_bit_ld("TAAAACCCGGGTTCAG", "TAAAACCCGGGCCCAG");  // 3 diff
+    
+    // Test simple cases to verify basic functionality
+    std::cout << "=== Step 3: Test simple cases ===\n";
+    test_bit_ld("AAAA", "AAAA");  // exact match
+    test_bit_ld("AAAA", "AAAT");  // 1 substitution
+    test_bit_ld("AAAA", "AATT");  // 2 substitutions
+    test_bit_ld("AAAA", "ATTT");  // 3 substitutions
+    test_bit_ld("AAAA", "TTTT");  // 4 substitutions
+
+    test_bit_ld("CCCC", "CCCG");  // 1 substitution
+    test_bit_ld("CCCC", "CCGG");  // 2 substitutions
+    test_bit_ld("CCCC", "CGGG");  // 3 substitutions
+    test_bit_ld("CCCC", "GGGG");  // 4 substitutions
+
+    // Test edge cases
+    std::cout << "=== Step 4: Test edge cases ===\n";
+    test_bit_ld("A", "A");    // single base exact
+    test_bit_ld("A", "T");    // single base diff
+    test_bit_ld("AT", "AT");  // two base exact
+    test_bit_ld("AT", "AC");  // two base diff
+    std::cout << "\nTest, Version 1: completed!\n";
+
+    // Run comprehensive tests
+    std::cout << "=== Step 5: Run comprehensive tests ===\n";
+    run_comprehensive_tests();
+    std::cout << "Comprehensive tests completed!\n";
+
+    //test_bit_trie("CGATCTAAGCCAAGAAGATCTGGTGTCG", "/Users/cmv/Desktop/rad_paper/cellranger_whitelists/3M-february-2018-3v3.txt.gz", 2);
+    std::cout << "Running automata tests..." << std::endl;
+    run_hybrid_automaton_tests();
+    std::cout << "Automata tests completed!" << std::endl;
     return 0;
 }

@@ -528,6 +528,7 @@ namespace config_utils {
     //config for read layout
     static std::unordered_map<std::string, std::string> layout_files = {
         {"five_prime", "resources/read_layout/five_prime_read_layout.csv" },
+        {"sctagger", "resources/read_layout/sctagger_sim_read_layout.csv" },
         {"three_prime", "resources/read_layout/three_prime_read_layout.csv" },
         {"splitseq", "resources/read_layout/splitseq_read_layout.csv" }
     };
@@ -597,4 +598,430 @@ namespace config_utils {
         return layout_files.erase(type) > 0;
     }
 
+};
+
+namespace plotting_utils {
+    struct peak {
+        size_t idx;   // index in y
+        double x;     // x[idx]
+        double y;     // y[idx]
+    };
+
+    inline std::vector<double> moving_average(
+        const std::vector<double>& y, int w = 5) {
+        if (w <= 1 || (int)y.size() <= w) return y;
+        std::vector<double> out(y.size());
+        double acc = 0.0;
+        for (int i = 0; i < (int)y.size(); ++i) {
+            acc += y[i];
+            if (i >= w) acc -= y[i - w];
+            if (i >= w-1) out[i - (w-1)/2] = acc / w;
+        }
+        int half = w/2;
+        for (int i = 0; i < half; ++i) out[i] = y[i];
+        for (int i = (int)y.size()-half; i < (int)y.size(); ++i) out[i] = y[i];
+        return out;
+    }
+
+    // strict local maxima + simple spacing and height threshold
+    inline std::vector<peak> find_peaks(
+        const std::vector<double>& x, const std::vector<double>& y_in,
+        double min_height = -INFINITY, int min_distance = 1, bool smooth = true, int ma_window = 7) {
+        const std::vector<double> y = smooth ? moving_average(y_in, ma_window) : y_in;
+        std::vector<size_t> cand;
+        if (y.size() >= 3) {
+            for (size_t i = 1; i + 1 < y.size(); ++i) {
+                if (y[i] > y[i-1] && y[i] > y[i+1] && y[i] >= min_height)
+                    cand.push_back(i);
+            }
+        }
+        if (cand.empty()) return {};
+
+        // enforce min_distance by greedy “keep highest in window”
+        std::vector<size_t> kept;
+        size_t j = 0;
+        while (j < cand.size()) {
+            size_t best = cand[j];
+            size_t k = j + 1;
+            while (k < cand.size() && (int)(cand[k] - cand[j]) < min_distance) {
+                if (y[cand[k]] > y[best]) best = cand[k];
+                ++k;
+            }
+            kept.push_back(best);
+            j = k;
+        }
+
+        std::vector<peak> out;
+        out.reserve(kept.size());
+        for (auto i : kept) out.push_back(peak{i, x[i], y[i]});
+        return out;
+    }
+
+    // first “flat” local minimum after a given peak (index in y)
+    inline std::optional<peak> first_flat_min_after(
+        const std::vector<double>& x, const std::vector<double>& y,
+        size_t start_idx, int slope_window = 7, double slope_tol = 1e-3) {
+        auto avg_abs_slope = [&](size_t i)->double {
+            int half = std::max(1, slope_window/2);
+            int L = std::max<int>(1, (int)i - half);
+            int R = std::min<int>((int)y.size()-2, (int)i + half);
+            double s = 0.0; int c = 0;
+            for (int k = L; k <= R; ++k) { s += std::fabs(y[k+1]-y[k]); ++c; }
+            return (c>0) ? s / c : 0.0;
+        };
+
+        for (size_t i = start_idx + 1; i + 1 < y.size(); ++i) {
+            if (y[i] <= y[i-1] && y[i] <= y[i+1]) {
+                if (avg_abs_slope(i) <= slope_tol)
+                    return peak{i, x[i], y[i]};
+            }
+        }
+        return std::nullopt;
+    }
+};
+
+namespace gmm_utils {
+    struct gmm_comp {
+        double weight; // π_k
+        double mean;   // μ_k
+        double var;    // σ_k^2
+    };
+
+    struct gmm_fit {
+        std::vector<gmm_comp> comps;
+        int K = 0;
+        double bic = std::numeric_limits<double>::infinity();
+        // evaluated on x grid for easy overlay
+        std::vector<std::vector<double>> comp_y; // K x x.size()
+        std::vector<double> mix_y;               // sum_k comp_y[k]
+    };
+
+    struct gmm_sweep {
+        std::vector<gmm_fit> fits;
+        int best_idx = -1;
+    };
+
+    // normalize y to sum=1; return weights
+    inline std::vector<double> normalize_weights(const std::vector<double>& y) {
+        double s = 0.0;
+        for (double v : y) s += v;
+        std::vector<double> w(y.size());
+        if (s <= 0) return w; // all zeros -> all zeros
+        for (size_t i = 0; i < y.size(); ++i) w[i] = y[i] / s;
+        return w;
+    }
+
+    // effective N for BIC from weights
+    inline double effective_n(const std::vector<double>& w) {
+        double s1 = 0.0, s2 = 0.0;
+        for (double wi : w) { s1 += wi; s2 += wi*wi; }
+        if (s2 == 0.0) return (double)w.size();
+        return (s1*s1) / s2;
+    }
+
+    inline double normal_pdf_1d(double x, double m, double v) {
+        if (v <= 0) v = 1e-12;
+        constexpr double two_pi = boost::math::constants::two_pi<double>();
+        double inv = 1.0 / std::sqrt(two_pi * v);
+        double z = (x - m);
+        return inv * std::exp(-0.5 * z * z / v);
+    }
+
+    // simple weighted quantiles in [0,1] of x under weights w (assumes x sorted ascending)
+    inline double weighted_quantile(const std::vector<double>& x, const std::vector<double>& w, double q
+    ) {
+        double acc = 0.0;
+        for (size_t i = 0; i < x.size(); ++i) {
+            acc += w[i];
+            if (acc >= q) return x[i];
+        }
+        return x.back();
+    }
+
+    inline gmm_fit fit_gmm_weighted(const std::vector<double>& x, const std::vector<double>& y,
+                                    int Kmin = 1, int Kmax = 5, int max_iters = 200, double tol = 1e-6,
+                                    double min_var = 1e-6) {
+        // Preconditions
+        gmm_fit best;
+        if (x.size() != y.size() || x.size() < 3 || Kmin < 1 || Kmax < Kmin) return best;
+
+        // Ensure x is ascending (your sampling already is)
+        // Build normalized weights (sum to 1)
+        std::vector<double> w = normalize_weights(y);
+        const size_t N = x.size();
+        const double Neff = effective_n(w);
+
+        // global weighted mean/var (for init)
+        double mu0 = 0.0, s0 = 0.0;
+        for (size_t i = 0; i < N; ++i) mu0 += w[i] * x[i];
+        for (size_t i = 0; i < N; ++i) { double d = x[i] - mu0; s0 += w[i] * d * d; }
+        s0 = std::max(s0, min_var);
+
+        auto run_em = [&](int K)->gmm_fit {
+            // ---- init by weighted quantiles for means; equal weights; same var ----
+            std::vector<gmm_comp> comps(K);
+            for (int k = 0; k < K; ++k) {
+                double q = (k + 0.5) / K; // mid-quantiles
+                comps[k].mean = weighted_quantile(x, w, q);
+                comps[k].weight = 1.0 / K;
+                comps[k].var = s0;
+            }
+
+            std::vector<std::vector<double>> resp(K, std::vector<double>(N)); // responsibilities r_ik
+            double prev_ll = -std::numeric_limits<double>::infinity();
+
+            for (int iter = 0; iter < max_iters; ++iter) {
+                // E-step: r_ik = π_k N(x_i|μ_k,σ^2_k) / sum_j
+                for (size_t i = 0; i < N; ++i) {
+                    double denom = 0.0;
+                    for (int k = 0; k < K; ++k) {
+                        double v = comps[k].weight * normal_pdf_1d(x[i], comps[k].mean, comps[k].var);
+                        resp[k][i] = v;
+                        denom += v;
+                    }
+                    if (denom <= 0.0) {
+                        // if all underflowed, assign uniform
+                        for (int k = 0; k < K; ++k) resp[k][i] = 1.0 / K;
+                    } else {
+                        double inv = 1.0 / denom;
+                        for (int k = 0; k < K; ++k) resp[k][i] *= inv;
+                    }
+                }
+
+                // M-step using weighted x-weights: w_i are sample weights for KDE grid
+                for (int k = 0; k < K; ++k) {
+                    // effective component mass
+                    double Nk = 0.0;
+                    for (size_t i = 0; i < N; ++i) Nk += w[i] * resp[k][i];
+                    Nk = std::max(Nk, 1e-12);
+
+                    // mean
+                    double mk = 0.0;
+                    for (size_t i = 0; i < N; ++i) mk += w[i] * resp[k][i] * x[i];
+                    mk /= Nk;
+
+                    // variance
+                    double vk = 0.0;
+                    for (size_t i = 0; i < N; ++i) {
+                        double d = x[i] - mk;
+                        vk += w[i] * resp[k][i] * d * d;
+                    }
+                    vk = std::max(vk / Nk, min_var);
+
+                    comps[k].mean = mk;
+                    comps[k].var  = vk;
+                    comps[k].weight = Nk; // temporary; normalize below
+                }
+                // normalize weights
+                double sum_pi = 0.0;
+                for (int k = 0; k < K; ++k) sum_pi += comps[k].weight;
+                if (sum_pi <= 0) {
+                    for (int k = 0; k < K; ++k) comps[k].weight = 1.0 / K;
+                } else {
+                    for (int k = 0; k < K; ++k) comps[k].weight /= sum_pi;
+                }
+
+                // log-likelihood of weighted grid: sum_i w_i log sum_k π_k N(x_i)
+                double ll = 0.0;
+                for (size_t i = 0; i < N; ++i) {
+                    double s = 0.0;
+                    for (int k = 0; k < K; ++k)
+                        s += comps[k].weight * normal_pdf_1d(x[i], comps[k].mean, comps[k].var);
+                    if (s <= 0) s = 1e-300;
+                    ll += w[i] * std::log(s);
+                }
+                if (std::abs(ll - prev_ll) < tol) break;
+                prev_ll = ll;
+            }
+
+            // BIC: -2*LL + p*log(Neff), with p = (K-1) + K*2 (weights-1 + mean + var per comp)
+            // (mixture weights have K-1 free params)
+            double ll = 0.0;
+            for (size_t i = 0; i < N; ++i) {
+                double s = 0.0;
+                for (int k = 0; k < K; ++k)
+                    s += comps[k].weight * normal_pdf_1d(x[i], comps[k].mean, comps[k].var);
+                if (s <= 0) s = 1e-300;
+                ll += w[i] * std::log(s);
+            }
+            int p = (K - 1) + 2 * K;
+            double bic = -2.0 * ll + p * std::log(std::max(Neff, 1.0));
+
+            // build comp_y and mix_y on the same grid (scale to density units)
+            std::vector<std::vector<double>> comp_y(K, std::vector<double>(N));
+            std::vector<double> mix_y(N, 0.0);
+            for (int k = 0; k < K; ++k) {
+                for (size_t i = 0; i < N; ++i) {
+                    double v = comps[k].weight * normal_pdf_1d(x[i], comps[k].mean, comps[k].var);
+                    comp_y[k][i] = v;
+                    mix_y[i] += v;
+                }
+            }
+
+            return gmm_fit{ std::move(comps), K, bic, std::move(comp_y), std::move(mix_y) };
+        };
+
+        // sweep K and keep best BIC
+        for (int K = Kmin; K <= Kmax; ++K) {
+            gmm_fit cur = run_em(K);
+            if (cur.bic < best.bic) best = std::move(cur);
+        }
+        return best;
+    }
+
+    // overload that accepts initial means (<= K seeds)
+    inline gmm_fit fit_gmm_weighted(const std::vector<double>& x, const std::vector<double>& y,
+                                int Kmin, int Kmax, int max_iters, double tol, double min_var,
+                                const std::vector<double>* init_means) {
+        // nullptr => quantile init
+        gmm_fit best;
+        // basic guards
+        if (x.size() != y.size() || x.size() < 3 || Kmin < 1 || Kmax < Kmin) return best;
+
+        // weights from density y (sum to 1)
+        std::vector<double> w = normalize_weights(y);
+        const size_t N = x.size();
+        const double Neff = effective_n(w);
+
+        // global weighted stats (for variance init)
+        double mu0 = 0.0, s0 = 0.0;
+        for (size_t i = 0; i < N; ++i) mu0 += w[i] * x[i];
+        for (size_t i = 0; i < N; ++i) { double d = x[i] - mu0; s0 += w[i] * d * d; }
+        s0 = std::max(s0, min_var);
+
+        auto run_em = [&](int K)->gmm_fit {
+            std::vector<gmm_comp> comps(K);
+
+            // ---- initialization ----
+            if (init_means && !init_means->empty()) {
+                const int S = std::min<int>((int)init_means->size(), K);
+                for (int k = 0; k < S; ++k) comps[k].mean = (*init_means)[k];
+                for (int k = S; k < K; ++k) {
+                    double q = (k + 0.5) / K;                  // mid-quantiles
+                    comps[k].mean = weighted_quantile(x, w, q);
+                }
+            } else {
+                for (int k = 0; k < K; ++k) {
+                    double q = (k + 0.5) / K;
+                    comps[k].mean = weighted_quantile(x, w, q);
+                }
+            }
+            for (int k = 0; k < K; ++k) { comps[k].weight = 1.0 / K; comps[k].var = s0; }
+
+            // responsibilities r_ik
+            std::vector<std::vector<double>> resp(K, std::vector<double>(N));
+            double prev_ll = -std::numeric_limits<double>::infinity();
+
+            // ---- EM iterations ----
+            for (int iter = 0; iter < max_iters; ++iter) {
+                // E-step
+                for (size_t i = 0; i < N; ++i) {
+                    double denom = 0.0;
+                    for (int k = 0; k < K; ++k) {
+                        double v = comps[k].weight * normal_pdf_1d(x[i], comps[k].mean, comps[k].var);
+                        resp[k][i] = v;
+                        denom += v;
+                    }
+                    if (denom <= 0.0) {
+                        const double u = 1.0 / K;
+                        for (int k = 0; k < K; ++k) resp[k][i] = u;
+                    } else {
+                        double inv = 1.0 / denom;
+                        for (int k = 0; k < K; ++k) resp[k][i] *= inv;
+                    }
+                }
+
+                // M-step (weighted by w_i)
+                for (int k = 0; k < K; ++k) {
+                    double Nk = 0.0;
+                    for (size_t i = 0; i < N; ++i) Nk += w[i] * resp[k][i];
+                    Nk = std::max(Nk, 1e-12);
+
+                    double mk = 0.0;
+                    for (size_t i = 0; i < N; ++i) mk += w[i] * resp[k][i] * x[i];
+                    mk /= Nk;
+
+                    double vk = 0.0;
+                    for (size_t i = 0; i < N; ++i) {
+                        double d = x[i] - mk;
+                        vk += w[i] * resp[k][i] * d * d;
+                    }
+                    vk = std::max(vk / Nk, min_var);
+
+                    comps[k].mean = mk;
+                    comps[k].var  = vk;
+                    comps[k].weight = Nk; // temp; normalize below
+                }
+                // normalize mixture weights
+                double sum_pi = 0.0;
+                for (int k = 0; k < K; ++k) sum_pi += comps[k].weight;
+                if (sum_pi <= 0.0) {
+                    for (int k = 0; k < K; ++k) comps[k].weight = 1.0 / K;
+                } else {
+                    for (int k = 0; k < K; ++k) comps[k].weight /= sum_pi;
+                }
+
+                // weighted log-likelihood
+                double ll = 0.0;
+                for (size_t i = 0; i < N; ++i) {
+                    double s = 0.0;
+                    for (int k = 0; k < K; ++k)
+                        s += comps[k].weight * normal_pdf_1d(x[i], comps[k].mean, comps[k].var);
+                    if (s <= 0) s = 1e-300;
+                    ll += w[i] * std::log(s);
+                }
+                if (std::abs(ll - prev_ll) < tol) break;
+                prev_ll = ll;
+            }
+
+            // BIC
+            double ll = 0.0;
+            for (size_t i = 0; i < N; ++i) {
+                double s = 0.0;
+                for (int k = 0; k < K; ++k)
+                    s += comps[k].weight * normal_pdf_1d(x[i], comps[k].mean, comps[k].var);
+                if (s <= 0) s = 1e-300;
+                ll += w[i] * std::log(s);
+            }
+            int p = (K - 1) + 2 * K; // (weights-1) + mean + var per comp
+            double bic = -2.0 * ll + p * std::log(std::max(Neff, 1.0));
+
+            // evaluate components and mixture on grid
+            std::vector<std::vector<double>> comp_y(K, std::vector<double>(N));
+            std::vector<double> mix_y(N, 0.0);
+            for (int k = 0; k < K; ++k) {
+                for (size_t i = 0; i < N; ++i) {
+                    double v = comps[k].weight * normal_pdf_1d(x[i], comps[k].mean, comps[k].var);
+                    comp_y[k][i] = v;
+                    mix_y[i] += v;
+                }
+            }
+
+            return gmm_fit{ std::move(comps), K, bic, std::move(comp_y), std::move(mix_y) };
+        };
+
+        // Sweep K and keep the best-BIC model
+        for (int K = Kmin; K <= Kmax; ++K) {
+            gmm_fit cur = run_em(K);
+            if (cur.bic < best.bic) best = std::move(cur);
+        }
+        return best;
+    }
+
+    inline gmm_sweep fit_gmm_sweep(const std::vector<double>& x, const std::vector<double>& y,
+                               int Kmin, int Kmax, const std::vector<double>* init_means = nullptr,
+                               int max_iters = 200, double tol = 1e-6, double min_var = 1e-6) {
+        gmm_sweep out;
+        out.fits.reserve(Kmax - Kmin + 1);
+        double best_bic = std::numeric_limits<double>::infinity();
+        for (int K = Kmin; K <= Kmax; ++K) {
+            auto f = fit_gmm_weighted(x, y, K, K, max_iters, tol, min_var, init_means);
+            out.fits.push_back(std::move(f));
+            if (out.fits.back().bic < best_bic) {
+                best_bic = out.fits.back().bic;
+                out.best_idx = (int)out.fits.size() - 1;
+            }
+        }
+        return out;
+    }
 };

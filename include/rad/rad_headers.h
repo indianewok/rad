@@ -22,6 +22,7 @@
 #include <numeric>
 #include <optional>
 #include <queue>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -45,8 +46,10 @@
 #include <boost/dll/runtime_symbol_info.hpp>
 #include <boost/multi_index/ordered_index.hpp>
 #include <boost/multi_index/sequenced_index.hpp>
+#include <boost/math/special_functions/fpclassify.hpp>
 #include <boost/iostreams/filtering_stream.hpp>
 #include <boost/multi_index/composite_key.hpp>
+#include <boost/math/constants/constants.hpp>
 #include <boost/iostreams/filter/gzip.hpp>
 #include <boost/multi_index_container.hpp>
 
@@ -56,8 +59,10 @@
 #include "csv-parser/single_include/csv.hpp"
 #include "parallel_hashmap/phmap.h"
 #include "edlib/include/edlib.h"
+#include "sciplot/sciplot.hpp"
 #include "gzstream/gzstream.h"
 #include "ssw/ssw_cpp.h"
+#include "kdepp/kde.h"
 #include "kseq/kseq.h"
 #include "zlib.h"
 

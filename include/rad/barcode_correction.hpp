@@ -14,17 +14,20 @@ enum barcode_counts {
 };
 
 // building a thread-safe counter to be used during count updating processes
+// needed to make something that was thread-safe to update in a shared location and couldn't figure out how to do it
+// ended up making an array of atomic ints, but then atomics aren't constructable in the way i wanted them to be
+// at least at load time, so i set it up so each counter value (to initialize) copies itself 
 struct counter {
-    // Use an array of 8 atomic ints.
+    // Use an array of 8 atomic ints
     std::array<std::atomic<int>, 8> counts;
 
     // Default constructor: initialize all counters to 0.
     counter() : counts{{0, 0, 0, 0, 0, 0, 0, 0}} { }
 
-    // A constructor that initializes all counters to a given value.
+    // A constructor that initializes all counters to a given value
     counter(int init) : counts{{init, init, init, init, init, init, init, init}} { }
 
-    // Copy constructor: copy each counter's current value.
+    // Copy constructor: copy each counter's current value
     counter(const counter &other) {
         for (size_t i = 0; i < counts.size(); ++i) {
             counts[i].store(other.counts[i].load(std::memory_order_relaxed),
@@ -32,7 +35,7 @@ struct counter {
         }
     }
 
-    // Assignment operator: copy each counter's value.
+    // Assignment operator: copy each counter's value
     counter& operator=(const counter &other) {
         for (size_t i = 0; i < counts.size(); ++i) {
             counts[i].store(other.counts[i].load(std::memory_order_relaxed),
@@ -41,12 +44,12 @@ struct counter {
         return *this;
     }
 
-    // Increment the counter at the specified index.
+    // Increment the counter at the specified index
     void increment(int index) {
         counts[index].fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Overload: increment using one of the enum values for clarity.
+    // Overload: increment using one of the enum values for clarity
     void increment(barcode_counts index) {
         counts[static_cast<int>(index)].fetch_add(1, std::memory_order_relaxed);
     }
@@ -84,6 +87,86 @@ struct counter {
             counts[barcode_counts::filtered].load(std::memory_order_relaxed)
         );
     }
+};
+
+// storage for per-barcode statistics
+// ncpm = normalized counts per million
+// log1p_ncpm = log(1 + ncpm) - log-plus-one transformation
+// log1p_ncpm_ztpois = log1p_transformed ncpm with ztpois adjustment
+struct bc_stats {
+    double ncpm;         // Normalized counts per million
+    double log1p_ncpm;   // log(1 + ncpm) - log-plus-one transformation
+    double log1p_ncpm_ztpois; // log1p_transformed ncpm with ztpois adjustment
+    double log1p_ncpm_density; // double-pass density calculation
+
+
+    //default constructor
+    bc_stats() : ncpm(0.0), log1p_ncpm(0.0), log1p_ncpm_ztpois(0.0), log1p_ncpm_density(0.0) {}
+
+    //constructor w/ values
+    bc_stats(
+        double ncpm_val,
+        double log1p_ncpm_val, 
+        double log1p_ncpm_ztpois_val,
+        double log1p_ncpm_density_val
+    ) 
+        :   ncpm(ncpm_val),
+            log1p_ncpm(log1p_ncpm_val),
+            log1p_ncpm_ztpois(log1p_ncpm_ztpois_val),
+            log1p_ncpm_density(log1p_ncpm_density_val) {}
+
+    // calculating ncpm per-barcode
+    void calculate_bc_ncpm(int barcode_count, double total_reads) {
+        if (total_reads > 0.0) {
+            ncpm = (static_cast<double>(barcode_count) / total_reads) * 1e6;
+        } else {
+            ncpm = 0.0;
+        }
+    }
+
+    // calculating log1p_ncpm per-barcode
+    void calculate_bc_log1p_ncpm() {
+        log1p_ncpm = std::log1p(ncpm);
+    }
+
+    void calculate_bc_ztpois_pct(double k, double lambda) {
+        if (k <= 0.0) {
+            log1p_ncpm_ztpois = 0.0;
+            return; // no zeroes allowed 
+        }
+        if (lambda <= 0.0) {
+            log1p_ncpm_ztpois = 0.0;
+            return;
+        }
+        
+        // Convert to integer for discrete distribution
+        int k_int = static_cast<int>(std::floor(k));
+        if (k_int <= 0) {
+            log1p_ncpm_ztpois = 0.0;
+            return;
+        }
+        
+        // Pre-calculate zero probability for truncation
+        double prob_zero = std::exp(-lambda);
+        double truncation_denom = 1.0 - prob_zero;
+        
+        // Calculate regular Poisson CDF: P(X <= k)
+        double regular_cdf = 0.0;
+        for (int j = 0; j <= k_int; j++) {
+            // Poisson PMF: P(X = j) = (lambda^j * exp(-lambda)) / j!
+            double log_pmf = j * std::log(lambda) - lambda - std::lgamma(j + 1.0);
+            regular_cdf += std::exp(log_pmf);
+        }
+        
+        // Zero-truncated CDF: P(X <= k | X > 0) = [P(X <= k) - P(X = 0)] / [1 - P(X = 0)]
+        double zt_cdf = (regular_cdf - prob_zero) / truncation_denom;
+        
+        // Clamp to [0, 1] and convert to percentage
+        zt_cdf = std::max(0.0, std::min(1.0, zt_cdf));
+        log1p_ncpm_ztpois = zt_cdf * 100.0; // Scale to percentage
+    }
+
+
 };
 
 // set up the int64_seq class to handle bit-to-sequence & sequence-to-bit
@@ -176,12 +259,14 @@ struct barcode_entry {
     mutable counter count;     // atomic counter for count
     bool filtered;             // flag for filtering
     std::string flags;         // additional flags
+    bc_stats stats;            // statistics
     
     barcode_entry()
       : barcode(0,1), 
        count(0),
        filtered(false), 
-       flags("")
+       flags(""),
+       stats()
        { }
 
     bool operator==(const barcode_entry &o) const noexcept {
@@ -191,6 +276,7 @@ struct barcode_entry {
     bool is_valid() const noexcept {
         return barcode.is_valid();
     }
+
 };
 
 // setting up hashing for int64_seq & barcode_entry
@@ -224,38 +310,91 @@ namespace mutation_tools {
     // t:  bitmask for text only used to select p or np per column
     // n:  number of columns (<=64)
     // max_dist: as soon as even the best possible remaining score exceeds max_dist, we return -1 as a sentinel.
-    int bit_ld(int64_t p, int64_t t, int n, int max_dist) {
-        int64_t np    = ~p;
-        int64_t HMASK = 1LL << (n - 1);        // mask for the high bit of the window
-        int64_t VP    = (1LL << n) - 1;        // all 1s
-        int64_t VN    = 0;                     // all 0s
-        int     score = n;                     // start at n
-        for (int j = 0; j < n; ++j) {
-            // select the Peq mask for column j
-            int64_t Bj = ((t >> j) & 1) ? p : np;
-            // Myers core
-            int64_t D0 = (((VP + (Bj & VP)) ^ VP) | Bj | VN);
-            int64_t HN = VP & D0;
-            int64_t HP = VN | ~(VP | D0);
-            // update score
-            if (HP & HMASK) {
-                score++;
-            }
-            else if (HN & HMASK) {
-                score--;
-            }
-            // early cutoff bound: even if we subtract 1 in every remaining column, our best possible = score - (n - j - 1)
-            int remaining = n - j - 1;
-            if (score - remaining > max_dist)
-                return -1;
-            // advance VP, VN
-            int64_t X = (HP << 1) | 1;
-            VN = X & D0;
-            VP = (HN << 1) | ~(X | D0);
-        }
-        return score;
+    int bit_ld(int64_t pattern, int64_t text, int n, int max_dist) {
+    // build pattern equality vectors
+    int64_t Peq[4] = {0, 0, 0, 0};
+    for (int i = 0; i < n; i++) {
+        int nuc = (pattern >> (2 * i)) & 3;
+        Peq[nuc] |= (1LL << i);
     }
+    
+    // initialize
+    int64_t Pv = (1LL << n) - 1;  // All 1s
+    int64_t Mv = 0;               // All 0s  
+    int score = n;
+    
+    // Step 3: process text character
+    for (int j = 0; j < n; j++) {
+        int text_nuc = (text >> (2 * j)) & 3;  // Extract nucleotide
+        int64_t Eq = Peq[text_nuc];             // Get equality vector
+        
+        // Myers core computation
+        int64_t Xv = Eq | Mv;
+        int64_t Xh = (((Eq & Pv) + Pv) ^ Pv) | Eq;
+        
+        int64_t Ph = Mv | ~(Xh | Pv);
+        int64_t Mh = Pv & Xh;
+        
+        // Update score
+        if (Ph & (1LL << (n-1))) score++;
+        if (Mh & (1LL << (n-1))) score--;
+        
+        // Early exit
+        if (score - (n - j - 1) > max_dist) return -1;
+        
+        // Update for next iteration
+        Ph <<= 1;
+        Pv = (Mh << 1) | ~(Xv | Ph);
+        Mv = Ph & Xv;
+    }
+    return score;
+}
 
+    // Bit-parallel partial matching: find best match of pattern within text
+    int bit_partial_match(int64_t pattern, int64_t text, int pattern_len, int text_len, int max_dist) {
+        if (pattern_len <= 0 || text_len <= 0 || pattern_len > 32 || text_len > 32) {
+            return -1;
+        }
+        
+        // Build pattern equality vectors
+        int64_t Peq[4] = {0, 0, 0, 0};
+        for (int i = 0; i < pattern_len; i++) {
+            int nuc = (pattern >> (2 * i)) & 3;
+            Peq[nuc] |= (1LL << i);
+        }
+        
+        int64_t pattern_mask = (1LL << pattern_len) - 1;
+        int64_t Pv = pattern_mask;
+        int64_t Mv = 0;
+        int score = pattern_len;
+        int min_score = pattern_len;  // Track minimum across all positions
+        
+        for (int j = 0; j < text_len; j++) {
+            int text_nuc = (text >> (2 * j)) & 3;
+            int64_t Eq = Peq[text_nuc] & pattern_mask;
+            
+            int64_t Xv = Eq | Mv;
+            int64_t Xh = (((Eq & Pv) + Pv) ^ Pv) | Eq;
+            int64_t Ph = Mv | ~(Xh | Pv);
+            int64_t Mh = Pv & Xh;
+            
+            Ph &= pattern_mask;
+            Mh &= pattern_mask;
+            
+            if (Ph & (1LL << (pattern_len - 1))) score++;
+            if (Mh & (1LL << (pattern_len - 1))) score--;
+            
+            min_score = std::min(min_score, score);  // Key difference from full matching
+            
+            if (min_score == 0) return 0;  // Perfect match found
+            
+            Ph <<= 1;
+            Pv = ((Mh << 1) | ~(Xv | Ph)) & pattern_mask;
+            Mv = Ph & Xv;
+        }
+        return (min_score <= max_dist) ? min_score : -1;
+    }
+/*
     // calculating levenshtein distance between one query and a set of multiple strings (naively, with no wildcard-based spacing)
     std::map<int, std::unordered_set<int64_seq>> int64_lvdist(const int64_seq &query, const std::unordered_set<int64_seq> &targets, int max_dist = 4) {
         std::map<int, std::unordered_set<int64_seq>> results;
@@ -267,7 +406,7 @@ namespace mutation_tools {
                 continue;
             }
             int dist = bit_ld(query.bits[0], target.bits[0], query.length, max_dist);
-            if(dist > 0){
+            if(dist >= 0){
                 results[dist].insert(target);
             }
         }
@@ -285,7 +424,7 @@ namespace mutation_tools {
                 continue;
             }
             int dist = bit_ld(query.bits[0], target.barcode.bits[0], query.length, max_dist);
-            if(dist > 0){
+            if(dist >= 0){
                 results[dist].insert(target.barcode);
             }
         }
@@ -293,7 +432,7 @@ namespace mutation_tools {
     }
 
     // calculating levenshtein distance between one query and a target sequence (int64_seq)
-    int int64_lvdist(const int64_seq &query, const int64_seq &target, int max_dist = 4) {
+    int int64_lvdist(const int64_seq &query, const int64_seq &target, int max_dist) {
         int result = -1;
         if (query.bits.empty() || target.bits.empty()){
             return result;
@@ -301,8 +440,78 @@ namespace mutation_tools {
         result = bit_ld(query.bits[0], target.bits[0], query.length, max_dist);
         return result;
     }
+*/
 
-    // generate point mutations for a given int64_seq sequence
+    // calculating levenshtein distance between one query and a set of multiple strings (partial matching)
+    std::map<int, std::unordered_set<int64_seq>> int64_lvdist(const int64_seq &query, const std::unordered_set<int64_seq> &targets, int max_dist = 4) {
+    std::map<int, std::unordered_set<int64_seq>> results;
+    if (query.bits.empty()){
+        return results;
+    }
+    for (const auto &target : targets) {
+        if (target.bits.empty()){
+            continue;
+        }
+        
+        int dist;
+        if (query.length <= target.length) {
+            // Query is shorter or equal, search query in target
+            dist = bit_partial_match(query.bits[0], target.bits[0], query.length, target.length, max_dist);
+        } else {
+            // Target is shorter, search target in query
+            dist = bit_partial_match(target.bits[0], query.bits[0], target.length, query.length, max_dist);
+        }
+        
+        if(dist >= 0){
+            results[dist].insert(target);
+        }
+    }
+    return results;
+}
+
+    // calculating levenshtein distance between one query and a set of multiple barcodes (wrapper for vectors of barcode_entries versus unordered sets)
+    std::map<int, std::unordered_set<int64_seq>> int64_lvdist(const int64_seq &query, const std::vector<barcode_entry> &targets, int max_dist = 4) {
+    std::map<int, std::unordered_set<int64_seq>> results;
+    if (query.bits.empty()){
+        return results;
+    }
+    for (const auto &target : targets) {
+        if (target.barcode.bits.empty()){
+            continue;
+        }
+        
+        int dist;
+        if (query.length <= target.barcode.length) {
+            // Query is shorter or equal, search query in target
+            dist = bit_partial_match(query.bits[0], target.barcode.bits[0], query.length, target.barcode.length, max_dist);
+        } else {
+            // Target is shorter, search target in query
+            dist = bit_partial_match(target.barcode.bits[0], query.bits[0], target.barcode.length, query.length, max_dist);
+        }
+        
+        if(dist >= 0){
+            results[dist].insert(target.barcode);
+        }
+    }
+    return results;
+}
+
+    // calculating levenshtein distance between one query and a target sequence (int64_seq)
+    int int64_lvdist(const int64_seq &query, const int64_seq &target, int max_dist) {
+    if (query.bits.empty() || target.bits.empty()){
+        return -1;
+    }
+    
+    if (query.length <= target.length) {
+        // Query is shorter or equal, search query in target
+        return bit_partial_match(query.bits[0], target.bits[0], query.length, target.length, max_dist);
+    } else {
+        // Target is shorter, search target in query
+        return bit_partial_match(target.bits[0], query.bits[0], target.length, query.length, max_dist);
+    }
+}
+    
+// generate point mutations for a given int64_seq sequence
     std::unordered_set<int64_seq> generate_point_mutations(const int64_seq &seq) {
         std::unordered_set<int64_seq> mutations;
         if (seq.bits.empty()){
@@ -591,6 +800,7 @@ namespace mutation_tools {
         return detect_hp(seq_str, max_hp);
     }
 };
+
 template<typename key, typename value>
 struct bc_multimap {
 private:
@@ -932,6 +1142,187 @@ public:
         return 0;
     }
 
+    template<typename T>
+    void set_bc_count(T const &x, int new_count, barcode_counts slot = barcode_counts::total) const {
+        const auto& k = key_of(x);
+        if (!k.is_valid()) return;
+        
+        auto it = associations.find(k);
+        if (it != associations.end() && !it->second.empty()) {
+            (*it->second.begin())->count.counts[slot].store(new_count, std::memory_order_relaxed);
+        }
+    }
+
+    template<typename T>
+    double get_bc_ncpm(T const &x) const {
+        const auto& k = key_of(x);
+        if (!k.is_valid()) return 0.0;
+        auto it = associations.find(k);
+        if (it != associations.end() && !it->second.empty()) {
+            return (*it->second.begin())->bc_stats.ncpm;
+        }
+        return 0.0;
+    }
+    
+    // Get log1p_ncpm for a barcode
+    template<typename T>
+    double get_bc_log1p_ncpm(T const &x) const {
+        const auto& k = key_of(x);
+        if (!k.is_valid()) return 0.0;
+        auto it = associations.find(k);
+        if (it != associations.end() && !it->second.empty()) {
+            return (*it->second.begin())->bc_stats.log1p_ncpm;
+        }
+        return 0.0;
+    }
+    
+    // Get log1p_ncpm ztpoisson percentage for a barcode
+    template<typename T>
+    double get_bc_log1p_ncpm_ztpois(T const &x) const {
+        const auto& k = key_of(x);
+        if (!k.is_valid()) return 0.0;
+        auto it = associations.find(k);
+        if (it != associations.end() && !it->second.empty()) {
+            return (*it->second.begin())->stats.log1p_ncpm_ztpois;
+        }
+        return 0.0;
+    }
+    
+    // Generic accessor that takes field name as string
+    template<typename T>
+    double get_bc_stat(T const &x, const std::string& stat_name) const {
+        const auto& k = key_of(x);
+        if (!k.is_valid()) return 0.0;
+        auto it = associations.find(k);
+        if (it != associations.end() && !it->second.empty()) {
+            const auto& stats = (*it->second.begin())->bc_stats;
+            
+            if (stat_name == "ncpm") {
+                return stats.ncpm;
+            } else if (stat_name == "log1p_ncpm") {
+                return stats.log1p_ncpm;
+            } else if (stat_name == "ncpm_ztpois") {
+                return stats.ncpm_ztpois;
+            } else if (stat_name == "log1p_ncpm_ztpois") {
+                return stats.log1p_ncpm_ztpois;
+            }
+        }
+        return 0.0;
+    }
+    
+    // Set ncpm for a barcode
+    template<typename T>
+    void set_bc_ncpm(T const &x, double val) const {
+        const auto& k = key_of(x);
+        if (!k.is_valid()) return;
+        auto it = associations.find(k);
+        if (it != associations.end() && !it->second.empty()) {
+            const_cast<value*>(*it->second.begin())->bc_stats.ncpm = val;
+        }
+    }
+    
+    // Set log1p_ncpm for a barcode
+    template<typename T>
+    void set_bc_log1p_ncpm(T const &x, double val) const {
+        const auto& k = key_of(x);
+        if (!k.is_valid()) return;
+        auto it = associations.find(k);
+        if (it != associations.end() && !it->second.empty()) {
+            const_cast<value*>(*it->second.begin())->bc_stats.log1p_ncpm = val;
+        }
+    }
+    
+    // Set log1p_ncpm ztpoisson percentage for a barcode
+    template<typename T>
+    void set_bc_log1p_ncpm_ztpois(T const &x, double val) const {
+        const auto& k = key_of(x);
+        if (!k.is_valid()) return;
+        auto it = associations.find(k);
+        if (it != associations.end() && !it->second.empty()) {
+            const_cast<value*>(*it->second.begin())->bc_stats.log1p_ncpm_ztpois = val;
+        }
+    }
+    
+    // Generic setter that takes field name as string
+    template<typename T>
+    void set_bc_stat(T const &x, const std::string& stat_name, double val) const {
+        const auto& k = key_of(x);
+        if (!k.is_valid()) return;
+        auto it = associations.find(k);
+        if (it != associations.end() && !it->second.empty()) {
+            auto& stats = const_cast<value*>(*it->second.begin())->bc_stats;
+            
+            if (stat_name == "ncpm") {
+                stats.ncpm = val;
+            } else if (stat_name == "log1p_ncpm") {
+                stats.log1p_ncpm = val;
+            } else if (stat_name == "log1p_ncpm_ztpois") {
+                stats.log1p_ncpm_ztpois = val;
+            }
+        }
+    }
+    
+    // Batch accessors for multiple barcodes
+    // Get all ncpm values as vector
+    std::vector<double> get_all_ncpm() const {
+        std::vector<double> values;
+        auto unique_entries = get_unique_entries();
+        values.reserve(unique_entries.size());
+        
+        for (const auto* entry : unique_entries) {
+            values.push_back(entry->bc_stats.ncpm);
+        }
+        return values;
+    }
+    
+    // Get all log1p_ncpm values as vector
+    std::vector<double> get_all_log1p_ncpm() const {
+        std::vector<double> values;
+        auto unique_entries = get_unique_entries();
+        values.reserve(unique_entries.size());
+        
+        for (const auto* entry : unique_entries) {
+            values.push_back(entry->bc_stats.log1p_ncpm);
+        }
+        return values;
+    }
+    
+    // Get all ZT-Poisson CDF percentages as vector
+    std::vector<double> get_all_log1p_ncpm_ztpois() const {
+        std::vector<double> values;
+        auto unique_entries = get_unique_entries();
+        values.reserve(unique_entries.size());
+        
+        for (const auto* entry : unique_entries) {
+            values.push_back(entry->bc_stats.log1p_ncpm_ztpois);
+        }
+        return values;
+    }
+    
+    // Generic batch accessor
+    std::vector<double> get_all_bc_stats(const std::string& stat_name) const {
+        std::vector<double> values;
+        auto unique_entries = get_unique_entries();
+        values.reserve(unique_entries.size());
+        
+        for (const auto* entry : unique_entries) {
+            const auto& stats = entry->bc_stats;
+            
+            if (stat_name == "ncpm") {
+                values.push_back(stats.ncpm);
+            } else if (stat_name == "log1p_ncpm") {
+                values.push_back(stats.log1p_ncpm);
+            } else if (stat_name == "ncpm_ztpois") {
+                values.push_back(stats.ncpm_ztpois);
+            } else if (stat_name == "log1p_ncpm_ztpois") {
+                values.push_back(stats.log1p_ncpm_ztpois);
+            } else {
+                values.push_back(0.0);  // Default for unknown stat
+            }
+        }
+        return values;
+    }
+    
     // ==== Utility Methods ====
     std::vector<const value*> get_unique_entries() const {
         std::vector<const value*> result;
@@ -940,6 +1331,27 @@ public:
             result.push_back(&val);
         }
         return result;
+    }
+
+    void calc_all_stats_wl(barcode_counts count_slot = barcode_counts::raw,
+                              bool verbose = false,
+                              const char* label = nullptr)
+    {
+        // 1) per-whitelist ncpm + log1p (already uses this->get_unique_entries())
+        this->calc_wl_log1p_ncpm(count_slot);
+
+        // 2) fit ZT-Poisson lambda on THIS whitelist
+        double lambda = this->calc_wl_ztpois_lambda();
+        if (verbose) {
+        #ifdef _OPENMP
+        #pragma omp critical
+        #endif
+            std::cout << "[calc_stats]"
+                    << (label ? std::string(" ") + label : std::string())
+                    << " lambda: " << lambda << '\n';
+        }
+        // 3) write per-barcode ZT-Poisson percentiles (again, within THIS whitelist)
+        this->calc_wl_ztpois_pct();
     }
 
     // ==== Iterator Support ====
@@ -1002,9 +1414,266 @@ public:
         return iterator(associations.end(), associations.end()); 
     }
 
-    // ==== Summary and Output Methods ====
+    // ==== Stats and Tabulation Methods ====
+    
+    //calculate ncpm and log1p_ncpm for all entries in whitelist
+    // based off of raw counts
+    void calc_wl_log1p_ncpm(barcode_counts count_slot = barcode_counts::raw) {
+        // Step 1: Calculate total reads across all barcodes
+        double total_reads = 0.0;
+        auto unique_entries = get_unique_entries();
+        for (const auto* entry : unique_entries) {
+            total_reads += entry->count.load(count_slot);
+        }
+        if (total_reads == 0.0){
+            // Avoid division by zero
+            return; 
+        }
+        // Step 2: Calculate ncpm for each barcode
+        for (const auto* entry : unique_entries) {
+            int count = entry->count.load(count_slot);
+            // Update the barcode's stats
+            auto* mutable_entry = const_cast<value*>(entry);
+            mutable_entry->stats.calculate_bc_ncpm(count, total_reads);
+            mutable_entry->stats.calculate_bc_log1p_ncpm();
+        }
+    }
+
+    // Estimate lambda from log1p_ncpm distribution of total whitelist
+    double calc_wl_ztpois_lambda() const {
+        auto unique_entries = get_unique_entries();
+        if (unique_entries.empty()){
+            return 1.0;
+        }
+        // Collect non-zero values
+        std::vector<double> non_zero_values;
+        for (const auto* entry : unique_entries) {
+            double log1p_val = entry->stats.log1p_ncpm;
+            if (log1p_val > 0.0) {
+                non_zero_values.push_back(log1p_val);
+            }
+        }
+        if (non_zero_values.empty()) return 1.0;
+        // Calculate mean of non-zero values for lambda estimate
+        double sample_mean = std::accumulate(non_zero_values.begin(), non_zero_values.end(), 0.0) / non_zero_values.size();
+        return std::max(0.1, sample_mean);
+    }
+
+    // calculate the ztpois, converted into a percentage, for the full whitelist
+    void calc_wl_ztpois_pct() {
+        double lambda = calc_wl_ztpois_lambda();
+        auto unique_entries = get_unique_entries();
+        for (const auto* entry : unique_entries) {
+            // Update the barcode's stats with the estimated lambda
+            auto* mutable_entry = const_cast<value*>(entry);
+            double k = mutable_entry->stats.log1p_ncpm;
+            mutable_entry->stats.calculate_bc_ztpois_pct(k,lambda);
+        }
+    }
+
+    // calculating whitelist density estimate, given statistic
+    kdepp::Kde1d<double> calc_wl_density(const std::string& stat_name, double threshold) const {
+    // Collect values above threshold
+    std::vector<double> values;
+    auto unique_entries = get_unique_entries();
+    
+    for (const auto* entry : unique_entries) {
+        double val = 0.0;
+        
+        // Get the requested statistic
+        if (stat_name == "log1p_ncpm_ztpois") {
+            val = entry->stats.log1p_ncpm_ztpois;
+        } else if (stat_name == "log1p_ncpm") {
+            val = entry->stats.log1p_ncpm;
+        } else if (stat_name == "ncpm") {
+            val = entry->stats.ncpm;
+        }
+        
+        // Simple filter: only include if above threshold
+        if (val > threshold) {
+            values.push_back(val);
+        }
+    }
+    // Return KDE object (throws if < 2 values)
+    return kdepp::Kde1d<double>(values);
+}
+
+    // overload for count-based filtering
+    kdepp::Kde1d<double> calc_wl_density(barcode_counts slot, int threshold) const {
+        std::vector<double> values;
+        auto unique_entries = get_unique_entries();
+        
+        for (const auto* entry : unique_entries) {
+            int count = entry->count.load(slot);
+            if (count > threshold) {
+                // Convert count to double and add
+                values.push_back(static_cast<double>(count));
+            }
+        }
+        
+        return kdepp::Kde1d<double>(values);
+    }
+    
+// Plotting function for the KDE density estimate w/ sciplot 
+    void plot_density(const kdepp::Kde1d<double>& kde, double min_x, double max_x,
+                  const std::string& output_file = "/Users/cmv/Desktop/density_plot.png",
+                  int n_points = 512)
+{
+    using namespace plotting_utils;
+    using namespace gmm_utils;
+
+    // --- sample KDE over full range ---
+    std::vector<double> x_vals, y_vals;
+    x_vals.reserve(n_points); y_vals.reserve(n_points);
+    for (int i = 0; i < n_points; ++i) {
+        double x = min_x + i * (max_x - min_x) / (n_points - 1);
+        x_vals.push_back(x);
+        y_vals.push_back(kde.eval(x));
+    }
+
+    // --- peaks on full range (for display + to find tallest for flatmin) ---
+    auto all_peaks = find_peaks(x_vals, y_vals, /*min_height=*/0.0, /*min_distance=*/25,
+                                /*smooth=*/true, /*ma_window=*/7);
+    // First flat min after tallest peak
+    std::optional<peak> flatmin;
+    if (!all_peaks.empty()) {
+        auto tallest = *std::max_element(all_peaks.begin(), all_peaks.end(),
+                                         [](const peak& a, const peak& b){ return a.y < b.y; });
+        flatmin = first_flat_min_after(x_vals, y_vals, tallest.idx, 9, 1e-3);
+    }
+
+    // ---------- PLOT 1: KDE ONLY (+ markers from full range) ----------
+    {
+        sciplot::Plot2D plot;
+        plot.drawCurve(x_vals, y_vals).lineWidth(2).label("KDE");
+
+        // show only "big" peaks to reduce clutter
+        if (!all_peaks.empty()) {
+            double max_y_full = *std::max_element(y_vals.begin(), y_vals.end());
+            const double rel_height = 0.05;
+            for (const auto& pk : all_peaks) {
+                if (pk.y >= rel_height * max_y_full) {
+                    plot.drawPoints(std::vector<double>{pk.x}, std::vector<double>{pk.y})
+                        .pointType(7).pointSize(2);
+                }
+            }
+        }
+        if (flatmin) {
+            plot.drawPoints(std::vector<double>{flatmin->x}, std::vector<double>{flatmin->y})
+                .pointType(5).pointSize(2);
+        }
+
+        plot.xlabel("Cumulative Density of Log1p(NCPM)");
+        plot.ylabel("Density");
+        plot.legend().atOutsideTopLeft().displayHorizontal();
+
+        sciplot::Figure fig = {{plot}};
+        sciplot::Canvas canvas = {{fig}};
+        canvas.size(1200, 1200);
+        canvas.save(output_file);
+    }
+
+    // === Build the post-flat segment to fit GMM on ===
+    size_t start_idx = 0;
+    if (flatmin) {
+        // include the flat minimum itself; use +1 if you want strictly after
+        start_idx = flatmin->idx;
+        if (start_idx >= x_vals.size()) start_idx = x_vals.size() - 1;
+    }
+    std::vector<double> x_post(x_vals.begin() + start_idx, x_vals.end());
+    std::vector<double> y_post(y_vals.begin() + start_idx, y_vals.end());
+
+    // If the post-flat segment is too short, bail out to full range
+    if (x_post.size() < 5) {
+        x_post = x_vals;
+        y_post = y_vals;
+        start_idx = 0;
+    }
+
+    // --- peaks on POST-FLAT segment (for K heuristic + seeds) ---
+    auto peaks_post = find_peaks(x_post, y_post, /*min_height=*/0.0, /*min_distance=*/1,
+                                 /*smooth=*/true, /*ma_window=*/5);
+    std::vector<peak> big_peaks_post;
+    if (!peaks_post.empty()) {
+        double max_y_post = *std::max_element(y_post.begin(), y_post.end());
+        const double rel_height_post = 0.05;
+        for (const auto& p : peaks_post)
+            if (p.y >= rel_height_post * max_y_post) big_peaks_post.push_back(p);
+    }
+
+    int K_guess = std::clamp<int>((int)big_peaks_post.size(), 1, 4);
+
+    // seeds from POST-FLAT peaks (left→right)
+    std::vector<double> init_means;
+    init_means.reserve(big_peaks_post.size());
+    std::sort(big_peaks_post.begin(), big_peaks_post.end(),
+              [](const peak& a, const peak& b){ return a.x < b.x; });
+    for (auto& p : big_peaks_post) init_means.push_back(p.x);
+
+    // ---------- PLOT 2: GMMs ONLY (POST-FLAT) ----------
+    auto derive_gmm_name = [&](std::string path) {
+        auto pos = path.find_last_of('.');
+        if (pos == std::string::npos) return path + "_gmm";
+        return path.substr(0, pos) + "_gmm" + path.substr(pos);
+    };
+    std::string gmm_file = derive_gmm_name(output_file);
+
+    // Sweep K around K_guess (bounded)
+    int Kmin = std::max(1, K_guess - 1);
+    int Kmax = std::min(4, K_guess + 1);
+    auto sweep = fit_gmm_sweep(x_post, y_post, Kmin, Kmax,
+                               init_means.empty() ? nullptr : &init_means);
+    const bool have_best = (sweep.best_idx >= 0);
+
+    {
+        sciplot::Plot2D plot;
+
+        // All mixture sums for post-flat segment
+        for (const auto& f : sweep.fits) {
+            plot.drawCurve(x_post, f.mix_y)
+                .lineWidth(1).lineStyle(3)
+                .label("GMM sum (K=" + std::to_string(f.K) + ")");
+        }
+
+        // Best mixture + components
+        if (have_best) {
+            const auto& best = sweep.fits[sweep.best_idx];
+            plot.drawCurve(x_post, best.mix_y)
+                .lineWidth(2).lineStyle(2)
+                .label("Best sum (K=" + std::to_string(best.K) + ")");
+
+            std::vector<int> order(best.K);
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(),
+                      [&](int a, int b){ return best.comps[a].weight > best.comps[b].weight; });
+            const std::vector<std::string> colors = {"red","blue","green","orange","purple","brown"};
+            for (int r = 0; r < best.K; ++r) {
+                int k = order[r];
+                auto c = plot.drawCurve(x_post, best.comp_y[k]);
+                if (r < (int)colors.size())
+                    c.lineColor(colors[r]).lineWidth(r < 2 ? 2 : 1).lineStyle(r < 2 ? 1 : 3)
+                     .label("comp " + std::to_string(k+1));
+                else
+                    c.lineWidth(1).lineStyle(3).label("comp " + std::to_string(k+1));
+            }
+        }
+
+        plot.xlabel("Cumulative Density of Log1p(NCPM) (post-flat)");
+        plot.ylabel("Density");
+        plot.legend().atOutsideTopLeft().displayHorizontal();
+
+        sciplot::Figure fig = {{plot}};
+        sciplot::Canvas canvas = {{fig}};
+        canvas.size(1200, 1200);
+        canvas.save(gmm_file);
+    }
+}
+
+// ==== Summary and Output Methods ====
     std::vector<std::tuple<std::string,int,int,int,int,int,int,int,int>>
-    summarize_counts(const std::unordered_set<key> *filter_keys = nullptr) const {
+    summarize_counts(
+        const std::unordered_set<key> *filter_keys = nullptr
+    ) const {
         using row = std::tuple<std::string,int,int,int,int,int,int,int,int>;
         std::vector<row> rows;
         std::vector<key> keys;
@@ -1045,7 +1714,12 @@ public:
         return rows;
     }
 
-    void write_wl_summary(std::ostream &out, const std::string class_id, const std::unordered_set<key> *filter_keys = nullptr, bool write_header = true) const {
+    void write_wl_summary(
+        std::ostream &out, 
+        const std::string class_id, 
+        const std::unordered_set<key> *filter_keys = nullptr, 
+        bool write_header = true
+    ) const {
         static bool header_printed = false;
         if(write_header && header_printed) header_printed = false;
         if(!header_printed) {
@@ -1069,10 +1743,103 @@ public:
         }
     }
 
-    void write_wl_summary(const std::string &path = "", const std::unordered_set<key> *filter_keys = nullptr) const {
+    void write_wl_summary(
+        const std::string &path = "", 
+        const std::unordered_set<key> *filter_keys = nullptr
+    ) const {
         std::ofstream ofs(path);
         if (!ofs) throw std::runtime_error("Failed to open output file: " + path);
         write_wl_summary(ofs, "", filter_keys);
+    }
+
+    //  version that includes barcode stats
+    std::vector<std::tuple<std::string,int,int,int,int,int,int,int,int,double,double,double>>
+    summarize_counts_with_stats(
+        const std::unordered_set<key> *filter_keys = nullptr
+    ) const {
+        using row = std::tuple<std::string,int,int,int,int,int,int,int,int,double,double,double>;
+        std::vector<row> rows;
+        std::vector<key> keys;
+        
+        if (filter_keys) {
+            keys.reserve(filter_keys->size());
+            for (auto const &k : *filter_keys)
+                keys.push_back(k);
+        } else {
+            std::unordered_set<key> seen;
+            seen.reserve(associations.size());
+            for (auto const &kv : associations)
+                seen.insert(kv.first);
+            keys.reserve(seen.size());
+            for (auto const &k : seen)
+                keys.push_back(k);
+        }
+        
+        rows.reserve(keys.size());
+        for (auto const &bc : keys) {
+            auto it = associations.find(bc);
+            int raw=0, tot=0, corr=0, fwd=0, rev=0, fwd_c=0, rev_c=0, filt=0;
+            double ncpm=0.0, log1p_ncpm=0.0, ncpm_ztpois=0.0, log1p_ncpm_ztpois=0.0;
+            
+            if (it != associations.end() && !it->second.empty()) {
+                // Get counts from first value pointer (they should all be the same for a given key)
+                const value* first_val = *it->second.begin();
+                raw = first_val->count.load(barcode_counts::raw);
+                tot = first_val->count.load(barcode_counts::total);
+                corr = first_val->count.load(barcode_counts::corrected);
+                fwd = first_val->count.load(barcode_counts::forw);
+                rev = first_val->count.load(barcode_counts::rev);
+                fwd_c = first_val->count.load(barcode_counts::forw_concat);
+                rev_c = first_val->count.load(barcode_counts::rev_concat);
+                filt = first_val->count.load(barcode_counts::filtered);
+                
+                // Get barcode stats
+                ncpm = first_val->stats.ncpm;
+                log1p_ncpm = first_val->stats.log1p_ncpm;
+                log1p_ncpm_ztpois = first_val->stats.log1p_ncpm_ztpois;
+            }
+            
+            rows.emplace_back(bc.bits_to_sequence(), raw, tot, corr, fwd, rev, fwd_c, rev_c, filt,
+                            ncpm, log1p_ncpm, log1p_ncpm_ztpois);
+        }
+        return rows;
+    }
+
+    //  write function with barcode stats
+    void write_wl_summary_with_stats(
+        std::ostream &out, 
+        const std::string class_id,
+        const std::unordered_set<key> *filter_keys = nullptr,
+        bool write_header = true
+    ) const {
+        static bool header_printed = false;
+        if(write_header && header_printed) header_printed = false;
+        if(!header_printed) {
+            out << "class_id,true_barcode,raw_count,total_count,corrected_count,forw_count,rev_count,"
+                << "forw_concat_count,rev_concat_count,filtered_count,"
+                << "ncpm,log1p_ncpm,log1p_ncpm_ztpois\n";
+            header_printed = true;
+        }
+        
+        auto rows = summarize_counts_with_stats(filter_keys);
+        for (auto const & tpl : rows) {
+            auto const & bc = std::get<0>(tpl);
+            auto raw = std::get<1>(tpl);
+            auto tot = std::get<2>(tpl);
+            auto corr = std::get<3>(tpl);
+            auto forw = std::get<4>(tpl);
+            auto rev = std::get<5>(tpl);
+            auto forw_concat = std::get<6>(tpl);
+            auto rev_concat = std::get<7>(tpl);
+            auto filtered = std::get<8>(tpl);
+            auto ncpm = std::get<9>(tpl);
+            auto log1p_ncpm = std::get<10>(tpl);
+            auto log1p_ncpm_ztpois = std::get<11>(tpl);
+            
+            out << class_id << ',' << bc << ',' << raw << "," << tot << ',' << corr << ',' << forw
+                << ',' << rev << ',' << forw_concat << ',' << rev_concat << ',' << filtered << ','
+                << ncpm << ',' << log1p_ncpm << ',' << log1p_ncpm_ztpois << '\n';
+        }
     }
 
 };
@@ -1104,6 +1871,7 @@ class whitelist {
                 // TIMING: Collect original barcode entries
                 auto start_collect = high_resolution_clock::now();
                 /*
+            
                 std::vector<const barcode_entry*> originals;
                 originals.reserve(true_bcs.size());
                 {
@@ -1321,7 +2089,7 @@ class whitelist {
                 }
             }
     };
-
+    
     std::unordered_map<std::string, std::reference_wrapper<whitelist::wl_entry>> maps;
     std::unordered_map<std::string, whitelist::wl_entry> lists;
     // operator[] for easy insert/access: W["barcode_1"].insert_bc_entry(obs, corr);
@@ -1421,6 +2189,7 @@ class whitelist {
                 out.true_ref.insert(seq);
             }
             for (auto const &seq : large) {
+                //this line trims duplicate entries in global bcs
                 if (out.true_ref.count(seq) == 0) {
                     if (seq.bits.empty()) continue;
                     barcode_entry be{};

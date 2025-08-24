@@ -10,6 +10,7 @@ static void usage(const char* prog) {
       << "  -k, --kit                         use this kit's default whitelist\n"
       << "  -g, --global_whitelist            path to a single custom global whitelist CSV(i.e, all barcodes that could potentially appear in this dataset)\n"
       << "  -c, --custom_whitelist            path to a single custom whitelist CSV (i.e, barcodes that you've already found in short-read matched data)\n"
+      << "  -R, --bc_correction_mode          either 'offensive' (default) or 'defensive', changes the behavior of barcode correction\n"
       << "  -M, --whitelist_mutation          mutation space of each barcode in the user-passed whitelist (default: 2)\n"
       << "  -m, --generated_mutation          mutation space of each barcode in the user-passed whitelist (default: 2)\n"
       << "  -S, --whitelist_shift             shift space of each barcode generated on the fly during runtime (default: 2)\n"
@@ -33,14 +34,16 @@ int main(int argc, char* argv[]) {
     int nthreads = 1;
     size_t max_reads = -1;  // -1 means unlimited
     size_t chunk_size = 5000;  // Default chunk size
+    std::string bc_corr_mode = "offensive"; // default mode
 
-    const char* optstring = "l:q:k:g:c:M:m:S:s:n:z:o:d:w:bt:vDh";
+    const char* optstring = "l:q:k:g:c:R:M:m:S:s:n:z:o:d:w:bt:vDh";
     struct option longopts[] = {
         {"layout",                      required_argument, nullptr, 'l'},
         {"fastq",                       required_argument, nullptr, 'q'},
         {"kit",                         required_argument, nullptr, 'k'},
         {"global_whitelist",            required_argument, nullptr, 'g'},
         {"custom_whitelist",            required_argument, nullptr, 'c'},
+        {"bc_corr_mode",                required_argument, nullptr, 'R'},
         {"whitelist_mutation",          required_argument, nullptr, 'M'},
         {"generated_mutation",          required_argument, nullptr, 'm'},
         {"whitelist_shift",             required_argument, nullptr, 'S'},
@@ -49,7 +52,7 @@ int main(int argc, char* argv[]) {
         {"chunk_size",                  required_argument, nullptr, 'z'},
         {"output",                      required_argument, nullptr, 'o'},
         {"dir",                         required_argument, nullptr, 'd'},
-        {"write_dbg",                   required_argument, nullptr, 'w'},
+        {"write_dbg",                   no_argument,       nullptr, 'w'},
         {"bc_split",                    no_argument,       nullptr, 'b'},
         {"threads",                     required_argument, nullptr, 't'},
         {"verbose",                     no_argument,       nullptr, 'v'},
@@ -66,10 +69,11 @@ int main(int argc, char* argv[]) {
           case 'k': custom_kit             = optarg;            break;
           case 'g': global_whitelist_path  = optarg;            break;
           case 'c': custom_whitelist_path  = optarg;            break;
-          case 'M': wl_mut   = std::stoi(optarg);               break;
-          case 'S': wl_shift = std::stoi(optarg);               break;
-          case 'm': gen_mut   = std::stoi(optarg);              break;
-          case 's': gen_shift = std::stoi(optarg);              break;
+          case 'R': bc_corr_mode           = optarg;            break;
+          case 'M': wl_mut                 = std::stoi(optarg); break;
+          case 'S': wl_shift               = std::stoi(optarg); break;
+          case 'm': gen_mut                = std::stoi(optarg); break;
+          case 's': gen_shift              = std::stoi(optarg); break;
           case 'n': max_reads            = std::stoull(optarg); break;
           case 'z': chunk_size           = std::stoull(optarg); break;
           case 'o': output_prefix          = optarg;            break;
@@ -130,6 +134,7 @@ int main(int argc, char* argv[]) {
                   << "  custom kit                   : " << (custom_kit.empty() ? "[none]" : custom_kit) << "\n"
                   << "  global whitelist             : " << (global_whitelist_path.empty()? "[none]" : global_whitelist_path) << "\n"
                   << "  custom whitelist             : " << (custom_whitelist_path.empty()? "[none]" : custom_whitelist_path) << "\n"
+                  << "  barcode correction mode      : " << bc_corr_mode             << "\n"
                   << "  whitelist-generated mutations: " << (wl_mut ? std::to_string(*wl_mut) : "default(2)") << "\n"
                   << "  read-generated mutations     : " << (gen_mut ? std::to_string(*gen_mut) : "default(2)") << "\n"
                   << "  whitelist-generated shifts   : " << (wl_shift ? std::to_string(*wl_shift) : "default(2)") << "\n"
@@ -232,7 +237,7 @@ int main(int argc, char* argv[]) {
         // if max reads is -1, it's unlimited--if not, then we default to the max number of reads that are user-specified
         size_t max_reads_param = (max_reads == -1) ? -1 : max_reads;
         // main function
-        SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut, gen_shift, max_verbose, nthreads, chunk_size, max_reads_param, write_debug);
+        SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut, gen_shift, max_verbose, nthreads, chunk_size, max_reads_param, write_debug, bc_corr_mode);
         
         auto sig_time = std::chrono::steady_clock::now() - sigalign_start;
         std::cout << "[sigalign] Time: "
@@ -241,6 +246,7 @@ int main(int argc, char* argv[]) {
 
         // Save whitelist summary
         if (verbose) std::cout << "[main] Saving whitelist summary...\n";
+        read_layout.save_stats_wl(outbase.string() + "_whitelist_stats.csv", false);
         read_layout.save_wl(outbase.string() + "_whitelist.csv", false);
 
         auto final_elapsed = std::chrono::steady_clock::now() - main_start;
