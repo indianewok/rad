@@ -570,19 +570,19 @@ void test_bit_trie(const std::string& query_seq, const std::string& whitelist_pa
         auto start_exact = std::chrono::high_resolution_clock::now();
         bool exact_found = trie.search(kmer_seq);
         auto end_exact = std::chrono::high_resolution_clock::now();
-        auto exact_time = std::chrono::duration_cast<std::chrono::microseconds>(end_exact - start_exact);
+        auto exact_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_exact - start_exact);
         
         std::cout << "  Exact search: " << (exact_found ? "Found" : "Not found")
-                  << " (" << exact_time.count() << "μs)\n";
+                  << " (" << exact_time.count() << "ms)\n";
         
         // Approximate search for this k-mer
         auto start_approx = std::chrono::high_resolution_clock::now();
         auto approx_results = trie.approximate_search(kmer_seq, max_mismatches);
         auto end_approx = std::chrono::high_resolution_clock::now();
-        auto approx_time = std::chrono::duration_cast<std::chrono::microseconds>(end_approx - start_approx);
+        auto approx_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_approx - start_approx);
         
         std::cout << "  Approximate search: " << approx_results.size() << " matches"
-                  << " (" << approx_time.count() << "μs)\n";
+                  << " (" << approx_time.count() << "ms)\n";
         
         // Show first few approximate matches
         if (!approx_results.empty()) {
@@ -671,7 +671,6 @@ public:
         return (prev_row[target_len] <= max_edit_distance) ? prev_row[target_len] : -1;
     }
 };
-
 
 class MyersAutomaton {
 private:
@@ -1000,10 +999,10 @@ void test_myers_automaton_hybrid(const std::string& query_seq, const std::string
     }
     
     auto end_myers = std::chrono::high_resolution_clock::now();
-    auto myers_time = std::chrono::duration_cast<std::chrono::microseconds>(end_myers - start_myers);
+    auto myers_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_myers - start_myers);
     
     std::cout << "Myers found " << myers_matches.size() << " matches in " 
-              << myers_time.count() << "μs\n";
+              << myers_time.count() << "ms\n";
     
     // Test 2: Myers Automaton Hybrid
     std::cout << "\n--- Testing Myers Automaton Hybrid ---\n";
@@ -1012,10 +1011,10 @@ void test_myers_automaton_hybrid(const std::string& query_seq, const std::string
     auto start_hybrid = std::chrono::high_resolution_clock::now();
     auto hybrid_matches = hybrid.find_all_matches(whitelist_vec);
     auto end_hybrid = std::chrono::high_resolution_clock::now();
-    auto hybrid_time = std::chrono::duration_cast<std::chrono::microseconds>(end_hybrid - start_hybrid);
+    auto hybrid_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_hybrid - start_hybrid);
     
     std::cout << "Hybrid found " << hybrid_matches.size() << " matches in " 
-              << hybrid_time.count() << "μs\n";
+              << hybrid_time.count() << "ms\n";
     
     // Test 3: Traditional DP Automaton (for comparison)
     std::cout << "\n--- Testing Traditional DP Automaton ---\n";
@@ -1032,16 +1031,16 @@ void test_myers_automaton_hybrid(const std::string& query_seq, const std::string
     }
     
     auto end_traditional = std::chrono::high_resolution_clock::now();
-    auto traditional_time = std::chrono::duration_cast<std::chrono::microseconds>(end_traditional - start_traditional);
+    auto traditional_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_traditional - start_traditional);
     
     std::cout << "Traditional found " << traditional_matches.size() << " matches in " 
-              << traditional_time.count() << "μs\n";
+              << traditional_time.count() << "ms\n";
     
     // Performance comparison
     std::cout << "\n--- Performance Comparison ---\n";
-    std::cout << "Pure Myers:      " << (myers_time.count() / 1000.0) << "ms\n";
-    std::cout << "Myers Hybrid:    " << (hybrid_time.count() / 1000.0) << "ms\n";
-    std::cout << "Traditional DP:  " << (traditional_time.count() / 1000.0) << "ms\n";
+    std::cout << "Pure Myers:      " << (myers_time.count() / 1000.0) << "s\n";
+    std::cout << "Myers Hybrid:    " << (hybrid_time.count() / 1000.0) << "s\n";
+    std::cout << "Traditional DP:  " << (traditional_time.count() / 1000.0) << "s\n";
     
     double hybrid_speedup = (double)myers_time.count() / hybrid_time.count();
     double traditional_speedup = (double)traditional_time.count() / hybrid_time.count();
@@ -1076,6 +1075,648 @@ void run_hybrid_automaton_tests() {
     
     // Test with your typical barcode
     test_myers_automaton_hybrid("AAACCCAAGAAGATCT", whitelist_path, 2);
+}
+
+// Whitelist-based Levenshtein Automaton for barcode demultiplexing
+// Build automata for each whitelist barcode, then test reads against all of them
+
+class WhitelistAutomaton {
+private:
+    std::string barcode;
+    int64_t barcode_bits;
+    int barcode_length;
+    int max_edit_distance;
+    
+    // Pre-computed pattern equality vectors (Myers optimization)
+    int64_t Peq[4];
+    int64_t pattern_mask;
+    
+public:
+    WhitelistAutomaton(const int64_seq& barcode_seq, int max_dist) 
+        : max_edit_distance(max_dist) {
+        
+        barcode = barcode_seq.bits_to_sequence();
+        barcode_bits = barcode_seq.bits[0];
+        barcode_length = barcode_seq.length;
+        
+        // Pre-build pattern equality vectors for this specific barcode
+        Peq[0] = Peq[1] = Peq[2] = Peq[3] = 0;
+        for (int i = 0; i < barcode_length; i++) {
+            int nuc = (barcode_bits >> (2 * i)) & 3;
+            Peq[nuc] |= (1LL << i);
+        }
+        
+        pattern_mask = (1LL << barcode_length) - 1;
+    }
+    
+    // Test if a read matches this barcode within edit distance
+    bool accepts(const int64_seq& read) const {
+        return get_edit_distance(read) >= 0;
+    }
+    
+    // Get exact edit distance if within threshold, -1 otherwise
+    int get_edit_distance(const int64_seq& read) const {
+        if (read.bits.empty() || read.length > 32) return -1;
+        
+        int read_len = read.length;
+        int64_t read_bits = read.bits[0];
+        
+        // Myers bit-parallel algorithm optimized for this specific barcode
+        int64_t Pv = pattern_mask;
+        int64_t Mv = 0;
+        int score = barcode_length;
+        int min_score = barcode_length; // Track minimum for partial matching
+        
+        for (int j = 0; j < read_len; j++) {
+            int read_nuc = (read_bits >> (2 * j)) & 3;
+            int64_t Eq = Peq[read_nuc] & pattern_mask; // Use pre-computed Peq!
+            
+            // Myers core computation
+            int64_t Xv = Eq | Mv;
+            int64_t Xh = (((Eq & Pv) + Pv) ^ Pv) | Eq;
+            int64_t Ph = Mv | ~(Xh | Pv);
+            int64_t Mh = Pv & Xh;
+            
+            Ph &= pattern_mask;
+            Mh &= pattern_mask;
+            
+            if (Ph & (1LL << (barcode_length - 1))) score++;
+            if (Mh & (1LL << (barcode_length - 1))) score--;
+            
+            min_score = std::min(min_score, score);
+            
+            // Early termination optimizations
+            if (min_score == 0) return 0; // Perfect match
+            if (min_score > max_edit_distance && 
+                (read_len - j - 1) < (min_score - max_edit_distance)) {
+                return -1; // Impossible to recover
+            }
+            
+            Ph <<= 1;
+            Pv = ((Mh << 1) | ~(Xv | Ph)) & pattern_mask;
+            Mv = Ph & Xv;
+        }
+        
+        return (min_score <= max_edit_distance) ? min_score : -1;
+    }
+    
+    const std::string& get_barcode() const { return barcode; }
+};
+
+// Whitelist manager - builds and manages all barcode automata
+class WhitelistAutomatonSet {
+private:
+    std::vector<WhitelistAutomaton> automata;
+    std::vector<int64_seq> original_barcodes;
+    int max_edit_distance;
+    
+public:
+    WhitelistAutomatonSet(const std::unordered_set<int64_seq>& whitelist, int max_dist) 
+        : max_edit_distance(max_dist) {
+        
+        std::cout << "Building automata for " << whitelist.size() << " barcodes...\n";
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        automata.reserve(whitelist.size());
+        original_barcodes.reserve(whitelist.size());
+        
+        for (const auto& barcode : whitelist) {
+            automata.emplace_back(barcode, max_dist);
+            original_barcodes.push_back(barcode);
+        }
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto build_time = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        std::cout << "Automata built in " << build_time.count() << "ms\n";
+    }
+    
+    // Find the best matching barcode(s) for a read
+    struct MatchResult {
+        int64_seq barcode;
+        int distance;
+        size_t barcode_index;
+    };
+    
+    std::vector<MatchResult> find_matches(const int64_seq& read) const {
+        std::vector<MatchResult> matches;
+        
+        for (size_t i = 0; i < automata.size(); i++) {
+            int dist = automata[i].get_edit_distance(read);
+            if (dist >= 0) {
+                matches.push_back({original_barcodes[i], dist, i});
+            }
+        }
+        
+        // Sort by distance (best matches first)
+        std::sort(matches.begin(), matches.end(), 
+                 [](const MatchResult& a, const MatchResult& b) {
+                     return a.distance < b.distance;
+                 });
+        
+        return matches;
+    }
+    
+    // Find only the best match (most common use case)
+    std::optional<MatchResult> find_best_match(const int64_seq& read) const {
+        std::optional<MatchResult> best_match;
+        int best_distance = max_edit_distance + 1;
+        
+        for (size_t i = 0; i < automata.size(); i++) {
+            int dist = automata[i].get_edit_distance(read);
+            if (dist >= 0 && dist < best_distance) {
+                best_distance = dist;
+                best_match = {original_barcodes[i], dist, i};
+                
+                if (dist == 0) break; // Perfect match, can't do better
+            }
+        }
+        
+        return best_match;
+    }
+    
+    // Batch processing for multiple reads
+    std::vector<std::optional<MatchResult>> batch_process(const std::vector<int64_seq>& reads) const {
+        std::vector<std::optional<MatchResult>> results;
+        results.reserve(reads.size());
+        
+        for (const auto& read : reads) {
+            results.push_back(find_best_match(read));
+        }
+        
+        return results;
+    }
+    
+    size_t size() const { return automata.size(); }
+};
+
+// Performance testing function
+void test_whitelist_automaton_performance(const std::string& whitelist_path, 
+                                        const std::vector<std::string>& test_reads,
+                                        int max_dist) {
+    
+    std::cout << "=== Whitelist Automaton Performance Test ===\n";
+    std::cout << "Max edit distance: " << max_dist << "\n";
+    std::cout << "Test reads: " << test_reads.size() << "\n";
+    
+    // Load whitelist
+    auto start_load = std::chrono::high_resolution_clock::now();
+    auto whitelist = load_simple_wl(whitelist_path);
+    auto end_load = std::chrono::high_resolution_clock::now();
+    auto load_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_load - start_load);
+    
+    std::cout << "Loaded " << whitelist.size() << " barcodes (" << load_time.count() << "ms)\n";
+    
+    // Build automaton set
+    WhitelistAutomatonSet automaton_set(whitelist, max_dist);
+    
+    // Convert test reads
+    std::vector<int64_seq> test_read_seqs;
+    for (const auto& read_str : test_reads) {
+        test_read_seqs.emplace_back(read_str);
+    }
+    
+    // Test individual read processing
+    std::cout << "\n--- Individual Read Processing ---\n";
+    auto start_individual = std::chrono::high_resolution_clock::now();
+    
+    int total_matches = 0;
+    std::map<int, int> distance_counts;
+    
+    for (const auto& read : test_read_seqs) {
+        auto best_match = automaton_set.find_best_match(read);
+        if (best_match.has_value()) {
+            total_matches++;
+            distance_counts[best_match->distance]++;
+        }
+    }
+    
+    auto end_individual = std::chrono::high_resolution_clock::now();
+    auto individual_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_individual - start_individual);
+    
+    std::cout << "Individual processing: " << individual_time.count() << "ms total\n";
+    std::cout << "Average per read: " << (individual_time.count() / test_reads.size()) << "ms\n";
+    std::cout << "Matches found: " << total_matches << "/" << test_reads.size() << "\n";
+    std::cout << "Distance distribution: ";
+    for (const auto& [dist, count] : distance_counts) {
+        std::cout << "d" << dist << "=" << count << " ";
+    }
+    std::cout << "\n";
+    
+    // Test batch processing
+    std::cout << "\n--- Batch Processing ---\n";
+    auto start_batch = std::chrono::high_resolution_clock::now();
+    auto batch_results = automaton_set.batch_process(test_read_seqs);
+    auto end_batch = std::chrono::high_resolution_clock::now();
+    auto batch_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_batch - start_batch);
+    
+    std::cout << "Batch processing: " << batch_time.count() << "ms total\n";
+    std::cout << "Average per read: " << (batch_time.count() / test_reads.size()) << "ms\n";
+    
+    // Performance metrics
+    double reads_per_second = (test_reads.size() * 1000.0) / individual_time.count();
+    std::cout << "Throughput: " << std::fixed << std::setprecision(0) << reads_per_second << " reads/second\n";
+    
+    // Show some example matches
+    std::cout << "\n--- Example Matches ---\n";
+    for (size_t i = 0; i < std::min((size_t)5, batch_results.size()); i++) {
+        std::cout << "Read: " << test_reads[i];
+        if (batch_results[i].has_value()) {
+            std::cout << " -> " << batch_results[i]->barcode.bits_to_sequence() 
+                      << " (distance: " << batch_results[i]->distance << ")\n";
+        } else {
+            std::cout << " -> No match\n";
+        }
+    }
+    std::cout << "\n";
+}
+
+// Updated comprehensive test function
+void run_whitelist_automaton_tests() {
+    std::cout << "\n" << std::string(60, '=') << "\n";
+    std::cout << "WHITELIST AUTOMATON PERFORMANCE TESTS\n";
+    std::cout << std::string(60, '=') << "\n";
+    
+    std::string whitelist_path = "/Users/cmv/Desktop/rad_paper/cellranger_whitelists/3M-february-2018-3v3.txt.gz";
+    
+    // Create test reads - mix of exact matches, close matches, and no matches
+    std::vector<std::string> test_reads = {
+        "AAACCCAAGAAGATCT",  // Should match something in whitelist
+        "AAACCCAAGAAGATCC",  // 1 edit from above
+        "AAACCCAAGAAGATAA",  // 2 edits from first
+        "CGATCTAAGCCAAGAAGATCTGGTGTCG", // Your longer test sequence
+        "AAGCCAAGAAGATCTG",  // Substring match
+        "TTTTTTTTTTTTTTTT",  // Probably no match
+        "AAACCCACAGATCGTT",  // Another test case
+        "AAACCCAAAGATCTTTCGTGTATTTT", // Different length
+    };
+    
+    // Test with different edit distances
+    for (int max_dist = 1; max_dist <= 3; max_dist++) {
+        std::cout << "\n" << std::string(40, '-') << "\n";
+        std::cout << "Testing with max_dist = " << max_dist << "\n";
+        std::cout << std::string(40, '-') << "\n";
+        
+        test_whitelist_automaton_performance(whitelist_path, test_reads, max_dist);
+    }
+}
+
+// Generate all sequences within a given Levenshtein distance of a barcode
+
+#include <string>
+#include <unordered_set>
+#include <vector>
+#include <chrono>
+#include <iostream>
+
+class LevenshteinGenerator {
+public:
+    // Generate all sequences within max_distance edits of the input barcode
+    static std::unordered_set<std::string> generate_all_edits(const std::string& barcode, int max_distance) {
+        std::unordered_set<std::string> all_sequences;
+        generate_edits_recursive(barcode, max_distance, all_sequences);
+        return all_sequences;
+    }
+
+private:
+    static void generate_edits_recursive(const std::string& sequence, int remaining_distance,
+                                       std::unordered_set<std::string>& results) {
+        // Add current sequence to results
+        results.insert(sequence);
+        
+        // Base case: no more edits allowed
+        if (remaining_distance == 0) {
+            return;
+        }
+        
+        // Generate all possible single edits from current sequence
+        std::vector<std::string> single_edits = generate_single_edits(sequence);
+        
+        // Recursively generate edits from each single edit
+        for (const std::string& edited_seq : single_edits) {
+            // Only recurse if we haven't seen this sequence before (pruning)
+            if (results.find(edited_seq) == results.end()) {
+                generate_edits_recursive(edited_seq, remaining_distance - 1, results);
+            }
+        }
+    }
+    
+    static std::vector<std::string> generate_single_edits(const std::string& sequence) {
+        std::vector<std::string> edits;
+        const char nucleotides[] = {'A', 'T', 'C', 'G'};
+        
+        // Substitutions: replace each character with each possible nucleotide
+        for (size_t i = 0; i < sequence.length(); i++) {
+            for (char nuc : nucleotides) {
+                if (nuc != sequence[i]) {  // Only generate actual changes
+                    std::string substituted = sequence;
+                    substituted[i] = nuc;
+                    edits.push_back(substituted);
+                }
+            }
+        }
+        
+        // Deletions: remove each character
+        for (size_t i = 0; i < sequence.length(); i++) {
+            std::string deleted = sequence.substr(0, i) + sequence.substr(i + 1);
+            edits.push_back(deleted);
+        }
+        
+        // Insertions: insert each nucleotide at each possible position
+        for (size_t i = 0; i <= sequence.length(); i++) {
+            for (char nuc : nucleotides) {
+                std::string inserted = sequence.substr(0, i) + nuc + sequence.substr(i);
+                edits.push_back(inserted);
+            }
+        }
+        
+        return edits;
+    }
+};
+
+// Optimized version that avoids string operations using bit encoding
+class BitLevenshteinGenerator {
+private:
+    static const char nucleotides[4];
+    
+public:
+    // Generate all int64_seq within max_distance edits
+    static std::unordered_set<int64_seq> generate_all_edits(const int64_seq& barcode, int max_distance) {
+        std::unordered_set<int64_seq> all_sequences;
+        generate_edits_recursive(barcode, max_distance, all_sequences);
+        return all_sequences;
+    }
+
+private:
+    static void generate_edits_recursive(const int64_seq& sequence, int remaining_distance,
+                                       std::unordered_set<int64_seq>& results) {
+        results.insert(sequence);
+        
+        if (remaining_distance == 0) {
+            return;
+        }
+        
+        std::vector<int64_seq> single_edits = generate_single_edits(sequence);
+        
+        for (const int64_seq& edited_seq : single_edits) {
+            if (results.find(edited_seq) == results.end()) {
+                generate_edits_recursive(edited_seq, remaining_distance - 1, results);
+            }
+        }
+    }
+    
+    static std::vector<int64_seq> generate_single_edits(const int64_seq& sequence) {
+        std::vector<int64_seq> edits;
+        
+        if (sequence.bits.empty() || sequence.length > 32) {
+            return edits;
+        }
+        
+        int64_t bits = sequence.bits[0];
+        int len = sequence.length;
+        
+        // Substitutions
+        for (int pos = 0; pos < len; pos++) {
+            int current_nuc = (bits >> (2 * pos)) & 3;
+            
+            for (int new_nuc = 0; new_nuc < 4; new_nuc++) {
+                if (new_nuc != current_nuc) {
+                    int64_t new_bits = bits;
+                    // Clear the 2 bits at this position
+                    new_bits &= ~(3LL << (2 * pos));
+                    // Set the new nucleotide
+                    new_bits |= ((int64_t)new_nuc << (2 * pos));
+                    
+                    int64_seq new_seq;
+                    new_seq.bits.push_back(new_bits);
+                    new_seq.length = len;
+                    edits.push_back(new_seq);
+                }
+            }
+        }
+        
+        // Deletions
+        for (int pos = 0; pos < len; pos++) {
+            if (len > 1) {  // Don't delete if it would make empty sequence
+                int64_t new_bits = 0;
+                int new_pos = 0;
+                
+                // Copy all nucleotides except the one at 'pos'
+                for (int i = 0; i < len; i++) {
+                    if (i != pos) {
+                        int nuc = (bits >> (2 * i)) & 3;
+                        new_bits |= ((int64_t)nuc << (2 * new_pos));
+                        new_pos++;
+                    }
+                }
+                
+                int64_seq new_seq;
+                new_seq.bits.push_back(new_bits);
+                new_seq.length = len - 1;
+                edits.push_back(new_seq);
+            }
+        }
+        
+        // Insertions
+        for (int pos = 0; pos <= len; pos++) {
+            for (int new_nuc = 0; new_nuc < 4; new_nuc++) {
+                if (len < 32) {  // Don't exceed maximum length
+                    int64_t new_bits = 0;
+                    int new_pos = 0;
+                    
+                    // Copy nucleotides before insertion point
+                    for (int i = 0; i < pos; i++) {
+                        int nuc = (bits >> (2 * i)) & 3;
+                        new_bits |= ((int64_t)nuc << (2 * new_pos));
+                        new_pos++;
+                    }
+                    
+                    // Insert new nucleotide
+                    new_bits |= ((int64_t)new_nuc << (2 * new_pos));
+                    new_pos++;
+                    
+                    // Copy nucleotides after insertion point
+                    for (int i = pos; i < len; i++) {
+                        int nuc = (bits >> (2 * i)) & 3;
+                        new_bits |= ((int64_t)nuc << (2 * new_pos));
+                        new_pos++;
+                    }
+                    
+                    int64_seq new_seq;
+                    new_seq.bits.push_back(new_bits);
+                    new_seq.length = len + 1;
+                    edits.push_back(new_seq);
+                }
+            }
+        }
+        
+        return edits;
+    }
+};
+
+// Test and benchmark the generator
+void test_levenshtein_generator() {
+    std::cout << "=== Levenshtein Generator Test ===\n";
+    
+    std::string test_barcode = "AAACCCAAGAAGATCT";
+    
+    for (int distance = 0; distance <= 2; distance++) {
+        std::cout << "\n--- Distance " << distance << " ---\n";
+        
+        auto start_time = std::chrono::high_resolution_clock::now();
+        
+        // Test string version
+        auto string_results = LevenshteinGenerator::generate_all_edits(test_barcode, distance);
+        
+        auto mid_time = std::chrono::high_resolution_clock::now();
+        
+        // Test bit version
+        int64_seq bit_barcode(test_barcode);
+        auto bit_results = BitLevenshteinGenerator::generate_all_edits(bit_barcode, distance);
+        
+        auto end_time = std::chrono::high_resolution_clock::now();
+        
+        auto string_duration = std::chrono::duration_cast<std::chrono::microseconds>(mid_time - start_time);
+        auto bit_duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - mid_time);
+        
+        std::cout << "String version: " << string_results.size() << " sequences in " 
+                  << string_duration.count() << "μs\n";
+        std::cout << "Bit version: " << bit_results.size() << " sequences in " 
+                  << bit_duration.count() << "μs\n";
+        std::cout << "Speedup: " << (double)string_duration.count() / bit_duration.count() << "x\n";
+        
+        // Verify results match
+        std::unordered_set<std::string> bit_strings;
+        for (const auto& seq : bit_results) {
+            bit_strings.insert(seq.bits_to_sequence());
+        }
+        
+        bool results_match = (string_results.size() == bit_strings.size());
+        if (results_match) {
+            for (const auto& str : string_results) {
+                if (bit_strings.find(str) == bit_strings.end()) {
+                    results_match = false;
+                    break;
+                }
+            }
+        }
+        
+        std::cout << "Results match: " << (results_match ? "YES" : "NO") << "\n";
+        
+        // Show examples for each distance
+        if (distance <= 2) {
+            std::cout << "First 50 examples:\n";
+            int shown = 0;
+            for (const auto& seq : string_results) {
+                if (seq != test_barcode && shown < 50) {
+                    std::cout << "  " << seq << "\n";
+                    shown++;
+                }
+            }
+        }
+    }
+}
+
+// Memory usage estimator
+void estimate_memory_usage(const std::string& barcode, int max_distance) {
+    std::cout << "\n=== Memory Usage Estimation ===\n";
+    std::cout << "Barcode: " << barcode << " (length: " << barcode.length() << ")\n";
+    std::cout << "Max distance: " << max_distance << "\n\n";
+    
+    for (int dist = 0; dist <= max_distance; dist++) {
+        auto sequences = LevenshteinGenerator::generate_all_edits(barcode, dist);
+        
+        size_t total_chars = 0;
+        for (const auto& seq : sequences) {
+            total_chars += seq.length();
+        }
+        
+        size_t estimated_memory = sequences.size() * 64 + total_chars; // rough estimate
+        
+        std::cout << "Distance " << dist << ":\n";
+        std::cout << "  Sequences: " << sequences.size() << "\n";
+        std::cout << "  Total characters: " << total_chars << "\n";
+        std::cout << "  Estimated memory: ~" << (estimated_memory / 1024) << " KB\n\n";
+    }
+    
+    // Extrapolate to full whitelist
+    auto full_sequences = LevenshteinGenerator::generate_all_edits(barcode, max_distance);
+    size_t per_barcode_memory = full_sequences.size() * 64;
+    size_t total_barcodes = 737000; // Approximate 10x whitelist size
+    size_t total_memory_gb = (per_barcode_memory * total_barcodes) / (1024 * 1024 * 1024);
+    
+    std::cout << "Extrapolation to full 10x whitelist (737K barcodes):\n";
+    std::cout << "Total estimated memory: ~" << total_memory_gb << " GB\n";
+}
+
+// Main test function
+void run_levenshtein_generator_tests() {
+    std::cout << "\n" << std::string(60, '=') << "\n";
+    std::cout << "LEVENSHTEIN EDIT GENERATOR TESTS\n";
+    std::cout << std::string(60, '=') << "\n";
+    
+    test_levenshtein_generator();
+    estimate_memory_usage("AAACCCAAGAAGATCT", 2);
+}
+
+
+// C++ Comparison Function
+void compare_mutation_functions(const std::string& test_barcode, int max_rounds = 2, int iterations = 10) {
+    std::cout << "=== Mutation Function Comparison ===\n";
+    std::cout << "Barcode: " << test_barcode << " (length: " << test_barcode.length() << ")\n";
+    std::cout << "Iterations: " << iterations << "\n\n";
+    
+    int64_seq seq(test_barcode);
+    
+    for (int rounds = 1; rounds <= max_rounds; ++rounds) {
+        std::cout << "--- Rounds " << rounds << " ---\n";
+        
+        // Test generate_mutated_barcodes
+        std::vector<double> mutated_times;
+        mutated_times.reserve(iterations);
+        size_t mutated_size = 0;
+        
+        for (int i = 0; i < iterations; ++i) {
+            auto start = std::chrono::high_resolution_clock::now();
+            auto results = mutation_tools::generate_mutated_barcodes(seq, rounds);
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+            mutated_times.push_back(duration.count());
+            if (i == 0) mutated_size = results.size();
+        }
+        
+        // Test generate_lv_barcodes  
+        std::vector<double> lv_times;
+        lv_times.reserve(iterations);
+        size_t lv_size = 0;
+        
+        for (int i = 0; i < iterations; ++i) {
+            auto start = std::chrono::high_resolution_clock::now();
+            auto results = mutation_tools::generate_lv_barcodes(seq, rounds);
+            auto end = std::chrono::high_resolution_clock::now();
+            
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+            lv_times.push_back(duration.count());
+            if (i == 0) lv_size = results.size();
+        }
+        
+        // Calculate averages
+        double mut_avg = std::accumulate(mutated_times.begin(), mutated_times.end(), 0.0) / iterations;
+        double lv_avg = std::accumulate(lv_times.begin(), lv_times.end(), 0.0) / iterations;
+        
+        std::cout << "generate_mutated_barcodes: " << mutated_size << " sequences, " 
+                  << mut_avg << "μs avg\n";
+        std::cout << "generate_lv_barcodes: " << lv_size << " sequences, " 
+                  << lv_avg << "μs avg\n";
+        
+        if (lv_avg < mut_avg) {
+            std::cout << "Levenshtein is " << (mut_avg / lv_avg) << "x faster\n";
+        } else {
+            std::cout << "Mutated is " << (lv_avg / mut_avg) << "x faster\n";
+        }
+        
+        std::cout << "Size ratio (LV/Mut): " << ((double)lv_size / mutated_size) << "\n\n";
+    }
 }
 
 int main() {
@@ -1197,6 +1838,16 @@ int main() {
     //test_bit_trie("CGATCTAAGCCAAGAAGATCTGGTGTCG", "/Users/cmv/Desktop/rad_paper/cellranger_whitelists/3M-february-2018-3v3.txt.gz", 2);
     std::cout << "Running automata tests..." << std::endl;
     run_hybrid_automaton_tests();
+    std::cout << "Hybrid automata tests completed!" << std::endl;
+    std::cout << "Running whitelist automata tests..." << std::endl;
+    run_whitelist_automaton_tests();
     std::cout << "Automata tests completed!" << std::endl;
+
+    std::cout << "Running Levenshtein generator tests..." << std::endl;
+    run_levenshtein_generator_tests();
+    std::cout << "Levenshtein generator tests completed!" << std::endl;
+
+    compare_mutation_functions("TAAAACCCGGGTTCAG");
+    
     return 0;
 }

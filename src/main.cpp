@@ -234,7 +234,7 @@ int main(int argc, char* argv[]) {
         std::cout << "[sigalign] Running sigalign with chunk size " << chunk_size << "...\n";
         memory_utils::get_rss();
         
-        // if max reads is -1, it's unlimited--if not, then we default to the max number of reads that are user-specified
+        // if max reads is -1, it's unlimited--if not, then default to the max number of reads that are user-specified
         size_t max_reads_param = (max_reads == -1) ? -1 : max_reads;
         // main function
         SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut, gen_shift, max_verbose, nthreads, chunk_size, max_reads_param, write_debug, bc_corr_mode);

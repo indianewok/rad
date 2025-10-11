@@ -2,7 +2,7 @@
 #include "rad_headers.h"
 
 /**
- * @brief Represents a position in the ReadLayout. Each string from PositionStrings is processed in this manner.
+ * @brief Represents a position in the ReadLayout. Each string from position strings is processed in this manner.
  */
 struct ParsedPosition {
     std::string ref_id; // Reference element ID this position is based on
@@ -112,7 +112,7 @@ struct type_tag {};             // Tag for accessing by type
 struct order_tag {};            // Tag for accessing by order
 struct direction_tag {};        // Tag for accessing by direction
 struct global_class_tag {};     // Tag for accessing by global class
-struct dir_order_tag {};        // Tag for accessing by order...and direction!
+struct dir_order_tag {};        // Tag for accessing by order...and direction
 
 
 /**
@@ -854,11 +854,12 @@ public:
                 // import & possibly generate mismatches
                 whitelist::wl_entry entry = wl_map.import_whitelist(spec, verbose, default_length);
                 // hardcoded whitelist size limit for entry so that we don't generate too many mismatches
-                /*if (entry.true_bcs.size() <= 10000) {
+                /*
+                if(entry.true_bcs.size() >= 100000 && entry.true_bcs.size() <= 1000000){
                     entry.generate_mismatch_barcodes(
-                        shift.value_or(2),
-                        mut.value_or(2),
-                    verbose, nthreads);
+                            shift.value_or(2),
+                            mut.value_or(2),
+                            verbose, nthreads);
                 }*/
 
                 // build filter_bcs from static_seqs
@@ -1049,7 +1050,7 @@ public:
 
     //save stats whitelist to a file
     void save_stats_wl(std::ostream &out, bool verbose, bool full = true, const std::string& whitelist_type = "true", 
-        bool include_stats = true, barcode_counts count_slot = barcode_counts::total) const {
+        bool include_stats = false, barcode_counts count_slot = barcode_counts::total) const {
     
         for (auto const& [class_id, wrap] : wl_map.maps) {
             auto &entry = wrap.get();
@@ -1074,7 +1075,7 @@ public:
                 // Calculate ztpoiss probabilities for all barcodes
                 true_bcs_mutable.calc_wl_ztpois_pct();
 
-                auto kde = true_bcs_mutable.calc_wl_density("log1p_ncpm_ztpois", 80.0);
+                auto kde = true_bcs_mutable.calc_wl_density("log1p_ncpm_ztpois", 50.0);
                 true_bcs_mutable.plot_density(kde, 80.0, 100.0);
 
                 // Do the same for global_bcs if needed

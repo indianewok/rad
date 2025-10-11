@@ -1,8 +1,8 @@
 ﻿Read Layout,,,,,
 id,seq,expected_length,type,class,whitelist
 forw_primer,CTACACGACGCTCTTCCGATCT,,static,,
-barcode,,16,variable,barcode,10x_3v1:/Users/cmv/Desktop/rad_paper/barcode_whitelists/rageseq_bcs.csv
+barcode,,16,variable,barcode,10x_3v4
 umi,,10,variable,umi,
 poly_t,,,static,poly_t,
 read,,,variable,read,
-rev_primer,ACTCTGCGTTGATACCACTGCTT,,static,,
+rev_primer,CCCATGTACTCTGCGTTGATACCACTGCTT,,static,,

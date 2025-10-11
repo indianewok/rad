@@ -1,0 +1,1185 @@
+#include "include/rad/rad_headers.h"
+
+struct extracted_bc {
+    std::string read_id;
+    std::string sequence;
+    int position;
+    bool is_reverse_complement;
+};
+
+// Simple reverse complement function
+std::string reverse_complement(const std::string& seq) {
+    std::string rc = seq;
+    std::reverse(rc.begin(), rc.end());
+    for (char& c : rc) {
+        switch (c) {
+            case 'A': case 'a': c = 'T'; break;
+            case 'T': case 't': c = 'A'; break;
+            case 'G': case 'g': c = 'C'; break;
+            case 'C': case 'c': c = 'G'; break;
+            case 'N': case 'n': c = 'N'; break;
+            default: break;
+        }
+    }
+    return rc;
+}
+
+// Extract barcode sequence given primer position
+std::string extract_barcode(
+    const std::string& sequence, int primer_pos, int primer_len, int n_bases, int m_left, int m_right, bool is_rc) {
+    int start_pos, end_pos; 
+    if (is_rc) {
+        // For reverse complement, extract before the primer
+        start_pos = std::max(0, primer_pos - m_right - n_bases);
+        end_pos = std::min((int)sequence.length(), primer_pos - m_right);
+    } else {
+        // For forward, extract after the primer
+        start_pos = std::max(0, primer_pos + primer_len + m_left);
+        end_pos = std::min((int)sequence.length(), start_pos + n_bases + m_right);
+    }
+    if (start_pos >= end_pos || start_pos < 0 || end_pos > (int)sequence.length()) {
+        return "";
+    }
+    return sequence.substr(start_pos, end_pos - start_pos);
+}
+
+// Structure to hold a read for processing
+struct read_chunk {
+    std::string read_id;
+    std::string sequence;
+};
+
+// Process a chunk of reads in parallel
+std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chunk,
+                                               const std::string& primer,
+                                               const std::string& primer_rc,
+                                               int n_bases, int m_left, int m_right,
+                                               double max_edit_distance_ratio) {
+    std::vector<extracted_bc> chunk_results;
+    
+    // Reserve space to avoid reallocations
+    chunk_results.reserve(chunk.size() / 5);
+    #pragma omp parallel
+    {
+        std::vector<extracted_bc> thread_results;
+        thread_results.reserve(chunk.size() / (10 * omp_get_num_threads()));
+        
+        #pragma omp for schedule(dynamic, 100)
+        for (size_t i = 0; i < chunk.size(); ++i) {
+            const auto& read = chunk[i];
+            
+            // Search for primer (forward)
+            EdlibAlignResult result = edlibAlign(primer.c_str(), primer.length(),
+                                               read.sequence.c_str(), read.sequence.length(),
+                                               edlibNewAlignConfig((int)(primer.length() * max_edit_distance_ratio), 
+                                                                 EDLIB_MODE_HW, EDLIB_TASK_LOC, NULL, 0));
+            
+            if (result.status == EDLIB_STATUS_OK && result.numLocations > 0) {
+                // Found primer - extract barcode
+                int primer_pos = result.startLocations[0];
+                std::string barcode = extract_barcode(read.sequence, primer_pos, primer.length(), 
+                                                    n_bases, m_left, m_right, false);
+                
+                if (!barcode.empty()) {
+                    thread_results.push_back({read.read_id, barcode, primer_pos, false});
+                }
+                edlibFreeAlignResult(result);
+                continue;
+            }
+            edlibFreeAlignResult(result);
+            
+            // Search for primer (reverse complement)
+            result = edlibAlign(primer_rc.c_str(), primer_rc.length(),
+                              read.sequence.c_str(), read.sequence.length(),
+                              edlibNewAlignConfig((int)(primer_rc.length() * max_edit_distance_ratio), 
+                                                 EDLIB_MODE_HW, EDLIB_TASK_LOC, NULL, 0));
+            
+            if (result.status == EDLIB_STATUS_OK && result.numLocations > 0) {
+                // Found reverse complement primer - extract barcode
+                int primer_pos = result.startLocations[0];
+                std::string barcode = extract_barcode(read.sequence, primer_pos, primer_rc.length(), 
+                                                    n_bases, m_left, m_right, true);
+                
+                if (!barcode.empty()) {
+                    thread_results.push_back({read.read_id, barcode, primer_pos, true});
+                }
+            }
+            edlibFreeAlignResult(result);
+        }
+        
+        // Merge thread results
+        #pragma omp critical
+        {
+            chunk_results.insert(chunk_results.end(), thread_results.begin(), thread_results.end());
+        }
+    }
+    return chunk_results;
+}
+
+// Parse FASTQ file (regular or gzipped) and extract barcodes with OpenMP parallelization
+std::vector<extracted_bc> process_fastq(const std::string& filename, 
+                                          const std::string& primer,
+                                          int n_bases, int m_left, int m_right,
+                                          int max_reads, double max_edit_distance_ratio = 0.2,
+                                          int chunk_size = 10000, int num_threads = 0) {
+    std::vector<extracted_bc> results;
+    gzFile fp = gzopen(filename.c_str(), "r");
+    if (!fp) {
+        std::cerr << "Error: Could not open file " << filename << std::endl;
+        return results;
+    }
+    
+    // Set number of OpenMP threads
+    if (num_threads > 0) {
+        omp_set_num_threads(num_threads);
+    }
+    
+    std::cout << "Using " << omp_get_max_threads() << " threads for parallel processing" << std::endl;
+    
+    kseq_t *seq = kseq_init(fp);
+    std::string primer_rc = reverse_complement(primer);
+    int reads_processed = 0;
+    int chunks_processed = 0;
+    
+    while (reads_processed < max_reads || max_reads <= 0) {
+        // Read a chunk of data
+        std::vector<read_chunk> chunk;
+        chunk.reserve(chunk_size);
+        
+        for (int i = 0; i < chunk_size && (kseq_read(seq) >= 0); ++i) {
+            if (max_reads > 0 && reads_processed >= max_reads) break;
+            
+            chunk.push_back({seq->name.s, seq->seq.s});
+            reads_processed++;
+        }
+        
+        if (chunk.empty()) break;
+        
+        chunks_processed++;
+        if (chunks_processed % 100 == 0) {
+            std::cout << "Processed " << reads_processed << " reads in " 
+                      << chunks_processed << " chunks, found " << results.size() 
+                      << " barcodes so far" << std::endl;
+        }
+        
+        // Process chunk in parallel
+        auto chunk_results = process_read_chunk(chunk, primer, primer_rc, 
+                                               n_bases, m_left, m_right, 
+                                               max_edit_distance_ratio);
+        
+        // Merge results
+        results.insert(results.end(), chunk_results.begin(), chunk_results.end());
+    }
+    
+    kseq_destroy(seq);
+    gzclose(fp);
+    
+    std::cout << "Processing complete: " << reads_processed 
+              << " reads processed, " << results.size() << " barcodes extracted" << std::endl;
+    
+    return results;
+}
+
+// Read whitelist barcodes from file (supports .gz compression)
+std::vector<std::string> read_whitelist(const std::string& filename) {
+    std::vector<std::string> whitelist;
+    
+    gzFile fp = gzopen(filename.c_str(), "r");
+    if (!fp) {
+        std::cerr << "Error: Could not open whitelist file " << filename << std::endl;
+        return whitelist;
+    }
+    
+    char buffer[1024];
+    std::string line;
+    
+    while (gzgets(fp, buffer, sizeof(buffer)) != NULL) {
+        line = buffer;
+        
+        // Remove newline character if present
+        if (!line.empty() && line.back() == '\n') {
+            line.pop_back();
+        }
+        
+        // Remove whitespace and empty lines
+        line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
+        if (!line.empty()) {
+            whitelist.push_back(line);
+        }
+    }
+    
+    gzclose(fp);
+    return whitelist;
+}
+
+// Barcode statistics structure
+struct bc_wl_stats {
+    std::string sequence;
+    int count;
+    double ncpm;
+    double log1p_ncpm;
+    double log1p_ncpm_ztpois;
+    
+    // Calculate NCPM per-barcode
+    void calculate_bc_ncpm(int barcode_count, double total_reads) {
+        if (total_reads > 0.0) {
+            ncpm = (static_cast<double>(barcode_count) / total_reads) * 1e6;
+        } else {
+            ncpm = 0.0;
+        }
+    }
+    
+    // Calculate log1p_ncpm per-barcode
+    void calculate_bc_log1p_ncpm() {
+        log1p_ncpm = std::log1p(ncpm);
+    }
+    
+    void calculate_bc_ztpois_pct(double k, double lambda) {
+        if (k <= 0.0) {
+            log1p_ncpm_ztpois = 0.0;
+            return; // no zeroes allowed
+        }
+        if (lambda <= 0.0) {
+            log1p_ncpm_ztpois = 0.0;
+            return;
+        }
+        
+        // Convert to integer for discrete distribution
+        int k_int = static_cast<int>(std::floor(k));
+        if (k_int <= 0) {
+            log1p_ncpm_ztpois = 0.0;
+            return;
+        }
+        
+        // Pre-calculate zero probability for truncation
+        double prob_zero = std::exp(-lambda);
+        double truncation_denom = 1.0 - prob_zero;
+        
+        // Calculate regular Poisson CDF: P(X <= k)
+        double regular_cdf = 0.0;
+        for (int j = 0; j <= k_int; j++) {
+            // Poisson PMF: P(X = j) = (lambda^j * exp(-lambda)) / j!
+            double log_pmf = j * std::log(lambda) - lambda - std::lgamma(j + 1.0);
+            regular_cdf += std::exp(log_pmf);
+        }
+        
+        // Zero-truncated CDF: P(X <= k | X > 0) = [P(X <= k) - P(X = 0)] / [1 - P(X = 0)]
+        double zt_cdf = (regular_cdf - prob_zero) / truncation_denom;
+        
+        // Clamp to [0, 1] and convert to percentage
+        zt_cdf = std::max(0.0, std::min(1.0, zt_cdf));
+        // Scale to percentage
+        log1p_ncpm_ztpois = zt_cdf * 100.0;
+    }
+
+};
+
+// Silverman's bandwidth calculation
+double calculate_silverman_bandwidth(const std::vector<double>& data) {
+    if (data.size() < 2) return 0.1;
+    
+    // Calculate standard deviation
+    double mean = std::accumulate(data.begin(), data.end(), 0.0) / data.size();
+    double sq_sum = 0.0;
+    for (double val : data) {
+        sq_sum += (val - mean) * (val - mean);
+    }
+    double std_dev = std::sqrt(sq_sum / (data.size() - 1));
+    
+    // Calculate IQR
+    std::vector<double> sorted_data = data;
+    std::sort(sorted_data.begin(), sorted_data.end());
+    double q1 = sorted_data[sorted_data.size() / 4];
+    double q3 = sorted_data[3 * sorted_data.size() / 4];
+    double iqr = q3 - q1;
+    
+    // Silverman's rule: 0.9 * min(sd, IQR/1.34) * n^(-1/5)
+    double n = static_cast<double>(data.size());
+    return 0.9 * std::min(std_dev, iqr / 1.34) * std::pow(n, -0.2);
+}
+
+// Simple kernel density estimation
+std::vector<std::pair<double, double>> kde(const std::vector<double>& data, double bandwidth, int n_points = 512) {
+    if (data.empty()) return {};
+    
+    double min_val = *std::min_element(data.begin(), data.end()) - 2 * bandwidth;
+    double max_val = *std::max_element(data.begin(), data.end()) + 2 * bandwidth;
+    double step = (max_val - min_val) / (n_points - 1);
+    
+    std::vector<std::pair<double, double>> density;
+    
+    for (int i = 0; i < n_points; ++i) {
+        double x = min_val + i * step;
+        double y = 0.0;
+        
+        // Gaussian kernel
+        for (double data_point : data) {
+            double z = (x - data_point) / bandwidth;
+            y += std::exp(-0.5 * z * z);
+        }
+        
+        y /= (data.size() * bandwidth * std::sqrt(2 * M_PI));
+        density.push_back({x, y});
+    }
+    
+    return density;
+}
+
+// Find peaks in density curve
+std::vector<double> find_peaks(const std::vector<std::pair<double, double>>& density,
+                               double min_height = 0.2, // default is 20%
+                               bool debug = false) {
+    std::vector<std::pair<double, double>> potential_peaks; // (x, height)
+
+    // 1) Max and threshold
+    double max_density = 0.0;
+    for (const auto& point : density) max_density = std::max(max_density, point.second);
+    double min_height_threshold = max_density * min_height; 
+    if (debug) {
+        std::cerr << "[find_peaks] max_density=" << std::setprecision(6) << max_density
+                  << "  min_height_threshold=" << min_height_threshold << " (10%)\n";
+    }
+
+    // 2) Collect local maxima; print all local max w/ PASS/FAIL
+    for (size_t i = 1; i + 1 < density.size(); ++i) {
+        const double y0 = density[i-1].second;
+        const double y1 = density[i].second;
+        const double y2 = density[i+1].second;
+
+        const bool is_local_max = (y1 > y0 && y1 > y2);
+        if (debug && is_local_max) {
+            std::cerr << "  local_max at x=" << std::fixed << std::setprecision(3) << density[i].first
+                      << " y=" << std::setprecision(6) << y1
+                      << " -> " << (y1 >= min_height_threshold ? "PASS" : "FAIL") << "\n";
+        }
+        if (is_local_max && y1 >= min_height_threshold) {
+            potential_peaks.push_back({density[i].first, y1});
+        }
+    }
+
+    // 3) Non-maximum suppression by separation
+    std::vector<double> final_peaks;
+    const double log_dist = 0.25;
+    const double eps = 1e-9; // for x-comparison
+
+    for (const auto& peak : potential_peaks) {
+        bool keep_peak = true;
+        for (const auto& other_peak : potential_peaks) {
+            if (std::abs(peak.first - other_peak.first) < eps) continue; // same peak
+            double distance = std::abs(peak.first - other_peak.first);
+            if (distance <= log_dist && other_peak.second > peak.second) {
+                keep_peak = false;
+                break;
+            }
+        }
+        if (keep_peak) final_peaks.push_back(peak.first);
+    }
+
+    if (debug) {
+        std::cerr << "  kept peaks: ";
+        for (double px : final_peaks) std::cerr << std::setprecision(3) << px << " ";
+        std::cerr << "\n";
+    }
+
+    return final_peaks;
+}
+
+static inline std::vector<std::pair<double,double>>
+kde_on_grid(
+    const std::vector<double>& data, 
+    double bandwidth,
+    double min_val,
+    double max_val, 
+    int n_points = 512)
+{
+    std::vector<std::pair<double,double>> density;
+    if (data.empty() || bandwidth <= 0.0 || n_points < 2) return density;
+
+    density.reserve(n_points);
+    const double step = (max_val - min_val) / (n_points - 1);
+    const double inv_norm = 1.0 / (data.size() * bandwidth * std::sqrt(2.0 * M_PI));
+
+    for (int i = 0; i < n_points; ++i) {
+        const double x = min_val + i * step;
+        double y = 0.0;
+        for (double z0 : data) {
+            const double z = (x - z0) / bandwidth;
+            y += std::exp(-0.5 * z * z);
+        }
+        density.push_back({x, y * inv_norm});
+    }
+    return density;
+}
+
+static inline double
+tau_intersection_on_grid(const std::vector<double>& xs, const std::vector<double>& LRw,
+                         const std::vector<double>& BGw, double tau /* e.g. 0.5 */)
+{
+    const size_t n = xs.size();
+    if (n == 0) return 0.0;
+    const double c = (tau == 0.5) ? 1.0 : (1.0 - tau) / tau;
+
+    auto diff_at = [&](size_t i){ return LRw[i] - c * BGw[i]; };
+
+    // find first sign change
+    for (size_t i = 0; i + 1 < n; ++i) {
+        const double d0 = diff_at(i), d1 = diff_at(i+1);
+        if ((d0 <= 0.0 && d1 >= 0.0) || (d0 >= 0.0 && d1 <= 0.0)) {
+            // linear interp
+            const double t = xs[i] + (xs[i+1] - xs[i]) * (0.0 - d0) / (d1 - d0 + 1e-300);
+            return t;
+        }
+    }
+    // no crossing: pick closest approach to zero
+    size_t k = 0;
+    double best = std::fabs(diff_at(0));
+    for (size_t i = 1; i < n; ++i) {
+        const double v = std::fabs(diff_at(i));
+        if (v < best) { best = v; k = i; }
+    }
+    return xs[k];
+}
+
+static inline std::vector<double>
+right_tail_area(const std::vector<double>& xs, const std::vector<double>& ys)
+{
+    const size_t n = xs.size();
+    std::vector<double> tail(n, 0.0);
+    if (n < 2) return tail;
+    // segment areas
+    std::vector<double> seg(n - 1, 0.0);
+    for (size_t i = 0; i + 1 < n; ++i) {
+        seg[i] = 0.5 * (ys[i] + ys[i+1]) * (xs[i+1] - xs[i]);
+    }
+    // cumulative from right
+    double acc = 0.0;
+    for (size_t i = n - 1; i-- > 0; ) {
+        acc += seg[i];
+        tail[i] = acc;
+    }
+    tail[n-1] = 0.0;
+    return tail;
+}
+
+// ---------- AF saddle cut ----------
+struct saddle_cut_result {
+    bool   ok              = false;  // found >= 2 peaks and a valley
+    double bw              = 0.0;
+    int    n_peaks         = 0;
+    double cut             = 0.0;    // raw valley x
+    double final_cut       = 0.0;    // widened plateau cut (clamped by left_bound)
+    bool   used_flat_widen = false;
+
+    double valley_height   = 0.0;
+    double left_peak       = 0.0;
+    double right_peak      = 0.0;
+    double plateau_left    = 0.0;    // widened plateau interval (for logging)
+    double plateau_right   = 0.0;
+};
+
+static inline saddle_cut_result
+compute_saddle_cut_af(const std::vector<double>& af_x,
+                      double bw = -1.0,
+                      int n_points = 512,
+                      double min_height_ratio = 0.10,   // peaks must be >=10% of max
+                      bool debug = false,
+                      double left_bound = -std::numeric_limits<double>::infinity()
+                      )
+{
+    saddle_cut_result res;
+    if (af_x.size() < 10) return res;
+
+    // 1) Bandwidth (Silverman fallback)
+    double use_bw = (bw > 0.0) ? bw : calculate_silverman_bandwidth(af_x);
+    if (!(use_bw > 0.0)) use_bw = 0.1;
+    res.bw = use_bw;
+
+    // 2) KDE on AF range
+    const double xmin = *std::min_element(af_x.begin(), af_x.end());
+    const double xmax = *std::max_element(af_x.begin(), af_x.end());
+    auto d = kde_on_grid(af_x, use_bw, xmin, xmax, n_points);
+    if (d.size() < 3) return res;
+
+    // 3) Peaks on AF KDE
+    auto pkx = find_peaks(d, /*min_height=*/min_height_ratio, /*debug=*/debug);
+    res.n_peaks = static_cast<int>(pkx.size());
+    if (pkx.size() < 2) {
+        if (debug) std::cerr << "[saddle] < 2 peaks → no saddle\n";
+        return res;
+    }
+
+    auto idx_of_x = [&](double x){
+        auto it = std::lower_bound(
+            d.begin(), d.end(), std::make_pair(x, -INFINITY),
+            [](const auto& a, const auto& b){ return a.first < b.first; });
+        size_t i = (it == d.end()) ? (d.size()-1) : static_cast<size_t>(it - d.begin());
+        if (i > 0 && std::fabs(d[i].first - x) > std::fabs(d[i-1].first - x)) --i;
+        return i;
+    };
+
+    struct peak_h { 
+        double x; 
+        double h; 
+        size_t i; 
+    };
+    std::vector<peak_h> ph;
+    ph.reserve(pkx.size());
+    for (double x : pkx) {
+        size_t i = idx_of_x(x);
+        ph.push_back({x, d[i].second, i});
+    }
+    std::sort(ph.begin(), ph.end(), [](const peak_h& a, const peak_h& b){ return a.h > b.h; });
+
+    const peak_h p1 = ph[0];
+    const peak_h p2 = ph[1];
+    size_t i_left  = std::min(p1.i, p2.i);
+    size_t i_right = std::max(p1.i, p2.i);
+
+    // 4) Raw valley minimum between the two tallest peaks
+    size_t i_valley = i_left;
+    double y_min = d[i_left].second;
+    for (size_t i = i_left + 1; i < i_right; ++i) {
+        if (d[i].second < y_min) { y_min = d[i].second; i_valley = i; }
+    }
+
+    res.ok            = (i_right > i_left + 1);
+    res.cut           = d[i_valley].first;
+    res.valley_height = d[i_valley].second;
+    res.left_peak     = d[i_left].first;
+    res.right_peak    = d[i_right].first;
+
+    if (!res.ok) return res;
+
+    // 5) “Keep walking” across flat valley -> widen both directions,
+    //    but: do not move left of left_bound; do not cross the right peak.
+    const double valley_h = res.valley_height;
+    const double tol      = p2.h*0.5;
+
+    // left expansion (stay > left_bound)
+    size_t L = i_valley;
+    while (L > 0 && std::fabs(d[L-1].second - valley_h) <= tol && d[L-1].first > left_bound) {
+        --L;
+    }
+    // right expansion (stay strictly before the right peak)
+    size_t R = i_valley;
+    while (R + 1 < d.size() && (R + 1) < i_right &&
+           std::fabs(d[R+1].second - valley_h) <= tol) {
+        ++R;
+    }
+
+    res.plateau_left  = std::max(left_bound, d[L].first);
+    res.plateau_right = d[R].first;
+
+    // Choose the leftmost point in the flat valley (“keep walking” left)
+    res.final_cut = std::max(left_bound, res.plateau_left);
+    res.used_flat_widen = (res.final_cut != res.cut);
+
+    if (debug) {
+        std::cerr << "[saddle] peaks @ " << p1.x << ", " << p2.x
+                  << "  raw valley = " << res.cut << " (h=" << valley_h << ")"
+                  << "  plateau=[" << res.plateau_left << ", " << res.plateau_right << "]"
+                  << "  final_cut = " << res.final_cut << "  (left_bound=" << left_bound
+                  << ", bw = " << res.bw << ")\n";
+    }
+    return res;
+}
+
+void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted_barcodes,
+                                      const std::vector<std::string>& whitelist,
+                                      const std::string& output_csv)
+{
+    std::cout << "Building hash map of extracted sequences...\n";
+
+    // 1) Collapse read-level to barcode counts
+    std::unordered_map<std::string, int> extracted_counts;
+    extracted_counts.reserve(extracted_barcodes.size());
+    for (const auto& x : extracted_barcodes) extracted_counts[x.sequence]++;
+
+    std::cout << "Found " << extracted_counts.size() << " unique sequences from "
+              << extracted_barcodes.size() << " total extractions\n";
+
+    // 2) Whitelist lookup
+    std::unordered_set<std::string> whitelist_set(whitelist.begin(), whitelist.end());
+    std::cout << "Built whitelist hash set with " << whitelist_set.size() << " barcodes\n";
+
+    // 3) Build stats (only WL barcodes)
+    std::vector<bc_wl_stats> barcode_stats;
+    barcode_stats.reserve(extracted_counts.size());
+
+    double total_reads = static_cast<double>(extracted_barcodes.size());
+    int total_perfect_matches = 0;
+    int unique_matches = 0;
+
+    for (const auto& kv : extracted_counts) {
+        const std::string& seq = kv.first;
+        int cnt = kv.second;
+        if (whitelist_set.find(seq) == whitelist_set.end()) continue;
+
+        bc_wl_stats s;
+        s.sequence = seq;
+        s.count    = cnt;
+        s.calculate_bc_ncpm(cnt, total_reads);
+        s.calculate_bc_log1p_ncpm();
+        barcode_stats.push_back(s);
+
+        total_perfect_matches += cnt;
+        unique_matches++;
+    }
+
+    // 4) zt_poisson on log1p_ncpm
+    double lambda = 0.0;
+    if (!barcode_stats.empty()) {
+        double sum = 0.0;
+        for (const auto& s : barcode_stats) sum += s.log1p_ncpm;
+        lambda = sum / barcode_stats.size();
+    }
+    std::cout << "Calculated lambda for zero-truncated Poisson (log1p_ncpm): " << lambda << "\n";
+
+    // ZT-Poisson percentile for each barcode
+    for (auto& s : barcode_stats) {
+        s.calculate_bc_ztpois_pct(s.log1p_ncpm, lambda);
+    }
+
+    // 5) Above-floor population (log1p scale)
+    const double FLOOR = 1.0;
+    const double ZTPOIS_RULE = 95.0; // fallback percentile if saddle/50% fail
+
+    std::vector<double> af_x; // log1p_ncpm for AF
+    af_x.reserve(barcode_stats.size());
+    for (const auto& s : barcode_stats){
+        if (s.log1p_ncpm >= FLOOR) af_x.push_back(s.log1p_ncpm);
+    }
+
+    // 6) PRIMARY THRESHOLD: AF-KDE saddle point on AF distribution
+    double threshold = FLOOR;                // numeric gate (log1p_ncpm)
+    std::string rule = "af_kde_saddle";
+    bool have_threshold = false;
+
+    double t_saddle = std::numeric_limits<double>::quiet_NaN();
+    bool   have_saddle = false;
+
+    if (af_x.size() >= 10) {
+        auto sd = compute_saddle_cut_af(af_x, /*bw=*/-1.0, /*n_points=*/512,
+                                        /*min_height_ratio=*/0.10, /*debug=*/false);
+        if (sd.ok) {
+            t_saddle = sd.final_cut;
+            threshold = std::max(sd.final_cut, FLOOR);
+            have_threshold = true;
+            have_saddle = true;
+            std::cout << "\n[AF-KDE saddle] peaks @ " << sd.left_peak << " & " << sd.right_peak
+                      << "  → saddle cut=" << sd.final_cut << " (bw = " << sd.bw << ")\n";
+        } else {
+            std::cout << "\n[AF-KDE saddle] No stable valley; will try fallback.\n";
+        }
+    } else {
+        std::cout << "\n[AF-KDE saddle] Not enough AF points (<10); will try fallback.\n";
+    }
+
+    // 7) FALLBACK THRESHOLD: ZT-Poisson 95th percentile → smallest x meeting it
+    if (!have_threshold) {
+        rule = "ztpois_95pct";
+        double best = std::numeric_limits<double>::infinity();
+        for (const auto& s : barcode_stats) {
+            if (s.log1p_ncpm >= FLOOR && s.log1p_ncpm_ztpois >= ZTPOIS_RULE) {
+                if (s.log1p_ncpm < best) best = s.log1p_ncpm;
+            }
+        }
+        if (std::isfinite(best)) {
+            threshold = best;
+            have_threshold = true;
+            std::cout << "[ZT-Poisson fallback] threshold = " << threshold << " (first x with ≥ "
+                      << ZTPOIS_RULE << "%)\n";
+        } else {
+            threshold = FLOOR;
+            std::cout << "[ZT-Poisson fallback] No items ≥ " << ZTPOIS_RULE
+                      << "% — using FLOOR = " << FLOOR << "\n";
+        }
+    }
+
+    // 8) DENSITY CALCS : AF mixture using a provisional LR/BG split (ZT-Poisson 95)
+    //    Also compute the 50% posterior intersection (t_purity50).
+    std::vector<double> lr_x, bg_x;
+    lr_x.reserve(af_x.size());
+    bg_x.reserve(af_x.size());
+    for (const auto& s : barcode_stats) {
+        if (s.log1p_ncpm < FLOOR) continue;
+        if (s.log1p_ncpm_ztpois >= ZTPOIS_RULE) {
+            lr_x.push_back(s.log1p_ncpm);
+        } else {
+            bg_x.push_back(s.log1p_ncpm);
+        }
+    }
+
+    double t_purity50 = std::numeric_limits<double>::quiet_NaN();
+    bool   have_tpurity50 = false;
+
+    if (af_x.size() >= 10 && lr_x.size() >= 10 && bg_x.size() >= 10) {
+        double bw = calculate_silverman_bandwidth(lr_x);
+        if (!(bw > 0.0)) bw = 0.1;
+        const int KDE_N = 512;
+        const double xmin = *std::min_element(af_x.begin(), af_x.end());
+        const double xmax = *std::max_element(af_x.begin(), af_x.end());
+
+        auto dR = kde_on_grid(lr_x, bw, xmin, xmax, KDE_N);  // fR|AF
+        auto dB = kde_on_grid(bg_x, bw, xmin, xmax, KDE_N);  // fB|AF
+
+        std::vector<double> xs, fR, fB;
+        xs.reserve(dR.size()); fR.reserve(dR.size()); fB.reserve(dB.size());
+        for (size_t i = 0; i < dR.size(); ++i) {
+            xs.push_back(dR[i].first);
+            fR.push_back(dR[i].second);
+            fB.push_back(dB[i].second);
+        }
+
+        const double piR = static_cast<double>(lr_x.size()) /
+                           static_cast<double>(lr_x.size() + bg_x.size());
+
+        // mixture-weighted components and AF
+        std::vector<double> LRw(fR.size()), BGw(fB.size()), AFw(fR.size());
+        for (size_t i = 0; i < fR.size(); ++i) {
+            LRw[i] = piR * fR[i];
+            BGw[i] = (1.0 - piR) * fB[i];
+            AFw[i] = LRw[i] + BGw[i];
+        }
+
+        std::cout << "\n[AF mixture diagnostics] bw=" << bw
+                  << "  |AF|=" << af_x.size()
+                  << "  |LR_in_AF|=" << lr_x.size()
+                  << "  |BG_in_AF|=" << bg_x.size()
+                  << "  piR=" << std::setprecision(6) << piR << "\n";
+
+        // 50% posterior intersection ("t_purity50")
+        t_purity50 = tau_intersection_on_grid(xs, LRw, BGw, /*tau=*/0.5);
+        have_tpurity50 = std::isfinite(t_purity50);
+        if (have_tpurity50) {
+            std::cout << "[t_purity50] 50% boundary at x = " << t_purity50 << "\n";
+        } else {
+            std::cout << "[t_purity50] could not compute.\n";
+        }
+
+        // If we have t_purity50 (and maybe a saddle), choose the greater of the two.
+        if (have_tpurity50 && have_saddle) {
+            double prev = threshold;
+            threshold = std::max(t_saddle, t_purity50);
+            rule = "max(saddle, t_purity50)";
+            std::cout << "[gate] prev=" << prev << "  → chosen=max(" << t_saddle
+                      << ", " << t_purity50 << ") = " << threshold << "\n";
+        } else if (have_tpurity50 && !have_saddle) {
+            double prev = threshold;
+            threshold = std::max(t_purity50, FLOOR);
+            rule = "t_purity50_only";
+            std::cout << "[gate] prev=" << prev << "  -> chosen=t_purity50=" << threshold << "\n";
+        }
+    } else {
+        std::cout << "\n[AF mixture diagnostics] Skipped (need ≥10 in AF/LR/BG).\n";
+    }
+
+    // Prepare the "between" band for annotation (only when both lines exist)
+    double band_lo = std::numeric_limits<double>::infinity();
+    double band_hi = -std::numeric_limits<double>::infinity();
+    bool   have_band = false;
+    if (have_saddle && have_tpurity50) {
+        band_lo = std::min(t_saddle, t_purity50);
+        band_hi = std::max(t_saddle, t_purity50);
+        have_band = true;
+    }
+
+    // 9) COLLAPSE DECISION: combine left-tail fraction + spread check
+    //    (a) left-tail %: if AF below threshold is small (≤10%), return ALL AF
+    //    (b) spread: if both sides are narrow (≤1.0) OR full range ≤ 2.0, return ALL AF
+    const double LEFT_TAIL_MAX_FRAC = 0.10;  // 10%
+    const double SPREAD_EPS = 1.0;           // in log1p_ncpm units
+    const int    MIN_SIDE_N = 5;             // avoid tiny/empty groups
+
+    size_t af_total = 0, af_left = 0, af_right = 0;
+    double left_min  =  std::numeric_limits<double>::infinity();
+    double right_min =  std::numeric_limits<double>::infinity();
+    double left_max  = -std::numeric_limits<double>::infinity();
+    double right_max = -std::numeric_limits<double>::infinity();
+
+    for (const auto& s : barcode_stats) {
+        if (s.log1p_ncpm < FLOOR) continue;
+        af_total++;
+        if (s.log1p_ncpm < threshold) {
+            af_left++;
+            left_min  = std::min(left_min,  s.log1p_ncpm);
+            left_max  = std::max(left_max,  s.log1p_ncpm);
+        } else {
+            af_right++;
+            right_min = std::min(right_min, s.log1p_ncpm);
+            right_max = std::max(right_max, s.log1p_ncpm);
+        }
+    }
+
+    const double left_frac   = (af_total > 0) ? (static_cast<double>(af_left) / af_total) : 1.0;
+    const bool   have_left   = (af_left  >= MIN_SIDE_N);
+    const bool   have_right  = (af_right >= MIN_SIDE_N);
+    const double left_range  = (have_left  ? (left_max  - left_min)  : 0.0);
+    const double right_range = (have_right ? (right_max - right_min) : 0.0);
+    const double full_range  = (std::isfinite(left_min) && std::isfinite(right_max))
+                                 ? (right_max - left_min)
+                                 : 0.0;
+
+    const bool narrow_both   = have_left && have_right &&
+                               (left_range <= SPREAD_EPS) && (right_range <= SPREAD_EPS);
+    const bool narrow_full   = (full_range > 0.0) && (full_range <= 2.0 * SPREAD_EPS);
+    const bool collapse_all_af = (af_total >= 10) &&
+                                 ((left_frac <= LEFT_TAIL_MAX_FRAC) || narrow_both || narrow_full);
+
+    std::cout << "\n[AF split] floor=" << FLOOR
+              << "  threshold=" << threshold
+              << "  rule=" << rule
+              << "\n         AF_total=" << af_total
+              << "  AF_left=" << af_left << " (" << left_frac * 100.0 << "%)"
+              << "  AF_right=" << af_right
+              << "\n[Spread]  left_range="  << left_range
+              << "  right_range=" << right_range
+              << "  full_range="  << full_range
+              << "\n[Collapse] " << (collapse_all_af ? "YES → return ALL AF" : "NO") << "\n";
+
+    // 10) Write CSV — explicit outputs + annotation band
+    //     final_barcode = TRUE iff:
+    //       - collapse_all_af: (log1p_ncpm >= FLOOR)
+    //       - else:            (log1p_ncpm >= threshold)
+    std::ofstream csv_out(output_csv);
+    csv_out << "barcode,count,ncpm,log1p_ncpm,ztpois_percentile,above_floor,over_threshold,"
+               "final_barcode,final_bc_annotation\n";
+
+    size_t n_final = 0, n_above_floor = 0;
+    for (const auto& s : barcode_stats) {
+        const bool above_floor   = (s.log1p_ncpm >= FLOOR);
+        if (above_floor) n_above_floor++;
+
+        const bool over_threshold = (s.log1p_ncpm >= threshold);
+        const bool final_barcode  = collapse_all_af ? above_floor : over_threshold;
+        if (final_barcode) n_final++;
+
+        // Annotation:
+        // - collapse mode: AF that pass are "high_confidence"
+        // - otherwise:
+        //     * ≥ chosen threshold: "high_confidence"
+        //     * between t_saddle and t_purity50: "high_sensitivity"
+        std::string ann;
+        if (collapse_all_af) {
+            if (final_barcode){
+                ann = "high_confidence";
+            }
+        } else {
+            if (over_threshold && above_floor) {
+                ann = "high_confidence";
+            } else if (have_band && above_floor &&
+                       s.log1p_ncpm >= band_lo && s.log1p_ncpm < band_hi) {
+                ann = "high_sensitivity";
+            } else {
+                ann = "low_confidence";
+            }
+        }
+
+        csv_out << s.sequence << ","
+                << s.count    << ","
+                << std::fixed << std::setprecision(6) << s.ncpm << ","
+                << s.log1p_ncpm << ","
+                << s.log1p_ncpm_ztpois << ","
+                << (above_floor   ? "TRUE" : "FALSE") << ","
+                << (over_threshold? "TRUE" : "FALSE") << ","
+                << (final_barcode ? "TRUE" : "FALSE") << ","
+                << ann
+                << "\n";
+    }
+
+    // 11) Console summary
+    std::cout << "\nStatistical analysis complete!\n"
+              << "Total extracted sequences: " << extracted_barcodes.size() << "\n"
+              << "Unique extracted sequences: " << extracted_counts.size() << "\n"
+              << "Total perfect matches: " << total_perfect_matches << "\n"
+              << "Unique barcodes with perfect matches: " << unique_matches << "\n"
+              << "Match rate: " << std::fixed << std::setprecision(2)
+              << (100.0 * total_perfect_matches / std::max<size_t>(1, extracted_barcodes.size())) << "%\n"
+              << "Above-floor barcodes: " << n_above_floor << "\n"
+              << "Final barcodes (TRUE): " << n_final << "\n"
+              << "Results written to: " << output_csv << "\n";
+}
+
+/*
+// master function for calculating matches and hits (cleaned)
+void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted_barcodes,
+                                      const std::vector<std::string>& whitelist,
+                                      const std::string& output_csv) {
+    std::cout << "Building hash map of extracted sequences..." << std::endl;
+
+    // 1) Collapse read-level to barcode counts
+    std::unordered_map<std::string, int> extracted_counts;
+    extracted_counts.reserve(extracted_barcodes.size());
+    for (const auto& x : extracted_barcodes) extracted_counts[x.sequence]++;
+
+    std::cout << "Found " << extracted_counts.size() << " unique sequences from "
+              << extracted_barcodes.size() << " total extractions\n";
+
+    // 2) Whitelist lookup
+    std::unordered_set<std::string> whitelist_set(whitelist.begin(), whitelist.end());
+    std::cout << "Built whitelist hash set with " << whitelist_set.size() << " barcodes\n";
+
+    // 3) Build stats for barcodes that are in the whitelist
+    std::vector<bc_wl_stats> barcode_stats;
+    barcode_stats.reserve(extracted_counts.size());
+
+    double total_reads = static_cast<double>(extracted_barcodes.size());
+    int total_perfect_matches = 0;
+    int unique_matches = 0;
+
+    for (const auto& kv : extracted_counts) {
+        const std::string& seq = kv.first;
+        int cnt = kv.second;
+        if (whitelist_set.find(seq) == whitelist_set.end()) continue;
+
+        bc_wl_stats s;
+        s.sequence = seq;
+        s.count    = cnt;
+        s.calculate_bc_ncpm(cnt, total_reads);
+        s.calculate_bc_log_ncpm();
+        barcode_stats.push_back(s);
+
+        total_perfect_matches += cnt;
+        unique_matches++;
+    }
+
+    // 4) ZT-Poisson parameter on log_ncpm
+    double lambda = 0.0;
+    if (!barcode_stats.empty()) {
+        double sum = 0.0;
+        for (const auto& s : barcode_stats){
+            sum += s.log_ncpm;
+        }
+        lambda = sum / barcode_stats.size();
+    }
+
+    std::cout << "Calculated lambda (Poisson on log_ncpm): " << lambda << "\n";
+
+    for (auto& s : barcode_stats) {
+        s.calculate_bc_pois_pct(s.log_ncpm, lambda);
+    }
+
+    // 5) Above-floor set (log scale);
+    const double FLOOR = 0.1;
+    std::vector<double> af_x;
+    af_x.reserve(barcode_stats.size());
+    for (const auto& s : barcode_stats) {
+        if (s.log_ncpm >= FLOOR) af_x.push_back(s.log_ncpm);
+    }
+
+    // 6) Threshold selection: AF KDE saddle cut → fallback ZT-Poisson 95th percentile
+    const double ZTPOIS_FALLBACK = 95.0;
+
+    double threshold = FLOOR;      // numeric x-threshold to gate on
+    std::string rule = "saddle_cut";
+    bool have_threshold = false;
+
+    // 6a) Try saddle on AF
+    if (af_x.size() >= 10) {
+        auto sd = compute_saddle_cut_af(af_x, -1.0, 512, 0.10, false);
+        if (sd.ok) {
+            threshold = std::max(sd.cut, FLOOR);
+            have_threshold = true;
+            std::cout << "\n[Saddle] peaks @ " << sd.left_peak << " & " << sd.right_peak
+                      << " → cut=" << sd.cut << " (bw=" << sd.bw << ")\n";
+        }
+    }
+
+    // 6b) Fallback to ZT-Poisson 95%: convert label rule to an x-threshold
+    if (!have_threshold) {
+        rule = "ztpois_95pct";
+        // choose the smallest log_ncpm whose ztpois_percentile >= 95 as threshold
+        double best = std::numeric_limits<double>::infinity();
+        for (const auto& s : barcode_stats) {
+            if (s.log_ncpm >= FLOOR && s.log_ncpm_ztpois >= ZTPOIS_FALLBACK) {
+                if (s.log_ncpm < best) best = s.log_ncpm;
+            }
+        }
+        if (std::isfinite(best)) {
+            threshold = best;
+            have_threshold = true;
+        } else {
+            // degenerate case: no item passes 95%; fall back to FLOOR
+            threshold = FLOOR;
+            std::cout << "[ZT-Poisson fallback] No items ≥95th pct; using FLOOR = " << FLOOR << "\n";
+        }
+    }
+
+    // 7) Collapse-to-all-AF rule by “small left tail”
+    //    If AF items left of the threshold are ≤5% of AF total, return *all AF*
+    const double LEFT_TAIL_MAX_FRAC = 0.1;
+    size_t af_total = 0, af_left = 0, af_right = 0;
+    for (const auto& s : barcode_stats) {
+        if (s.log_ncpm >= FLOOR) {
+            af_total++;
+            if (s.log_ncpm < threshold) af_left++; else af_right++;
+        }
+    }
+    const double left_frac = (af_total > 0) ? (static_cast<double>(af_left) / af_total) : 1.0;
+    const bool collapse_all_af = (af_total >= 10) && (left_frac <= LEFT_TAIL_MAX_FRAC);
+
+    std::cout << "\n[AF split] floor=" << FLOOR << "  threshold=" << threshold
+              << "  rule=" << rule
+              << "\n         AF_total=" << af_total
+              << "  AF_left=" << af_left << " (" << left_frac * 100.0 << "%)"
+              << "  AF_right=" << af_right
+              << "\n[Collapse] " << (collapse_all_af ? "YES → return ALL AF" : "NO") << "\n";
+
+    // 8) Write CSV (simplified & explicit)
+    //    final_barcode = TRUE iff:
+    //      - collapse_all_af: log_ncpm >= FLOOR
+    //      - else:            log_ncpm >= threshold
+    std::ofstream csv_out(output_csv);
+    csv_out << "barcode,count,ncpm,log_ncpm,ztpois_percentile,above_floor,final_barcode,"
+               "likely_real,decision_rule,threshold,collapsed_all_af\n";
+
+    size_t n_final = 0, n_above_floor = 0;
+    for (const auto& s : barcode_stats) {
+        const bool above_floor = (s.log_ncpm >= FLOOR);
+        if (above_floor) n_above_floor++;
+
+        const bool pass_threshold = collapse_all_af ? above_floor
+                                                   : (s.log_ncpm >= threshold);
+        if (pass_threshold) n_final++;
+
+        // “likely_real” is aligned with the chosen rule:
+        //   saddle_cut -> same as pass_threshold
+        //   ztpois_fallback -> ztpois_percentile >= 95 (and above_floor)
+        bool likely_real = false;
+        if (rule == "saddle_cut") {
+            likely_real = pass_threshold;
+        } else { // ztpois_95pct
+            likely_real = above_floor && (s.log_ncpm_ztpois >= ZTPOIS_FALLBACK);
+        }
+
+        csv_out << s.sequence << ","
+                << s.count << ","
+                << std::fixed << std::setprecision(6) << s.ncpm << ","
+                << s.log_ncpm << ","
+                << s.log1p_ncpm_ztpois << ","
+                << (above_floor ? "TRUE" : "FALSE") << ","
+                << (pass_threshold ? "TRUE" : "FALSE") << ","
+                << (likely_real ? "TRUE" : "FALSE") << ","
+                << rule << ","
+                << threshold << ","
+                << (collapse_all_af ? "TRUE" : "FALSE")
+                << "\n";
+    }
+
+    // 9) Console summary
+    std::cout << "\nStatistical analysis complete!\n"
+              << "Total extracted sequences: " << extracted_barcodes.size() << "\n"
+              << "Unique extracted sequences: " << extracted_counts.size() << "\n"
+              << "Total perfect matches: " << total_perfect_matches << "\n"
+              << "Unique barcodes with perfect matches: " << unique_matches << "\n"
+              << "Match rate: " << std::fixed << std::setprecision(2)
+              << (100.0 * total_perfect_matches / std::max<size_t>(1, extracted_barcodes.size())) << "%\n"
+              << "Above-floor barcodes: " << n_above_floor << "\n"
+              << "Final barcodes (TRUE): " << n_final << "\n"
+              << "Results written to: " << output_csv << "\n";
+}
+*/
+// Write results to FASTA
+void write_fasta(const std::vector<extracted_bc>& barcodes, const std::string& output_file) {
+    std::ofstream out(output_file);
+    for (size_t i = 0; i < barcodes.size(); ++i) {
+        out << ">" << barcodes[i].read_id << "_pos" << barcodes[i].position 
+            << (barcodes[i].is_reverse_complement ? "_rc" : "_fwd") << "\n"
+            << barcodes[i].sequence << "\n";
+    }
+}
+
+void print_usage(const char* program_name) {
+    std::cout << "Usage: " << program_name << " [options]\n"
+              << "Options:\n"
+              << "  -i, --input FILE       Input FASTQ file\n"
+              << "  -o, --output FILE      Output FASTA file\n"
+              << "  -p, --primer SEQ       Primer sequence to search for\n"
+              << "  -n, --n-bases INT      Number of bases to extract (barcode length)\n"
+              << "  -l, --left-margin INT  Bases to include on left side [default: 0]\n"
+              << "  -r, --right-margin INT Bases to include on right side [default: 0]\n"
+              << "  -m, --max-reads INT    Maximum number of reads to process [default: all]\n"
+              << "  -e, --max-error FLOAT  Maximum edit distance ratio [default: 0.2]\n"
+              << "  -w, --whitelist FILE   Barcode whitelist for perfect match analysis (optional)\n"
+              << "  -c, --csv FILE         Output CSV file for perfect matches (requires --whitelist)\n"
+              << "  -t, --threads INT      Number of threads for parallel processing [default: auto]\n"
+              << "  -k, --chunk-size INT   Chunk size for parallel processing [default: 10000]\n"
+              << "  -h, --help             Show this help message\n";
+}
+
+int main(int argc, char* argv[]) {
+    std::string input_file, output_file, primer, whitelist_file, csv_file;
+    int n_bases = 16, m_left = 0, m_right = 0, max_reads = 0, num_threads = 0, chunk_size = 10000;
+    double max_error = 0.2;
+    
+    static struct option long_options[] = {
+        {"input", required_argument, 0, 'i'},
+        {"output", required_argument, 0, 'o'},
+        {"primer", required_argument, 0, 'p'},
+        {"n-bases", required_argument, 0, 'n'},
+        {"left-margin", required_argument, 0, 'l'},
+        {"right-margin", required_argument, 0, 'r'},
+        {"max-reads", required_argument, 0, 'm'},
+        {"max-error", required_argument, 0, 'e'},
+        {"whitelist", required_argument, 0, 'w'},
+        {"csv", required_argument, 0, 'c'},
+        {"threads", required_argument, 0, 't'},
+        {"chunk-size", required_argument, 0, 'k'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}
+    };
+    
+    int opt;
+    while ((opt = getopt_long(argc, argv, "i:o:p:n:l:r:m:e:w:c:t:k:h", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'i': input_file = optarg; break;
+            case 'o': output_file = optarg; break;
+            case 'p': primer = optarg; break;
+            case 'n': n_bases = std::atoi(optarg); break;
+            case 'l': m_left = std::atoi(optarg); break;
+            case 'r': m_right = std::atoi(optarg); break;
+            case 'm': max_reads = std::atoi(optarg); break;
+            case 'e': max_error = std::atof(optarg); break;
+            case 'w': whitelist_file = optarg; break;
+            case 'c': csv_file = optarg; break;
+            case 't': num_threads = std::atoi(optarg); break;
+            case 'k': chunk_size = std::atoi(optarg); break;
+            case 'h': print_usage(argv[0]); return 0;
+            default: print_usage(argv[0]); return 1;
+        }
+    }
+    
+    if (input_file.empty() || output_file.empty() || primer.empty()) {
+        std::cerr << "Error: Missing required arguments\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+    
+    if (!csv_file.empty() && whitelist_file.empty()) {
+        std::cerr << "Error: --csv requires --whitelist\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+    
+    std::cout << "Processing " << input_file << "...\n";
+    std::cout << "Primer: " << primer << "\n";
+    std::cout << "Extracting " << n_bases << " bases with margins: left=" << m_left << ", right=" << m_right << "\n";
+    std::cout << "Chunk size: " << chunk_size << " reads per chunk\n";
+    
+    auto barcodes = process_fastq(input_file, primer, n_bases, m_left, m_right, max_reads, max_error, chunk_size, num_threads);
+    
+    std::cout << "Found " << barcodes.size() << " barcodes\n";
+    
+    write_fasta(barcodes, output_file);
+    std::cout << "Results written to " << output_file << "\n";
+    
+    if (!whitelist_file.empty()) {
+        std::cout << "\nLoading whitelist and performing perfect match analysis...\n";
+        auto whitelist = read_whitelist(whitelist_file);
+        std::cout << "Loaded " << whitelist.size() << " whitelist barcodes\n";
+        std::string csv_output = csv_file.empty() ? "perfect_matches.csv" : csv_file;
+        count_perfect_matches_with_stats(barcodes, whitelist, csv_output);
+    }
+    
+    return 0;
+}

@@ -186,6 +186,7 @@ namespace seq_utils {
         return str; // Return original string if no prefix found
     }
 
+    /*
     std::string substr_w_padding(const std::string& str, int start, int stop, int pad) {
         int start_pos = std::max(1, start - pad) -1 ;
         int stop_pos = std::min(static_cast<int>(str.length()), stop + pad);
@@ -194,7 +195,25 @@ namespace seq_utils {
             return ""; // Return empty string if length is non-positive
         }
         return str.substr(start_pos, length);
-    }
+    }*/
+   std::string substr_w_padding(const std::string& str, int start, int stop, int pad) {
+    if (str.empty()) return "";
+
+    // Safety: clamp start/stop into [1, str.length()]
+    int n = static_cast<int>(str.length());
+    start = std::max(1, std::min(start, n));
+    stop  = std::max(1, std::min(stop,  n));
+
+    // Ensure stop >= start
+    if (stop < start) std::swap(start, stop);
+
+    int start_pos = std::max(1, start - pad) - 1; // convert to 0-based
+    int stop_pos  = std::min(n, stop + pad);
+    int length    = stop_pos - start_pos;
+
+    if (length <= 0) return "";
+    return str.substr(start_pos, length);
+}
 
     static std::vector<std::pair<size_t,std::string>>extract(const std::string& seq, const std::string& pattern, size_t length, int offset){
         std::vector<std::pair<size_t,std::string>> results;
@@ -530,7 +549,10 @@ namespace config_utils {
         {"five_prime", "resources/read_layout/five_prime_read_layout.csv" },
         {"sctagger", "resources/read_layout/sctagger_sim_read_layout.csv" },
         {"three_prime", "resources/read_layout/three_prime_read_layout.csv" },
-        {"splitseq", "resources/read_layout/splitseq_read_layout.csv" }
+        {"splitseq", "resources/read_layout/splitseq_read_layout.csv" },
+        {"curio_sc", "resources/read_layout/curio_sc_read_layout.csv" },
+        {"curio_trekker", "resources/read_layout/curio_trekker_read_layout.csv"}
+
     };
 
     // check if the layout is a custom one

@@ -1,4 +1,3 @@
-#pragma once
 #include "rad_headers.h"
 
 /**
@@ -265,7 +264,7 @@ private:
         std::string sequence;
         sequence.reserve(length);
         
-        // Simple approach: use base_dist for equal probability, could be enhanced for GC content
+        //use base_dist for equal probability, could be enhanced for GC content
         for (int i = 0; i < length; ++i) {
             sequence += bases[base_dist(rng)];
         }

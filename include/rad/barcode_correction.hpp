@@ -367,7 +367,8 @@ namespace mutation_tools {
         int64_t Pv = pattern_mask;
         int64_t Mv = 0;
         int score = pattern_len;
-        int min_score = pattern_len;  // Track minimum across all positions
+        // Track minimum across all positions
+        int min_score = pattern_len;
         
         for (int j = 0; j < text_len; j++) {
             int text_nuc = (text >> (2 * j)) & 3;
@@ -383,10 +384,10 @@ namespace mutation_tools {
             
             if (Ph & (1LL << (pattern_len - 1))) score++;
             if (Mh & (1LL << (pattern_len - 1))) score--;
-            
-            min_score = std::min(min_score, score);  // Key difference from full matching
-            
-            if (min_score == 0) return 0;  // Perfect match found
+            // Key difference from full matching
+            min_score = std::min(min_score, score);  
+            // Perfect match found
+            if (min_score == 0) return 0; 
             
             Ph <<= 1;
             Pv = ((Mh << 1) | ~(Xv | Ph)) & pattern_mask;
@@ -498,18 +499,18 @@ namespace mutation_tools {
 
     // calculating levenshtein distance between one query and a target sequence (int64_seq)
     int int64_lvdist(const int64_seq &query, const int64_seq &target, int max_dist) {
-    if (query.bits.empty() || target.bits.empty()){
-        return -1;
+        if (query.bits.empty() || target.bits.empty()){
+            return -1;
+        }
+        
+        if (query.length <= target.length) {
+            // Query is shorter or equal, search query in target
+            return bit_partial_match(query.bits[0], target.bits[0], query.length, target.length, max_dist);
+        } else {
+            // Target is shorter, search target in query
+            return bit_partial_match(target.bits[0], query.bits[0], target.length, query.length, max_dist);
+        }
     }
-    
-    if (query.length <= target.length) {
-        // Query is shorter or equal, search query in target
-        return bit_partial_match(query.bits[0], target.bits[0], query.length, target.length, max_dist);
-    } else {
-        // Target is shorter, search target in query
-        return bit_partial_match(target.bits[0], query.bits[0], target.length, query.length, max_dist);
-    }
-}
     
 // generate point mutations for a given int64_seq sequence
     std::unordered_set<int64_seq> generate_point_mutations(const int64_seq &seq) {
@@ -629,61 +630,6 @@ namespace mutation_tools {
         
         return final_mutations;
     }
-    
-    //generating shifted barcodes
-    /*std::unordered_set<int64_seq> generate_shifted_barcodes(const int64_seq &seq, int shift) {
-        std::unordered_set<int64_seq> result;
-        // 1) Quick exits
-        if (seq.bits.empty() || shift <= 0 || shift >= seq.length){
-            return result;
-        }
-    
-        // 2) Get the string
-        std::string barcode = seq.bits_to_sequence();
-        int L = (int)barcode.size();
-    
-        // 3) Compute cores
-        std::string coreR = barcode.substr(0, L - shift);  // for left shifts
-        std::string coreL = barcode.substr(shift);         // for right shifts
-    
-        const char bases[4] = {'A','C','G','T'};
-        std::string buf(shift, ' ');
-    
-        // 4) Build left shifts
-        std::function<void(int)> dfs_left = [&](int pos) {
-            if (pos == shift) {
-                // Make a fresh int64_seq from the new string
-                int64_seq cand;
-                cand.sequence_to_bits(buf + coreR);
-                result.insert(std::move(cand));
-                return;
-            }
-            for (char b : bases) {
-                buf[pos] = b;
-                dfs_left(pos + 1);
-            }
-        };
-        dfs_left(0);
-    
-        // 5) Build right shifts
-        std::function<void(int)> dfs_right = [&](int pos) {
-            if (pos == shift) {
-                int64_seq cand;
-                cand.sequence_to_bits(coreL + buf);
-                result.insert(std::move(cand));
-                return;
-            }
-            for (char b : bases) {
-                buf[pos] = b;
-                dfs_right(pos + 1);
-            }
-        };
-        dfs_right(0);
-    
-        // 6) Remove the original if it was regenerated
-        result.erase(seq);
-        return result;
-    }*/
 
     // Call this exactly the same way as before, but it will reuse its buffer
     std::unordered_set<int64_seq> generate_shifted_barcodes(const int64_seq &seq, int shift) {
@@ -741,6 +687,102 @@ namespace mutation_tools {
         // 8) Drop the original if it snuck back in
         result.erase(seq);
         return result;
+    }
+
+    // Generate Levenshtein barcodes
+    std::unordered_set<int64_seq> generate_lv_barcodes(const int64_seq &seq, int edit_rounds = 1) {
+        if (seq.bits.empty()) return {};
+        
+        std::unordered_set<int64_seq> all_mutations;
+        std::unordered_set<int64_seq> current_round;
+        current_round.insert(seq);
+        all_mutations.insert(seq);
+        
+        for (int round = 0; round < edit_rounds; ++round) {
+            std::unordered_set<int64_seq> next_round;
+            
+            for (const auto& candidate : current_round) {
+                int64_t bits = candidate.bits[0];
+                int length = candidate.length;
+                
+                // SUBSTITUTIONS
+                for (int pos = 0; pos < length; ++pos) {
+                    int64_t original_nuc = (bits >> (2 * pos)) & 3;
+                    for (int64_t new_nuc = 0; new_nuc < 4; ++new_nuc) {
+                        if (new_nuc != original_nuc) {
+                            int64_t clear_mask = ~(3LL << (2 * pos));
+                            int64_t new_bits = (bits & clear_mask) | (new_nuc << (2 * pos));
+                            int64_seq new_seq(new_bits, length);
+                            
+                            if (all_mutations.insert(new_seq).second) {
+                                next_round.insert(new_seq);
+                            }
+                        }
+                    }
+                }
+                
+                // DELETIONS
+                if (length > 1) {
+                    for (int del_pos = 0; del_pos < length; ++del_pos) {
+                        int64_t new_bits = 0;
+                        int new_pos = 0;
+                        
+                        for (int i = 0; i < length; ++i) {
+                            if (i != del_pos) {
+                                int64_t nuc = (bits >> (2 * i)) & 3;
+                                new_bits |= (nuc << (2 * new_pos));
+                                new_pos++;
+                            }
+                        }
+                        
+                        int64_seq new_seq(new_bits, length - 1);
+                        if (all_mutations.insert(new_seq).second) {
+                            next_round.insert(new_seq);
+                        }
+                    }
+                }
+                
+                // INSERTIONS
+                if (length < 32) {
+                    for (int ins_pos = 0; ins_pos <= length; ++ins_pos) {
+                        for (int64_t new_nuc = 0; new_nuc < 4; ++new_nuc) {
+                            int64_t new_bits = 0;
+                            int new_pos = 0;
+                            
+                            // Copy before insertion
+                            for (int i = 0; i < ins_pos; ++i) {
+                                int64_t nuc = (bits >> (2 * i)) & 3;
+                                new_bits |= (nuc << (2 * new_pos));
+                                new_pos++;
+                            }
+                            
+                            // Insert new nucleotide
+                            new_bits |= (new_nuc << (2 * new_pos));
+                            new_pos++;
+                            
+                            // Copy after insertion
+                            for (int i = ins_pos; i < length; ++i) {
+                                int64_t nuc = (bits >> (2 * i)) & 3;
+                                new_bits |= (nuc << (2 * new_pos));
+                                new_pos++;
+                            }
+                            
+                            int64_seq new_seq(new_bits, length + 1);
+                            if (all_mutations.insert(new_seq).second) {
+                                next_round.insert(new_seq);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (next_round.empty()) break;
+            current_round = std::move(next_round);
+        }
+        
+        // Remove original sequence
+        all_mutations.erase(seq);
+        return all_mutations;
     }
 
     //detect homopolymers in a sequence
@@ -2223,9 +2265,11 @@ class whitelist {
         }
     }
     
-    //import a whitelist from file--can be true barcodes or not. cheap but easy way to import b/w both global or custom--just set
+    //import a whitelist from file--can be true barcodes or not. 
+    //cheap but easy way to import b/w both global or custom--just set
     //an arbitrary threshold for the number of true barcodes to be kept because ideally after a certain size of barcodes
     //you really just want to treat them both the same way
+    
     wl_entry import_whitelist(std::string const &field, bool verbose, uint16_t default_length = 16) {
         if(verbose) std::cout << "[import_whitelist] Importing whitelist from " << field << "\n";
         // split into 1 or 2 specs

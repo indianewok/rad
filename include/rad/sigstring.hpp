@@ -210,8 +210,9 @@ public:
         const int min_match_bases = 5;
         
         // If expected_end is not provided, use the target's length
-        if (expected_end < 0)
-            expected_end = target.size();
+        if (expected_end < 0){
+                expected_end = target.size();
+        }
 
         // Custom equality rules:
         // Uppercase A, C, T, G match their lowercase forms and also the pad character 'x'.
@@ -338,9 +339,10 @@ public:
             )
             ||
             (
+                //edited here for concat
                 deviation > 100 && 
                 ssw_length >= 10 && 
-                ssw_max_matches >= 10
+                ssw_max_matches_ind >= 10
             )) {
                 alignment.positions.push_back({ssw_start, ssw_end});
                 alignment.edit_distance = compute_edit_distance(sswAlign.cigar_string.c_str());
@@ -467,128 +469,20 @@ namespace barcode_correction {
             } else if (total_count >= threshold & raw_count < 2){
                 //kill it if it gets 10 freebies with no associated raw counts
                 whitelist.set_bc_count(candidate, -1);
+                return false;
             }
         return overall_pass;
     }
 
+
 std::pair<std::optional<int64_seq>, std::optional<int>> 
-resolve_multiple_hits_depr_v3(
+resolve_multiple_hits_complex(
     const int64_seq& query,
     const std::unordered_set<int64_seq>& candidates,
     int max_dist,
     bool verbose,
     const std::string& wl_type,
-    const whitelist::wl_entry* wl = nullptr
-) {
-    auto sorted = mutation_tools::int64_lvdist(query, candidates, max_dist);
-    if (sorted.empty()) return {std::nullopt, std::nullopt};
-
-    const auto& target_whitelist = (wl_type == "global") ? wl->global_bcs : wl->true_bcs;
-
-    struct candidate_info {
-        int64_seq barcode;
-        int edit_distance;
-        double cdf_score;
-        int raw_count;
-    };
-
-    // Collect all candidates
-    std::vector<candidate_info> all_candidates;
-    for (const auto& [edit_dist, candidate_set] : sorted) {
-        for (const auto& candidate : candidate_set) {
-            candidate_info info;
-            info.barcode = candidate;
-            info.edit_distance = edit_dist;
-            info.cdf_score = target_whitelist.get_bc_log1p_ncpm_ztpois(candidate);
-            info.raw_count = target_whitelist.get_bc_count(candidate, barcode_counts::raw);
-            all_candidates.push_back(info);
-        }
-    }
-
-    // Filter for raw_count > 0
-    all_candidates.erase(
-        std::remove_if(all_candidates.begin(), all_candidates.end(),
-            [](const candidate_info& c) { return c.raw_count <= 0; }),
-        all_candidates.end()
-    );
-    
-    if (all_candidates.empty()) {
-        if (verbose) std::cout << "No candidates with raw_count > 0, rejecting\n";
-        return {std::nullopt, sorted.begin()->first};
-    }
-
-    // Check if any have CDF > 50
-    bool has_high_cdf = false;
-    for (const auto& c : all_candidates) {
-        if (c.cdf_score > 50) {
-            has_high_cdf = true;
-            break;
-        }
-    }
-
-    if (has_high_cdf) {
-        // Use CDF-based selection
-        std::map<int, std::vector<candidate_info*>> by_distance;
-        for (auto& c : all_candidates) {
-            if (c.cdf_score > 50) {
-                by_distance[c.edit_distance].push_back(&c);
-            }
-        }
-        
-        // Get lowest edit distance with CDF > 50
-        int best_distance = by_distance.begin()->first;
-        auto& best_candidates = by_distance.begin()->second;
-        
-        if (best_candidates.size() == 1) {
-            if (verbose) std::cout << "Winner: unique CDF > 50 at distance " << best_distance << "\n";
-            return {best_candidates[0]->barcode, best_distance};
-        } else {
-            if (verbose) std::cout << "Multiple barcodes with CDF > 50 at distance " << best_distance << ", rejecting\n";
-            return {std::nullopt, best_distance};
-        }
-    } else {
-        // Use raw count-based selection
-        std::map<int, std::vector<candidate_info*>> by_distance;
-        for (auto& c : all_candidates) {
-            by_distance[c.edit_distance].push_back(&c);
-        }
-        
-        // Find lowest edit distance with highest raw count
-        for (auto& [dist, cands] : by_distance) {
-            // Find max raw count at this distance
-            int max_raw_count = 0;
-            for (auto* c : cands) {
-                max_raw_count = std::max(max_raw_count, c->raw_count);
-            }
-            
-            // Collect candidates with max raw count
-            std::vector<candidate_info*> best_at_distance;
-            for (auto* c : cands) {
-                if (c->raw_count == max_raw_count) {
-                    best_at_distance.push_back(c);
-                }
-            }
-            
-            if (best_at_distance.size() == 1) {
-                if (verbose) std::cout << "Winner: unique highest raw count at distance " << dist << "\n";
-                return {best_at_distance[0]->barcode, dist};
-            }
-            // If tied, continue to next distance (implicit rejection of this distance)
-        }
-        
-        if (verbose) std::cout << "No unique winner by raw count, rejecting\n";
-        return {std::nullopt, sorted.begin()->first};
-    }
-}
-
-
-std::pair<std::optional<int64_seq>, std::optional<int>> 
-resolve_multiple_hits(
-    const int64_seq& query,
-    const std::unordered_set<int64_seq>& candidates,
-    int max_dist,
-    bool verbose,
-    const std::string& wl_type,
+    const std::string& mode,
     const whitelist::wl_entry* wl = nullptr
 ) {
     auto sorted = mutation_tools::int64_lvdist(query, candidates, max_dist);
@@ -636,7 +530,7 @@ resolve_multiple_hits(
                          << ", raw_count=" << distance_candidates[0].raw_count << ")\n";
             }
             
-            if (passes_quality_check(distance_candidates[0].barcode, wl, wl_type, "defensive", verbose)) {
+            if (passes_quality_check(distance_candidates[0].barcode, wl, wl_type, mode, verbose)) {
                 return {distance_candidates[0].barcode, edit_dist};
             } else {
                 if (verbose) std::cout << "Quality check failed for candidate, rejecting\n";
@@ -670,7 +564,7 @@ resolve_multiple_hits(
                          << " (CDF=" << max_cdf << ")\n";
             }
             
-            if (passes_quality_check(cdf_winners[0].barcode, wl, wl_type, "defensive", verbose)) {
+            if (passes_quality_check(cdf_winners[0].barcode, wl, wl_type, mode, verbose)) {
                 return {cdf_winners[0].barcode, edit_dist};
             } else {
                 if (verbose) std::cout << "Quality check failed for CDF winner, rejecting\n";
@@ -707,7 +601,7 @@ resolve_multiple_hits(
                          << " (raw_count=" << max_raw_count << ")\n";
             }
             
-            if (passes_quality_check(count_winners[0].barcode, wl, wl_type, "offensive", verbose)) {
+            if (passes_quality_check(count_winners[0].barcode, wl, wl_type, mode, verbose)) {
                 return {count_winners[0].barcode, edit_dist};
             } else {
                 if (verbose) std::cout << "Quality check failed for count winner, rejecting\n";
@@ -727,137 +621,6 @@ resolve_multiple_hits(
     if (verbose) std::cout << "No candidates with raw_count > 0 at any distance, rejecting\n";
     return {std::nullopt, std::nullopt};
 }
-
-// Resolve multiple hits for a given query against a set of candidates
-std::pair<std::optional<int64_seq>, std::optional<int>>
-resolve_multiple_hits_depr_v2(
-    const int64_seq& query,
-    const std::unordered_set<int64_seq>& candidates,
-        int max_dist,
-        bool verbose,
-        const std::string& wl_type,
-        const whitelist::wl_entry* wl = nullptr
-    ) {
-        auto sorted = mutation_tools::int64_lvdist(query, candidates, 2);
-        if (sorted.empty()) return {std::nullopt, std::nullopt};
-
-        const auto& target_whitelist = (wl_type == "global") ? wl->global_bcs : wl->true_bcs;
-
-        struct candidate_info {
-            int64_seq barcode;
-            int edit_distance;
-            double cdf_score;
-            int raw_count;
-        };
-
-        // Collect all candidates
-        std::vector<candidate_info> all_candidates;
-        for (const auto& [edit_dist, candidate_set] : sorted) {
-            for (const auto& candidate : candidate_set) {
-                candidate_info info;
-                info.barcode = candidate;
-                info.edit_distance = edit_dist;
-                info.cdf_score = target_whitelist.get_bc_log1p_ncpm_ztpois(candidate);
-                info.raw_count = target_whitelist.get_bc_count(candidate, barcode_counts::raw);
-                all_candidates.push_back(info);
-            }
-        }
-
-        // STEP 1: Find highest CDF score
-        double max_cdf = 0;
-        for (const auto& c : all_candidates) {
-            max_cdf = std::max(max_cdf, c.cdf_score);
-        }
-
-        // STEP 2: If all CDFs are 0, filter to only raw_count > 0
-        /*if (max_cdf == 0) {
-            all_candidates.erase(
-                std::remove_if(all_candidates.begin(), all_candidates.end(),
-                    [](const candidate_info& c) { return c.raw_count == 0; }),
-                all_candidates.end()
-            );
-            
-            if (all_candidates.empty()) {
-                if (verbose) std::cout << "All candidates have CDF=0 and raw_count=0, rejecting\n";
-                return {std::nullopt, sorted.begin()->first};
-            }
-        }*/
-
-        // STEP 3: Group by edit distance
-        std::map<int, std::vector<candidate_info>> by_distance;
-        for (const auto& c : all_candidates) {
-            by_distance[c.edit_distance].push_back(c);
-        }
-
-        // STEP 4: Find unique edit distances at highest CDF
-        /*
-        if (max_cdf > 0) {
-            for (const auto& [dist, cands] : by_distance) {
-                if (cands.size() == 1 && cands[0].cdf_score == max_cdf) {
-                    // Found unique barcode at this distance with max CDF!
-                    if (verbose) {
-                        std::cout << "Winner: unique at edit_dist=" << dist 
-                                << " with max CDF=" << max_cdf << "\n";
-                    }
-                    return {cands[0].barcode, dist};
-                }
-            }
-        }
-        */
-        // STEP 5: No unique distance at max CDF, so find highest CDF at lowest distance
-        for (auto& [dist, cands] : by_distance) {  // map iterates in sorted order
-            // Find best CDF at this distance
-            candidate_info* best = nullptr;
-            int count_at_best = 0;
-            
-            for (auto& c : cands) {
-                if (!best || c.cdf_score > best->cdf_score) {
-                    best = &c;
-                    count_at_best = 1;
-                } else if (c.cdf_score == best->cdf_score) {
-                    count_at_best++;
-                }
-            }
-            
-            if (count_at_best == 1) {
-                // Unique best at this distance
-                if (verbose) {
-                    std::cout << "Winner at edit_dist=" << dist 
-                            << " with CDF=" << best->cdf_score << "\n";
-                }
-                return {best->barcode, dist};
-            }
-            
-            // Multiple tied at this distance - if CDF > 0, reject as ambiguous
-            if (best->cdf_score > 0) {
-                if (verbose) {
-                    std::cout << "Ambiguous: " << count_at_best 
-                            << " candidates tied at dist=" << dist 
-                            << " with CDF=" << best->cdf_score << ", rejecting\n";
-                }
-                return {std::nullopt, dist};
-            }
-            // CDF = 0, use raw counts as tiebreaker
-            candidate_info* count_best = nullptr;
-            for (auto& c : cands) {
-                if (!count_best || c.raw_count > count_best->raw_count) {
-                    count_best = &c;
-                }
-            }
-            // Check if unique by raw count
-            int winners = 0;
-            for (auto& c : cands) {
-                if (c.raw_count == count_best->raw_count) winners++;
-            }
-            
-            if (winners == 1) {
-                return {count_best->barcode, dist};
-            }
-        }
-        // Everything is ambiguous
-        if (verbose) std::cout << "No unique winner found, rejecting all\n";
-        return {std::nullopt, sorted.begin()->first};
-    }
 
 std::pair<std::optional<int64_seq>, std::optional<int>> 
 resolve_multiple_hits_simple(
@@ -890,7 +653,7 @@ resolve_multiple_hits_simple(
         
         if (valid_candidates.size() == 1) {
             if (verbose) std::cout << "Winner: unique candidate at distance " << edit_dist << "\n";
-            if(passes_quality_check(valid_candidates[0], wl, wl_type, "defensive", verbose)) {
+            if(passes_quality_check(valid_candidates[0], wl, wl_type, "offensive", verbose)) {
                 return {valid_candidates[0], edit_dist};
             } else {
                 if (verbose) std::cout << "Quality check failed for candidate, rejecting\n";
@@ -1142,9 +905,7 @@ resolve_multiple_hits_simple(
             // Single best match
             int64_seq best_candidate = best_matches[0];
             
-           // if (passes_quality_check(best_candidate, wl, whitelist_type, mode, verbose)) {
-           if(best_matches.size() == 1) {
-           //if(best_distance <= 3){
+           if(passes_quality_check(best_candidate, wl, whitelist_type, mode, verbose)){
                 if (verbose) {
                     #pragma omp critical
                     {
@@ -1186,332 +947,6 @@ resolve_multiple_hits_simple(
     return std::nullopt;
 }
 
-    std::optional<int64_seq> check_against_wl_exhaustive_v2(
-    const int64_seq& bc,
-    const std::string& whitelist_type,
-    int max_dist,
-    bool verbose,
-    const std::string& mode,
-    const whitelist::wl_entry* wl = nullptr) {
-    
-    // Select the appropriate whitelist based on type
-    const auto& whitelist = (whitelist_type == "global") ? wl->global_bcs : wl->true_bcs;
-    
-    // Early exit if whitelist is empty
-    if (whitelist.empty()) {
-        return std::nullopt;
-    }
-    
-    if (verbose) {
-        #pragma omp critical
-        {
-            std::ostringstream oss;
-            oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK" : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK")
-                << " (checking " << whitelist.size() << " sequences)\n";
-            std::cout << oss.str();
-        }
-    }
-    
-    // Get all unique barcodes as candidates
-    std::unordered_set<int64_seq> candidates;
-    auto unique_entries = whitelist.get_unique_entries();
-    for (const auto* entry : unique_entries) {
-        candidates.insert(entry->barcode);
-    }
-    
-    // Use the existing tiebreaker function
-    auto [result, distance] = resolve_multiple_hits(bc, candidates, 2, verbose, whitelist_type, wl);
-    
-    if (result.has_value()) {
-        // Quality check the winner
-        if (passes_quality_check(result.value(), wl, whitelist_type, mode, verbose)) {
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << "LVDIST::" << distance.value() << "\n"
-                        << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_MATCHED" 
-                                                     : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_MATCHED")
-                        << "\n";
-                    std::cout << oss.str();
-                }
-            }
-            return result.value();
-        } else {
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_QUALITY_FAILED - rejecting barcode" 
-                                                     : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_QUALITY_FAILED - rejecting barcode") << "\n";
-                    std::cout << oss.str();
-                }
-            }
-            return std::nullopt;
-        }
-    } else {
-        if (verbose) {
-            #pragma omp critical
-            {
-                std::ostringstream oss;
-                oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_NO_WINNER" 
-                                                 : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_NO_WINNER") << "\n";
-                std::cout << oss.str();
-            }
-        }
-        return std::nullopt;
-    }
-}
-
-
-std::optional<int64_seq> check_against_wl_exhaustive_v3(
-    const int64_seq& bc,
-    const std::string& whitelist_type,
-    int max_dist,
-    bool verbose,
-    const std::string& mode,
-    const whitelist::wl_entry* wl = nullptr
-) {
-    // Select the appropriate whitelist based on type
-    const auto& whitelist = (whitelist_type == "global") ? wl->global_bcs : wl->true_bcs;
-    
-    // Early exit if whitelist is empty
-    if (whitelist.empty()) {
-        return std::nullopt;
-    }
-    
-    if (verbose) {
-        #pragma omp critical
-        {
-            std::ostringstream oss;
-            oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK" : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK")
-                << " (checking " << whitelist.size() << " sequences)\n";
-            std::cout << oss.str();
-        }
-    }
-    
-    struct match_info {
-        int64_seq barcode;
-        int edit_distance;
-        int raw_count;
-        double cdf_score;
-    };
-    
-    // Collect all matches with their metrics
-    std::vector<match_info> matches;
-    auto unique_entries = whitelist.get_unique_entries();
-    
-    for (const auto* entry : unique_entries) {
-        int distance = mutation_tools::int64_lvdist(bc, entry->barcode, max_dist);
-        if (distance >= 0) {
-            match_info info;
-            info.barcode = entry->barcode;
-            info.edit_distance = distance;
-            info.raw_count = whitelist.get_bc_count(entry->barcode, barcode_counts::raw);
-            info.cdf_score = whitelist.get_bc_log1p_ncpm_ztpois(entry->barcode);
-            matches.push_back(info);
-        }
-    }
-    
-    if (matches.empty()) {
-        if (verbose) {
-            #pragma omp critical
-            {
-                std::ostringstream oss;
-                oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_NO_MATCHES" 
-                                                 : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_NO_MATCHES") << "\n";
-                std::cout << oss.str();
-            }
-        }
-        return std::nullopt;
-    }
-    
-    if (verbose) {
-        #pragma omp critical
-        {
-            std::ostringstream oss;
-            oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_FOUND" 
-                                             : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_FOUND")
-                << " (" << matches.size() << " matches)\n";
-            std::cout << oss.str();
-        }
-    }
-    
-    // Group matches by edit distance
-    std::map<int, std::vector<match_info>> matches_by_distance;
-    for (const auto& match : matches) {
-        matches_by_distance[match.edit_distance].push_back(match);
-    }
-    
-    // Process each edit distance in ascending order
-    for (const auto& [distance, distance_matches] : matches_by_distance) {
-        if (distance_matches.size() == 1) {
-            // Single match at this distance
-            const auto& candidate = distance_matches[0];
-            
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_CANDIDATE::" 
-                                                     : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_CANDIDATE::")
-                        << candidate.barcode.bits_to_sequence() 
-                        << " (dist=" << distance << ", raw=" << candidate.raw_count 
-                        << ", cdf=" << candidate.cdf_score << ")\n";
-                    std::cout << oss.str();
-                }
-            }
-            
-            // Quality check (but relaxed for higher distances)
-            if (distance <= 3 || passes_quality_check(candidate.barcode, wl, whitelist_type, mode, verbose)) {
-                if (verbose) {
-                    #pragma omp critical
-                    {
-                        std::ostringstream oss;
-                        oss << "LVDIST::" << distance << "\n"
-                            << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_MATCHED" 
-                                                         : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_MATCHED") << "\n";
-                        std::cout << oss.str();
-                    }
-                }
-                return candidate.barcode;
-            } else {
-                if (verbose) {
-                    #pragma omp critical
-                    {
-                        std::ostringstream oss;
-                        oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_QUALITY_FAILED - rejecting barcode" 
-                                                         : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_QUALITY_FAILED - rejecting barcode") << "\n";
-                        std::cout << oss.str();
-                    }
-                }
-                return std::nullopt;
-            }
-        } else {
-            // Multiple matches at this distance - apply tie-breaking based on distance
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_FOUND" 
-                                                     : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_FOUND")
-                        << " (" << distance_matches.size() << " at distance " << distance << ")\n";
-                    std::cout << oss.str();
-                }
-            }
-            
-            match_info best_candidate;
-            bool found_winner = false;
-            
-            if (distance <= 2) {
-                // For close matches (distance <= 2), use raw count as tie-breaker
-                int max_raw_count = 0;
-                std::vector<match_info> raw_count_winners;
-                
-                for (const auto& match : distance_matches) {
-                    if (match.raw_count > max_raw_count) {
-                        max_raw_count = match.raw_count;
-                        raw_count_winners.clear();
-                        raw_count_winners.push_back(match);
-                    } else if (match.raw_count == max_raw_count) {
-                        raw_count_winners.push_back(match);
-                    }
-                }
-                
-                if (raw_count_winners.size() == 1 && max_raw_count > 0) {
-                    best_candidate = raw_count_winners[0];
-                    found_winner = true;
-                    
-                    if (verbose) {
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << "Raw count tie-breaker winner at distance " << distance 
-                                << ": " << best_candidate.barcode.bits_to_sequence()
-                                << " (raw_count=" << max_raw_count << ")\n";
-                            std::cout << oss.str();
-                        }
-                    }
-                }
-            } else {
-                // For distant matches (distance > 2), use CDF score as tie-breaker
-                double max_cdf_score = 0;
-                std::vector<match_info> cdf_winners;
-                
-                for (const auto& match : distance_matches) {
-                    if (match.cdf_score > max_cdf_score) {
-                        max_cdf_score = match.cdf_score;
-                        cdf_winners.clear();
-                        cdf_winners.push_back(match);
-                    } else if (match.cdf_score == max_cdf_score) {
-                        cdf_winners.push_back(match);
-                    }
-                }
-                
-                if (cdf_winners.size() == 1 && max_cdf_score > 0) {
-                    best_candidate = cdf_winners[0];
-                    found_winner = true;
-                    
-                    if (verbose) {
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << "CDF tie-breaker winner at distance " << distance 
-                                << ": " << best_candidate.barcode.bits_to_sequence()
-                                << " (cdf=" << max_cdf_score << ")\n";
-                            std::cout << oss.str();
-                        }
-                    }
-                }
-            }
-            
-            if (found_winner) {
-                // Apply quality check to the winner
-                if (distance <= 3 || passes_quality_check(best_candidate.barcode, wl, whitelist_type, mode, verbose)) {
-                    if (verbose) {
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << "LVDIST::" << distance << "\n"
-                                << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_MATCHED_RESOLVED" 
-                                                             : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_MATCHED_RESOLVED") << "\n";
-                            std::cout << oss.str();
-                        }
-                    }
-                    return best_candidate.barcode;
-                } else {
-                    if (verbose) {
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_RESOLVED_QUALITY_FAILED - rejecting barcode" 
-                                                             : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_RESOLVED_QUALITY_FAILED - rejecting barcode") << "\n";
-                            std::cout << oss.str();
-                        }
-                    }
-                    return std::nullopt;
-                }
-            } else {
-                // No clear winner after tie-breaking - reject as ambiguous
-                if (verbose) {
-                    #pragma omp critical
-                    {
-                        std::ostringstream oss;
-                        oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_AMBIGUOUS" 
-                                                         : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_AMBIGUOUS")
-                            << " (" << distance_matches.size() << " equally good matches at distance " << distance << ")\n";
-                        std::cout << oss.str();
-                    }
-                }
-                return std::nullopt;
-            }
-        }
-    }
-    
-    return std::nullopt;
-}
-
-
     std::optional<int64_seq> kmer_fuzzy_wl_search_v2(
     const int64_seq& original_barcode, 
     const std::string& expanded_seq, 
@@ -1532,7 +967,8 @@ std::optional<int64_seq> check_against_wl_exhaustive_v3(
     // Step 1: Generate k-mers from expanded sequence
     std::vector<std::string> kmer_strings = seq_utils::kmerize(expanded_seq, bc_len);
     std::unordered_set<int64_seq> all_candidates;
-    
+
+
     for (const auto& kmer_str : kmer_strings) {
         int64_seq kmer;
         kmer.sequence_to_bits(kmer_str);
@@ -1577,7 +1013,7 @@ std::optional<int64_seq> check_against_wl_exhaustive_v3(
     } else { // offensive mode
         // Check true first, then global
         
-        auto true_result = check_against_wl(original_barcode, all_candidates, "true", 2, verbose, mode, &wl);
+        auto true_result = check_against_wl(original_barcode, all_candidates, "true", max_dist, verbose, mode, &wl);
         if (true_result.has_value()) {
             if (verbose) {
                 #pragma omp critical
@@ -1588,7 +1024,7 @@ std::optional<int64_seq> check_against_wl_exhaustive_v3(
             }
             return true_result;
         }
-        
+
         auto global_result = check_against_wl(original_barcode, all_candidates, "global", max_dist, verbose, mode, &wl);
         if (global_result.has_value()) {
             if (verbose) {
@@ -1612,80 +1048,20 @@ std::optional<int64_seq> check_against_wl_exhaustive_v3(
     std::unordered_set<int64_seq> mutation_candidates;
     int64_seq exp_bc;
     exp_bc.sequence_to_bits(expanded_seq);
-    //auto mutations;
-    // = mutation_tools::generate_mutated_barcodes(exp_bc, 2);
-
-    /*for (const auto& mutant : mutations) {
-        std::string mutant_exp_seq = mutant.bits_to_sequence();
-        auto ins = seq_utils::kmerize(mutant_exp_seq, bc_len);
-        for(const auto& kmer_str : ins) {
-            int64_seq kmer;
-            kmer.sequence_to_bits(kmer_str);
-            if (kmer.is_valid()) {
-                mutation_candidates.insert(kmer);
-            }
-        }
-    }
-    if(verbose) {
-        #pragma omp critical
-        {
-            std::cout << "[kmer_fuzzy_wl_search] Generated " << mutations.size() << " mutated expanded barcodes" << std::endl;
-        }
-    }
-    
-    // Use the same mode-based priority for mutations
-    if (mode == "defensive") {
-        auto global_result = check_against_wl(exp_bc, mutation_candidates, "global", max_dist, verbose, mode, &wl);
-        if (global_result.has_value()) {
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::cout << "[kmer_fuzzy_wl_search] KMER_MUTATION_HIT (global): " 
-                              << global_result.value().bits_to_sequence() << std::endl;
-                }
-            }
-            return global_result;
-        }
-        
-        auto true_result = check_against_wl(exp_bc, mutation_candidates, "true", max_dist, verbose, mode, &wl);
-        if (true_result.has_value()) {
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::cout << "[kmer_fuzzy_wl_search] KMER_MUTATION_HIT (true): " 
-                              << true_result.value().bits_to_sequence() << std::endl;
-                }
-            }
-            return true_result;
-        }
-    } else { // offensive mode
-        */
        //BEST VERSION WORKS HERE @ ED 2, check_against_wl_exhaustive regular
+    if(wl.true_bcs.size() <= 30000){
        auto true_result = check_against_wl_exhaustive_v1(exp_bc, "true", 2, verbose, mode, &wl);
-        if (true_result.has_value()) {
+       if (true_result.has_value()) {
             if (verbose) {
                 #pragma omp critical
-                {
+                { 
                     std::cout << "[kmer_fuzzy_wl_search] KMER_MUTATION_HIT (true): " 
                               << true_result.value().bits_to_sequence() << std::endl;
                 }
             }
             return true_result;
         }
-        /*
-        auto global_result = check_against_wl(exp_bc, mutation_candidates, "global", max_dist, verbose, mode, &wl);
-        if (global_result.has_value()) {
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::cout << "[kmer_fuzzy_wl_search] KMER_MUTATION_HIT (global): " 
-                              << global_result.value().bits_to_sequence() << std::endl;
-                }
-            }
-            return global_result;
-        }
-    }*/
-   
+    }
     if (verbose) {
         #pragma omp critical
         {
@@ -1708,7 +1084,6 @@ std::optional<int64_seq> check_against_wl_exhaustive_v3(
         auto key = seq_utils::remove_rc(elem.class_id);
         auto &wl = layout.wl_map.maps.at(key).get();
         int max_dist = 4;
-        
         // extract and reverse‐complement the raw string
         // encoded barcode and reverse complement
         std::string raw = elem.seq.value();
@@ -1778,7 +1153,7 @@ std::optional<int64_seq> check_against_wl_exhaustive_v3(
                 }
             } else {
                 // Use enhanced resolution with count-based tie breaking for global
-                auto [resolved, min_dist] = resolve_multiple_hits(bc, matched, max_dist, verbose, "global", &wl);
+                auto [resolved, min_dist] = resolve_multiple_hits_simple(bc, matched, max_dist, verbose, "global", &wl);
                 if (resolved.has_value()) {
                     // Quality check the resolved candidate
                     if (passes_quality_check(resolved.value(), &wl, "global", mode, verbose)) {
@@ -1858,7 +1233,7 @@ std::optional<int64_seq> check_against_wl_exhaustive_v3(
                 }
             } else {
                 // Use enhanced resolution with count-based tie breaking for true
-                auto [resolved, min_dist] = resolve_multiple_hits(bc, matched, max_dist, verbose, "true", &wl);
+                auto [resolved, min_dist] = resolve_multiple_hits_simple(bc, matched, 2, verbose, "true", &wl);
                 if (resolved.has_value()) {
                     // Quality check the resolved candidate
                     if (passes_quality_check(resolved.value(), &wl, "true", mode, verbose)) {
@@ -1912,8 +1287,8 @@ std::optional<int64_seq> check_against_wl_exhaustive_v3(
         // IF DEFENSIVE: Check against global first, and then true
      
         // === k-mer fuzzy search ===
-    
-      auto kmer_fuzzy_result = kmer_fuzzy_wl_search_v2(bc, expanded_seq, bc_len, mode, wl, verbose, 3);
+
+      auto kmer_fuzzy_result = kmer_fuzzy_wl_search_v2(bc, expanded_seq, bc_len, mode, wl, verbose, max_dist);
       if (verbose) {
             #pragma omp critical
             {
@@ -1935,7 +1310,7 @@ std::optional<int64_seq> check_against_wl_exhaustive_v3(
                 return(global_result);
             }
 
-            auto true_result = check_against_wl(exp_bc, muts, "true", max_dist, verbose, mode, &wl);
+            auto true_result = check_against_wl(exp_bc, muts, "true", 2, verbose, mode, &wl);
             if(true_result.has_value()){
                 return(true_result);
             }
@@ -1944,21 +1319,30 @@ std::optional<int64_seq> check_against_wl_exhaustive_v3(
         // IF OFFENSIVE: Check against true first, and then global
         
         if(mode == "offensive") {
-            auto true_result = check_against_wl(exp_bc, muts, "true", max_dist, verbose, mode, &wl);
-            auto global_result = check_against_wl(exp_bc, muts, "global", max_dist, verbose, mode, &wl);
-
-            if(true_result.has_value() && !global_result.has_value()){
+            auto true_result = check_against_wl(exp_bc, muts, "true", 2, verbose, mode, &wl);
+            if (true_result.has_value()) {
+                if (verbose) {
+                    #pragma omp critical
+                    {
+                        std::cout << "[kmer_fuzzy_wl_search] KMER_DIRECT_HIT (true): " 
+                                << true_result.value().bits_to_sequence() << std::endl;
+                    }
+                }
                 return true_result;
-            } else if (!true_result.has_value() && global_result.has_value()){
+            }
+
+            auto global_result = check_against_wl(exp_bc, muts, "global", max_dist, verbose, mode, &wl);
+            if (global_result.has_value()) {
+                if (verbose) {
+                    #pragma omp critical
+                    {
+                        std::cout << "[kmer_fuzzy_wl_search] KMER_DIRECT_HIT (global): " 
+                                << global_result.value().bits_to_sequence() << std::endl;
+                    }
+                }
                 return global_result;
             }
-          //  if(true_result.has_value()){
-         //       return(true_result);
-           // }
-
-            //if(global_result.has_value()){
-          //      return(global_result);
-          //  }
+        
         }
 
         // === no match ===
@@ -1966,7 +1350,7 @@ std::optional<int64_seq> check_against_wl_exhaustive_v3(
             #pragma omp critical
             {
                 std::ostringstream oss;
-                oss << "NO_MATCH_FOUND\n";
+                oss << "[kmer_fuzzy_wl_search] NO_MATCH_FOUND\n";
                 std::cout << oss.str();
             }
         }
@@ -2758,7 +2142,12 @@ private:
     }
 
     //  update_bc_counts with whitelist selection and global filtering
-    void update_bc_counts(SigString &sig, const ReadLayout &layout, bool verbose, bool skip_global_writes = true) {
+    void update_bc_counts(
+        SigString &sig, 
+        const ReadLayout &layout, 
+        bool verbose, 
+        bool skip_global_writes = true
+    ) {
         auto type = sig.read_type; // "forward", "reverse", "concatenate", or "filtered"
         bool has_global_only_barcodes = false;
     
@@ -2869,6 +2258,476 @@ private:
                 }
             }
             sig.set_type("skipped");
+        }
+    }
+
+    bool process_direction_basic(
+        const std::string& direction,
+        std::vector<std::reference_wrapper<const seq_element>>& elements,
+        const read_streaming::sequence& read,
+        const ReadLayout& layout,
+        std::string& filtered_because,
+        bool verbose
+    ) {
+        
+        // Length filtering
+        if (!filter_short_reads(elements, layout)) {
+            filtered_because += direction + ":FILTERED_READ_LENGTH";
+            set_info(filtered_because);
+            return false;
+        }
+        
+        // Sort elements by order
+        std::sort(elements.begin(), elements.end(), [](const auto& a, const auto& b) {
+            return a.get().order < b.get().order;
+        });
+        
+        // Mask overlapping elements and trim reads
+        mask_and_trim_elements(elements, read, verbose);
+        
+        // Validate positions and check for overlaps
+        return validate_element_positions(elements, direction, filtered_because, verbose);
+    }
+
+    void mask_and_trim_elements(
+        std::vector<std::reference_wrapper<const seq_element>>& elements,
+        const read_streaming::sequence& read,
+        bool verbose
+    ) {
+
+        std::string masked_read = read.seq;
+        std::string masked_qual = read.is_fastq ? read.qual : "";
+        
+        // Step 1: Mask non-read elements
+        for (const auto& elem_ref : elements) {
+            const auto& elem = elem_ref.get();
+            if (elem.global_class == "read" || elem.position.first <= 0 || 
+                elem.position.second <= elem.position.first) {
+                continue;
+            }
+            
+            mask_element_in_sequence(masked_read, masked_qual, elem);
+        }
+        
+        // Step 2: Extract and clean read elements
+        for (const auto& elem_ref : elements) {
+            const auto& elem = elem_ref.get();
+            if (elem.global_class != "read" || !elem.seq) continue;
+            
+            extract_and_clean_read_element(elem, masked_read, masked_qual, read, verbose);
+            break; // Only one read element per direction
+        }
+    }
+    
+    void mask_element_in_sequence(
+        std::string& masked_read, 
+        std::string& masked_qual,
+        const seq_element& elem
+    ) {
+        size_t start = elem.position.first - 1;
+        size_t length = elem.position.second - elem.position.first + 1;
+        
+        if (start + length <= masked_read.size()) {
+            std::fill(masked_read.begin() + start, masked_read.begin() + start + length, 'N');
+            if (!masked_qual.empty() && masked_qual.size() == masked_read.size()) {
+                std::fill(masked_qual.begin() + start, masked_qual.begin() + start + length, '\x7F');
+            }
+        }
+    }
+    
+    void extract_and_clean_read_element(
+        const seq_element& elem,
+        const std::string& masked_read,
+        const std::string& masked_qual,
+        const read_streaming::sequence& read,
+        bool verbose
+    ) {
+        
+        size_t start = elem.position.first - 1;
+        size_t length = elem.position.second - elem.position.first + 1;
+        
+        if (start + length >= masked_read.size() || start < 1 || length <= 1) {
+            if (verbose) {
+                log_verbose("Skipping read element due to out-of-bounds parameters");
+            }
+            return;
+        }
+        
+        // Extract and clean sequence
+        std::string window = masked_read.substr(start, length);
+        std::string window_qual = read.is_fastq ? masked_qual.substr(start, length) : "";
+        
+        auto cleaned_result = remove_masked_positions(window, window_qual, read.is_fastq);
+        std::string cleaned_seq = cleaned_result.first;
+        std::string cleaned_qual = cleaned_result.second;
+        
+        // Update element
+        edit_elem(elem.class_id, [cleaned_seq, cleaned_qual, is_fastq = read.is_fastq](seq_element& el) {
+            *el.seq = cleaned_seq;
+            if (is_fastq) {
+                el.qual = cleaned_qual;
+            }
+        });
+        
+        if (verbose) {
+            log_verbose("Cleaned read element: " + elem.class_id + " -> " + cleaned_seq);
+        }
+    }
+    
+    std::pair<std::string, std::string> 
+    remove_masked_positions(
+        const std::string& window,
+        const std::string& window_qual,
+        bool is_fastq
+    ) {
+        std::string cleaned_seq, cleaned_qual;
+        cleaned_seq.reserve(window.size());
+        if (is_fastq) cleaned_qual.reserve(window.size());
+        
+        for (size_t i = 0; i < window.size(); ++i) {
+            if (window[i] != 'N') {
+                cleaned_seq.push_back(window[i]);
+                if (is_fastq) {
+                    cleaned_qual.push_back(window_qual[i]);
+                }
+            }
+        }
+        
+        return {cleaned_seq, cleaned_qual};
+    }
+    
+    bool validate_element_positions(
+        std::vector<std::reference_wrapper<const seq_element>>& elements,
+        const std::string& direction,
+        std::string& filtered_because,
+        bool verbose
+    ) {
+
+        // Check for invalid positions
+        for (const auto& elem_ref : elements) {
+            const auto& elem = elem_ref.get();
+            if (elem.global_class == "start" || elem.global_class == "stop" || 
+                elem.global_class == "poly_tail") {
+                continue;
+            }
+            
+            if (elem.position.first <= 0 || elem.position.second <= 0 || 
+                elem.position.second <= elem.position.first) {
+                
+                mark_element_failed(elem.class_id);
+                filtered_because += ":FILTERED_ELEMENT_" + elem.class_id + "_INVALID_POSITIONS";
+                set_info(filtered_because);
+                return false;
+            }
+        }
+        
+        // Check for overlapping variable elements
+        return check_variable_element_overlaps(elements, direction, filtered_because, verbose);
+    }
+    
+    bool check_variable_element_overlaps(
+        std::vector<std::reference_wrapper<const seq_element>>& elements,
+        const std::string& direction,
+        std::string& filtered_because,
+        bool verbose
+    ) {
+        
+        for (size_t i = 0; i < elements.size(); i++) {
+            const auto& e1 = elements[i].get();
+            if (e1.global_class == "start" || e1.global_class == "stop" || e1.type != "variable") {
+                continue;
+            }
+            
+            for (size_t j = i + 1; j < elements.size(); j++) {
+                const auto& e2 = elements[j].get();
+                if (e2.global_class == "start" || e2.global_class == "stop" || e2.type != "variable") {
+                    continue;
+                }
+                
+                if (e1.position.second >= e2.position.first + 3) {
+                    mark_element_failed(e1.class_id);
+                    mark_element_failed(e2.class_id);
+                    
+                    if (verbose) {
+                        log_verbose("Overlap detected: " + e1.class_id + " and " + e2.class_id);
+                    }
+                    
+                    filtered_because += ":FILTERED_VARIABLE_" + e1.class_id + "_OVERLAPPING_POSITIONS";
+                    set_info(filtered_because);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    
+    int count_non_barcode_elements(
+        const std::vector<std::reference_wrapper<const seq_element>>& elements
+    ) {
+        int count = 0;
+        for (const auto& elem_ref : elements) {
+            const auto& elem = elem_ref.get();
+            if (elem.type == "variable" && elem.element_pass && 
+                elem.global_class != "barcode" && elem.global_class == "read") {
+                count++;
+            }
+        }
+        return count;
+    }
+    
+    bool process_barcodes_for_direction(
+        const std::string& direction,
+        std::vector<std::reference_wrapper<const seq_element>>& elements,
+        const read_streaming::sequence& read,
+        const ReadLayout& layout,
+        int gen_mut, 
+        int gen_shift,
+        const std::string& mode,
+        bool verbose
+    ) {
+        
+        bool has_multiple_barcodes = count_barcodes_in_direction(elements) > 1;
+        bool all_barcodes_passed = true;
+        
+        for (const auto& elem_ref : elements) {
+            const auto& elem = elem_ref.get();
+            if (elem.global_class != "barcode") continue;
+            
+            bool barcode_passed = process_single_barcode(
+                elem, layout, read, gen_mut, gen_shift, mode, verbose
+            );
+            
+            if (!barcode_passed) {
+               // if(verbose){
+              //      log_verbose("Marking element failed: " + elem.seq.value());
+               // }
+                mark_element_failed(elem.class_id, "filter");
+                //interestingly, works multi-threaded but fails single-threaded
+                //add_failed_barcode_to_filter(elem, layout, verbose);
+                // If single barcode fails, direction fails
+                if (!has_multiple_barcodes) {
+                    all_barcodes_passed = false;
+                    break;
+                }
+            }
+        }
+        return all_barcodes_passed;
+    }
+    
+    bool process_single_barcode(
+        const seq_element& elem,
+        const ReadLayout& layout,
+        const read_streaming::sequence& read,
+        int gen_mut, int gen_shift,
+        const std::string& mode,
+        bool verbose
+    ) {
+
+        if (verbose) {
+            log_verbose("Processing barcode: " + elem.seq.value());
+        }
+        
+        auto correction_result = barcode_correction::correct_barcode_v2(
+            elem, layout, read, verbose, gen_mut, gen_shift, mode
+        );
+        
+        //if (!correction_result.has_value() && verbose) {
+      //      log_verbose("Barcode correction failed for: " + elem.seq.value());
+      //      return false;
+      //  }
+        
+        // Apply correction and update element
+        if (!correction_result.has_value()) {
+            return false;
+        }
+
+        apply_barcode_correction(elem, correction_result.value(), layout, verbose);
+        return true;
+    }
+    
+    void apply_barcode_correction(
+        const seq_element& elem,
+        const int64_seq& corrected_barcode,
+        const ReadLayout& layout,
+        bool verbose
+    ) {
+
+        auto& wl = layout.wl_map.maps.at(seq_utils::remove_rc(elem.class_id)).get();
+        std::string final_bc = corrected_barcode.bits_to_sequence();
+        
+        // Determine which whitelist the correction came from
+        bool found_in_true = wl.true_bcs.check_wl_for(corrected_barcode);
+        bool found_in_global = wl.global_bcs.check_wl_for(corrected_barcode);
+        
+        std::string final_wl = (found_in_true && !found_in_global) ? "true" : "global";
+        
+        // Update the element
+        auto& id_index = sig_elements.get<sig_id_tag>();
+        id_index.modify(id_index.find(elem.class_id), [&](seq_element& e) {
+            e.original_seq = e.seq;
+            e.seq = final_bc;
+            e.element_pass = true;
+            e.flags = final_wl;
+        });
+        
+        if (verbose) {
+            log_verbose("Barcode corrected: " + elem.class_id + " -> " + final_bc + " (" + final_wl + ")");
+        }
+    }
+    
+    std::pair<std::string, std::string> determine_read_direction(
+        const std::map<std::string, bool>& direction_valid,
+        const std::map<std::string, int>& pass_counts,
+        bool verbose
+    ) {
+        
+        int forward_count = (direction_valid.count("forward") && direction_valid.at("forward")) 
+                           ? pass_counts.at("forward") : 0;
+        int reverse_count = (direction_valid.count("reverse") && direction_valid.at("reverse")) 
+                           ? pass_counts.at("reverse") : 0;
+        
+        bool forward_valid = (forward_count > 0 && forward_count >= reverse_count);
+        bool reverse_valid = (reverse_count > 0 && reverse_count >= forward_count);
+        
+        std::string preliminary_type;
+        if (forward_valid && reverse_valid) {
+            preliminary_type = "concatenate";
+        } else if (forward_valid) {
+            preliminary_type = "forward";
+        } else if (reverse_valid) {
+            preliminary_type = "reverse";
+        } else {
+            preliminary_type = "filtered";
+        }
+        
+        if (verbose) {
+            log_verbose("Preliminary read type: " + preliminary_type + 
+                       " (forward: " + std::to_string(forward_count) + 
+                       ", reverse: " + std::to_string(reverse_count) + ")");
+        }
+        
+        return {preliminary_type, preliminary_type};
+    }
+    
+    void determine_final_read_type(
+        const std::map<std::string, bool>& direction_valid,
+        const std::map<std::string, int>& pass_counts,
+        bool verbose
+    ) {
+
+        int forward_count = (direction_valid.count("forward") && direction_valid.at("forward"))
+            ? pass_counts.at("forward") : 0;
+        int reverse_count = (direction_valid.count("reverse") && direction_valid.at("reverse")) 
+                           ? pass_counts.at("reverse") : 0;
+        
+        bool forward_valid = (forward_count > 0 && forward_count >= reverse_count);
+        bool reverse_valid = (reverse_count > 0 && reverse_count >= forward_count);
+        
+        if (forward_valid && reverse_valid) {
+            set_type("concatenate");
+        } else if (forward_valid) {
+            set_type("forward");
+        } else if (reverse_valid) {
+            set_type("reverse");
+        } else {
+            set_type("filtered");
+        }
+    }
+    
+    // Utility functions
+    void mark_element_failed(const std::string& class_id, const std::string& flags = "") {
+        auto& id_index = sig_elements.get<sig_id_tag>();
+        id_index.modify(id_index.find(class_id), [flags](seq_element& e) {
+            e.element_pass = false;
+            if (!flags.empty()) {
+                e.flags = flags;
+            }
+        });
+    }
+    
+    void add_failed_barcode_to_filter(
+        const seq_element& elem,
+        const ReadLayout& layout,
+        bool verbose
+    ) {
+        if (!elem.seq.has_value()) return;
+        
+        auto& wl = layout.wl_map.maps.at(seq_utils::remove_rc(elem.class_id)).get();
+        int64_seq failed_bc, rc_failed_bc;
+        failed_bc.sequence_to_bits(elem.seq.value());
+        rc_failed_bc.sequence_to_bits(seq_utils::revcomp(elem.seq.value()));
+        
+        #pragma omp critical
+        {
+            // Check if neither the barcode nor its reverse complement are already keys
+            if (!wl.filter_bcs.check_wl_for(failed_bc) && !wl.filter_bcs.check_wl_for(rc_failed_bc)) {
+                if (verbose) {
+                    log_verbose("Adding failed barcode to filter: " + failed_bc.bits_to_sequence());
+                }
+                
+                barcode_entry failed_entry;
+                failed_entry.barcode = failed_bc;
+                failed_entry.filtered = true;
+                failed_entry.flags = "filtered";
+                
+                // Double-check that it's still not present
+                auto failed_range = wl.filter_bcs.equal_range(failed_bc);
+                auto rc_failed_range = wl.filter_bcs.equal_range(rc_failed_bc);
+                
+                if ((failed_range.first == failed_range.second) && 
+                    (rc_failed_range.first == rc_failed_range.second)) {
+                    // Entry doesn't exist - insert it
+                    //wl.filter_bcs.insert_bc_entry(failed_bc, failed_entry);
+                }
+            }
+        }
+    }
+    
+    int count_barcodes_in_direction(
+        const std::vector<std::reference_wrapper<const seq_element>>& elements
+    ) {
+        int count = 0;
+        for (const auto& elem_ref : elements) {
+            if (elem_ref.get().global_class == "barcode") count++;
+        }
+        return count;
+    }
+
+    int count_all_valid_elements(
+        const std::vector<std::reference_wrapper<const seq_element>>& elements
+    ) {
+        int count = 0;
+        for (const auto& elem_ref : elements) {
+            const auto& elem = elem_ref.get();
+            if (elem.type == "variable" && elem.element_pass && 
+                (elem.global_class == "read" || elem.global_class == "barcode")) {
+                count++;
+            }
+        }
+        return count;
+    }
+    
+    void log_verbose(const std::string& message) {
+        #pragma omp critical
+        {
+            std::ostringstream oss;
+            oss << message << std::endl;
+            std::cout << oss.str();
+        }
+    }
+
+    void log_final_results(
+        const std::map<std::string, bool>& direction_valid,
+        const std::map<std::string, int>& pass_counts
+    ) {
+        #pragma omp critical
+        {
+            std::ostringstream oss;
+            oss << "Final read type: " << read_type
+                << ", forward elements: " << (pass_counts.count("forward") ? pass_counts.at("forward") : 0)
+                << ", reverse elements: " << (pass_counts.count("reverse") ? pass_counts.at("reverse") : 0)
+                << std::endl;
+            std::cout << oss.str();
         }
     }
 
@@ -3182,6 +3041,7 @@ public:
     }
    
     // contains per-unit barcode correction
+    /*
     void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, 
                          int gen_mut, int gen_shift, bool verbose, std::string mode) {
         // make a resever for the qual that doesn't interfere w/ASCII characters
@@ -3632,7 +3492,80 @@ public:
             }
         }
     }
-     
+     */
+
+    // Refactored sigalign_filter 
+    void sigalign_filter(
+        const read_streaming::sequence &read, 
+        const ReadLayout& layout, 
+        int gen_mut, 
+        int gen_shift, 
+        bool verbose, 
+        std::string mode
+    ) {
+        
+        constexpr char qual_mask = '\x7F';
+        auto direction_elements = group_directionally();
+        
+        std::string filtered_because = "";
+        std::map<std::string, bool> direction_valid;
+        std::map<std::string, int> pass_counts;
+        
+        if (verbose) {
+            log_verbose("Starting sigalign_filter processing");
+        }
+        
+        // Phase 1: Process each direction for basic validation and masking
+        for (auto& [direction, elements] : direction_elements) {
+            direction_valid[direction] = process_direction_basic(
+                direction, elements, read, layout, filtered_because, verbose
+            );
+            
+            if (!direction_valid[direction]) {
+                pass_counts[direction] = 0;
+                continue;
+            }
+            
+            // Count valid variable elements (excluding barcodes for now)
+            pass_counts[direction] = count_non_barcode_elements(elements);
+        }
+        
+        // Phase 2: Determine read direction based on non-barcode elements
+        auto [final_direction, read_type_preliminary] = determine_read_direction(
+            direction_valid, pass_counts, verbose
+        );
+        
+        // Phase 3: Barcode correction (only for valid directions)
+        for (auto& [direction, elements] : direction_elements) {
+            if (!direction_valid[direction]){
+                continue;
+            }
+            bool barcode_success = process_barcodes_for_direction(
+                direction, elements, read, layout, gen_mut, gen_shift, mode, verbose
+            );
+            
+            if (!barcode_success) {
+                direction_valid[direction] = false;
+                pass_counts[direction] = 0;
+                filtered_because += ":" + direction + ":BARCODE_CORRECTION_FAILED";
+                set_info(filtered_because);
+            } else {
+                // Recount elements including successfully corrected barcodes
+                pass_counts[direction] = count_all_valid_elements(elements);
+            }
+        }
+        
+        // Phase 4: Final read type determination
+        determine_final_read_type(direction_valid, pass_counts, verbose);
+        
+        // Phase 5: Update barcode counts
+        update_bc_counts(*this, layout, verbose);
+        
+        if (verbose) {
+            log_final_results(direction_valid, pass_counts);
+        }
+    }
+
     //metrics parallelized over reads
     static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
                          std::optional<int> gen_mut, std::optional<int> gen_shift, bool verbose, 
@@ -3648,7 +3581,7 @@ public:
     std::unique_ptr<sigstring_writing> sig_writer, csv_writer, metrics_file;
     sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, compress_fastq, /*append=*/false);
 
-    auto& wl = layout.wl_map.maps.at("barcode").get();
+    //auto& wl = layout.wl_map.maps.at("barcode").get();
 
     // Initialize the parallel writer
     parallel_writer writer;
@@ -3817,17 +3750,24 @@ public:
                   << queue_time_ms / 1000.0 << "s queue), "
                   << passed_count << " passed (" << (double)passed_count / chunk.size() * 100.0 << "%)" << std::endl;
        
-        if(chunk_id % 100 == 0){
-            bc_mem_utils::print_memory_report(wl.true_bcs, "true_bcs");
-        }
-
-        if(chunk_id % 50000 == 0) {
-            wl.true_bcs.calc_all_stats_wl();
-            if(!wl.global_bcs.empty()) {
-                wl.global_bcs.calc_all_stats_wl();
+            if (chunk_id % 100 == 0) {
+                // loop over all classes present in wl_map, fix for the hardcoded barcodes up top
+                for (const auto& kv : layout.wl_map.maps) {
+                    const std::string& class_id = kv.first;
+                    auto& wl = kv.second.get();
+                    bc_mem_utils::print_memory_report(wl.true_bcs, class_id + ":true_bcs");
+                }
             }
-        }
 
+            if (chunk_id % 50000 == 0) {
+                for (const auto& kv : layout.wl_map.maps) {
+                    auto& wl = kv.second.get();
+                    wl.true_bcs.calc_all_stats_wl();
+                    if (!wl.global_bcs.empty()) {
+                        wl.global_bcs.calc_all_stats_wl();
+                    }
+                }
+            }
         // Free memory explicitly
         std::vector<read_streaming::sequence>().swap(chunk);
         //std::vector<read_streaming::sequence>().clear();
@@ -3939,236 +3879,118 @@ public:
     }
    
     // FASTQ format
-    std::string to_fastqa_depr() const {
-    std::vector<std::string> dirs;
-    if(read_type == "skipped"){
-        return ""; // Skip if read type is "skipped"
-    }
-    if (read_type == "concatenate") {
-        dirs = { 
-            "forward", 
-            "reverse" 
-        };
-    } else {
-        dirs = { 
-            read_type 
-        };
-    }
-
-    std::string all_records;
-    for (const auto& dir : dirs) {
-        std::vector<std::string> bc_keys;
-        std::unordered_map<std::string, std::string> bc_map;
-        std::unordered_map<std::string, std::string> bc_dir;
-        std::unordered_map<std::string, std::string> cr_map;
-
-        std::string umi, read_seq, read_qual;
-        for (const auto& elem : sig_elements) {
-            if (!elem.seq.has_value()) continue;
-            if (elem.direction != dir) continue;
-
-            if (elem.global_class == "barcode") {
-                auto key = seq_utils::remove_rc(elem.class_id);
-                bool is_fwd = (dir == "forward");
-
-                if (bc_map.find(key) == bc_map.end()) {
-                    bc_keys.push_back(key);
-                    bc_map[key] = elem.seq.value();
-                    bc_dir[key] = dir;
-                    if (elem.original_seq.has_value()) {
-                        cr_map[key] = elem.original_seq.value();
-                    }
-                } else if (is_fwd && bc_dir[key] == "reverse") {
-                    bc_map[key] = elem.seq.value();
-                    bc_dir[key] = dir;
-                    if (elem.original_seq.has_value()) {
-                        cr_map[key] = elem.original_seq.value();
-                    }
-                }
-                continue;
-            }
-
-            if (elem.global_class == "umi") {
-                if (elem.seq.has_value()) {
-                    umi = elem.seq.value();
-                }
-                continue;
-            }
-
-            if (elem.global_class == "read") {
-                read_seq = elem.seq.value();
-                if (elem.qual.has_value()) {
-                    read_qual = elem.qual.value();
-                }
-                continue;
-            }
-
-            if (elem.global_class == "poly_tail" || elem.global_class == "start" || elem.global_class == "stop") {
-                continue;
-            }
+    std::string to_fastqa() const {
+        std::vector<std::string> dirs;
+        if(read_type == "skipped"){
+            return ""; // Skip if read type is "skipped"
         }
-
-        std::string cb_tag, cr_tag;
-        for (size_t i = 0; i < bc_keys.size(); ++i) {
-            const auto& key = bc_keys[i];
-            if (i) {
-                cb_tag += '-';
-                if (!cr_tag.empty()) cr_tag += '-';
-            }
-            cb_tag += bc_map[key];
-            if (cr_map.find(key) != cr_map.end()) {
-                cr_tag += cr_map[key];
-            }
-        }
-
-        bool is_fastq = !read_qual.empty();
-        bool is_concatenate = (read_type == "concatenate");
-        bool is_forward = (dir == "forward");
-        std::stringstream ss;
-        //generating modified sequence id for rad
-        ss << (is_fastq ? '@' : '>') << sequence_id << (is_forward ? "-F" : "-R") << (is_concatenate ? "-CT" : "");
-        //adding barcode tag
-        if (!cb_tag.empty()) ss << "\tCB:Z:" << cb_tag;
-        //adding corrected read tag for SAM
-        //added a fix here so that it's left empty for reverse complement fixes as well, otherwise RCs show up and it's annoying to parse later
-        if (!cr_tag.empty() && (cb_tag != cr_tag && seq_utils::revcomp(cb_tag) != cr_tag)) {
-            ss << "\tCR:Z:" << cr_tag;
+        if (read_type == "concatenate") {
+            dirs = {
+                "forward",
+                "reverse"
+            };
         } else {
-            // Ensure CR tag is present even if empty
-            ss << "\tCR:Z:"; 
+            dirs = {
+                read_type
+            };
         }
-        //adding transcript tag for SAM
-        if (!umi.empty()) ss << "\tUB:Z:" << umi;
-
-        if(is_forward){
-            ss << "\tTS:A:+";
-        } else {
-            ss << "\tTS:A:-";
-        }
-
-        ss << "\n" << read_seq << "\n";
-        if (is_fastq) {
-            ss << "+\n" << read_qual << "\n";
-        }
-        all_records += ss.str();
-    }
-
-    return all_records;
-}
-
-// FASTQ format
-std::string to_fastqa() const {
-    std::vector<std::string> dirs;
-    if(read_type == "skipped"){
-        return ""; // Skip if read type is "skipped"
-    }
-    if (read_type == "concatenate") {
-        dirs = {
-            "forward",
-            "reverse"
-        };
-    } else {
-        dirs = {
-            read_type
-        };
-    }
-    std::string all_records;
-    for (const auto& dir : dirs) {
-        std::vector<std::string> bc_keys;
-        std::unordered_map<std::string, std::string> bc_map;
-        std::unordered_map<std::string, std::string> bc_dir;
-        std::unordered_map<std::string, std::string> cr_map;
-        std::string umi, read_seq, read_qual;
-        
-        // First pass: collect all elements for this direction
-        for (const auto& elem : sig_elements) {
-            if (!elem.seq.has_value()) continue;
-            if (elem.direction != dir) continue;
-            if (elem.global_class == "barcode") {
-                auto key = seq_utils::remove_rc(elem.class_id);
-                bool is_fwd = (dir == "forward");
-                if (bc_map.find(key) == bc_map.end()) {
-                    bc_keys.push_back(key);
-                    bc_map[key] = elem.seq.value();
-                    bc_dir[key] = dir;
-                    if (elem.original_seq.has_value()) {
-                        cr_map[key] = elem.original_seq.value();
+        std::string all_records;
+        for (const auto& dir : dirs) {
+            std::vector<std::string> bc_keys;
+            std::unordered_map<std::string, std::string> bc_map;
+            std::unordered_map<std::string, std::string> bc_dir;
+            std::unordered_map<std::string, std::string> cr_map;
+            std::string umi, read_seq, read_qual;
+            
+            // First pass: collect all elements for this direction
+            for (const auto& elem : sig_elements) {
+                if (!elem.seq.has_value()) continue;
+                if (elem.direction != dir) continue;
+                if (elem.global_class == "barcode") {
+                    auto key = seq_utils::remove_rc(elem.class_id);
+                    bool is_fwd = (dir == "forward");
+                    if (bc_map.find(key) == bc_map.end()) {
+                        bc_keys.push_back(key);
+                        bc_map[key] = elem.seq.value();
+                        bc_dir[key] = dir;
+                        if (elem.original_seq.has_value()) {
+                            cr_map[key] = elem.original_seq.value();
+                        }
+                    } else if (is_fwd && bc_dir[key] == "reverse") {
+                        bc_map[key] = elem.seq.value();
+                        bc_dir[key] = dir;
+                        if (elem.original_seq.has_value()) {
+                            cr_map[key] = elem.original_seq.value();
+                        }
                     }
-                } else if (is_fwd && bc_dir[key] == "reverse") {
-                    bc_map[key] = elem.seq.value();
-                    bc_dir[key] = dir;
-                    if (elem.original_seq.has_value()) {
-                        cr_map[key] = elem.original_seq.value();
+                    continue;
+                }
+                if (elem.global_class == "umi") {
+                    if (elem.seq.has_value()) {
+                        umi = elem.seq.value();
                     }
+                    continue;
                 }
-                continue;
-            }
-            if (elem.global_class == "umi") {
-                if (elem.seq.has_value()) {
-                    umi = elem.seq.value();
+                if (elem.global_class == "read") {
+                    read_seq = elem.seq.value();
+                    if (elem.qual.has_value()) {
+                        read_qual = elem.qual.value();
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if (elem.global_class == "read") {
-                read_seq = elem.seq.value();
-                if (elem.qual.has_value()) {
-                    read_qual = elem.qual.value();
+                if (elem.global_class == "poly_tail" || elem.global_class == "start" || elem.global_class == "stop") {
+                    continue;
                 }
-                continue;
             }
-            if (elem.global_class == "poly_tail" || elem.global_class == "start" || elem.global_class == "stop") {
-                continue;
+            
+            // Check if we have essential components - skip this direction if not
+            if (bc_map.empty() || read_seq.empty()) {
+                continue; // Skip this direction if either barcode or read are empty
             }
-        }
-        
-        // Check if we have essential components - skip this direction if not
-        if (bc_map.empty() && read_seq.empty()) {
-            continue; // Skip this direction if both barcode and read are empty
-        }
-        
-        std::string cb_tag, cr_tag;
-        for (size_t i = 0; i < bc_keys.size(); ++i) {
-            const auto& key = bc_keys[i];
-            if (i) {
-                cb_tag += '-';
-                if (!cr_tag.empty()) cr_tag += '-';
+            
+            std::string cb_tag, cr_tag;
+            for (size_t i = 0; i < bc_keys.size(); ++i) {
+                const auto& key = bc_keys[i];
+                if (i) {
+                    cb_tag += '-';
+                    if (!cr_tag.empty()) cr_tag += '-';
+                }
+                cb_tag += bc_map[key];
+                if (cr_map.find(key) != cr_map.end()) {
+                    cr_tag += cr_map[key];
+                }
             }
-            cb_tag += bc_map[key];
-            if (cr_map.find(key) != cr_map.end()) {
-                cr_tag += cr_map[key];
+            bool is_fastq = !read_qual.empty();
+            bool is_concatenate = (read_type == "concatenate");
+            bool is_forward = (dir == "forward");
+            std::stringstream ss;
+            //generating modified sequence id for rad
+            ss << (is_fastq ? '@' : '>') << sequence_id << (is_forward ? "-F" : "-R") << (is_concatenate ? "-CT" : "");
+            //adding barcode tag
+            if (!cb_tag.empty()) ss << "\tCB:Z:" << cb_tag;
+            //adding corrected read tag for SAM
+            //added a fix here so that it's left empty for reverse complement fixes as well, otherwise RCs show up and it's annoying to parse later
+            if (!cr_tag.empty() && (cb_tag != cr_tag && seq_utils::revcomp(cb_tag) != cr_tag)) {
+                ss << "\tCR:Z:" << cr_tag;
+            } else {
+                // Ensure CR tag is present even if empty
+                ss << "\tCR:Z:";
             }
+            //adding transcript tag for SAM
+            if (!umi.empty()) ss << "\tUB:Z:" << umi;
+            if(is_forward){
+                ss << "\tTS:A:+";
+            } else {
+                ss << "\tTS:A:-";
+            }
+            ss << "\n" << read_seq << "\n";
+            if (is_fastq) {
+                ss << "+\n" << read_qual << "\n";
+            }
+            all_records += ss.str();
         }
-        bool is_fastq = !read_qual.empty();
-        bool is_concatenate = (read_type == "concatenate");
-        bool is_forward = (dir == "forward");
-        std::stringstream ss;
-        //generating modified sequence id for rad
-        ss << (is_fastq ? '@' : '>') << sequence_id << (is_forward ? "-F" : "-R") << (is_concatenate ? "-CT" : "");
-        //adding barcode tag
-        if (!cb_tag.empty()) ss << "\tCB:Z:" << cb_tag;
-        //adding corrected read tag for SAM
-        //added a fix here so that it's left empty for reverse complement fixes as well, otherwise RCs show up and it's annoying to parse later
-        if (!cr_tag.empty() && (cb_tag != cr_tag && seq_utils::revcomp(cb_tag) != cr_tag)) {
-            ss << "\tCR:Z:" << cr_tag;
-        } else {
-            // Ensure CR tag is present even if empty
-            ss << "\tCR:Z:";
-        }
-        //adding transcript tag for SAM
-        if (!umi.empty()) ss << "\tUB:Z:" << umi;
-        if(is_forward){
-            ss << "\tTS:A:+";
-        } else {
-            ss << "\tTS:A:-";
-        }
-        ss << "\n" << read_seq << "\n";
-        if (is_fastq) {
-            ss << "+\n" << read_qual << "\n";
-        }
-        all_records += ss.str();
+        return all_records;
     }
-    return all_records;
-}
 
     // CSV conversion
     std::string to_csv(bool write_header = false) const {
