@@ -89,6 +89,8 @@ add_executable(synth_gen src/synthetic_main.cpp)
 add_executable(error_model src/badread_sim.cpp)
 add_executable(correct_bc_dbg src/barcode_test.cpp)
 add_executable(generate_whitelist src/whitelist_generator.cpp)
+add_executable(consolidate_fastq_headers src/consolidate_headers.cpp)
+
 
 # pull in every dependency through rad_lib
 target_link_libraries(rad PRIVATE rad_lib)
@@ -97,6 +99,7 @@ target_link_libraries(synth_gen PRIVATE rad_lib)
 target_link_libraries(error_model PRIVATE rad_lib)
 target_link_libraries(correct_bc_dbg PRIVATE rad_lib)
 target_link_libraries(generate_whitelist PRIVATE rad_lib)
+target_link_libraries(consolidate_fastq_headers PRIVATE rad_lib)
 
 # --------------------------------------------------------------------------
 message(STATUS "Configure-time compiler: ${CMAKE_CXX_COMPILER}")

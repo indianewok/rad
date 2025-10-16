@@ -1209,7 +1209,7 @@ resolve_multiple_hits_simple(
             
             if (matched.size() == 1) {
                 int64_seq candidate = *matched.begin();
-                // QC: if this fails on true whitelist, we reject the barcode entirely
+                // QC: if this fails on true whitelist, reject the barcode entirely
                 if (passes_quality_check(candidate, &wl, "true", mode, verbose) || bc == candidate || rc_bc == candidate) {
                     if (verbose) {
                         #pragma omp critical
@@ -1283,8 +1283,7 @@ resolve_multiple_hits_simple(
                 std::cout << oss.str();
             }
         }
-        // NEW --  generate mutations and then:
-        // IF DEFENSIVE: Check against global first, and then true
+        // generate mutations and then:
      
         // === k-mer fuzzy search ===
 
@@ -2491,8 +2490,9 @@ private:
         
         for (const auto& elem_ref : elements) {
             const auto& elem = elem_ref.get();
-            if (elem.global_class != "barcode") continue;
-            
+            if (elem.global_class != "barcode"){
+                continue;
+            }
             bool barcode_passed = process_single_barcode(
                 elem, layout, read, gen_mut, gen_shift, mode, verbose
             );
@@ -2502,7 +2502,6 @@ private:
               //      log_verbose("Marking element failed: " + elem.seq.value());
                // }
                 mark_element_failed(elem.class_id, "filter");
-                //interestingly, works multi-threaded but fails single-threaded
                 //add_failed_barcode_to_filter(elem, layout, verbose);
                 // If single barcode fails, direction fails
                 if (!has_multiple_barcodes) {
@@ -2747,7 +2746,7 @@ public:
         }
     }
     int max_distance = -1;
-    // Make a mutable copy of the read so we can mask aligned regions.
+    // Make a mutable copy of the read to mask aligned regions
     std::string mutable_seq = read.seq;
     size_t read_length = read.seq.length();
 
@@ -2782,7 +2781,7 @@ public:
                 }
             }
         }
-        // For 'start' or 'stop' types, add an element without alignment.
+        // For 'start' or 'stop' types, add an element without alignment
         if (it->global_class == "start" || it->global_class == "stop") {
             add_element(seq_element(
                 it->class_id,
@@ -2801,7 +2800,7 @@ public:
             continue;
         }
 
-        // Update max_distance from misalignment_threshold if available. If not, set to ~20% of the adapter seq length.
+        // Update max_distance from misalignment_threshold if available; if not, set to ~20% of the adapter seq length
         // this will be the case for R1/R2 reads
         if (it->misalignment_threshold) {
             max_distance = std::get<0>(*it->misalignment_threshold);
@@ -2827,7 +2826,7 @@ public:
                         mutable_seq.substr(positions.first - 1,
                                              positions.second - positions.first + 1)
                     ));
-                    // Mask the found region so that it is not re-aligned.
+                    // Mask the found region so that it is not re-aligned
                     std::fill(mutable_seq.begin() + positions.first - 1,
                               mutable_seq.begin() + positions.second, 'X');
                 }
@@ -2850,7 +2849,7 @@ public:
                 : static_cast<int>(read_length);
 
         } else {
-            // Default to using the entire read length if no statistics are available.
+            // Default to using the entire read length if no stats are available
             expected_start = 1;
             expected_end = static_cast<int>(read_length);
         }
@@ -2864,7 +2863,7 @@ public:
             }
         }
 
-        // Use the entire mutable sequence as target.
+        // Use the entire mutable sequence as target
         auto result = aligner.align_static_elements(it->seq,
                                                     mutable_seq,
                                                     verbose,
@@ -2874,7 +2873,7 @@ public:
                                                     expected_start,
                                                     expected_end);
             if (result.success) {
-                // Positions returned are relative to the full read.
+                // Positions returned are relative to the full read
                 for (const auto& pos : result.positions) {
                     int adj_start = pos.first;
                     int adj_end = pos.second;
@@ -2900,11 +2899,11 @@ public:
                                              adj_end - adj_start + 1)
                     ));
 
-                    // Mask the aligned region so that it is not re-aligned.
+                    // Mask the aligned region so that it is not re-aligned
                     std::fill(mutable_seq.begin() + adj_start - 1,
                               mutable_seq.begin() + adj_end, 'X');
                 }
-                // Primary region yielded a valid match; skip further processing for this element.
+                // Primary region yielded a valid match; skip further processing for this element
                 continue;
             }
         }
@@ -2929,7 +2928,7 @@ public:
         auto variable_range = type_index.equal_range("variable");
         
         for (auto it = variable_range.first; it != variable_range.second; ++it) {
-            // Add a placeholder element into our sig_elements container.
+            // Add a placeholder element into sig_elements container
             add_element(seq_element(
                 it->class_id,
                 it->global_class,
@@ -2950,7 +2949,7 @@ public:
             }
         }
         
-        // Partition non-read variables by direction.
+        // Partition non-read variables by direction
         std::vector<const ReadElement*> non_read_forward;
         std::vector<const ReadElement*> non_read_reverse;
         for (const auto* var : non_read_vars) {
@@ -2963,7 +2962,7 @@ public:
         
         int positioned_count = 0;
         
-        // Process forward non-read variables in natural order.
+        // Process forward non-read variables
         std::multimap<std::string, const seq_element*> static_refs;
         for (const auto& elem : sig_elements) {
             if (elem.type == "static") {
@@ -2984,11 +2983,11 @@ public:
             }
         }
         
-        // Process forward non-read variables.
+        // Process forward non-read variables
         for (const auto* var : non_read_forward) {
             if (generate_variable_elements(var, static_refs, read.seq, sig_elements, verbose)) {
                 positioned_count++;
-                // Add the newly generated variable element(s) to the static_refs multimap so that secondary positions can be calculated.
+                // Add the newly generated variable element(s) to the static_refs multimap so that secondary positions can be calculated
                 auto found = sig_elements.get<sig_id_tag>().find(var->class_id);
                 if (found != sig_elements.get<sig_id_tag>().end()) {
                     static_refs.insert({var->class_id, &(*found)});
@@ -2996,7 +2995,7 @@ public:
             }
         }
         
-        // Process reverse non-read variables in reverse order.
+        // Process reverse non-read variables in reverse order
         for (auto it = non_read_reverse.rbegin(); it != non_read_reverse.rend(); ++it) {
             const auto* var = *it;
             if (generate_variable_elements(var, static_refs, read.seq, sig_elements, verbose)) {
@@ -3008,7 +3007,7 @@ public:
             }
         }
         
-        // Build a container for total references.
+        //  total ref container
         std::multimap<std::string, const seq_element*> total_refs;
         for (const auto& elem : sig_elements) {
             total_refs.insert({elem.class_id, &elem});
@@ -3023,7 +3022,7 @@ public:
                 }
             }
         }
-        // Process read variables last.
+        // Process read variables last
         for (const auto* var : read_vars) {
             if (generate_variable_elements(var, total_refs, read.seq, sig_elements, verbose)) {
                 positioned_count++;
@@ -3515,7 +3514,7 @@ public:
             log_verbose("Starting sigalign_filter processing");
         }
         
-        // Phase 1: Process each direction for basic validation and masking
+        // part 1: Process each direction for basic validation and masking
         for (auto& [direction, elements] : direction_elements) {
             direction_valid[direction] = process_direction_basic(
                 direction, elements, read, layout, filtered_because, verbose
@@ -3530,12 +3529,12 @@ public:
             pass_counts[direction] = count_non_barcode_elements(elements);
         }
         
-        // Phase 2: Determine read direction based on non-barcode elements
+        // part 2: Determine read direction based on non-barcode elements
         auto [final_direction, read_type_preliminary] = determine_read_direction(
             direction_valid, pass_counts, verbose
         );
         
-        // Phase 3: Barcode correction (only for valid directions)
+        // part 3: Barcode correction (only for valid directions)
         for (auto& [direction, elements] : direction_elements) {
             if (!direction_valid[direction]){
                 continue;
@@ -3964,7 +3963,7 @@ public:
             bool is_concatenate = (read_type == "concatenate");
             bool is_forward = (dir == "forward");
             std::stringstream ss;
-            //generating modified sequence id for rad
+            //generating modified sequence id
             ss << (is_fastq ? '@' : '>') << sequence_id << (is_forward ? "-F" : "-R") << (is_concatenate ? "-CT" : "");
             //adding barcode tag
             if (!cb_tag.empty()) ss << "\tCB:Z:" << cb_tag;
@@ -4028,11 +4027,5 @@ public:
         }
         return ss.str();
     }
-
-    //add split per barcode on demux
-    //igblast->airr.tsv (That's a little downstream)
-    //immcantation framework is separable by pipes (made into data.table, col.name is in the info)
-    //use equals for immcantation (depends on how it gets parsed, but the colon has other meanings)
-    //can you encode/decode stuff in a .fasta/.fastq file 
 
 };
