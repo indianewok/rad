@@ -1049,6 +1049,9 @@ resolve_multiple_hits_simple(
     int64_seq exp_bc;
     exp_bc.sequence_to_bits(expanded_seq);
        //BEST VERSION WORKS HERE @ ED 2, check_against_wl_exhaustive regular
+       //totally arbitrary sizing of the whitelist to scan under, chosen bc i guesstimate that's the max of a sc expt
+       //also if this number gets big it goes slow
+       //case in point, nearly a 2x speedup going from ~5k barcodes to 12k barcodes in the wl
     if(wl.true_bcs.size() <= 30000){
        auto true_result = check_against_wl_exhaustive_v1(exp_bc, "true", 2, verbose, mode, &wl);
        if (true_result.has_value()) {
@@ -1283,8 +1286,7 @@ resolve_multiple_hits_simple(
                 std::cout << oss.str();
             }
         }
-        // generate mutations and then:
-     
+        // generate mutations
         // === k-mer fuzzy search ===
 
       auto kmer_fuzzy_result = kmer_fuzzy_wl_search_v2(bc, expanded_seq, bc_len, mode, wl, verbose, max_dist);
@@ -2498,9 +2500,6 @@ private:
             );
             
             if (!barcode_passed) {
-               // if(verbose){
-              //      log_verbose("Marking element failed: " + elem.seq.value());
-               // }
                 mark_element_failed(elem.class_id, "filter");
                 //add_failed_barcode_to_filter(elem, layout, verbose);
                 // If single barcode fails, direction fails
@@ -2529,12 +2528,7 @@ private:
         auto correction_result = barcode_correction::correct_barcode_v2(
             elem, layout, read, verbose, gen_mut, gen_shift, mode
         );
-        
-        //if (!correction_result.has_value() && verbose) {
-      //      log_verbose("Barcode correction failed for: " + elem.seq.value());
-      //      return false;
-      //  }
-        
+
         // Apply correction and update element
         if (!correction_result.has_value()) {
             return false;

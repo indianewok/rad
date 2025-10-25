@@ -14,10 +14,15 @@ public:
         
         file_pointer(const std::string& file_path) : path(file_path) {
             fp = gzopen(path.c_str(), "r");
-            if (fp) seq = kseq_init(fp);
-            else seq = nullptr;
+            if (!fp) {
+                seq = nullptr;
+                return;
+            }
+            // Bump the zlib internal buffer to 4 MiB
+            gzbuffer(fp, 1 << 22);
+            seq = kseq_init(fp);
         }
-        
+
         ~file_pointer() {
             if (seq) kseq_destroy(seq);
             if (fp) gzclose(fp);
@@ -355,7 +360,7 @@ class parallel_writer {
             job->chunk_id = next_chunk_id++;
             job->size = data.size();
             // Control queue size to limit memory usage
-            constexpr size_t MAX_QUEUE_SIZE = 10;
+            constexpr size_t MAX_QUEUE_SIZE = 50;
             // Add job to the queue
             {
                 std::unique_lock<std::mutex> lock(queue_mutex);
@@ -413,7 +418,9 @@ class parallel_writer {
             std::chrono::time_point<std::chrono::high_resolution_clock> queued_time;
         };
         
-        std::vector<std::shared_ptr<WriteJob>> write_queue;
+        //std::vector<std::shared_ptr<WriteJob>> write_queue;
+        std::deque<std::shared_ptr<WriteJob>> write_queue;
+
         std::mutex queue_mutex;
         std::condition_variable queue_cv;
         std::thread writer_thread;
@@ -450,8 +457,11 @@ class parallel_writer {
                     }
                     
                     if (!write_queue.empty()) {
+                        //job = write_queue.front();
+                        //write_queue.erase(write_queue.begin());
+                        //queue_size--;
                         job = write_queue.front();
-                        write_queue.erase(write_queue.begin());
+                        write_queue.pop_front();
                         queue_size--;
                         
                         // Notify that queue has space
@@ -594,171 +604,140 @@ namespace io_bc_split_utils {
         return whitelist;
     }
 
-    /**
-     * @brief Enhanced file writer that manages multiple barcode files efficiently
-     */
-    class parallel_barcode_writer {
-    private:
-        std::string output_dir;
-        std::unordered_map<std::string, std::unique_ptr<boost::iostreams::filtering_ostream>> writers;
-        std::unordered_map<std::string, std::unique_ptr<std::ofstream>> base_streams;
-        std::unordered_map<std::string, size_t> access_counter; // Track access for LRU
-        mutable std::mutex writers_mutex;
-        size_t max_open_files;
-        bool verbose;
-        int compression_level;
-        size_t access_tick;
-        
-    public:
-        parallel_barcode_writer(const std::string& output_directory, bool verbose_mode = false, 
-                               size_t max_files = 500, int comp_level = 1) 
-            : output_dir(output_directory), max_open_files(max_files), verbose(verbose_mode), 
-              compression_level(comp_level), access_tick(0) {
-            boost::filesystem::path output_path(output_dir);
-            if (!boost::filesystem::exists(output_path)) {
-                boost::filesystem::create_directories(output_path);
+class parallel_barcode_writer {
+public:
+    explicit parallel_barcode_writer(std::string out_dir,
+                                     int gzip_level = 1,
+                                     std::size_t max_open = 1024,
+                                     std::size_t filebuf_bytes = 1 << 20)
+        : output_dir_(std::move(out_dir)),
+          gzip_level_(gzip_level),
+          max_open_files_(max_open),
+          filebuf_bytes_(filebuf_bytes) {}
+
+    // Thread-safe: callers can invoke concurrently.
+    void write_records(const std::unordered_map<std::string, std::vector<std::string>>& barcode_records) {
+        // Phase 1: resolve Writer* for each barcode while holding the global lock ONCE.
+        std::vector<std::pair<Writer*, const std::vector<std::string>*>> work;
+        work.reserve(barcode_records.size());
+
+        {
+            std::lock_guard<std::mutex> lock(writers_mutex_);  // global map/LRU lock
+
+            if (writers_.size() >= max_open_files_) {
+                close_lru_locked_(max_open_files_ / 3);
             }
-            
-            if (verbose) {
-                //std::cout << "[split_fastqas] Using compression level: " << compression_level  << " (1=fastest, 6=default, 9=best)" << std::endl;
+
+            for (const auto& [bc, recs] : barcode_records) {
+                if (recs.empty()) continue;
+                Writer* w = get_or_create_locked_(bc);  // lock precondition is satisfied here
+                w->last_access = ++access_tick_;
+                work.emplace_back(w, &recs);
             }
+        } // global lock released here
+
+        // Phase 2: do I/O per file, each with its own small lock, in parallel across barcodes.
+        for (auto& [w, recs] : work) {
+            std::lock_guard<std::mutex> lk(w->mtx);   // per-writer serialization only
+            auto& out = *(w->out);
+            for (const auto& r : *recs) out << r;
         }
-        
-        void write_records(const std::unordered_map<std::string, std::vector<std::string>>& barcode_records) {
-            std::lock_guard<std::mutex> lock(writers_mutex);
-            
-            // Close some files if we have too many open
-            if (writers.size() >= max_open_files) {
-                close_lru_files(max_open_files / 3); // Close 1/3 of files
-            }
-            
-            for (const auto& [barcode, records] : barcode_records) {
-                // Skip empty record sets
-                if (records.empty()){
-                    continue;
-                }
-                // Get or create writer for this barcode
-                if (writers.find(barcode) == writers.end()) {
-                    create_writer(barcode);
-                }
-                
-                // Update access time for LRU
-                access_counter[barcode] = ++access_tick;
-                
-                // Write all records for this barcode
-                auto& writer = *writers[barcode];
-                for (const auto& record : records) {
-                    writer << record;
-                }
-                writer.flush();
-            }
-        }
-        
-        // Explicit cleanup method
-        void close_all() {
-            std::lock_guard<std::mutex> lock(writers_mutex);
-            
-            // Safely close all writers
-            for (auto& [barcode, writer] : writers) {
-                try {
-                    if (writer) {
-                        writer->reset();
-                    }
-                } catch (const std::exception& e) {
-                    if (verbose) {
-                        std::cerr << "[split_fastqas] Warning: Error closing writer for " 
-                                  << barcode << ": " << e.what() << std::endl;
-                    }
-                }
-            }
-            
-            writers.clear();
-            base_streams.clear();
-            access_counter.clear();
-        }
-        
-        ~parallel_barcode_writer() {
-            close_all();
-        }
-        
-    private:
-        void create_writer(const std::string& barcode) {
-            try {
-                std::string output_filename = (boost::filesystem::path(output_dir) / (barcode + ".fastq.gz")).string();
-                
-                auto base_stream = std::make_unique<std::ofstream>(output_filename, std::ios::binary | std::ios::app);
-                if (!base_stream->is_open()) {
-                    throw std::runtime_error("Failed to create output file: " + output_filename);
-                }
-                
-                auto filtering_stream = std::make_unique<boost::iostreams::filtering_ostream>();
-                
-                // Configure compression parameters
-                boost::iostreams::gzip_params gzip_params;
-                gzip_params.level = compression_level;
-                
-                filtering_stream->push(boost::iostreams::gzip_compressor(gzip_params));
-                filtering_stream->push(*base_stream);
-                
-                base_streams[barcode] = std::move(base_stream);
-                writers[barcode] = std::move(filtering_stream);
-                access_counter[barcode] = ++access_tick;
-                
-                if (verbose && writers.size() % 100 == 0) {
-                    //std::cout << "[split_fastqas] Created writer for barcode: " << barcode << " (total: " << writers.size() << ")" << std::endl;
-                }
-            } catch (const std::exception& e) {
-                if (verbose) {
-                    std::cerr << "[split_fastqas] Error creating writer for " << barcode 
-                              << ": " << e.what() << std::endl;
-                }
-                throw;
-            }
-        }
-        
-        void close_lru_files(size_t num_to_close) {
-            if (writers.empty() || num_to_close == 0) return;
-            
-            // Create vector of (barcode, access_time) pairs
-            std::vector<std::pair<std::string, size_t>> access_times;
-            access_times.reserve(writers.size());
-            
-            for (const auto& [barcode, writer] : writers) {
-                access_times.emplace_back(barcode, access_counter[barcode]);
-            }
-            
-            // Sort by access time (oldest first)
-            std::sort(access_times.begin(), access_times.end(),
-                     [](const auto& a, const auto& b) { return a.second < b.second; });
-            
-            // Close the oldest files
-            size_t closed = 0;
-            for (const auto& [barcode, access_time] : access_times) {
-                if (closed >= num_to_close) break;
-                
-                try {
-                    auto writer_it = writers.find(barcode);
-                    if (writer_it != writers.end() && writer_it->second) {
-                        writer_it->second->reset();
-                        writers.erase(writer_it);
-                    }
-                    
-                    base_streams.erase(barcode);
-                    access_counter.erase(barcode);
-                    closed++;
-                    
-                    if (verbose && closed % 50 == 0) {
-                        //std::cout << "[split_fastqas] Closed " << closed << " LRU files" << std::endl;
-                    }
-                } catch (const std::exception& e) {
-                    if (verbose) {
-                        std::cerr << "[split_fastqas] Warning: Error closing LRU file " 
-                                  << barcode << ": " << e.what() << std::endl;
-                    }
-                }
-            }
-        }
+    }
+
+    void close_all() {
+        std::lock_guard<std::mutex> lock(writers_mutex_);
+        for (auto& kv : writers_) finalize_locked_(kv.second.get());
+        writers_.clear();
+    }
+
+    ~parallel_barcode_writer() { try { close_all(); } catch (...) {} }
+
+private:
+    struct Writer {
+        std::mutex mtx;   // guards I/O to this file only
+        std::unique_ptr<boost::iostreams::filtering_ostream> out;
+        std::unique_ptr<std::ofstream> file;
+        std::vector<char> filebuf;   // big buffer owned by streambuf
+        std::size_t last_access = 0;
+        std::string path;
     };
+
+    // PRECONDITION: writers_mutex_ is held.
+    Writer* get_or_create_locked_(const std::string& barcode) {
+        auto it = writers_.find(barcode);
+        if (it != writers_.end()) return it->second.get();
+
+        auto w = std::make_unique<Writer>();
+        w->path = output_dir_ + "/" + barcode + ".fastq.gz";
+
+        // prepare large buffer before open
+        w->file = std::make_unique<std::ofstream>();
+        w->filebuf.resize(filebuf_bytes_);
+        w->file->rdbuf()->pubsetbuf(w->filebuf.data(), static_cast<std::streamsize>(w->filebuf.size()));
+
+        w->file->open(w->path, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!w->file->is_open()) throw std::runtime_error("Failed to open for write: " + w->path);
+
+        w->out = std::make_unique<boost::iostreams::filtering_ostream>();
+        boost::iostreams::gzip_params gz; gz.level = gzip_level_;
+        w->out->push(boost::iostreams::gzip_compressor(gz));
+        w->out->push(*(w->file));
+
+        Writer* raw = w.get();
+        writers_.emplace(barcode, std::move(w));
+        return raw;
+    }
+
+    // PRECONDITION: writers_mutex_ is held.
+    void close_lru_locked_(std::size_t n_close) {
+        if (!n_close || writers_.empty()) return;
+        n_close = std::min(n_close, writers_.size());
+
+        std::vector<Writer*> vec;
+        vec.reserve(writers_.size());
+        for (auto& kv : writers_) vec.push_back(kv.second.get());
+
+        std::nth_element(vec.begin(), vec.begin() + n_close, vec.end(),
+            [](const Writer* a, const Writer* b){ return a->last_access < b->last_access; });
+
+        // erase those with smallest last_access
+        std::unordered_set<const Writer*> kill;
+        kill.reserve(n_close * 2 + 1);
+        for (std::size_t i = 0; i < n_close; ++i) kill.insert(vec[i]);
+
+        for (auto it = writers_.begin(); it != writers_.end(); ) {
+            if (kill.count(it->second.get())) {
+                finalize_locked_(it->second.get());
+                it = writers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // PRECONDITION: writers_mutex_ is held.
+    static void finalize_locked_(Writer* w) {
+        if (!w) return;
+        if (w->out) { try { w->out->reset(); } catch (...) {} w->out.reset(); }
+        if (w->file) {
+            try { w->file->flush(); } catch (...) {}
+            try { w->file->close(); } catch (...) {}
+            w->file.reset();
+        }
+        w->filebuf.clear();
+        w->filebuf.shrink_to_fit();
+    }
+
+private:
+    std::string output_dir_;
+    int         gzip_level_;
+    std::size_t max_open_files_;
+    std::size_t filebuf_bytes_;
+
+    std::mutex writers_mutex_;  // protects writers_ map + LRU + fd budget
+    std::unordered_map<std::string, std::unique_ptr<Writer>> writers_;
+    std::size_t access_tick_ = 0;
+};
 
     /**
      * @brief Parallel barcode splitter using kseq with chunk_streaming

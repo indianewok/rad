@@ -854,13 +854,15 @@ public:
                 // import & possibly generate mismatches
                 whitelist::wl_entry entry = wl_map.import_whitelist(spec, verbose, default_length);
                 // hardcoded whitelist size limit for entry so that we don't generate too many mismatches
-                /*
-                if(entry.true_bcs.size() >= 100000 && entry.true_bcs.size() <= 1000000){
+                
+                // hardcoded this to essentially cover all scenarios where the whitelist becomes
+                // detrimental to size, so basically b/w 10K-30K barcodes we pregenerate it
+                if(entry.true_bcs.size() >= 10000 && entry.true_bcs.size() <= 30000){
                     entry.generate_mismatch_barcodes(
                             shift.value_or(2),
                             mut.value_or(2),
                             verbose, nthreads);
-                }*/
+                }
 
                 // build filter_bcs from static_seqs
                 entry.filter_bcs.clear();

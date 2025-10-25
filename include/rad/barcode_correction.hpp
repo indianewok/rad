@@ -395,53 +395,6 @@ namespace mutation_tools {
         }
         return (min_score <= max_dist) ? min_score : -1;
     }
-/*
-    // calculating levenshtein distance between one query and a set of multiple strings (naively, with no wildcard-based spacing)
-    std::map<int, std::unordered_set<int64_seq>> int64_lvdist(const int64_seq &query, const std::unordered_set<int64_seq> &targets, int max_dist = 4) {
-        std::map<int, std::unordered_set<int64_seq>> results;
-        if (query.bits.empty()){
-            return results;
-        }
-        for (const auto &target : targets) {
-            if (target.bits.empty()){
-                continue;
-            }
-            int dist = bit_ld(query.bits[0], target.bits[0], query.length, max_dist);
-            if(dist >= 0){
-                results[dist].insert(target);
-            }
-        }
-        return results;
-    }
-
-    // calculating levenshtein distance between one query and a set of multiple barcodes (wrapper for vectors of barcode_entries versus unordered sets)
-    std::map<int, std::unordered_set<int64_seq>> int64_lvdist(const int64_seq &query, const std::vector<barcode_entry> &targets, int max_dist = 4) {
-        std::map<int, std::unordered_set<int64_seq>> results;
-        if (query.bits.empty()){
-            return results;
-        }
-        for (const auto &target : targets) {
-            if (target.barcode.bits.empty()){
-                continue;
-            }
-            int dist = bit_ld(query.bits[0], target.barcode.bits[0], query.length, max_dist);
-            if(dist >= 0){
-                results[dist].insert(target.barcode);
-            }
-        }
-        return results;
-    }
-
-    // calculating levenshtein distance between one query and a target sequence (int64_seq)
-    int int64_lvdist(const int64_seq &query, const int64_seq &target, int max_dist) {
-        int result = -1;
-        if (query.bits.empty() || target.bits.empty()){
-            return result;
-        }
-        result = bit_ld(query.bits[0], target.bits[0], query.length, max_dist);
-        return result;
-    }
-*/
 
     // calculating levenshtein distance between one query and a set of multiple strings (partial matching)
     std::map<int, std::unordered_set<int64_seq>> int64_lvdist(const int64_seq &query, const std::unordered_set<int64_seq> &targets, int max_dist = 4) {
@@ -1912,19 +1865,6 @@ class whitelist {
                 
                 // TIMING: Collect original barcode entries
                 auto start_collect = high_resolution_clock::now();
-                /*
-            
-                std::vector<const barcode_entry*> originals;
-                originals.reserve(true_bcs.size());
-                {
-                    std::unordered_set<const barcode_entry*> seen;
-                    seen.reserve(true_bcs.size());
-                    for (auto const &p : true_bcs.associations) {
-                        if (seen.insert(p.second).second)
-                            originals.push_back(p.second);
-                    }
-                }
-                */
 
                 std::vector<const barcode_entry*> originals = true_bcs.get_unique_entries();
 
@@ -1948,19 +1888,13 @@ class whitelist {
                 // TIMING: Generate mutations and shifts
                 auto start_generation = high_resolution_clock::now();
                 
-                size_t total_shifts_generated = 0;
                 size_t total_mutations_generated = 0;
-                size_t shifts_added = 0;
                 size_t mutations_added = 0;
-                size_t shifts_rejected_global = 0;
                 size_t mutations_rejected_global = 0;
                 
                 // Track timing for individual operations
-                double total_shift_generation_ms = 0;
                 double total_mutation_generation_ms = 0;
-                double total_shift_lookup_ms = 0;
                 double total_mutation_lookup_ms = 0;
-                double total_shift_insert_ms = 0;
                 double total_mutation_insert_ms = 0;
                 
                 auto start_loop = high_resolution_clock::now();
@@ -1971,38 +1905,10 @@ class whitelist {
                     
                     // Time individual barcode processing for first few
                     auto barcode_start = high_resolution_clock::now();
-                    
-                    // === SHIFTED GENERATION ===
-                    auto shift_gen_start = high_resolution_clock::now();
-                    auto shifted = mutation_tools::generate_shifted_barcodes(orig_bits, shift);
-                    auto shift_gen_end = high_resolution_clock::now();
-                    
-                    double shift_gen_time = duration<double, std::milli>(shift_gen_end - shift_gen_start).count();
-                    total_shift_generation_ms += shift_gen_time;
-                    total_shifts_generated += shifted.size();
-                    
-                    // === SHIFTED LOOKUP & INSERT ===
-                    auto shift_lookup_start = high_resolution_clock::now();
-                    
-                    for (auto const &s_bits : shifted) {
-                        bool in_wl = global_bcs.check_wl_for(s_bits) || true_bcs.check_wl_for(s_bits);
-                        if (!in_wl) {
-                            auto shift_insert_start = high_resolution_clock::now();
-                            true_bcs.insert_bc_entry(s_bits, *orig_be);
-                            auto shift_insert_end = high_resolution_clock::now();
-                            total_shift_insert_ms += duration<double, std::milli>(shift_insert_end - shift_insert_start).count();
-                            shifts_added++;
-                        } else {
-                            shifts_rejected_global++;
-                        }
-                    }
-                    
-                    auto shift_lookup_end = high_resolution_clock::now();
-                    total_shift_lookup_ms += duration<double, std::milli>(shift_lookup_end - shift_lookup_start).count();
-                    
+                                        
                     // === MUTATION GENERATION ===
                     auto mutation_gen_start = high_resolution_clock::now();
-                    auto mutated = mutation_tools::generate_mutated_barcodes(orig_bits, mutation_rounds);
+                    auto mutated = mutation_tools::generate_lv_barcodes(orig_bits, mutation_rounds);
                     auto mutation_gen_end = high_resolution_clock::now();
                     
                     double mutation_gen_time = duration<double, std::milli>(mutation_gen_end - mutation_gen_start).count();
@@ -2034,12 +1940,11 @@ class whitelist {
                         double total_time = duration<double, std::milli>(barcode_end - barcode_start).count();
                         std::cout << "[generate_mismatch_barcodes] Barcode " << i + 1 << " (" 
                                 << orig_bits.bits_to_sequence() << "): "
-                                << shifted.size() << " shifts (" << shift_gen_time << "ms gen), "
                                 << mutated.size() << " mutations (" << mutation_gen_time << "ms gen), "
                                 << "total " << total_time << "ms\n";
                     }
                     
-                    // Memory usage check every 100000 barcodes
+                    // Memory usage check every 10000 barcodes
                     if (verbose && i % 1000 == 0 && i > 0) {
                         size_t current_true_bcs_size = true_bcs.associations.size();
                         size_t growth = current_true_bcs_size - initial_true_bcs_size;
@@ -2088,26 +1993,17 @@ class whitelist {
                     std::cout << "  - Sanity check: " << sanity_ms << " ms (" << (sanity_ms/total_ms*100) << "%)\n";
                     
                     std::cout << "\n=== DETAILED OPERATION BREAKDOWN ===\n";
-                    std::cout << "Shift generation: " << total_shift_generation_ms << " ms (" 
-                            << (total_shift_generation_ms/total_ms*100) << "%)\n";
                     std::cout << "Mutation generation: " << total_mutation_generation_ms << " ms (" 
                             << (total_mutation_generation_ms/total_ms*100) << "%)\n";
-                    std::cout << "Shift lookups: " << total_shift_lookup_ms << " ms (" 
-                            << (total_shift_lookup_ms/total_ms*100) << "%)\n";
                     std::cout << "Mutation lookups: " << total_mutation_lookup_ms << " ms (" 
                             << (total_mutation_lookup_ms/total_ms*100) << "%)\n";
-                    std::cout << "Shift insertions: " << total_shift_insert_ms << " ms (" 
-                            << (total_shift_insert_ms/total_ms*100) << "%)\n";
                     std::cout << "Mutation insertions: " << total_mutation_insert_ms << " ms (" 
                             << (total_mutation_insert_ms/total_ms*100) << "%)\n";
                     
                     std::cout << "\n=== GENERATION STATISTICS ===\n";
                     std::cout << "Processed " << originals.size() << " original barcodes\n";
-                    std::cout << "Shifts: generated " << total_shifts_generated << ", added " << shifts_added 
-                            << ", rejected " << shifts_rejected_global << "\n";
                     std::cout << "Mutations: generated " << total_mutations_generated << ", added " << mutations_added 
                             << ", rejected " << mutations_rejected_global << "\n";
-                    std::cout << "Average shifts per barcode: " << (double)total_shifts_generated / originals.size() << "\n";
                     std::cout << "Average mutations per barcode: " << (double)total_mutations_generated / originals.size() << "\n";
                     std::cout << "Time per barcode: " << (loop_ms / originals.size()) << " ms\n";
                     
@@ -2118,7 +2014,7 @@ class whitelist {
                             << " (~" << (final_memory_estimate / 1024 / 1024) << " MB)\n";
                     std::cout << "Growth: +" << total_growth << " associations (+~" 
                             << ((final_memory_estimate - initial_memory_estimate) / 1024 / 1024) << " MB)\n";
-                    std::cout << "Memory efficiency: " << (double)total_growth / (total_shifts_generated + total_mutations_generated) * 100 
+                    std::cout << "Memory efficiency: " << (double)total_growth / (total_mutations_generated) * 100 
                             << "% of generated items were unique and added\n";
                     
                     if (missing == 0) {
