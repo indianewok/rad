@@ -802,7 +802,7 @@ public:
     }
 
     // load whitelist
-    void load_wl(std::optional<std::string> wl_path,std::optional<int> shift, std::optional<int> mut, bool verbose, int nthreads) {
+    void load_wl(std::optional<std::string> wl_path,std::optional<int> mut, bool verbose, int nthreads) {
         using namespace std::chrono;
         auto t0 = high_resolution_clock::now();
 
@@ -859,7 +859,6 @@ public:
                 // detrimental to size, so basically b/w 10K-30K barcodes we pregenerate it
                 if(entry.true_bcs.size() >= 10000 && entry.true_bcs.size() <= 30000){
                     entry.generate_mismatch_barcodes(
-                            shift.value_or(2),
                             mut.value_or(2),
                             verbose, nthreads);
                 }
@@ -875,16 +874,10 @@ public:
                     for (auto const &kmer : seq_utils::circ_kmerize(s, def_len)) {
                         int64_seq bits(kmer);
                         entry.filter_bcs.insert_bc_entry(bits);
-                        auto mutations = mutation_tools::generate_mutated_barcodes(bits, 2);
+                        auto mutations = mutation_tools::generate_lv_barcodes(bits, 2);
                         for (auto const &mut_bits : mutations) {
                             if(entry.filter_bcs.check_wl_for(mut_bits)){
                                 entry.filter_bcs.insert_bc_entry(mut_bits);
-                            }
-                        }
-                        auto shifts = mutation_tools::generate_shifted_barcodes(bits, 2);
-                        for (auto const &shift_bits : shifts) {
-                            if(!entry.filter_bcs.check_wl_for(shift_bits)){
-                                entry.filter_bcs.insert_bc_entry(shift_bits);   
                             }
                         }
                     }
@@ -1522,11 +1515,14 @@ public:
 
     Misalignment_Setup(const ReadLayout& layout) {
         // Extract static adapters (non poly-tail, non start/stop)
+        // guards against empty seq -- need to update for static indexing
         for (const auto& elem : layout.by_type()) {
             if (elem.type == "static" &&
                 elem.global_class != "poly_tail" &&
                 elem.global_class != "start" &&
-                elem.global_class != "stop") {
+                elem.global_class != "stop" &&
+                elem.seq != ""
+            ) {
                 if (elem.direction == "forward") {
                     forward_adapters.push_back({elem.class_id, elem.seq});
                     init_consensus_matrices(elem.class_id, elem.seq.length(), 20);

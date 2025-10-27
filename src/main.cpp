@@ -13,8 +13,6 @@ static void usage(const char* prog) {
       << "  -R, --bc_correction_mode          either 'offensive' (default) or 'defensive', changes the behavior of barcode correction\n"
       << "  -M, --whitelist_mutation          mutation space of each barcode in the user-passed whitelist (default: 2)\n"
       << "  -m, --generated_mutation          mutation space of each barcode in the user-passed whitelist (default: 2)\n"
-      << "  -S, --whitelist_shift             shift space of each barcode generated on the fly during runtime (default: 2)\n"
-      << "  -s, --generated_shift             shift space of each barcode generated on the fly during runtime (default: 3)\n"
       << "  -n, --max_reads                   maximum number of reads to process (default: all)\n"
       << "  -z, --chunk_size                  chunk size for processing reads (default: 5000)\n"
       << "  -o, --output                      filename prefix  (default: output)\n"
@@ -30,7 +28,7 @@ static void usage(const char* prog) {
 int main(int argc, char* argv[]) {
     std::string layout_key, fastq_path, custom_kit, global_whitelist_path, custom_whitelist_path, output_prefix, output_dir;
     bool verbose = false, max_verbose = false, split_bc = false, write_debug = false;
-    std::optional<int> wl_shift, wl_mut, gen_shift, gen_mut;
+    std::optional<int> wl_mut, gen_mut;
     int nthreads = 1;
     size_t max_reads = -1;  // -1 means unlimited
     size_t chunk_size = 5000;  // Default chunk size
@@ -46,8 +44,6 @@ int main(int argc, char* argv[]) {
         {"bc_corr_mode",                required_argument, nullptr, 'R'},
         {"whitelist_mutation",          required_argument, nullptr, 'M'},
         {"generated_mutation",          required_argument, nullptr, 'm'},
-        {"whitelist_shift",             required_argument, nullptr, 'S'},
-        {"generated_shift",             required_argument, nullptr, 's'},
         {"max_reads",                   required_argument, nullptr, 'n'},
         {"chunk_size",                  required_argument, nullptr, 'z'},
         {"output",                      required_argument, nullptr, 'o'},
@@ -71,9 +67,7 @@ int main(int argc, char* argv[]) {
           case 'c': custom_whitelist_path  = optarg;            break;
           case 'R': bc_corr_mode           = optarg;            break;
           case 'M': wl_mut                 = std::stoi(optarg); break;
-          case 'S': wl_shift               = std::stoi(optarg); break;
           case 'm': gen_mut                = std::stoi(optarg); break;
-          case 's': gen_shift              = std::stoi(optarg); break;
           case 'n': max_reads            = std::stoull(optarg); break;
           case 'z': chunk_size           = std::stoull(optarg); break;
           case 'o': output_prefix          = optarg;            break;
@@ -137,8 +131,6 @@ int main(int argc, char* argv[]) {
                   << "  barcode correction mode      : " << bc_corr_mode             << "\n"
                   << "  whitelist-generated mutations: " << (wl_mut ? std::to_string(*wl_mut) : "default(2)") << "\n"
                   << "  read-generated mutations     : " << (gen_mut ? std::to_string(*gen_mut) : "default(2)") << "\n"
-                  << "  whitelist-generated shifts   : " << (wl_shift ? std::to_string(*wl_shift) : "default(2)") << "\n"
-                  << "  read-generated shifts        : " << (gen_shift ? std::to_string(*gen_shift) : "default(3)") << "\n"
                   << "  max reads                    : " << (max_reads == -1 ? "all" : std::to_string(max_reads)) << "\n"
                   << "  chunk size                   : " << chunk_size               << "\n"
                   << "  output directory             : " << outdir.string()          << "\n"
@@ -220,13 +212,13 @@ int main(int argc, char* argv[]) {
 
         if (whitelist_path) {
             if (verbose) std::cout << "[main] Loading custom kit & whitelist...\n";
-            read_layout.load_wl(whitelist_path.value(), wl_shift, wl_mut, verbose, nthreads);
+            read_layout.load_wl(whitelist_path.value(), wl_mut, verbose, nthreads);
         } else if (!custom_kit.empty()) {
             if (verbose) std::cout << "[main] Loading kit whitelist...\n";
-            read_layout.load_wl(std::nullopt, wl_shift, wl_mut, verbose, nthreads);
+            read_layout.load_wl(std::nullopt, wl_mut, verbose, nthreads);
         } else {
             if (verbose) std::cout << "[main] Loading all whitelists...\n";
-            read_layout.load_wl(std::nullopt, wl_shift, wl_mut, verbose, nthreads);
+            read_layout.load_wl(std::nullopt, wl_mut, verbose, nthreads);
         }
 
         // Demultiplex with chunk_size parameter
@@ -237,7 +229,7 @@ int main(int argc, char* argv[]) {
         // if max reads is -1, it's unlimited--if not, then default to the max number of reads that are user-specified
         size_t max_reads_param = (max_reads == -1) ? -1 : max_reads;
         // main function
-        SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut, gen_shift, max_verbose, nthreads, chunk_size, max_reads_param, write_debug, bc_corr_mode);
+        SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut, max_verbose, nthreads, chunk_size, max_reads_param, write_debug, bc_corr_mode);
         
         auto sig_time = std::chrono::steady_clock::now() - sigalign_start;
         std::cout << "[sigalign] Time: "

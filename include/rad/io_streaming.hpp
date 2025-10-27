@@ -210,75 +210,171 @@ private:
     std::atomic<size_t> seqs_processed; //< global counter
 };
 
+class pigz_writing {
+    public:
+    inline FILE* open_pigz_pipe(const std::string& out_path, int threads=1, int level=6) {
+        if (const char* no = std::getenv("RAD_NO_PIGZ"); no && *no) return nullptr;
+
+    #ifndef PIGZ_PATH
+    #  define PIGZ_PATH "pigz"
+    #endif
+        std::string pigz = PIGZ_PATH;
+        if (const char* env = std::getenv("RAD_PIGZ"); env && *env) pigz = env;
+
+        std::string cmd = "'" + pigz + "' -c -p " + std::to_string(threads) +
+                        " -" + std::to_string(level) + " > '" + out_path + "'";
+        FILE* fp = popen(cmd.c_str(), "w");
+        if (!fp) return nullptr;
+        // 16MB stdio buffer to reduce write() syscalls
+        static std::vector<char> buf(16u << 20);
+        setvbuf(fp, buf.data(), _IOFBF, buf.size());
+        return fp;
+    }
+
+    inline void pigz_write(FILE* fp, const char* data, size_t n) {
+        if (!n) return;
+        size_t w = std::fwrite(data, 1, n, fp);
+        if (w != n) throw std::runtime_error("Short write to pigz");
+    }
+
+    inline int close_pigz_pipe(FILE* fp) {
+        if (!fp) return 0;
+        std::fflush(fp);
+        return pclose(fp);
+    }
+};
+
 namespace bio = boost::iostreams;
 class sigstring_writing {
-    public:
-        enum class format { 
-            FASTQA, 
-            SIGSTRING, 
-            CSV 
-        };
-    
-    private:
-        format fmt;
-        std::ofstream file_;
-        bio::filtering_ostream out_; // the chain: [gzip_compressor?] -> file_
-    
-    public:
-        /// @param output_path   base filename ("myout"), or with .gz
-        /// @param output_format which of the three formats to emit
-        /// @param compress      if true, writes gzipped output; otherwise plaintext
-        /// @param append        if true, opens in append mode; otherwise truncates
-        /// @param level         gzip compression level [1..9] (1=fastest, 9=best)
-        sigstring_writing(std::string output_path,format output_format, bool compress, bool append,int level = 1): fmt(output_format) {
-            std::ios_base::openmode mode = 
-                std::ios::out | std::ios::binary | (append ? std::ios::app : std::ios::trunc);
-    
-            if (compress) {
-                // ensure .gz suffix
-                if (output_path.size() < 3 ||
-                    output_path.substr(output_path.size()-3) != ".gz")
-                    output_path += ".gz";
-    
-                file_.open(output_path, mode);
-                if (!file_.is_open())
-                    throw std::runtime_error("Failed to open file: " + output_path);
-    
-                bio::gzip_params params;
-                params.level = level;        // set the compression level
-                out_.push(bio::gzip_compressor(params));
-                out_.push(file_);
-            }
-            else {
-                file_.open(output_path, mode);
-                if (!file_.is_open())
-                    throw std::runtime_error("Failed to open file: " + output_path);
-                // no compressor ⇒ write straight to file_
-                out_.push(file_);
-            }
-        }
-    
-        template<typename T> void operator()(const std::vector<T>& chunk) {
-                for (auto const& item : chunk) {
-                    switch (fmt) {
-                        case format::FASTQA:
-                            out_ << item.to_fastqa();
-                            break;
-                        case format::SIGSTRING:
-                            out_ << item.to_sigstring() << "\n";
-                            break;
-                        case format::CSV:
-                            out_ << item.to_csv();
-                            break;
-                    }
-            }
-        }
-        ~sigstring_writing() {
-            // flushing:
-            out_.reset();    // first flush and pop all filters
-            file_.flush();   // then flush the underlying file
-        }
+public:
+    enum class format { 
+        FASTQA, 
+        SIGSTRING, 
+        CSV 
     };
+
+private:
+    // Common
+    format fmt;
+    bool compress_;
+    bool use_pigz_ = false;
+
+    // --- pigz path ---
+    pigz_writing pigz_;
+    FILE* pigz_fp_ = nullptr;
+    std::string pigz_buf_;
+    size_t pigz_flush_threshold_ = (8u << 20); // 8MB
+
+    // --- zlib/boost path ---
+    std::ofstream file_;
+    bio::filtering_ostream out_; // chain: [gzip?] -> file_
+
+    inline void pigz_flush_if_big_() {
+        if (pigz_buf_.size() >= pigz_flush_threshold_) {
+            pigz_.pigz_write(pigz_fp_, pigz_buf_.data(), pigz_buf_.size());
+            pigz_buf_.clear();
+            // keep capacity or shrink if you want:
+            // pigz_buf_.shrink_to_fit();
+        }
+    }
+
+    template <typename T>
+    inline void write_one_(const T& item) {
+        switch (fmt) {
+            case format::FASTQA:
+                if (use_pigz_) { pigz_buf_.append(item.to_fastqa()); pigz_flush_if_big_(); }
+                else           { out_ << item.to_fastqa(); }
+                break;
+            case format::SIGSTRING:
+                if (use_pigz_) { pigz_buf_.append(item.to_sigstring()); pigz_buf_.push_back('\n'); pigz_flush_if_big_(); }
+                else           { out_ << item.to_sigstring() << "\n"; }
+                break;
+            case format::CSV:
+                if (use_pigz_) { pigz_buf_.append(item.to_csv()); pigz_flush_if_big_(); }
+                else           { out_ << item.to_csv(); }
+                break;
+        }
+    }
+
+public:
+    /// @param output_path   base filename ("myout"), will add ".gz" if compress==true and it isn't present
+    /// @param output_format which of the three formats to emit
+    /// @param compress      if true, writes gzipped output (pigz if available; else zlib/boost)
+    /// @param append        if true, opens in append mode; otherwise truncates
+    /// @param level         gzip compression level [1..9]
+    /// @param pigz_threads  pigz worker threads (ignored if not using pigz)
+    sigstring_writing(std::string output_path, format output_format, bool compress, bool append, int level=6, int pigz_threads=1)
+        : fmt(output_format), compress_(compress)
+    {
+        std::ios_base::openmode mode =
+            std::ios::out | std::ios::binary | (append ? std::ios::app : std::ios::trunc);
+
+        if (compress_) {
+            // ensure .gz suffix for either pigz or zlib
+            if (output_path.size() < 3 || output_path.substr(output_path.size()-3) != ".gz")
+                output_path += ".gz";
+
+            // Try pigz first
+            pigz_fp_ = pigz_.open_pigz_pipe(output_path, pigz_threads, level);
+            if (pigz_fp_) {
+                use_pigz_ = true;
+                // nothing else to open; pigz writes the file
+                return;
+            }
+
+            // Fallback: your existing Boost gzip chain (single-threaded zlib)
+            file_.open(output_path, mode);
+            if (!file_.is_open()) throw std::runtime_error("Failed to open file: " + output_path);
+
+            bio::gzip_params params;
+            params.level = level;
+            out_.push(bio::gzip_compressor(params));
+            out_.push(file_);
+        } else {
+            // Plain text (no compression)
+            file_.open(output_path, mode);
+            if (!file_.is_open()) throw std::runtime_error("Failed to open file: " + output_path);
+            out_.push(file_);
+        }
+    }
+
+    template<typename T>
+    void operator()(const std::vector<T>& chunk) {
+        if (chunk.empty()) return;
+        if (use_pigz_) {
+            // Build big uncompressed buffer for pigz (few syscalls, fewer context switches)
+            for (auto const& item : chunk) write_one_(item);
+        } else {
+            // Your legacy path (ostream through Boost chain)
+            for (auto const& item : chunk) write_one_(item);
+        }
+    }
+
+    // Optional: adjust pigz flush size (in bytes)
+    void set_pigz_flush_threshold(size_t bytes) { pigz_flush_threshold_ = bytes; }
+
+    ~sigstring_writing() {
+        try {
+            if (use_pigz_) {
+                // flush tail and close pipe
+                if (!pigz_buf_.empty()) {
+                    pigz_.pigz_write(pigz_fp_, pigz_buf_.data(), pigz_buf_.size());
+                    pigz_buf_.clear();
+                }
+                (void)pigz_.close_pigz_pipe(pigz_fp_);
+                pigz_fp_ = nullptr;
+                use_pigz_ = false;
+            } else {
+                // flush Boost chain + file
+                out_.reset();  // pops filters and flushes
+                file_.flush();
+                file_.close();
+            }
+        } catch (...) {
+        }
+    }
+};
+
 
 class parallel_writer {
     public:

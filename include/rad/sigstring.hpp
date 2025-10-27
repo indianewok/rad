@@ -1038,7 +1038,6 @@ resolve_multiple_hits_simple(
         }
     }
     
-    // Step 3: Try k-mer mutations using existing check_against_wl logic
     if (verbose) {
         #pragma omp critical
         {
@@ -1081,7 +1080,6 @@ resolve_multiple_hits_simple(
         const read_streaming::sequence& full_read, 
         bool verbose, 
         int mut_dist, 
-        int shift_dist,
         std::string mode) {
         // pick the right whitelist
         auto key = seq_utils::remove_rc(elem.class_id);
@@ -1103,10 +1101,11 @@ resolve_multiple_hits_simple(
         exp_bc.sequence_to_bits(expanded_seq);
         exp_rcbc.sequence_to_bits(seq_utils::revcomp(expanded_seq));
         int bc_len = static_cast<int>(bc.length);
+        int hp_threshold = std::max(4, static_cast<int>(bc_len * 0.4)); // 40% of barcode length, minimum 4
 
         // === filtering for messy barcodes ===
         bool filtered_hit = !wl.filter_bcs.empty() && (wl.filter_bcs.check_wl_for(bc) || wl.filter_bcs.check_wl_for(rc_bc));
-        bool seq_hit = !wl.filter_bcs.empty() && (seq_utils::int_kmerize(raw, 2) < 4 || mutation_tools::detect_hp(raw, 7));
+        bool seq_hit = !wl.filter_bcs.empty() && (seq_utils::int_kmerize(raw, 2) < 4 || mutation_tools::detect_hp(raw, hp_threshold));
         if (filtered_hit || seq_hit) {
             if (verbose) {
                 #pragma omp critical
@@ -2462,14 +2461,16 @@ private:
         return true;
     }
     
-    int count_non_barcode_elements(
+    int count_valid_reads(
         const std::vector<std::reference_wrapper<const seq_element>>& elements
     ) {
         int count = 0;
         for (const auto& elem_ref : elements) {
             const auto& elem = elem_ref.get();
-            if (elem.type == "variable" && elem.element_pass && 
-                elem.global_class != "barcode" && elem.global_class == "read") {
+            if (elem.type == "variable" && 
+                elem.element_pass && 
+                elem.global_class != "barcode" && 
+                elem.global_class == "read") {
                 count++;
             }
         }
@@ -2482,7 +2483,6 @@ private:
         const read_streaming::sequence& read,
         const ReadLayout& layout,
         int gen_mut, 
-        int gen_shift,
         const std::string& mode,
         bool verbose
     ) {
@@ -2496,7 +2496,7 @@ private:
                 continue;
             }
             bool barcode_passed = process_single_barcode(
-                elem, layout, read, gen_mut, gen_shift, mode, verbose
+                elem, layout, read, gen_mut, mode, verbose
             );
             
             if (!barcode_passed) {
@@ -2516,7 +2516,7 @@ private:
         const seq_element& elem,
         const ReadLayout& layout,
         const read_streaming::sequence& read,
-        int gen_mut, int gen_shift,
+        int gen_mut,
         const std::string& mode,
         bool verbose
     ) {
@@ -2526,7 +2526,7 @@ private:
         }
         
         auto correction_result = barcode_correction::correct_barcode_v2(
-            elem, layout, read, verbose, gen_mut, gen_shift, mode
+            elem, layout, read, verbose, gen_mut, mode
         );
 
         // Apply correction and update element
@@ -2628,7 +2628,8 @@ private:
     }
     
     // Utility functions
-    void mark_element_failed(const std::string& class_id, const std::string& flags = "") {
+    void mark_element_failed(const std::string& class_id, const std::string& flags = "") 
+    {
         auto& id_index = sig_elements.get<sig_id_tag>();
         id_index.modify(id_index.find(class_id), [flags](seq_element& e) {
             e.element_pass = false;
@@ -2638,10 +2639,7 @@ private:
         });
     }
     
-    void add_failed_barcode_to_filter(
-        const seq_element& elem,
-        const ReadLayout& layout,
-        bool verbose
+    void add_failed_barcode_to_filter(const seq_element& elem, const ReadLayout& layout, bool verbose
     ) {
         if (!elem.seq.has_value()) return;
         
@@ -2794,7 +2792,8 @@ public:
             continue;
         }
 
-        // Update max_distance from misalignment_threshold if available; if not, set to ~20% of the adapter seq length
+        // Update max_distance from misalignment_threshold if available; 
+        //if not, set to ~20% of the adapter seq length
         // this will be the case for R1/R2 reads
         if (it->misalignment_threshold) {
             max_distance = std::get<0>(*it->misalignment_threshold);
@@ -2827,6 +2826,7 @@ public:
             }
             continue;
         }
+
         // For other static elements (non-poly_tail), use the alignment statistics
         // to define the expected region for the adapter
         int expected_start, expected_end;
@@ -2901,7 +2901,7 @@ public:
                 continue;
             }
         }
-}
+    }
    
     //this version iterates across reverse elements in reverse order, which fixes issues with rc umi/rc barcode dependencies
     void sigalign_variable(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose) {
@@ -3033,467 +3033,8 @@ public:
         }
     }
    
-    // contains per-unit barcode correction
-    /*
-    void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, 
-                         int gen_mut, int gen_shift, bool verbose, std::string mode) {
-        // make a resever for the qual that doesn't interfere w/ASCII characters
-        constexpr char qual_mask = '\x7F';
-        auto direction_elements = group_directionally();
-        // For recording validity and count per direction.
-        std::string filtered_because = "";
-        std::map<std::string, bool> direction_valid;
-        std::map<std::string, int> pass_counts, static_counts;
-        std::unordered_map<std::string, std::unordered_set<int64_seq>> seen_bcs;
-        bool skip_global_writes = false;
-        aligner_tools aligner;
-
-        // Process each direction separately.
-        for (auto& [direction, elements] : direction_elements) {
-            int barcode_count = 0;
-            bool multiple_barcodes = false;
-            std::string masked_read = read.seq;
-            std::string masked_qual = read.is_fastq ? read.qual : "";
-            //step one--mask elements within the read from overlapping adapters/poly-tails
-            for (auto const& ref : elements) {
-                const auto& e = ref.get();
-                if (e.global_class == "read" || e.position.first <= 0 || e.position.second <= e.position.first){
-                    continue;
-                }
-                // for this direction, if there's more than one barcode, we can set the multiple barcodes flag
-                // to true
-                if (e.global_class == "barcode"){
-                    barcode_count++;
-                    if (barcode_count > 1) {
-                        multiple_barcodes = true;
-                    }
-                }
-                size_t s = e.position.first - 1;
-                size_t len = e.position.second - e.position.first + 1;
-                //this populates the masked read with 'N's
-                //if the read is shorter than the expected length, skip
-                if (s + len <= masked_read.size()) {
-                    std::fill(masked_read.begin() + s, masked_read.begin() + s + len, 'N');
-                    if (read.is_fastq && masked_qual.size() == masked_read.size()) {
-                        std::fill(masked_qual.begin() + s, masked_qual.begin() + s + len, qual_mask);
-                    }
-                }
-            }
-            
-            //step two--trim the read to remove 'N's
-            for (auto const& ref : elements) {
-                const auto& e = ref.get();
-                if (e.global_class != "read" || !e.seq){
-                    continue;
-                }
-
-                size_t start = e.position.first - 1;
-                size_t length = e.position.second - e.position.first + 1;
-                if (start + length >= masked_read.size() || start < 1 || length <= 1 || start + length <= 1) {
-                    if(verbose){
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << "Skipping a read element due to out-of-bounds parameters.\n"
-                                    << "Start: " << start << ", Length: " << length 
-                                    << ", Read length: " << masked_read.size() << "\n"
-                                    << "Masked read: " << masked_read << "\n"
-                                    << "Direction: " << direction << std::endl;
-                            std::cout << oss.str();
-                        }
-                    }
-                    break;  // out of bounds—skip
-                }
-
-                // extract, then strip all 'N's
-                std::string window = masked_read.substr(start, length);
-                std::string window_qual = read.is_fastq ? masked_qual.substr(start, length) : "";
-
-                std::string cleaned_seq;
-                std::string cleaned_qual;
-                // reserve space for cleaned sequences
-                cleaned_seq.reserve(window.size());
-                // if the read is fastq, reserve space for qualscores
-                if (read.is_fastq){
-                    cleaned_qual.reserve(window.size());
-                }
-
-                for (size_t i = 0; i < window.size(); ++i) {
-                    if (window[i] != 'N') {
-                        cleaned_seq.push_back(window[i]);
-                        if (read.is_fastq) {
-                            // use the corresponding quality character
-                            cleaned_qual.push_back(window_qual[i]);
-                        }
-                    }
-                }
-                // small lambda for dealing with editing elements
-                edit_elem(e.class_id, [cleaned_seq, cleaned_qual, &read, verbose](seq_element &el) {
-                    *el.seq = cleaned_seq;
-                    if (read.is_fastq) {
-                            el.qual = cleaned_qual;
-                            if(verbose){
-                                #pragma omp critical
-                                {
-                                    std::ostringstream oss;
-                                    oss << "Masked qual: " << cleaned_qual << "\n";
-                                    std::cout << oss.str();
-                                }
-                        } else {
-                            if(verbose){
-                                #pragma omp critical
-                                {
-                                    std::ostringstream oss;
-                                    oss << "Masked qual: " << el.qual.value() << "\n";
-                                    std::cout << oss.str();
-                                }
-                            }
-                        }
-                    }
-                });
-
-                // verbose logging
-                if (verbose) {
-                    #pragma omp critical
-                    {
-                    std::ostringstream oss;
-                    oss << "Trimmed read for " << e.class_id 
-                              << " -> " << cleaned_seq << "\n"
-                              << "Masked read: " << masked_read << std::endl;
-                    std::cout << oss.str();
-
-                    }
-                    if(read.is_fastq) {
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << "Masked qual: " << cleaned_qual << std::endl;
-                            std::cout << oss.str();
-                        }
-                    }
-                }
-                break;  // only one read element per direction
-            }
-
-            bool valid_direction = true;
-            int count = 0;
-            
-            //per-direction check and length filter
-            static bool length_filter_set = false;
-            if (!filter_short_reads(elements, layout)) {
-                direction_valid[direction] = false;
-                if(verbose){
-                    std::string filtered_reason = direction + ":FILTERED_READ_LENGTH";
-                    #pragma omp critical
-                    {
-                        std::ostringstream oss;
-                        oss << filtered_reason << std::endl;
-                        std::cout << oss.str();
-                    }
-                }
-
-                if (!length_filter_set) {
-                    filtered_because = "FILTERED_READ_LENGTH";
-                    set_info(filtered_because);
-                    length_filter_set = true;
-                }
-                continue;
-            }
-
-            // Sort by order.
-            std::sort(elements.begin(), elements.end(), [](const auto& a, const auto& b) {
-                return a.get().order < b.get().order;
-            });
-
-            // per element checks in this direction, and filters.
-            for (auto &elem_ref : elements) {
-                int statics = 0;
-                const auto& elem = elem_ref.get();
-                // Skip "start" or "stop" elements for filtering/counting.
-                if (elem.global_class == "start" || elem.global_class == "stop" || elem.global_class == "poly_tail"){
-                    continue;
-                }
-                // Count static elements in this direction.
-                if(elem.type == "static"){
-                    ++statics;
-                    static_counts[direction] = statics;
-                }
-               
-                // If any variable element has invalid positions, mark the entire direction as invalid and flag the element.
-                if (elem.position.first <= 0 || elem.position.second <= 0 || elem.position.second <= elem.position.first) {
-                    valid_direction = false;
-                    auto& id_index = sig_elements.get<sig_id_tag>();
-                    id_index.modify(
-                        id_index.find(elem.class_id), [](seq_element &e) { 
-                                        e.element_pass = false; 
-                                    });
-                    if (verbose) {
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << 
-                            "Filtered element " << 
-                            elem.class_id << 
-                            " (invalid positions) in direction " << direction << std::endl;
-                            std::cout << oss.str();
-                        }
-                    }
-                    filtered_because = filtered_because + ":FILTERED_ELEMENT_" + elem.class_id + "_OVERLAPPING_POSITIONS";
-                    set_info(filtered_because);
-                    // Exit processing for this direction
-                    break;
-                }
-                //barcode correction here!!!
-                if (elem.global_class == "barcode") {
-                    if(verbose){
-                        #pragma omp critical
-                        {
-                            std::ostringstream oss;
-                            oss << "Barcode correction for " << elem.seq.value() << std::endl;
-                            std::cout << oss.str();
-                        }
-                    }
-                    auto& wl = layout.wl_map.maps.at(seq_utils::remove_rc(elem.class_id)).get();
-
-                    if(!wl.true_bcs.empty()){
-                        auto out = barcode_correction::correct_barcode_v2(elem, layout, read, verbose, gen_mut, gen_shift, mode);
-                        //auto out = barcode_correction::correct_barcode(elem, layout, read, verbose, gen_mut, gen_shift);
-
-                        bool matched = out.has_value();
-                        if(matched) {
-                            if(verbose) {
-                                #pragma omp critical
-                                {
-                                    std::ostringstream oss;
-                                    oss << "Barcode correction matched: " << matched 
-                                        << " for element: " << elem.class_id << std::endl;
-                                    std::cout << oss.str();
-                                }
-                            }
-                            int64_seq original_bc;
-                            original_bc.sequence_to_bits(elem.seq.value());
-                            int64_seq correct_bc = out.value();
-                            seen_bcs[seq_utils::remove_rc(elem.class_id)].insert(out.value());
-                            //fixing this because corrected is only in the forward direction anyways so need to revcomp
-                            std::string final_bc = correct_bc.bits_to_sequence();
-                            // Check if the corrected barcode exists in true_bcs or global_bcs
-                            bool found_in_true = wl.true_bcs.check_wl_for(correct_bc);
-                            bool found_in_global = wl.global_bcs.check_wl_for(correct_bc);
-                            //first check if the corrected barcode is the same as an original sequence
-                            bool already_keyed = wl.true_bcs.check_wl_for(original_bc) || wl.global_bcs.check_wl_for(original_bc);         
-                            if (!already_keyed) {
-                                if (found_in_true &! found_in_global) {
-                                    auto true_range = wl.true_bcs.equal_range(correct_bc);
-                                    if (!wl.true_bcs.check_wl_for(original_bc) && true_range.first != true_range.second) {
-                                        const barcode_entry& correct_entry = (*true_range.first);
-                                        //const barcode_entry* correct_entry = &(*true_range.first);
-                                        #pragma omp critical
-                                        {
-                                            //wl.true_bcs.insert_bc_entry(original_bc, correct_entry);
-                                        }
-                                    }
-                                }
-                                else if (found_in_global &! found_in_true) {
-                                    // Correct barcode found in global_bcs
-                                    auto global_range = wl.global_bcs.equal_range(correct_bc);
-                                    if (!wl.true_bcs.check_wl_for(original_bc) && global_range.first != global_range.second) {
-                                        const barcode_entry& correct_entry = (*global_range.first);
-                                        //const barcode_entry* correct_entry = &(*global_range.first);
-                                        #pragma omp critical
-                                        {
-                                            wl.global_bcs.insert_bc_entry(original_bc, correct_entry);
-                                        }
-                                    }
-                                }
-                            }
-                            // update original_seq with the original sequence, set the sequence to the final corrected barcode
-                            // and set element pass to be true
-                            auto& id_index = sig_elements.get<sig_id_tag>();
-                            std::string final_wl;
-                            if(found_in_true &! found_in_global){
-                                final_wl = "true";
-                            } else {
-                                final_wl = "global";
-                            }
-
-                            id_index.modify(
-                                id_index.find(elem.class_id), [&](seq_element &e){
-                                    e.original_seq = e.seq;
-                                    e.seq = final_bc;
-                                    e.element_pass = true;
-                                    e.flags = final_wl;
-                                }
-                            );
-                        } else {
-                            // else mark the element as failed
-                            auto& id_index = sig_elements.get<sig_id_tag>();
-                            id_index.modify(id_index.find(elem.class_id),[](seq_element &e) {
-                                        e.element_pass = false; 
-                                        e.flags = "filter";
-                                    }
-                                );
-                            if(elem.seq.has_value()){
-                                int64_seq failed_bc, rc_failed_bc;
-                                failed_bc.sequence_to_bits(elem.seq.value());
-                                rc_failed_bc.sequence_to_bits(seq_utils::revcomp(elem.seq.value()));
-                                
-                                #pragma omp critical
-                                {
-                                    // Check if neither the barcode nor its reverse complement are already keys
-                                    if (!wl.filter_bcs.check_wl_for(failed_bc) && !wl.filter_bcs.check_wl_for(rc_failed_bc)) {
-                                        if(verbose){
-                                            std::ostringstream oss;
-                                            oss << "Barcode failed for " << failed_bc.bits_to_sequence() 
-                                                << "\nno direct match found for this key, adding as a new barcode\n";
-                                            std::cout << oss.str();
-                                        }
-                                        barcode_entry failed_entry;
-                                        failed_entry.barcode = failed_bc;
-                                        failed_entry.filtered = true;
-                                        failed_entry.flags = "filtered";  
-                                        // Double-check that it's still not present
-                                        auto failed_range = wl.filter_bcs.equal_range(failed_bc);
-                                        auto rc_failed_range = wl.filter_bcs.equal_range(rc_failed_bc);
-                                        if((failed_range.first == failed_range.second) && (rc_failed_range.first == rc_failed_range.second)) {
-                                            // Entry doesn't exist - insert it
-                                            //wl.filter_bcs.insert_bc_entry(failed_bc, failed_entry);
-                                        }
-                                    }
-                                }
-                            }
-                            // adding this in to try to manage if there are multiple barcodes, whether we should set this entire direction to false. 
-                            //right now, we *only* return completely correct barcodes (all multiples are also correct) 
-                            if(!multiple_barcodes){
-                                // so if multiple barcodes is false, then we set the direction value to false and set the pass counts to 0.
-                                //here's also where we fail something if a barcode doesn't pass
-                                filtered_because = filtered_because + ":" + direction + ":BARCODE_NOT_FOUND";
-                                set_info(filtered_because);
-                                valid_direction = false;
-                                //don't remember why we also failed the pass_counts in this direction here if we've already failed the direction
-                                //pass_counts[direction] = 0;    
-                            }
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // If no static elements were found, mark the direction as invalid.
-            if(static_counts[direction] == 0){
-                valid_direction = false;
-                pass_counts[direction] = 0;
-                filtered_because = filtered_because + ":FILTERED_DIRECTION_" + direction + "_NO_STATIC_ELEMENTS";
-                set_info(filtered_because);
-            }
-
-            // If the direction failed the per-element check, record zero passing variable elements.
-            //removed pass_counts [direction] = 0 because we could blind ourselves to concatenates
-            if (!valid_direction) {
-                direction_valid[direction] = false;
-                //pass_counts[direction] = 0;
-                continue;
-            }
-
-            // Second pass: Check for overlaps among variable elements (skip start/stop elements).
-            for (size_t i = 0; i < elements.size(); i++) {
-                const auto& e1 = elements[i].get();
-                if (e1.global_class == "start" || e1.global_class == "stop" || e1.type != "variable")
-                    continue;
-                for (size_t j = i + 1; j < elements.size(); j++) {
-                    const auto& e2 = elements[j].get();
-                    if (e2.global_class == "start" || e2.global_class == "stop" || e2.type != "variable")
-                        continue;
-                    // Check for overlap beyond a tolerance (here e1.position.second >= e2.position.first + 3)
-                    if (e1.position.second >= e2.position.first + 3) {
-                        auto& id_index = sig_elements.get<sig_id_tag>();
-                        id_index.modify(id_index.find(e1.class_id),
-                                        [](seq_element &e) { e.element_pass = false; });
-                        id_index.modify(id_index.find(e2.class_id),
-                                        [](seq_element &e) { e.element_pass = false; });
-                        if (verbose) {
-                            #pragma omp critical
-                            {
-                                std::ostringstream oss;
-                                oss << "Overlap detected: Filtering variable elements " 
-                                          << e1.class_id << " and " << e2.class_id 
-                                          << " in direction " << direction << std::endl;
-                                std::cout << oss.str();
-                            }
-                        }
-                        filtered_because = filtered_because + ":FILTERED_VARIABLE_" + e1.class_id + "_OVERLAPPING_POSITIONS";
-                        set_info(filtered_because);
-                    }
-                }
-            }
-            
-            // Count passing variable elements after all modifications.
-            for (auto &elem_ref : elements) {
-                const auto& elem = elem_ref.get();
-                if (elem.type == "variable" && elem.element_pass && 
-                    (elem.global_class == "read" || elem.global_class == "barcode"))
-                    count++;
-            }
-
-            // if we've gotten to this point, then we have a valid direction and a valid pass count
-            direction_valid[direction] = true;
-            pass_counts[direction] = count;
-
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << "\nDirection " << direction << " valid: " << direction_valid[direction] 
-                              << " with " << count << " passing variable elements." << std::endl;
-                    std::cout << oss.str();
-                }
-            }
-        }
-        
-        // Decide the overall read type based on the pass counts.
-        int forward_count = (direction_valid.count("forward") && direction_valid.at("forward")) ? pass_counts["forward"] : 0;
-        int reverse_count = (direction_valid.count("reverse") && direction_valid.at("reverse")) ? pass_counts["reverse"] : 0;
-        
-        bool forward_valid = (forward_count > 0 && forward_count >= reverse_count);
-        bool reverse_valid = (reverse_count > 0 && reverse_count >= forward_count);
-
-        if (forward_valid && reverse_valid) {
-            set_type("concatenate"); 
-        } else if (forward_valid) {
-            set_type("forward");
-        } else if (reverse_valid) {
-            set_type("reverse");
-        } else {
-            set_type("filtered");
-        }
-
-        // Update the read barcode counts.
-        update_bc_counts(*this, layout, verbose);
-
-        if(verbose){
-            #pragma omp critical
-            {
-                std::ostringstream oss;
-                oss << "Final read type: "
-                          << read_type
-                          << ", forward element(s) count: "
-                          << forward_count
-                          << ", reverse element(s) count: "
-                          << reverse_count
-                          << "\n"
-                          << std::endl;
-                std::cout << oss.str();
-            }
-        }
-    }
-     */
-
     // Refactored sigalign_filter 
-    void sigalign_filter(
-        const read_streaming::sequence &read, 
-        const ReadLayout& layout, 
-        int gen_mut, 
-        int gen_shift, 
-        bool verbose, 
+    void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, int gen_mut, bool verbose, 
         std::string mode
     ) {
         
@@ -3519,8 +3060,8 @@ public:
                 continue;
             }
             
-            // Count valid variable elements (excluding barcodes for now)
-            pass_counts[direction] = count_non_barcode_elements(elements);
+            // Count valid reads
+            pass_counts[direction] = count_valid_reads(elements);
         }
         
         // part 2: Determine read direction based on non-barcode elements
@@ -3534,7 +3075,7 @@ public:
                 continue;
             }
             bool barcode_success = process_barcodes_for_direction(
-                direction, elements, read, layout, gen_mut, gen_shift, mode, verbose
+                direction, elements, read, layout, gen_mut, mode, verbose
             );
             
             if (!barcode_success) {
@@ -3561,7 +3102,7 @@ public:
 
     //metrics parallelized over reads
     static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
-                         std::optional<int> gen_mut, std::optional<int> gen_shift, bool verbose, 
+                         std::optional<int> gen_mut, bool verbose, 
                          int num_threads, size_t chunk_size, size_t max_reads, bool write_debug, std::string mode) {
 
     // Output file paths
@@ -3669,7 +3210,7 @@ public:
                 SigString sig(read.id, read.seq.length());
                 sig.sigalign_static(read, layout, verbose);
                 sig.sigalign_variable(read, layout, verbose);
-                sig.sigalign_filter(read, layout, gen_mut.value_or(2), gen_shift.value_or(3), verbose, mode);
+                sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode);
                 
                 //full length debug results
                 if(write_debug) {

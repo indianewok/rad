@@ -1848,7 +1848,7 @@ class whitelist {
         std::unordered_set<int64_seq> true_ref;
         bc_multimap<int64_seq, barcode_entry> true_bcs, global_bcs, filter_bcs;
         
-        void generate_mismatch_barcodes(int shift, int mutation_rounds, bool verbose, int nthreads = 1) {
+        void generate_mismatch_barcodes(int mutation_rounds, bool verbose, int nthreads = 1) {
                 using namespace std::chrono;
                 auto start_total = high_resolution_clock::now();
                 
@@ -1857,8 +1857,7 @@ class whitelist {
                     {
                         std::ostringstream oss;
                         oss << "[generate_mismatch_barcodes] Generating shifted and mutated barcodes for "
-                            << true_ref.size() << " true barcodes with shift = " << shift
-                            << " and mutation_rounds = " << mutation_rounds << "\n";
+                            << "mutation_rounds = " << mutation_rounds << "\n";
                         std::cout << oss.str();
                     }
                 }
@@ -1906,7 +1905,7 @@ class whitelist {
                     // Time individual barcode processing for first few
                     auto barcode_start = high_resolution_clock::now();
                                         
-                    // === MUTATION GENERATION ===
+                    // === LEVENSHTEIN MUTATION GENERATION ===
                     auto mutation_gen_start = high_resolution_clock::now();
                     auto mutated = mutation_tools::generate_lv_barcodes(orig_bits, mutation_rounds);
                     auto mutation_gen_end = high_resolution_clock::now();
