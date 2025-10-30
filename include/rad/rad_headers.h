@@ -40,6 +40,7 @@
 #include <boost/bimap.hpp>
 #include <boost/optional.hpp>
 #include <boost/filesystem.hpp>
+#include <boost/lockfree/queue.hpp>
 #include <boost/functional/hash.hpp>
 #include <boost/multi_index/member.hpp>
 #include <boost/bimap/unordered_set_of.hpp>

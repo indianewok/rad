@@ -258,15 +258,15 @@ struct barcode_entry {
     int64_seq barcode;         // barcode sequence
     mutable counter count;     // atomic counter for count
     bool filtered;             // flag for filtering
-    std::string flags;         // additional flags
-    bc_stats stats;            // statistics
+   //std::string flags;         // additional flags
+    // bc_stats stats;            // statistics
     
     barcode_entry()
       : barcode(0,1), 
        count(0),
-       filtered(false), 
-       flags(""),
-       stats()
+       filtered(false) 
+       //,flags(""),
+       //stats()
        { }
 
     bool operator==(const barcode_entry &o) const noexcept {
@@ -810,11 +810,11 @@ public:
     // Stable value storage where barcode entries are stored singularly
     phmap::parallel_node_hash_set<value> unique_values;
 
-    // pointer map of associations, split up into 16 submaps/shards
+    // pointer map of associations, split up into 2^number_of_shards in there to allow for concurrent read-writes
     //if there's read-write, each submap gets its own mutex to avoid rehash failures
     using pointer_map = phmap::parallel_node_hash_map<key, phmap::flat_hash_set<const value*>, phmap::Hash<key>,
                         phmap::EqualTo<key>, std::allocator<std::pair<const key, phmap::flat_hash_set<const value*>>>,
-                        4, std::mutex>; 
+                        6, std::mutex>; 
 
     pointer_map associations;
 
@@ -1102,6 +1102,19 @@ public:
     }
 
     // ==== Count Management Methods ====
+    // In barcode_correction.hpp
+    template<typename T>
+    counter get_all_bc_counts(T const &x) const {
+        const auto& k = key_of(x);
+        if (!k.is_valid()) return counter(0);
+        
+        auto it = associations.find(k);
+        if (it != associations.end() && !it->second.empty()) {
+            return (*it->second.begin())->count;  // Returns copy of counter
+        }
+        return counter(0);
+    }
+
     template<typename T>
     void update_bc_count(T const &x, barcode_counts slot = total) const {
         const auto& k = key_of(x);
@@ -1148,176 +1161,6 @@ public:
         }
     }
 
-    template<typename T>
-    double get_bc_ncpm(T const &x) const {
-        const auto& k = key_of(x);
-        if (!k.is_valid()) return 0.0;
-        auto it = associations.find(k);
-        if (it != associations.end() && !it->second.empty()) {
-            return (*it->second.begin())->bc_stats.ncpm;
-        }
-        return 0.0;
-    }
-    
-    // Get log1p_ncpm for a barcode
-    template<typename T>
-    double get_bc_log1p_ncpm(T const &x) const {
-        const auto& k = key_of(x);
-        if (!k.is_valid()) return 0.0;
-        auto it = associations.find(k);
-        if (it != associations.end() && !it->second.empty()) {
-            return (*it->second.begin())->bc_stats.log1p_ncpm;
-        }
-        return 0.0;
-    }
-    
-    // Get log1p_ncpm ztpoisson percentage for a barcode
-    template<typename T>
-    double get_bc_log1p_ncpm_ztpois(T const &x) const {
-        const auto& k = key_of(x);
-        if (!k.is_valid()) return 0.0;
-        auto it = associations.find(k);
-        if (it != associations.end() && !it->second.empty()) {
-            return (*it->second.begin())->stats.log1p_ncpm_ztpois;
-        }
-        return 0.0;
-    }
-    
-    // Generic accessor that takes field name as string
-    template<typename T>
-    double get_bc_stat(T const &x, const std::string& stat_name) const {
-        const auto& k = key_of(x);
-        if (!k.is_valid()) return 0.0;
-        auto it = associations.find(k);
-        if (it != associations.end() && !it->second.empty()) {
-            const auto& stats = (*it->second.begin())->bc_stats;
-            
-            if (stat_name == "ncpm") {
-                return stats.ncpm;
-            } else if (stat_name == "log1p_ncpm") {
-                return stats.log1p_ncpm;
-            } else if (stat_name == "ncpm_ztpois") {
-                return stats.ncpm_ztpois;
-            } else if (stat_name == "log1p_ncpm_ztpois") {
-                return stats.log1p_ncpm_ztpois;
-            }
-        }
-        return 0.0;
-    }
-    
-    // Set ncpm for a barcode
-    template<typename T>
-    void set_bc_ncpm(T const &x, double val) const {
-        const auto& k = key_of(x);
-        if (!k.is_valid()) return;
-        auto it = associations.find(k);
-        if (it != associations.end() && !it->second.empty()) {
-            const_cast<value*>(*it->second.begin())->bc_stats.ncpm = val;
-        }
-    }
-    
-    // Set log1p_ncpm for a barcode
-    template<typename T>
-    void set_bc_log1p_ncpm(T const &x, double val) const {
-        const auto& k = key_of(x);
-        if (!k.is_valid()) return;
-        auto it = associations.find(k);
-        if (it != associations.end() && !it->second.empty()) {
-            const_cast<value*>(*it->second.begin())->bc_stats.log1p_ncpm = val;
-        }
-    }
-    
-    // Set log1p_ncpm ztpoisson percentage for a barcode
-    template<typename T>
-    void set_bc_log1p_ncpm_ztpois(T const &x, double val) const {
-        const auto& k = key_of(x);
-        if (!k.is_valid()) return;
-        auto it = associations.find(k);
-        if (it != associations.end() && !it->second.empty()) {
-            const_cast<value*>(*it->second.begin())->bc_stats.log1p_ncpm_ztpois = val;
-        }
-    }
-    
-    // Generic setter that takes field name as string
-    template<typename T>
-    void set_bc_stat(T const &x, const std::string& stat_name, double val) const {
-        const auto& k = key_of(x);
-        if (!k.is_valid()) return;
-        auto it = associations.find(k);
-        if (it != associations.end() && !it->second.empty()) {
-            auto& stats = const_cast<value*>(*it->second.begin())->bc_stats;
-            
-            if (stat_name == "ncpm") {
-                stats.ncpm = val;
-            } else if (stat_name == "log1p_ncpm") {
-                stats.log1p_ncpm = val;
-            } else if (stat_name == "log1p_ncpm_ztpois") {
-                stats.log1p_ncpm_ztpois = val;
-            }
-        }
-    }
-    
-    // Batch accessors for multiple barcodes
-    // Get all ncpm values as vector
-    std::vector<double> get_all_ncpm() const {
-        std::vector<double> values;
-        auto unique_entries = get_unique_entries();
-        values.reserve(unique_entries.size());
-        
-        for (const auto* entry : unique_entries) {
-            values.push_back(entry->bc_stats.ncpm);
-        }
-        return values;
-    }
-    
-    // Get all log1p_ncpm values as vector
-    std::vector<double> get_all_log1p_ncpm() const {
-        std::vector<double> values;
-        auto unique_entries = get_unique_entries();
-        values.reserve(unique_entries.size());
-        
-        for (const auto* entry : unique_entries) {
-            values.push_back(entry->bc_stats.log1p_ncpm);
-        }
-        return values;
-    }
-    
-    // Get all ZT-Poisson CDF percentages as vector
-    std::vector<double> get_all_log1p_ncpm_ztpois() const {
-        std::vector<double> values;
-        auto unique_entries = get_unique_entries();
-        values.reserve(unique_entries.size());
-        
-        for (const auto* entry : unique_entries) {
-            values.push_back(entry->bc_stats.log1p_ncpm_ztpois);
-        }
-        return values;
-    }
-    
-    // Generic batch accessor
-    std::vector<double> get_all_bc_stats(const std::string& stat_name) const {
-        std::vector<double> values;
-        auto unique_entries = get_unique_entries();
-        values.reserve(unique_entries.size());
-        
-        for (const auto* entry : unique_entries) {
-            const auto& stats = entry->bc_stats;
-            
-            if (stat_name == "ncpm") {
-                values.push_back(stats.ncpm);
-            } else if (stat_name == "log1p_ncpm") {
-                values.push_back(stats.log1p_ncpm);
-            } else if (stat_name == "ncpm_ztpois") {
-                values.push_back(stats.ncpm_ztpois);
-            } else if (stat_name == "log1p_ncpm_ztpois") {
-                values.push_back(stats.log1p_ncpm_ztpois);
-            } else {
-                values.push_back(0.0);  // Default for unknown stat
-            }
-        }
-        return values;
-    }
-    
     // ==== Utility Methods ====
     std::vector<const value*> get_unique_entries() const {
         std::vector<const value*> result;
@@ -1326,27 +1169,6 @@ public:
             result.push_back(&val);
         }
         return result;
-    }
-
-    void calc_all_stats_wl(barcode_counts count_slot = barcode_counts::raw,
-                              bool verbose = false,
-                              const char* label = nullptr)
-    {
-        // 1) per-whitelist ncpm + log1p (already uses this->get_unique_entries())
-        this->calc_wl_log1p_ncpm(count_slot);
-
-        // 2) fit ZT-Poisson lambda on THIS whitelist
-        double lambda = this->calc_wl_ztpois_lambda();
-        if (verbose) {
-        #ifdef _OPENMP
-        #pragma omp critical
-        #endif
-            std::cout << "[calc_stats]"
-                    << (label ? std::string(" ") + label : std::string())
-                    << " lambda: " << lambda << '\n';
-        }
-        // 3) write per-barcode ZT-Poisson percentiles (again, within THIS whitelist)
-        this->calc_wl_ztpois_pct();
     }
 
     // ==== Iterator Support ====
@@ -1409,260 +1231,6 @@ public:
         return iterator(associations.end(), associations.end()); 
     }
 
-    // ==== Stats and Tabulation Methods ====
-    
-    //calculate ncpm and log1p_ncpm for all entries in whitelist
-    // based off of raw counts
-    void calc_wl_log1p_ncpm(barcode_counts count_slot = barcode_counts::raw) {
-        // Step 1: Calculate total reads across all barcodes
-        double total_reads = 0.0;
-        auto unique_entries = get_unique_entries();
-        for (const auto* entry : unique_entries) {
-            total_reads += entry->count.load(count_slot);
-        }
-        if (total_reads == 0.0){
-            // Avoid division by zero
-            return; 
-        }
-        // Step 2: Calculate ncpm for each barcode
-        for (const auto* entry : unique_entries) {
-            int count = entry->count.load(count_slot);
-            // Update the barcode's stats
-            auto* mutable_entry = const_cast<value*>(entry);
-            mutable_entry->stats.calculate_bc_ncpm(count, total_reads);
-            mutable_entry->stats.calculate_bc_log1p_ncpm();
-        }
-    }
-
-    // Estimate lambda from log1p_ncpm distribution of total whitelist
-    double calc_wl_ztpois_lambda() const {
-        auto unique_entries = get_unique_entries();
-        if (unique_entries.empty()){
-            return 1.0;
-        }
-        // Collect non-zero values
-        std::vector<double> non_zero_values;
-        for (const auto* entry : unique_entries) {
-            double log1p_val = entry->stats.log1p_ncpm;
-            if (log1p_val > 0.0) {
-                non_zero_values.push_back(log1p_val);
-            }
-        }
-        if (non_zero_values.empty()) return 1.0;
-        // Calculate mean of non-zero values for lambda estimate
-        double sample_mean = std::accumulate(non_zero_values.begin(), non_zero_values.end(), 0.0) / non_zero_values.size();
-        return std::max(0.1, sample_mean);
-    }
-
-    // calculate the ztpois, converted into a percentage, for the full whitelist
-    void calc_wl_ztpois_pct() {
-        double lambda = calc_wl_ztpois_lambda();
-        auto unique_entries = get_unique_entries();
-        for (const auto* entry : unique_entries) {
-            // Update the barcode's stats with the estimated lambda
-            auto* mutable_entry = const_cast<value*>(entry);
-            double k = mutable_entry->stats.log1p_ncpm;
-            mutable_entry->stats.calculate_bc_ztpois_pct(k,lambda);
-        }
-    }
-
-    // calculating whitelist density estimate, given statistic
-    kdepp::Kde1d<double> calc_wl_density(const std::string& stat_name, double threshold) const {
-    // Collect values above threshold
-    std::vector<double> values;
-    auto unique_entries = get_unique_entries();
-    
-    for (const auto* entry : unique_entries) {
-        double val = 0.0;
-        
-        // Get the requested statistic
-        if (stat_name == "log1p_ncpm_ztpois") {
-            val = entry->stats.log1p_ncpm_ztpois;
-        } else if (stat_name == "log1p_ncpm") {
-            val = entry->stats.log1p_ncpm;
-        } else if (stat_name == "ncpm") {
-            val = entry->stats.ncpm;
-        }
-        
-        // Simple filter: only include if above threshold
-        if (val > threshold) {
-            values.push_back(val);
-        }
-    }
-    // Return KDE object (throws if < 2 values)
-    return kdepp::Kde1d<double>(values);
-}
-
-    // overload for count-based filtering
-    kdepp::Kde1d<double> calc_wl_density(barcode_counts slot, int threshold) const {
-        std::vector<double> values;
-        auto unique_entries = get_unique_entries();
-        
-        for (const auto* entry : unique_entries) {
-            int count = entry->count.load(slot);
-            if (count > threshold) {
-                // Convert count to double and add
-                values.push_back(static_cast<double>(count));
-            }
-        }
-        
-        return kdepp::Kde1d<double>(values);
-    }
-    
-// Plotting function for the KDE density estimate w/ sciplot 
-    void plot_density(const kdepp::Kde1d<double>& kde, double min_x, double max_x,
-                  const std::string& output_file = "/Users/cmv/Desktop/density_plot.png",
-                  int n_points = 512)
-{
-    using namespace plotting_utils;
-    using namespace gmm_utils;
-
-    // --- sample KDE over full range ---
-    std::vector<double> x_vals, y_vals;
-    x_vals.reserve(n_points); y_vals.reserve(n_points);
-    for (int i = 0; i < n_points; ++i) {
-        double x = min_x + i * (max_x - min_x) / (n_points - 1);
-        x_vals.push_back(x);
-        y_vals.push_back(kde.eval(x));
-    }
-
-    // --- peaks on full range (for display + to find tallest for flatmin) ---
-    auto all_peaks = find_peaks(x_vals, y_vals, /*min_height=*/0.0, /*min_distance=*/25,
-                                /*smooth=*/true, /*ma_window=*/7);
-    // First flat min after tallest peak
-    std::optional<peak> flatmin;
-    if (!all_peaks.empty()) {
-        auto tallest = *std::max_element(all_peaks.begin(), all_peaks.end(),
-                                         [](const peak& a, const peak& b){ return a.y < b.y; });
-        flatmin = first_flat_min_after(x_vals, y_vals, tallest.idx, 9, 1e-3);
-    }
-
-    // ---------- PLOT 1: KDE ONLY (+ markers from full range) ----------
-    {
-        sciplot::Plot2D plot;
-        plot.drawCurve(x_vals, y_vals).lineWidth(2).label("KDE");
-
-        // show only "big" peaks to reduce clutter
-        if (!all_peaks.empty()) {
-            double max_y_full = *std::max_element(y_vals.begin(), y_vals.end());
-            const double rel_height = 0.05;
-            for (const auto& pk : all_peaks) {
-                if (pk.y >= rel_height * max_y_full) {
-                    plot.drawPoints(std::vector<double>{pk.x}, std::vector<double>{pk.y})
-                        .pointType(7).pointSize(2);
-                }
-            }
-        }
-        if (flatmin) {
-            plot.drawPoints(std::vector<double>{flatmin->x}, std::vector<double>{flatmin->y})
-                .pointType(5).pointSize(2);
-        }
-
-        plot.xlabel("Cumulative Density of Log1p(NCPM)");
-        plot.ylabel("Density");
-        plot.legend().atOutsideTopLeft().displayHorizontal();
-
-        sciplot::Figure fig = {{plot}};
-        sciplot::Canvas canvas = {{fig}};
-        canvas.size(1200, 1200);
-        canvas.save(output_file);
-    }
-
-    // === Build the post-flat segment to fit GMM on ===
-    size_t start_idx = 0;
-    if (flatmin) {
-        // include the flat minimum itself; use +1 if you want strictly after
-        start_idx = flatmin->idx;
-        if (start_idx >= x_vals.size()) start_idx = x_vals.size() - 1;
-    }
-    std::vector<double> x_post(x_vals.begin() + start_idx, x_vals.end());
-    std::vector<double> y_post(y_vals.begin() + start_idx, y_vals.end());
-
-    // If the post-flat segment is too short, bail out to full range
-    if (x_post.size() < 5) {
-        x_post = x_vals;
-        y_post = y_vals;
-        start_idx = 0;
-    }
-
-    // --- peaks on POST-FLAT segment (for K heuristic + seeds) ---
-    auto peaks_post = find_peaks(x_post, y_post, /*min_height=*/0.0, /*min_distance=*/1,
-                                 /*smooth=*/true, /*ma_window=*/5);
-    std::vector<peak> big_peaks_post;
-    if (!peaks_post.empty()) {
-        double max_y_post = *std::max_element(y_post.begin(), y_post.end());
-        const double rel_height_post = 0.05;
-        for (const auto& p : peaks_post)
-            if (p.y >= rel_height_post * max_y_post) big_peaks_post.push_back(p);
-    }
-
-    int K_guess = std::clamp<int>((int)big_peaks_post.size(), 1, 4);
-
-    // seeds from POST-FLAT peaks (left→right)
-    std::vector<double> init_means;
-    init_means.reserve(big_peaks_post.size());
-    std::sort(big_peaks_post.begin(), big_peaks_post.end(),
-              [](const peak& a, const peak& b){ return a.x < b.x; });
-    for (auto& p : big_peaks_post) init_means.push_back(p.x);
-
-    // ---------- PLOT 2: GMMs ONLY (POST-FLAT) ----------
-    auto derive_gmm_name = [&](std::string path) {
-        auto pos = path.find_last_of('.');
-        if (pos == std::string::npos) return path + "_gmm";
-        return path.substr(0, pos) + "_gmm" + path.substr(pos);
-    };
-    std::string gmm_file = derive_gmm_name(output_file);
-
-    // Sweep K around K_guess (bounded)
-    int Kmin = std::max(1, K_guess - 1);
-    int Kmax = std::min(4, K_guess + 1);
-    auto sweep = fit_gmm_sweep(x_post, y_post, Kmin, Kmax,
-                               init_means.empty() ? nullptr : &init_means);
-    const bool have_best = (sweep.best_idx >= 0);
-
-    {
-        sciplot::Plot2D plot;
-
-        // All mixture sums for post-flat segment
-        for (const auto& f : sweep.fits) {
-            plot.drawCurve(x_post, f.mix_y)
-                .lineWidth(1).lineStyle(3)
-                .label("GMM sum (K=" + std::to_string(f.K) + ")");
-        }
-
-        // Best mixture + components
-        if (have_best) {
-            const auto& best = sweep.fits[sweep.best_idx];
-            plot.drawCurve(x_post, best.mix_y)
-                .lineWidth(2).lineStyle(2)
-                .label("Best sum (K=" + std::to_string(best.K) + ")");
-
-            std::vector<int> order(best.K);
-            std::iota(order.begin(), order.end(), 0);
-            std::sort(order.begin(), order.end(),
-                      [&](int a, int b){ return best.comps[a].weight > best.comps[b].weight; });
-            const std::vector<std::string> colors = {"red","blue","green","orange","purple","brown"};
-            for (int r = 0; r < best.K; ++r) {
-                int k = order[r];
-                auto c = plot.drawCurve(x_post, best.comp_y[k]);
-                if (r < (int)colors.size())
-                    c.lineColor(colors[r]).lineWidth(r < 2 ? 2 : 1).lineStyle(r < 2 ? 1 : 3)
-                     .label("comp " + std::to_string(k+1));
-                else
-                    c.lineWidth(1).lineStyle(3).label("comp " + std::to_string(k+1));
-            }
-        }
-
-        plot.xlabel("Cumulative Density of Log1p(NCPM) (post-flat)");
-        plot.ylabel("Density");
-        plot.legend().atOutsideTopLeft().displayHorizontal();
-
-        sciplot::Figure fig = {{plot}};
-        sciplot::Canvas canvas = {{fig}};
-        canvas.size(1200, 1200);
-        canvas.save(gmm_file);
-    }
-}
 
 // ==== Summary and Output Methods ====
     std::vector<std::tuple<std::string,int,int,int,int,int,int,int,int>>
@@ -1747,96 +1315,6 @@ public:
         write_wl_summary(ofs, "", filter_keys);
     }
 
-    //  version that includes barcode stats
-    std::vector<std::tuple<std::string,int,int,int,int,int,int,int,int,double,double,double>>
-    summarize_counts_with_stats(
-        const std::unordered_set<key> *filter_keys = nullptr
-    ) const {
-        using row = std::tuple<std::string,int,int,int,int,int,int,int,int,double,double,double>;
-        std::vector<row> rows;
-        std::vector<key> keys;
-        
-        if (filter_keys) {
-            keys.reserve(filter_keys->size());
-            for (auto const &k : *filter_keys)
-                keys.push_back(k);
-        } else {
-            std::unordered_set<key> seen;
-            seen.reserve(associations.size());
-            for (auto const &kv : associations)
-                seen.insert(kv.first);
-            keys.reserve(seen.size());
-            for (auto const &k : seen)
-                keys.push_back(k);
-        }
-        
-        rows.reserve(keys.size());
-        for (auto const &bc : keys) {
-            auto it = associations.find(bc);
-            int raw=0, tot=0, corr=0, fwd=0, rev=0, fwd_c=0, rev_c=0, filt=0;
-            double ncpm=0.0, log1p_ncpm=0.0, ncpm_ztpois=0.0, log1p_ncpm_ztpois=0.0;
-            
-            if (it != associations.end() && !it->second.empty()) {
-                // Get counts from first value pointer (they should all be the same for a given key)
-                const value* first_val = *it->second.begin();
-                raw = first_val->count.load(barcode_counts::raw);
-                tot = first_val->count.load(barcode_counts::total);
-                corr = first_val->count.load(barcode_counts::corrected);
-                fwd = first_val->count.load(barcode_counts::forw);
-                rev = first_val->count.load(barcode_counts::rev);
-                fwd_c = first_val->count.load(barcode_counts::forw_concat);
-                rev_c = first_val->count.load(barcode_counts::rev_concat);
-                filt = first_val->count.load(barcode_counts::filtered);
-                
-                // Get barcode stats
-                ncpm = first_val->stats.ncpm;
-                log1p_ncpm = first_val->stats.log1p_ncpm;
-                log1p_ncpm_ztpois = first_val->stats.log1p_ncpm_ztpois;
-            }
-            
-            rows.emplace_back(bc.bits_to_sequence(), raw, tot, corr, fwd, rev, fwd_c, rev_c, filt,
-                            ncpm, log1p_ncpm, log1p_ncpm_ztpois);
-        }
-        return rows;
-    }
-
-    //  write function with barcode stats
-    void write_wl_summary_with_stats(
-        std::ostream &out, 
-        const std::string class_id,
-        const std::unordered_set<key> *filter_keys = nullptr,
-        bool write_header = true
-    ) const {
-        static bool header_printed = false;
-        if(write_header && header_printed) header_printed = false;
-        if(!header_printed) {
-            out << "class_id,true_barcode,raw_count,total_count,corrected_count,forw_count,rev_count,"
-                << "forw_concat_count,rev_concat_count,filtered_count,"
-                << "ncpm,log1p_ncpm,log1p_ncpm_ztpois\n";
-            header_printed = true;
-        }
-        
-        auto rows = summarize_counts_with_stats(filter_keys);
-        for (auto const & tpl : rows) {
-            auto const & bc = std::get<0>(tpl);
-            auto raw = std::get<1>(tpl);
-            auto tot = std::get<2>(tpl);
-            auto corr = std::get<3>(tpl);
-            auto forw = std::get<4>(tpl);
-            auto rev = std::get<5>(tpl);
-            auto forw_concat = std::get<6>(tpl);
-            auto rev_concat = std::get<7>(tpl);
-            auto filtered = std::get<8>(tpl);
-            auto ncpm = std::get<9>(tpl);
-            auto log1p_ncpm = std::get<10>(tpl);
-            auto log1p_ncpm_ztpois = std::get<11>(tpl);
-            
-            out << class_id << ',' << bc << ',' << raw << "," << tot << ',' << corr << ',' << forw
-                << ',' << rev << ',' << forw_concat << ',' << rev_concat << ',' << filtered << ','
-                << ncpm << ',' << log1p_ncpm << ',' << log1p_ncpm_ztpois << '\n';
-        }
-    }
-
 };
 
 class whitelist {
@@ -1845,7 +1323,7 @@ class whitelist {
         ~whitelist() = default;
 
     struct wl_entry {
-        std::unordered_set<int64_seq> true_ref;
+        //std::unordered_set<int64_seq> true_ref;
         bc_multimap<int64_seq, barcode_entry> true_bcs, global_bcs, filter_bcs;
         
         void generate_mismatch_barcodes(int mutation_rounds, bool verbose, int nthreads = 1) {
@@ -1968,7 +1446,7 @@ class whitelist {
                 
                 // TIMING: Sanity check
                 auto start_sanity = high_resolution_clock::now();
-                
+                /*
                 size_t missing = 0;
                 for (auto const &orig_bits : true_ref) {
                     if (!true_bcs.check_wl_for(orig_bits)) {
@@ -1977,7 +1455,7 @@ class whitelist {
                                 << orig_bits.bits_to_sequence() << "\n";
                     }
                 }
-                
+                */
                 auto end_sanity = high_resolution_clock::now();
                 double sanity_ms = duration<double, std::milli>(end_sanity - start_sanity).count();
                 
@@ -2015,7 +1493,7 @@ class whitelist {
                             << ((final_memory_estimate - initial_memory_estimate) / 1024 / 1024) << " MB)\n";
                     std::cout << "Memory efficiency: " << (double)total_growth / (total_mutations_generated) * 100 
                             << "% of generated items were unique and added\n";
-                    
+                    /* 
                     if (missing == 0) {
                         std::cout << "\n[generate_mismatch_barcodes] All " << true_ref.size() 
                                 << " original barcodes are present\n";
@@ -2023,6 +1501,7 @@ class whitelist {
                         std::cerr << "\n[generate_mismatch_barcodes] " << missing << "/" 
                                 << true_ref.size() << " originals missing!\n";
                     }
+                    */
                 }
             }
     };
@@ -2101,9 +1580,9 @@ class whitelist {
                 barcode_entry be;
                 be.barcode = seq;
                 be.filtered = false;
-                be.flags = "flag";
+                //be.flags = "flag";
                 out.true_bcs.emplace(seq, std::move(be));
-                out.true_ref.insert(seq);
+                //out.true_ref.insert(seq);
             }
             return;
         }
@@ -2121,18 +1600,18 @@ class whitelist {
                 barcode_entry be;
                 be.barcode = seq;
                 be.filtered = false;
-                be.flags = "";
+                //be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
-                out.true_ref.insert(seq);
+                //out.true_ref.insert(seq);
             }
             for (auto const &seq : large) {
                 //this line trims duplicate entries in global bcs
-                if (out.true_ref.count(seq) == 0) {
+                if (!out.true_bcs.check_wl_for(seq)) {
                     if (seq.bits.empty()) continue;
                     barcode_entry be{};
                     be.barcode   = seq;
                     be.filtered  = false;
-                    be.flags     = "";
+                    //be.flags     = "";
                     out.global_bcs.emplace(seq, be);
                 }
             }
@@ -2144,18 +1623,18 @@ class whitelist {
                 barcode_entry be;
                 be.barcode = seq;
                 be.filtered = false;
-                be.flags = "";
+                //be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
-                out.true_ref.insert(seq);
+                //out.true_ref.insert(seq);
             }
             for (auto const &seq : B) {
                 if (seq.bits.empty()) continue;
                 barcode_entry be;
                 be.barcode = seq;
                 be.filtered = false;
-                be.flags = "";
+                //be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
-                out.true_ref.insert(seq);
+                //out.true_ref.insert(seq);
             }
         }
     }
@@ -2194,53 +1673,129 @@ class whitelist {
 };
 
 //needed to include this down here because of the definitions above that I couldn't make work by movign this to the misc utils, though I sure would love for this to be there
+// Fixed memory calculation functions
 namespace bc_mem_utils {
-
-    inline constexpr std::size_t get_bc_entry_mem() {
-        return sizeof(barcode_entry);
+    
+    // Get actual memory of int64_seq including vector allocation
+    inline std::size_t get_int64seq_mem(const int64_seq& seq) {
+        std::size_t base = sizeof(int64_seq);  // 16 bytes (uint16_t + vector overhead)
+        std::size_t vec_capacity = seq.bits.capacity() * sizeof(int64_t);  // Actual heap allocation
+        return base + vec_capacity;
+    }
+    
+    // Get actual memory of barcode_entry including nested structures
+    inline std::size_t get_bc_entry_mem(const barcode_entry& entry) {
+        std::size_t base = sizeof(barcode_entry);
+        
+        // Add int64_seq's vector allocation
+        std::size_t seq_vec = entry.barcode.bits.capacity() * sizeof(int64_t);
+        
+        // Add string allocations (flags field)
+        //std::size_t flags_mem = entry.flags.capacity();
+        
+        return base + seq_vec;// + flags_mem;
     }
 
-    inline constexpr std::size_t get_int64seq_mem() {
-        return sizeof(int64_seq);
-    }
-
+    // Updated approx_unique with correct per-element sizing
     template<typename Key, typename Value>
     std::size_t approx_unique(const bc_multimap<Key, Value>& m) {
-        // deque — no buckets, just size * value size
-        return m.debug_unique_values().size() * sizeof(Value);
+        const auto& set = m.debug_unique_values();
+        if (set.empty()) return 0;
+        
+        // Calculate actual element sizes by sampling
+        std::size_t total_element_size = 0;
+        std::size_t sample_count = 0;
+        constexpr std::size_t max_samples = 100;
+        
+        for (const auto& elem : set) {
+            total_element_size += get_bc_entry_mem(elem);
+            if (++sample_count >= max_samples) break;
+        }
+        
+        // Average element size
+        std::size_t avg_element_size = sample_count > 0 
+            ? total_element_size / sample_count 
+            : sizeof(Value);
+        
+        // Total element memory (actual heap allocations)
+        constexpr size_t node_overhead = 16;  // malloc overhead per node
+        std::size_t element_memory = set.size() * (avg_element_size + node_overhead);
+        
+        // Bucket array (load factor ~0.875)
+        std::size_t estimated_buckets = static_cast<size_t>(set.size() / 0.875);
+        std::size_t bucket_memory = estimated_buckets * sizeof(void*);
+        
+        // 64 submaps with metadata
+        constexpr size_t num_submaps = 64;
+        std::size_t submap_overhead = num_submaps * 128;
+        
+        return element_memory + bucket_memory + submap_overhead;
     }
-
+    
+    // Updated approx_assoc with correct Key sizing
     template<typename Key, typename Value>
     std::size_t approx_assoc(const bc_multimap<Key, Value>& m) {
         const auto& mm = m.debug_associations();
-        std::size_t buckets = mm.bucket_count() * memory_utils::get_pointer_mem();
-        std::size_t nodes = mm.size() * (
-            sizeof(Key)
-            + sizeof(const Value*)
-            + 2 * memory_utils::get_pointer_mem()
-        );
-        return buckets + nodes;
+        if (mm.empty()) return 0;
+        
+        // Sample keys to get average size (they contain vectors too!)
+        std::size_t total_key_size = 0;
+        std::size_t key_sample_count = 0;
+        constexpr std::size_t max_key_samples = 100;
+        
+        for (const auto& [key, value_set] : mm) {
+            if constexpr (std::is_same_v<Key, int64_seq>) {
+                total_key_size += get_int64seq_mem(key);
+            } else {
+                total_key_size += sizeof(Key);
+            }
+            if (++key_sample_count >= max_key_samples) break;
+        }
+        
+        std::size_t avg_key_size = key_sample_count > 0 
+            ? total_key_size / key_sample_count 
+            : sizeof(Key);
+        
+        // Outer map bucket array
+        std::size_t outer_buckets = mm.bucket_count() * sizeof(void*);
+        
+        // Outer map nodes (key + ptr to inner set + malloc overhead)
+        constexpr size_t node_overhead = 16;
+        std::size_t outer_nodes = mm.size() * (avg_key_size + sizeof(void*) + node_overhead);
+        
+        // Inner flat_hash_sets - THIS IS THE BIG ONE
+        std::size_t inner_set_memory = 0;
+        for (const auto& [key, value_set] : mm) {
+            // Inner set bucket array
+            std::size_t inner_buckets = value_set.bucket_count() * sizeof(void*);
+            
+            // Pointers stored in inner set
+            std::size_t inner_elements = value_set.size() * sizeof(const Value*);
+            
+            // Set object overhead (the flat_hash_set itself)
+            constexpr std::size_t set_overhead = 64;
+            
+            inner_set_memory += inner_buckets + inner_elements + set_overhead;
+        }
+        
+        // Submap overhead
+        constexpr size_t num_submaps = 64;
+        std::size_t submap_overhead = num_submaps * 128;
+        
+        return outer_buckets + outer_nodes + inner_set_memory + submap_overhead;
     }
-
-    template<typename Key, typename Value>
-    std::size_t get_full_wl_mem(const bc_multimap<Key, Value>& m) {
-        return approx_unique(m) + approx_assoc(m);
-    }
-
-       template<typename Key, typename Value>
+    
+        template<typename Key, typename Value>
     void print_submap_distribution(const bc_multimap<Key, Value>& m) {
         const auto& associations = m.debug_associations();
-        
         if (associations.empty()) {
             std::cout << "No associations to analyze\n";
             return;
         }
-        
         // Get number of submaps
         size_t num_submaps = associations.subcnt();
         std::vector<size_t> submap_sizes(num_submaps, 0);
         size_t total_entries = 0;
-        
         try {
             // Since subsize() isn't available, count manually by iterating
             for (const auto& [k, value_set] : associations) {
@@ -2254,14 +1809,11 @@ namespace bc_mem_utils {
             std::cout << "Error analyzing submap distribution\n";
             return;
         }
-        
-        std::cout << "Submap distribution (" << total_entries << " total, " 
+        std::cout << "Submap distribution (" << total_entries << " total, "
                   << num_submaps << " submaps):\n";
-        
         // Auto-size the grid
         size_t grid_cols = static_cast<size_t>(std::ceil(std::sqrt(num_submaps)));
         size_t grid_rows = static_cast<size_t>(std::ceil(static_cast<double>(num_submaps) / grid_cols));
-        
         // Print as grid
         for (size_t row = 0; row < grid_rows; ++row) {
             for (size_t col = 0; col < grid_cols; ++col) {
@@ -2276,7 +1828,6 @@ namespace bc_mem_utils {
             }
             std::cout << "\n";
         }
-        
         // Print raw counts and balance
         std::cout << "Raw counts: [";
         for (size_t i = 0; i < num_submaps; ++i) {
@@ -2284,37 +1835,89 @@ namespace bc_mem_utils {
             if (i < num_submaps - 1) std::cout << ", ";
         }
         std::cout << "]\n";
-        
         if (num_submaps > 1) {
             auto [min_it, max_it] = std::minmax_element(submap_sizes.begin(), submap_sizes.end());
             double min_pct = (*min_it * 100.0) / total_entries;
             double max_pct = (*max_it * 100.0) / total_entries;
             double balance_ratio = (*min_it > 0) ? static_cast<double>(*max_it) / (*min_it) : 0.0;
-            
-            std::cout << "Balance: min=" << std::fixed << std::setprecision(1) << min_pct 
+            std::cout << "Balance: min=" << std::fixed << std::setprecision(1) << min_pct
                       << "%, max=" << max_pct << "%, ratio=" << std::setprecision(2) << balance_ratio << "\n";
         }
     }
 
+    // Enhanced memory report with breakdown
     template<typename Key, typename Value>
     void print_memory_report(const bc_multimap<Key, Value>& m, const std::string& name = "") {
         if (!name.empty()) std::cout << "=== " << name << " ===\n";
         
-        std::cout << "Counts: " << m.unique_val_size() << " unique, " 
-                  << m.association_size() << " associations\n";
+        std::size_t unique_mem = approx_unique(m);
+        std::size_t assoc_mem = approx_assoc(m);
+        std::size_t total_mem = unique_mem + assoc_mem;
         
-        std::cout << "Memory: " << (approx_unique(m) / 1024) << "KB unique, "
-                  << (approx_assoc(m) / 1024) << "KB assoc, "
-                  << (get_full_wl_mem(m) / 1024) << "KB total\n";
+        std::cout << "Counts:\n";
+        std::cout << "  Unique values:    " << m.unique_val_size() << "\n";
+        std::cout << "  Associations:     " << m.association_size() << "\n";
         
+        std::cout << "\nMemory breakdown:\n";
+        std::cout << "  Unique storage:   " << std::setw(10) << (unique_mem / 1024) << " KB  ("
+                  << std::fixed << std::setprecision(1) 
+                  << (100.0 * unique_mem / total_mem) << "%)\n";
+        std::cout << "  Association map:  " << std::setw(10) << (assoc_mem / 1024) << " KB  ("
+                  << (100.0 * assoc_mem / total_mem) << "%)\n";
+        std::cout << "  Total:            " << std::setw(10) << (total_mem / 1024) << " KB  ("
+                  << std::setprecision(2) << (total_mem / 1024.0 / 1024.0) << " MB)\n";
+        
+        // Per-entry analysis
+        if (m.unique_val_size() > 0) {
+            std::cout << "\nPer-entry costs:\n";
+            std::cout << "  Unique storage:   " << (unique_mem / m.unique_val_size()) << " bytes/entry\n";
+        }
+        if (m.association_size() > 0) {
+            std::cout << "  Association:      " << (assoc_mem / m.association_size()) << " bytes/assoc\n";
+        }
+        
+        // Sample a few entries to show actual sizes
+        std::cout << "\nSample element sizes:\n";
+        size_t sample = 0;
+        for (const auto& elem : m.debug_unique_values()) {
+            std::size_t elem_size = get_bc_entry_mem(elem);
+            std::cout << "  Entry " << sample << ": " << elem_size << " bytes "
+                      << "(barcode vec capacity: " << elem.barcode.bits.capacity() << " bits\n";
+                      //<< ", flags: " << elem.flags.capacity() << " chars)\n";
+            if (++sample >= 5) break;
+        }
+        
+        // Validation
         size_t bad_keys = m.validate_association_keys();
         size_t null_vals = m.validate_association_values();
         if (bad_keys > 0 || null_vals > 0) {
-            std::cout << "Issues: " << bad_keys << " bad keys, " << null_vals << " null values\n";
+            std::cout << "\n Issues: " << bad_keys << " bad keys, " << null_vals << " null values\n";
         }
         
         print_submap_distribution(m);
         std::cout << "\n";
     }
 
+    // Add this to diagnose the mutation generation memory explosion
+    inline void print_mem_snapshot(
+        const bc_multimap<int64_seq, barcode_entry>& true_bcs,
+        const bc_multimap<int64_seq, barcode_entry>& global_bcs,
+        size_t iteration) 
+    {
+        std::cout << "\n--- Iteration " << iteration << " Memory Snapshot ---\n";
+        
+        std::size_t true_unique = approx_unique(true_bcs);
+        std::size_t true_assoc = approx_assoc(true_bcs);
+        std::size_t global_unique = approx_unique(global_bcs);
+        std::size_t global_assoc = approx_assoc(global_bcs);
+        std::size_t total = true_unique + true_assoc + global_unique + global_assoc;
+        
+        std::cout << "true_bcs:   " << std::setw(8) << true_bcs.unique_val_size() << " unique, "
+                  << std::setw(8) << true_bcs.association_size() << " assoc, "
+                  << std::setw(8) << ((true_unique + true_assoc) / 1024 / 1024) << " MB\n";
+        std::cout << "global_bcs: " << std::setw(8) << global_bcs.unique_val_size() << " unique, "
+                  << std::setw(8) << global_bcs.association_size() << " assoc, "
+                  << std::setw(8) << ((global_unique + global_assoc) / 1024 / 1024) << " MB\n";
+        std::cout << "TOTAL: " << (total / 1024 / 1024) << " MB\n";
+    }
 };

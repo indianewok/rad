@@ -850,11 +850,11 @@ public:
             if (pit == wl_map.lists.end()) {
                 if (verbose) std::cout << "[load_wl] Loading from " << path << " ...\n";
                 auto t1 = high_resolution_clock::now();
-
+                memory_utils::get_rss();
                 // import & possibly generate mismatches
                 whitelist::wl_entry entry = wl_map.import_whitelist(spec, verbose, default_length);
                 // hardcoded whitelist size limit for entry so that we don't generate too many mismatches
-                
+                memory_utils::get_rss();
                 // hardcoded this to essentially cover all scenarios where the whitelist becomes
                 // detrimental to size, so basically b/w 10K-30K barcodes we pregenerate it
                 if(entry.true_bcs.size() >= 10000 && entry.true_bcs.size() <= 30000){
@@ -862,7 +862,7 @@ public:
                             mut.value_or(2),
                             verbose, nthreads);
                 }
-
+                memory_utils::get_rss();
                 // build filter_bcs from static_seqs
                 entry.filter_bcs.clear();
                 size_t def_len = default_length;
@@ -885,18 +885,20 @@ public:
                 auto t2 = high_resolution_clock::now();
                 double ms = duration<double, std::milli>(t2 - t1).count();
                 std::cout << "[load_wl] loaded in " << (ms/1000.0) << " s\n";
-
+                memory_utils::get_rss();
                 pit = wl_map.lists.emplace(path, std::move(entry)).first;
             }
 
             // alias into maps by reference
             auto &master = pit->second;
             auto [mit, inserted] = wl_map.maps.try_emplace(key, std::ref(master));
-
             if (inserted) {
                 std::cout << "[load_wl] New entry for key ='"<< key << "'\n";
+                memory_utils::get_rss();
+
             } else if (verbose) {
                 std::cout << "[load_wl] Reusing entry for key ='"<< key << "'\n";
+                memory_utils::get_rss();
             }
 
             {
@@ -908,15 +910,12 @@ public:
                         << ", filter = "<<E.filter_bcs.size()
                         << "\n";
             }
-             // inline helper to get MB from bytes
         }
 
         for (auto & [key, entry_ref] : wl_map.maps) {
             auto &E = entry_ref.get();
-            //E.global_bcs.clear_associations();
             std::unordered_set<int64_seq> to_remove;
             to_remove.reserve(E.true_bcs.size());
-
             for (auto const & [bc,be] : E.true_bcs){
                 to_remove.insert(bc);
             }
@@ -924,21 +923,6 @@ public:
             for (auto const &bc : to_remove){
                 E.global_bcs.remove_bc_entry(bc);
             }
-
-
-        //pseudocount setup
-        /*
-        for (auto & [key, entry_ref] : wl_map.maps) {
-            auto &E = entry_ref.get();
-            // Give true barcodes a pseudocount boost in global_bcs
-            for (auto const & [bc, be] : E.true_bcs) {
-                // Set raw count to 1000 for true barcodes in global_bcs
-                E.global_bcs.set_bc_count(bc, 1000, barcode_counts::total);
-            }
-            // Replace true_bcs with global_bcs
-            E.true_bcs = E.global_bcs;
-            E.global_bcs.clear_associations();
-        */
 
             // final report
             std::cout << "[load_wl]"
@@ -952,21 +936,20 @@ public:
                 
                 size_t bad_keys = E.true_bcs.validate_association_keys();
                 size_t null_values = E.true_bcs.validate_association_values();
+                memory_utils::get_rss();
 
                 std::cout << "Bad keys: " << bad_keys << ", Null values: " << null_values << std::endl;
-                    //E.true_bcs.get_health_report("true_bcs").print();
-
-                    //E.true_bcs.full_cleanup("true_bcs").print();
-                    //E.global_bcs.full_cleanup("global_bcs");
             
                 std::printf(
                     "[%s] unique_set = %.2fMiB, associations = %.2fMiB, total = %.2fMiB\n",
                         kv.first.c_str(),
                     
                         memory_utils::to_mib(bc_mem_utils::approx_unique(E.true_bcs)),
-                        memory_utils::to_mib(bc_mem_utils::approx_assoc(E.true_bcs)),
-                        memory_utils::to_mib(bc_mem_utils::get_full_wl_mem(E.true_bcs))
+                        memory_utils::to_mib(bc_mem_utils::approx_assoc(E.true_bcs))
                 );
+                bc_mem_utils::print_memory_report(E.true_bcs, "true_bcs");
+                memory_utils::get_rss();
+
             }
         }
 
@@ -985,7 +968,18 @@ public:
         }
         
         if (whitelist_type == "true" || whitelist_type == "both") {
-            entry.true_bcs.write_wl_summary(out, class_id, &entry.true_ref);
+            std::unordered_set<int64_seq> seen_true;
+            seen_true.reserve(entry.true_bcs.size());
+            for (auto const &kv : entry.true_bcs) {
+                auto cnt = kv.second.count.load(barcode_counts::total);
+                if (cnt > 0) {
+                    seen_true.insert(kv.second.barcode);
+                }
+            }
+
+            if (!seen_true.empty()) {
+                entry.true_bcs.write_wl_summary(out, class_id, &seen_true);
+            }
         }
         
         if ((whitelist_type == "global" || whitelist_type == "both") && full) {
@@ -1034,142 +1028,6 @@ public:
             {
                 std::ofstream global_out(base + "_global" + extension);
                 save_wl(global_out, verbose, true, "global");
-            }
-            
-            if (verbose) {
-                std::cout << "[save_wl] Written to " << base << "_true" << extension 
-                        << " and " << base << "_global" << extension << std::endl;
-            }
-        }
-    }
-
-    //save stats whitelist to a file
-    void save_stats_wl(std::ostream &out, bool verbose, bool full = true, const std::string& whitelist_type = "true", 
-        bool include_stats = false, barcode_counts count_slot = barcode_counts::total) const {
-    
-        for (auto const& [class_id, wrap] : wl_map.maps) {
-            auto &entry = wrap.get();
-            
-            if (verbose) {
-                std::cout << "[save_wl] [" << class_id << "] type=" << whitelist_type << std::endl;
-            }
-            
-            // Calculate barcode stats if requested
-            if (include_stats) {
-                if (verbose) {
-                    std::cout << "[save_wl] [" << class_id << "] Calculating barcode statistics..." << std::endl;
-                }
-                // Calculate ncpm and log1p_ncpm for true_bcs
-                auto& true_bcs_mutable = const_cast<decltype(entry.true_bcs)&>(entry.true_bcs);
-                true_bcs_mutable.calc_wl_log1p_ncpm(count_slot);
-                // Calculate lambda and zero-truncated Poisson probabilities
-                double lambda = true_bcs_mutable.calc_wl_ztpois_lambda();
-                if (verbose) {
-                    std::cout << "[save_wl] [" << class_id << "] Estimated lambda: " << lambda << std::endl;
-                }
-                // Calculate ztpoiss probabilities for all barcodes
-                true_bcs_mutable.calc_wl_ztpois_pct();
-
-                auto kde = true_bcs_mutable.calc_wl_density("log1p_ncpm_ztpois", 50.0);
-                true_bcs_mutable.plot_density(kde, 80.0, 100.0);
-
-                // Do the same for global_bcs if needed
-                if ((whitelist_type == "global" || whitelist_type == "both") && full) {
-                    auto& global_bcs_mutable = const_cast<decltype(entry.global_bcs)&>(entry.global_bcs);
-                    global_bcs_mutable.calc_wl_log1p_ncpm(count_slot);
-                    global_bcs_mutable.calc_wl_ztpois_pct();
-                }
-            }
-            
-            // Write true barcodes
-            if (whitelist_type == "true" || whitelist_type == "both") {
-                if (include_stats) {
-                    entry.true_bcs.write_wl_summary_with_stats(out, class_id, &entry.true_ref);
-                } else {
-                    entry.true_bcs.write_wl_summary(out, class_id, &entry.true_ref);
-                }
-            }
-            
-            // Write global barcodes
-            if ((whitelist_type == "global" || whitelist_type == "both") && full) {
-                std::unordered_set<int64_seq> seen_global;
-                seen_global.reserve(entry.global_bcs.size());
-                
-                for (auto const &kv : entry.global_bcs) {
-                    auto cnt = kv.second.count.load(count_slot);
-                    if (cnt > 0) {
-                        seen_global.insert(kv.second.barcode);
-                    }
-                }
-                
-                if (!seen_global.empty()) {
-                    if (include_stats) {
-                        entry.global_bcs.write_wl_summary_with_stats(out, class_id + "_global", &seen_global);
-                    } else {
-                        entry.global_bcs.write_wl_summary(out, class_id + "_global", &seen_global);
-                    }
-                }
-            }
-            
-            if (verbose && include_stats) {
-                // Print summary statistics
-                auto unique_entries = entry.true_bcs.get_unique_entries();
-                size_t entries_with_stats = 0;
-                double avg_ncpm = 0.0, avg_log1p = 0.0, avg_ztpois = 0.0;
-                
-                for (const auto* bc_entry : unique_entries) {
-                    if (bc_entry->stats.ncpm > 0) {
-                        entries_with_stats++;
-                        avg_ncpm += bc_entry->stats.ncpm;
-                        avg_log1p += bc_entry->stats.log1p_ncpm;
-                        avg_ztpois += bc_entry->stats.log1p_ncpm_ztpois;
-                    }
-                }
-                
-                if (entries_with_stats > 0) {
-                    avg_ncpm /= entries_with_stats;
-                    avg_log1p /= entries_with_stats;
-                    avg_ztpois /= entries_with_stats;
-                    
-                    std::cout << "[save_wl] [" << class_id << "] Stats summary:" << std::endl;
-                    std::cout << "  Barcodes with stats: " << entries_with_stats << "/" << unique_entries.size() << std::endl;
-                    std::cout << "  Average ncpm: " << avg_ncpm << std::endl;
-                    std::cout << "  Average log1p_ncpm: " << avg_log1p << std::endl;
-                    std::cout << "  Average zt poisson prob: " << avg_ztpois << std::endl;
-                }
-            }
-        }
-    }
-
-    void save_stats_wl(const std::string &path, bool verbose, bool full = true) const {
-        if (!full) {
-            std::ofstream out(path);
-            if (!out.is_open()) {
-                std::cerr << "[error] Error opening file for writing: " << path << "\n";
-                return;
-            }
-            save_stats_wl(out, verbose, full, "true");
-            out.close();
-        } else {
-            // Extract base and extension
-            std::string base = path;
-            size_t dot_pos = base.find_last_of('.');
-            std::string extension = "";
-            if (dot_pos != std::string::npos) {
-                extension = base.substr(dot_pos);
-                base = base.substr(0, dot_pos);
-            }
-            
-            // Write true barcodes
-            {
-                std::ofstream true_out(base + "_true" + extension);
-                save_stats_wl(true_out, verbose, true, "true");
-            }
-            
-            // Write global barcodes  
-            {
-                std::ofstream global_out(base + "_global" + extension);
-                save_stats_wl(global_out, verbose, true, "global");
             }
             
             if (verbose) {

@@ -238,11 +238,11 @@ int main(int argc, char* argv[]) {
 
         // Save whitelist summary
         if (verbose) std::cout << "[main] Saving whitelist summary...\n";
-        read_layout.save_stats_wl(outbase.string() + "_whitelist_stats.csv", false);
+        //read_layout.save_stats_wl(outbase.string() + "_whitelist_stats.csv", false);
         read_layout.save_wl(outbase.string() + "_whitelist.csv", false);
 
         auto final_elapsed = std::chrono::steady_clock::now() - main_start;
-        std::cout << "[main] Completed in "
+        std::cout << "[main] Total code duration: "
                   << std::chrono::duration_cast<std::chrono::seconds>(final_elapsed).count()
                   << " s\n";
 
@@ -252,7 +252,7 @@ int main(int argc, char* argv[]) {
             if (verbose) std::cout << "[main] Splitting output by barcode...\n";
             auto split_start = std::chrono::steady_clock::now();
             try {
-                io_bc_split_utils::split_fastqas(outbase.string(), verbose, nthreads);
+                //io_bc_split_utils::split_fastqas(outbase.string(), verbose, nthreads);
                 auto split_time = std::chrono::steady_clock::now() - split_start;
                 std::cout << "[main] Barcode splitting time: "
                           << std::chrono::duration_cast<std::chrono::seconds>(split_time).count()

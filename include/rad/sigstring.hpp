@@ -421,13 +421,12 @@ namespace barcode_correction {
         
             // Get the appropriate whitelist reference
             const auto& whitelist = (whitelist_source == "global") ? wl->global_bcs : wl->true_bcs;
-            
-            int raw_count = whitelist.get_bc_count(candidate, barcode_counts::raw);
-            int total_count = whitelist.get_bc_count(candidate, barcode_counts::total);
-            int filtered_count = whitelist.get_bc_count(candidate, barcode_counts::filtered);
-            int corrected_count = whitelist.get_bc_count(candidate, barcode_counts::corrected);
-            double cdf = whitelist.get_bc_log1p_ncpm_ztpois(candidate);
-        
+            counter all_counts = whitelist.get_all_bc_counts(candidate);
+            int raw_count = all_counts.load(barcode_counts::raw);
+            int total_count = all_counts.load(barcode_counts::total);
+            int filtered_count = all_counts.load(barcode_counts::filtered);
+            int corrected_count = all_counts.load(barcode_counts::corrected);
+                    
             if(total_count < 0 & raw_count < 2){
                return false;
             }
@@ -473,154 +472,6 @@ namespace barcode_correction {
             }
         return overall_pass;
     }
-
-
-std::pair<std::optional<int64_seq>, std::optional<int>> 
-resolve_multiple_hits_complex(
-    const int64_seq& query,
-    const std::unordered_set<int64_seq>& candidates,
-    int max_dist,
-    bool verbose,
-    const std::string& wl_type,
-    const std::string& mode,
-    const whitelist::wl_entry* wl = nullptr
-) {
-    auto sorted = mutation_tools::int64_lvdist(query, candidates, max_dist);
-    if (sorted.empty()) return {std::nullopt, std::nullopt};
-
-    const auto& target_whitelist = (wl_type == "global") ? wl->global_bcs : wl->true_bcs;
-
-    struct candidate_info {
-        int64_seq barcode;
-        int edit_distance;
-        double cdf_score;
-        int raw_count;
-    };
-
-    // Process each edit distance in ascending order (sorted map guarantees this)
-    for (const auto& [edit_dist, candidate_set] : sorted) {
-        std::vector<candidate_info> distance_candidates;
-        
-        // Collect all candidates at this edit distance with their metrics
-        for (const auto& candidate : candidate_set) {
-            int raw_count = target_whitelist.get_bc_count(candidate, barcode_counts::raw);
-            
-            // Only consider candidates with some evidence (raw_count > 0)
-            if (raw_count > 0 || (edit_dist <= 1)) {
-                candidate_info info;
-                info.barcode = candidate;
-                info.edit_distance = edit_dist;
-                info.cdf_score = target_whitelist.get_bc_log1p_ncpm_ztpois(candidate);
-                info.raw_count = raw_count;
-                distance_candidates.push_back(info);
-            }
-        }
-        
-        // Skip this edit distance if no valid candidates
-        if (distance_candidates.empty()) {
-            if (verbose) std::cout << "No candidates with raw_count > 0 at distance " << edit_dist << "\n";
-            continue;
-        }
-        
-        // If only one candidate at this distance, we have a winner
-        if (distance_candidates.size() == 1) {
-            if (verbose) {
-                std::cout << "Winner: unique candidate at distance " << edit_dist 
-                         << " (CDF=" << distance_candidates[0].cdf_score 
-                         << ", raw_count=" << distance_candidates[0].raw_count << ")\n";
-            }
-            
-            if (passes_quality_check(distance_candidates[0].barcode, wl, wl_type, mode, verbose)) {
-                return {distance_candidates[0].barcode, edit_dist};
-            } else {
-                if (verbose) std::cout << "Quality check failed for candidate, rejecting\n";
-                return {std::nullopt, edit_dist};
-            }
-        }
-        
-        // Multiple candidates at this distance - use tie-breaking logic
-        if (verbose) {
-            std::cout << "Multiple candidates (" << distance_candidates.size() 
-                     << ") at distance " << edit_dist << ", applying tie-breakers\n";
-        }
-        
-        // Tie-breaker 1: Highest CDF score
-        double max_cdf = 0;
-        for (const auto& c : distance_candidates) {
-            max_cdf = std::max(max_cdf, c.cdf_score);
-        }
-        
-        std::vector<candidate_info> cdf_winners;
-        for (const auto& c : distance_candidates) {
-            if (c.cdf_score == max_cdf) {
-                cdf_winners.push_back(c);
-            }
-        }
-        
-        // If CDF tie-breaker gives us a unique winner
-        if (cdf_winners.size() == 1) {
-            if (verbose) {
-                std::cout << "CDF tie-breaker winner: " << cdf_winners[0].barcode.bits_to_sequence()
-                         << " (CDF=" << max_cdf << ")\n";
-            }
-            
-            if (passes_quality_check(cdf_winners[0].barcode, wl, wl_type, mode, verbose)) {
-                return {cdf_winners[0].barcode, edit_dist};
-            } else {
-                if (verbose) std::cout << "Quality check failed for CDF winner, rejecting\n";
-                return {std::nullopt, edit_dist};
-            }
-        }
-        
-        // Tie-breaker 2: Highest raw count (among CDF winners)
-        if (max_cdf > 0) {
-            // If CDF > 0 but still tied, reject as ambiguous
-            if (verbose) {
-                std::cout << "Multiple candidates tied with CDF=" << max_cdf 
-                         << " at distance " << edit_dist << ", rejecting as ambiguous\n";
-            }
-            return {std::nullopt, edit_dist};
-        }
-        
-        // All CDF scores are 0, so use raw count tie-breaker
-        int max_raw_count = 0;
-        for (const auto& c : cdf_winners) {
-            max_raw_count = std::max(max_raw_count, c.raw_count);
-        }
-        
-        std::vector<candidate_info> count_winners;
-        for (const auto& c : cdf_winners) {
-            if (c.raw_count == max_raw_count) {
-                count_winners.push_back(c);
-            }
-        }
-        
-        if (count_winners.size() == 1) {
-            if (verbose) {
-                std::cout << "Raw count tie-breaker winner: " << count_winners[0].barcode.bits_to_sequence()
-                         << " (raw_count=" << max_raw_count << ")\n";
-            }
-            
-            if (passes_quality_check(count_winners[0].barcode, wl, wl_type, mode, verbose)) {
-                return {count_winners[0].barcode, edit_dist};
-            } else {
-                if (verbose) std::cout << "Quality check failed for count winner, rejecting\n";
-                return {std::nullopt, edit_dist};
-            }
-        }
-        
-        // Still tied after all tie-breakers - reject as ambiguous
-        if (verbose) {
-            std::cout << "Still tied after all tie-breakers at distance " << edit_dist 
-                     << ", rejecting as ambiguous\n";
-        }
-        return {std::nullopt, edit_dist};
-    }
-    
-    // No valid candidates found at any distance
-    if (verbose) std::cout << "No candidates with raw_count > 0 at any distance, rejecting\n";
-    return {std::nullopt, std::nullopt};
-}
 
 std::pair<std::optional<int64_seq>, std::optional<int>> 
 resolve_multiple_hits_simple(
@@ -2659,7 +2510,7 @@ private:
                 barcode_entry failed_entry;
                 failed_entry.barcode = failed_bc;
                 failed_entry.filtered = true;
-                failed_entry.flags = "filtered";
+                //failed_entry.flags = "filtered";
                 
                 // Double-check that it's still not present
                 auto failed_range = wl.filter_bcs.equal_range(failed_bc);
@@ -3101,7 +2952,7 @@ public:
     }
 
     //metrics parallelized over reads
-    static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
+    static void sigalign_old(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
                          std::optional<int> gen_mut, bool verbose, 
                          int num_threads, size_t chunk_size, size_t max_reads, bool write_debug, std::string mode) {
 
@@ -3113,7 +2964,7 @@ public:
     // Initialize writers
     std::unique_ptr<std::ofstream> metrics_file_ptr;
     std::unique_ptr<sigstring_writing> sig_writer, csv_writer, metrics_file;
-    sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, compress_fastq, /*append=*/false);
+    sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, compress_fastq, /*append=*/false, num_threads);
 
     //auto& wl = layout.wl_map.maps.at("barcode").get();
 
@@ -3124,8 +2975,8 @@ public:
         sig_path = output_prefix + ".sig";
         csv_path = output_prefix + ".csv";
         metrics_path = output_prefix + ".metrics.tsv";
-        sig_writer = std::make_unique<sigstring_writing>(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false);
-        csv_writer = std::make_unique<sigstring_writing>(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false);
+        sig_writer = std::make_unique<sigstring_writing>(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false, num_threads);
+        csv_writer = std::make_unique<sigstring_writing>(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false, num_threads);
         // Write CSV header
         {
             SigString header("", 0);
@@ -3136,7 +2987,7 @@ public:
         *metrics_file_ptr << "chunk_id\tseqs_in_chunk\tseqs_passed\tread_time_ms\tprocess_time_ms\tqueue_time_ms\ttotal_time_ms\n";    
     }
     // Initialize file and reader
-    file_streaming files(fastq_path);
+    file_streaming files(fastq_path, num_threads);
     read_streaming reader(files);
     
     // Counters
@@ -3162,8 +3013,9 @@ public:
         
         size_t local_count = 0;
         while (local_count < chunk_size) {
-            if (max_reads > 0 && total_reads >= max_reads) break;
-            
+            if (max_reads > 0 && total_reads >= max_reads){
+                break;
+            }
             auto seq = reader.next_sequence();
             if (!seq) break;
             
@@ -3248,27 +3100,47 @@ public:
         
         // Queue results for writing (non-blocking)
         if (!results.empty()) {
-            if(write_debug && sig_writer && csv_writer){
+            if (write_debug && sig_writer && csv_writer) {
                 writer.write_all(*sig_writer, *csv_writer, fastqa_writer, full_results);
             } else {
-                writer.write(fastqa_writer, results);
+                // serialize FASTQ in parallel, then enqueue once
+                auto serialize_start = std::chrono::high_resolution_clock::now();
+                // Build FASTQ strings in parallel from results
+                std::vector<std::string> fq(results.size());
+
+                #pragma omp parallel for schedule(static, 1024) num_threads(num_threads)
+                for (size_t i = 0; i < results.size(); ++i) {
+                    fq[i] = results[i].to_fastqa();
+                }
+
+                // Compact empties (sequential, cheap)
+                auto it = std::remove_if(fq.begin(), fq.end(),[](const std::string& s){ return s.empty(); });
+                fq.erase(it, fq.end());
+                auto serialize_done = std::chrono::high_resolution_clock::now();
+                // Enqueue one write job that streams each string into the sink
+                writer.write_slabs(fastqa_writer, std::move(fq));
+
+                auto enqueue_done = std::chrono::high_resolution_clock::now();
+                auto serialize_ms = std::chrono::duration_cast<std::chrono::milliseconds>(serialize_done - serialize_start).count();
+                // (2) time to push job into queue (nearly 0 unless backpressure)
+                auto enqueue_ms = std::chrono::duration_cast<std::chrono::milliseconds>(enqueue_done - serialize_done).count();
             }
         }
 
-        // Queue time ends here
+        // Move queue_end_time *after* serialization+enqueue to keep accounting consistent
         auto queue_end_time = std::chrono::high_resolution_clock::now();
-        
+
         // Calculate timing information
-        auto read_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(read_end_time - start_time).count();
+        auto read_time_ms    = std::chrono::duration_cast<std::chrono::milliseconds>(read_end_time    - start_time).count();
         auto process_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(process_end_time - read_end_time).count();
-        auto queue_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time - process_end_time).count();
-        auto total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time - start_time).count();
-        
-        // Update timing totals
-        total_read_time += read_time_ms;
+        auto queue_time_ms   = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time   - process_end_time).count();
+        auto total_time_ms   = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time   - start_time).count();
+
+        // Update totals
+        total_read_time    += read_time_ms;
         total_process_time += process_time_ms;
-        total_queue_time += queue_time_ms;
-        
+        total_queue_time   += queue_time_ms;
+    
         // Log metrics
         if(write_debug && metrics_file_ptr){
             *metrics_file_ptr << chunk_id << "\t" << chunk.size() << "\t" << passed_count << "\t"
@@ -3290,16 +3162,6 @@ public:
                     const std::string& class_id = kv.first;
                     auto& wl = kv.second.get();
                     bc_mem_utils::print_memory_report(wl.true_bcs, class_id + ":true_bcs");
-                }
-            }
-
-            if (chunk_id % 50000 == 0) {
-                for (const auto& kv : layout.wl_map.maps) {
-                    auto& wl = kv.second.get();
-                    wl.true_bcs.calc_all_stats_wl();
-                    if (!wl.global_bcs.empty()) {
-                        wl.global_bcs.calc_all_stats_wl();
-                    }
                 }
             }
         // Free memory explicitly
@@ -3346,6 +3208,268 @@ public:
     }
 }
     
+// metrics parallelized over reads
+    static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
+                     std::optional<int> gen_mut, bool verbose, 
+                     int num_threads, size_t chunk_size, size_t max_reads, bool write_debug, std::string mode) 
+{
+    std::string file_out = path_utils::get_fastqa_type(fastq_path);
+    std::string fastq_output_path = output_prefix + file_out;
+    bool compress_fastq = true;
+
+    std::unique_ptr<std::ofstream> metrics_file_ptr;
+    std::unique_ptr<sigstring_writing> sig_writer, csv_writer;
+    sigstring_writing fastqa_writer(
+        fastq_output_path,
+        sigstring_writing::format::FASTQA,
+        compress_fastq,
+        false,
+        num_threads
+    );
+
+    parallel_writer writer;
+
+    if (write_debug) {
+        std::string sig_path = output_prefix + ".sig";
+        std::string csv_path = output_prefix + ".csv";
+        std::string metrics_path = output_prefix + ".metrics.tsv";
+
+        sig_writer = std::make_unique<sigstring_writing>(
+            sig_path, sigstring_writing::format::SIGSTRING, false, false, num_threads);
+        csv_writer = std::make_unique<sigstring_writing>(
+            csv_path, sigstring_writing::format::CSV, false, false, num_threads);
+
+        {
+            SigString header("", 0);
+            (*csv_writer)(std::vector<SigString>{header});
+        }
+        
+        metrics_file_ptr = std::make_unique<std::ofstream>(metrics_path);
+        *metrics_file_ptr << "chunk_id\tseqs_in_chunk\tseqs_passed\tin_flight\tprocess_time_ms\tqueue_time_ms\ttotal_time_ms\trss_mb\n";
+    }
+
+    int pigz_threads = (num_threads > 0 ? num_threads : 1);
+    if (const char* e = std::getenv("RAD_PIGZ_THREADS")) {
+        int v = std::atoi(e);
+        if (v > 0) pigz_threads = v;
+    }
+
+    std::atomic<size_t> total_reads{0};
+    std::atomic<size_t> total_passed{0};
+    std::atomic<size_t> chunk_id_ctr{0};
+    std::atomic<long long> total_process_time_ms{0};
+    std::atomic<long long> total_queue_time_ms{0};
+    std::mutex metrics_mu;
+
+    auto process_chunk = [&](std::vector<read_streaming::sequence>& chunk, 
+                             const std::string& path)
+    {
+        if (chunk.empty()){
+            return;
+        }
+
+        const size_t my_chunk_id = ++chunk_id_ctr;
+        const auto wall_t0 = std::chrono::high_resolution_clock::now();
+
+        // Thread-local buffers for serialized FASTQ output
+        std::vector<std::string> thread_buffers(num_threads);
+        std::atomic<size_t> passed_count{0};
+        
+        std::vector<SigString> debug_sigs;
+        if (write_debug) {
+            debug_sigs.reserve(chunk.size());
+        }
+
+        // Track per-thread processing time
+        std::vector<double> thread_times(num_threads, 0.0);
+
+        // === process and serialize in one pass ===
+        #pragma omp parallel num_threads(num_threads)
+        {
+            int tid = omp_get_thread_num();
+            auto thread_start = std::chrono::high_resolution_clock::now();
+            
+            // Pre-allocate thread-local buffer
+            //character = byte in c++, so really guesstimating how big the chunk is in bytes
+            //attempting to hardcode it--200 mb total (one chunk) divided by number of threads
+            size_t est_per_thread = (chunk.size() / num_threads + 1) * 1600;
+            thread_buffers[tid].reserve(est_per_thread);
+            
+            std::vector<SigString> thread_debug;
+            if (write_debug) {
+                thread_debug.reserve(chunk.size() / num_threads + 1);
+            }
+
+            #pragma omp for schedule(dynamic) nowait
+            for (size_t i = 0; i < chunk.size(); ++i) {
+                const auto& read = chunk[i];
+                
+                // Process the read in tight scope
+                {
+                    SigString sig(read.id, read.seq.length());
+                    sig.sigalign_static(read, layout, verbose);
+                    sig.sigalign_variable(read, layout, verbose);
+                    sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode);
+
+                    // Keep for debug if needed
+                    if (write_debug) {
+                        thread_debug.push_back(sig);
+                    }
+
+                    // Serialize directly to thread buffer if passed
+                    if (sig.read_type != "filtered" && sig.read_type != "skipped") {
+                        sig.to_fastqa_append(thread_buffers[tid]);
+                        passed_count.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }  // sig destroyed here
+            }
+            
+            auto thread_end = std::chrono::high_resolution_clock::now();
+            thread_times[tid] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                thread_end - thread_start).count();
+
+            // Merge debug data if needed
+            if (write_debug) {
+                #pragma omp critical
+                {
+                    for (auto& s : thread_debug) {
+                        debug_sigs.push_back(std::move(s));
+                    }
+                }
+            }
+        }
+
+        const auto wall_t1 = std::chrono::high_resolution_clock::now();
+        
+        // Calculate actual work time (max across all threads)
+        double actual_process_ms = 0.0;
+        for (double t : thread_times) {
+            actual_process_ms = std::max(actual_process_ms, t);
+        }
+
+        // === CONSOLIDATE AND WRITE ===
+        if (passed_count > 0) {
+            if (write_debug && sig_writer && csv_writer) {
+                writer.write_all(*sig_writer, *csv_writer, fastqa_writer, debug_sigs);
+            } else {
+                size_t total_size = 0;
+                for (const auto& buf : thread_buffers) {
+                    total_size += buf.size();
+                }
+                
+                std::string consolidated;
+                consolidated.reserve(total_size);
+                
+                for (auto& buf : thread_buffers) {
+                    if (!buf.empty()) {
+                        consolidated.append(buf);
+                        std::string().swap(buf);
+                    }
+                }
+                
+                writer.write_raw_string(fastqa_writer, std::move(consolidated));
+            }
+        }
+
+        const auto wall_t2 = std::chrono::high_resolution_clock::now();
+
+        // Update counters
+        total_reads += chunk.size();
+        total_passed += passed_count.load();
+
+        const double wall_process_ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall_t1 - wall_t0).count();
+        const double queue_ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall_t2 - wall_t1).count();
+        
+        // Use actual thread time for accounting
+        total_process_time_ms.fetch_add(static_cast<long long>(actual_process_ms), std::memory_order_relaxed);
+        total_queue_time_ms.fetch_add(static_cast<long long>(queue_ms), std::memory_order_relaxed);
+
+        // Metrics
+        if (write_debug && metrics_file_ptr) {
+            std::lock_guard<std::mutex> lk(metrics_mu);
+            *metrics_file_ptr << my_chunk_id << "\t" 
+                              << chunk.size() << "\t" 
+                              << passed_count.load() << "\t"
+                              << actual_process_ms << "\t" 
+                              << queue_ms << "\t" 
+                              << (actual_process_ms + queue_ms) <<
+                               "\n";
+        }
+
+        //print chunk stats
+        {
+            std::lock_guard<std::mutex> lk(metrics_mu);
+            std::cout << "[chunk_stats] " << my_chunk_id 
+                      << ", processed=" << chunk.size()
+                      << ", passed=" << passed_count << " (" 
+                      << (chunk.size() ? (double)passed_count.load() * 100.0 / (double)chunk.size() : 0.0) 
+                      << "%), wall=" << wall_process_ms / 1000.0 << "s"
+                      << ", actual=" << actual_process_ms / 1000.0 << "s"
+                      << ", queue=" << queue_ms / 1000.0 << "s\n";
+            memory_utils::get_rss();
+
+            if (my_chunk_id % 100 == 0) {
+                for (const auto& kv : layout.wl_map.maps) {
+                    const std::string& class_id = kv.first;
+                    auto& wl = kv.second.get();
+                    bc_mem_utils::print_memory_report(wl.true_bcs, class_id + ":true_bcs");
+                    bc_mem_utils::print_memory_report(wl.global_bcs, class_id + ":global_bcs");
+                    bc_mem_utils::print_memory_report(wl.filter_bcs, class_id + ":filter_bcs");
+
+                }
+            }
+        }
+
+        // Cleanup
+        std::vector<read_streaming::sequence>().swap(chunk);
+        std::vector<std::string>().swap(thread_buffers);
+        if (write_debug) {
+            std::vector<SigString>().swap(debug_sigs);
+        }
+    };
+
+    // Start streaming with backpressure limit
+    {
+        // Limit to 2-3 chunks in flight
+        chunk_streaming<read_streaming::sequence, decltype(process_chunk)>streamer(chunk_size, pigz_threads);
+        const int64_t limit = (max_reads > 0 ? static_cast<int64_t>(max_reads) : -1);
+        streamer.process_chunks(fastq_path, process_chunk, num_threads, limit);
+    }
+
+    writer.stop();
+
+    if (write_debug && metrics_file_ptr) {
+        metrics_file_ptr->close();
+    }
+
+    // Summary
+    const double process_s = total_process_time_ms.load() / 1000.0;
+    const double queue_s   = total_queue_time_ms.load()   / 1000.0;
+    const double total_s   = process_s + queue_s;
+
+    std::cout << "\n[sigalign] Performance Summary:\n";
+    std::cout << "────────────────────────────────────────────────────\n";
+    std::cout << "[sigalign] Total runtime: " << total_s << " seconds\n";
+    std::cout << "[sigalign] Total chunks processed: " << chunk_id_ctr.load() << "\n";
+    std::cout << "[sigalign] Total reads processed: " << total_reads.load() << "\n";
+    std::cout << "[sigalign] Reads passing filter: " << total_passed.load() << " ("
+              << (total_reads > 0 ? (total_passed.load() * 100.0 / (double)total_reads.load()) : 0.0) << "%)\n";
+    std::cout << "[sigalign] Timing breakdown:\n";
+    std::cout << "  - Process time: " << process_s << " seconds\n";
+    std::cout << "  - Queue time: " << queue_s << " seconds\n";
+
+    if (write_debug) {
+        std::cout << "\n[sigalign] Output written to:\n"
+                  << "[sigalign] [sigstring]: " << output_prefix << ".sig\n"
+                  << "[sigalign]       [csv]: " << output_prefix << ".csv\n"
+                  << "[sigalign]     [fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n"
+                  << "[sigalign]   [metrics]: " << output_prefix << ".metrics.tsv\n";
+    } else {
+        std::cout << "\n[sigalign] Output written to:\n"
+                  << "[sigalign][fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n";
+    }
+}
+
     // sigstring format
     std::string to_sigstring() const {
         std::stringstream ss;
@@ -3412,6 +3536,123 @@ public:
         return ss.str().empty() ? "" : ss.str();
     }
    
+    // zero-copy serializer
+    void to_fastqa_append(std::string& buffer) const {
+        if (read_type == "skipped") return;
+        
+        std::vector<std::string> dirs;
+        if (read_type == "concatenate") {
+            dirs = {"forward", "reverse"};
+        } else {
+            dirs = {read_type};
+        }
+        
+        for (const auto& dir : dirs) {
+            std::vector<std::string> bc_keys;
+            std::unordered_map<std::string, std::string> bc_map;
+            std::unordered_map<std::string, std::string> bc_dir;
+            std::unordered_map<std::string, std::string> cr_map;
+            std::string umi, read_seq, read_qual;
+            
+            // Collect elements
+            for (const auto& elem : sig_elements) {
+                if (!elem.seq.has_value()) continue;
+                if (elem.direction != dir) continue;
+                
+                if (elem.global_class == "barcode") {
+                    auto key = seq_utils::remove_rc(elem.class_id);
+                    bool is_fwd = (dir == "forward");
+                    if (bc_map.find(key) == bc_map.end()) {
+                        bc_keys.push_back(key);
+                        bc_map[key] = elem.seq.value();
+                        bc_dir[key] = dir;
+                        if (elem.original_seq.has_value()) {
+                            cr_map[key] = elem.original_seq.value();
+                        }
+                    } else if (is_fwd && bc_dir[key] == "reverse") {
+                        bc_map[key] = elem.seq.value();
+                        bc_dir[key] = dir;
+                        if (elem.original_seq.has_value()) {
+                            cr_map[key] = elem.original_seq.value();
+                        }
+                    }
+                    continue;
+                }
+                
+                if (elem.global_class == "umi") {
+                    if (elem.seq.has_value()) {
+                        umi = elem.seq.value();
+                    }
+                    continue;
+                }
+                
+                if (elem.global_class == "read") {
+                    read_seq = elem.seq.value();
+                    if (elem.qual.has_value()) {
+                        read_qual = elem.qual.value();
+                    }
+                    continue;
+                }
+            }
+            
+            // Skip if missing essential components
+            if (bc_map.empty() || read_seq.empty()) {
+                continue;
+            }
+            
+            // Build barcode tags
+            std::string cb_tag, cr_tag;
+            for (size_t i = 0; i < bc_keys.size(); ++i) {
+                const auto& key = bc_keys[i];
+                if (i) {
+                    cb_tag += '-';
+                    if (!cr_tag.empty()) cr_tag += '-';
+                }
+                cb_tag += bc_map[key];
+                if (cr_map.find(key) != cr_map.end()) {
+                    cr_tag += cr_map[key];
+                }
+            }
+            
+            bool is_fastq = !read_qual.empty();
+            bool is_concatenate = (read_type == "concatenate");
+            bool is_forward = (dir == "forward");
+            
+            // Append directly to buffer - no intermediate string
+            buffer += (is_fastq ? '@' : '>');
+            buffer += sequence_id;
+            buffer += (is_forward ? "-F" : "-R");
+            if (is_concatenate) buffer += "-CT";
+            
+            if (!cb_tag.empty()) {
+                buffer += "\tCB:Z:";
+                buffer += cb_tag;
+            }
+            
+            if (!cr_tag.empty() && (cb_tag != cr_tag && seq_utils::revcomp(cb_tag) != cr_tag)) {
+                buffer += "\tCR:Z:";
+                buffer += cr_tag;
+            } else {
+                buffer += "\tCR:Z:";
+            }
+            
+            if (!umi.empty()) {
+                buffer += "\tUB:Z:";
+                buffer += umi;
+            }
+            
+            buffer += (is_forward ? "\tTS:A:+\n" : "\tTS:A:-\n");
+            buffer += read_seq;
+            buffer += '\n';
+            
+            if (is_fastq) {
+                buffer += "+\n";
+                buffer += read_qual;
+                buffer += '\n';
+            }
+        }
+    }
+
     // FASTQ format
     std::string to_fastqa() const {
         std::vector<std::string> dirs;

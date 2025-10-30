@@ -1,31 +1,205 @@
 #pragma once
 #include "rad_headers.h"
 
-// Initialize kseq for gzipped file reading
-KSEQ_INIT(gzFile, gzread)
+//simplest solution i could figure out 
+namespace kseq_fd {
+    #ifndef KSEQ_INIT_INT_READ
+    #define KSEQ_INIT_INT_READ
+    KSEQ_INIT(int, read)
+    #endif
+}
 
+namespace kseq_gz {
+    #ifndef KSEQ_INIT_GZFILE_GZREAD  
+    #define KSEQ_INIT_GZFILE_GZREAD
+    KSEQ_INIT(gzFile, gzread)
+    #endif
+}
+
+/**
+ * @brief Parallel decompression reading using pigz
+ * 
+ * Manages pigz subprocess for multi-threaded decompression of gzipped files.
+ */
+class pigz_reading {
+public:
+    /**
+     * @brief Open a pigz decompression pipe for reading
+     * @param input_path Path to compressed file (.gz, .fq.gz, .fastq.gz, etc.)
+     * @param threads Number of decompression threads (default: 4)
+     * @return FILE* pointer to pipe, or nullptr on failure
+     */
+    inline FILE* open_pigz_read_pipe(const std::string& input_path, int threads = 4) {
+        // Allow disabling via environment variable
+        if (const char* no = std::getenv("RAD_NO_PIGZ"); no && *no) {
+            return nullptr;
+        }
+
+        #ifndef PIGZ_PATH
+        #  define PIGZ_PATH "pigz"
+        #endif
+        
+        std::string pigz = PIGZ_PATH;
+        if (const char* env = std::getenv("RAD_PIGZ"); env && *env) {
+            pigz = env;
+        }
+
+        // Use pigz -dc for decompression to stdout
+        // -d = decompress, -c = write to stdout, -p = threads
+        std::string cmd = "'" + pigz + "' -dc -p " + std::to_string(threads) + 
+                         " '" + input_path + "'";
+        
+        FILE* fp = popen(cmd.c_str(), "r");
+        if (!fp) {
+            return nullptr;
+        }
+        
+        // Large read buffer (16 MB) to reduce read() syscalls
+        static thread_local std::vector<char> read_buf(16u << 20);
+        setvbuf(fp, read_buf.data(), _IOFBF, read_buf.size());
+        
+        return fp;
+    }
+
+    /**
+     * @brief Close pigz decompression pipe
+     * @param fp FILE pointer from open_pigz_read_pipe
+     * @return Exit status of pigz process
+     */
+    inline int close_pigz_read_pipe(FILE* fp) {
+        if (!fp) return -1;
+        return pclose(fp);
+    }
+
+    /**
+     * @brief Check if pigz is available on the system
+     * @return true if pigz is found in PATH
+     */
+    static bool is_pigz_available() {
+        #ifndef PIGZ_PATH
+        #  define PIGZ_PATH "pigz"
+        #endif
+        
+        std::string pigz = PIGZ_PATH;
+        if (const char* env = std::getenv("RAD_PIGZ"); env && *env) {
+            pigz = env;
+        }
+        
+        std::string cmd = "which '" + pigz + "' > /dev/null 2>&1";
+        return system(cmd.c_str()) == 0;
+    }
+};
+
+/**
+ * @brief File streaming with automatic parallel decompression
+ * 
+ * Automatically uses pigz for .gz files when available, falls back to gzip.
+ * Handles both single files and directories of FASTQ/FASTA files.
+ */
 class file_streaming {
 public:
-
     struct file_pointer {
-        gzFile fp;
-        kseq_t* seq;
+        FILE* fp_pigz;      // Pigz pipe handle or regular file handle
+        gzFile fp_gzip;     // Fallback gzip handle
+        kseq_fd::kseq_t* seq_fd;     // kseq for FILE* (pigz path or uncompressed)
+        kseq_gz::kseq_t* seq_gz;     // kseq for gzFile (fallback path)
+        int fd;             // File descriptor for kseq
         std::string path;
+        bool using_pigz;
+        pigz_reading pigz_reader;
         
-        file_pointer(const std::string& file_path) : path(file_path) {
-            fp = gzopen(path.c_str(), "r");
-            if (!fp) {
-                seq = nullptr;
-                return;
+        inline kseq_fd::kseq_t* get_seq_fd() { 
+            return seq_fd; 
+        }
+
+        inline kseq_gz::kseq_t* get_seq_gz() { 
+            return seq_gz; 
+        }
+
+        // one-step read that picks the right backend
+        inline int kseq_read_any() {
+            if (using_pigz) {
+                return seq_fd ? kseq_fd::kseq_read(seq_fd) : -1;  // -1 = EOF, -2 = bad FASTQ
+            } else {
+                return seq_gz ? kseq_gz::kseq_read(seq_gz) : -1;
             }
-            // Bump the zlib internal buffer to 4 MiB
-            gzbuffer(fp, 1 << 22);
-            seq = kseq_init(fp);
+        }
+
+        // unified field accessors (avoid duplicating branches)
+        inline const char* name_s() const {
+            return using_pigz ? seq_fd->name.s : seq_gz->name.s;
+        }
+        inline const char* comment_s() const {
+            return using_pigz ? (seq_fd->comment.l ? seq_fd->comment.s : nullptr)
+                            : (seq_gz->comment.l ? seq_gz->comment.s : nullptr);
+        }
+        inline const char* seq_s() const {
+            return using_pigz ? seq_fd->seq.s : seq_gz->seq.s;
+        }
+        inline int qual_len() const {
+            return using_pigz ? seq_fd->qual.l : seq_gz->qual.l;
+        }
+        inline const char* qual_s() const {
+            return using_pigz ? (seq_fd->qual.l ? seq_fd->qual.s : nullptr)
+                            : (seq_gz->qual.l ? seq_gz->qual.s : nullptr);
+        }
+
+        file_pointer(const std::string& file_path, int pigz_threads = 4) 
+            : fp_pigz(nullptr), fp_gzip(nullptr), seq_fd(nullptr), seq_gz(nullptr),
+              fd(-1), path(file_path), using_pigz(false) {
+            
+            // Check if file is compressed
+            bool is_compressed = has_gz_extension(file_path);
+            
+            if (is_compressed) {
+                // Try pigz first for parallel decompression
+                if (pigz_reading::is_pigz_available()) {
+                    fp_pigz = pigz_reader.open_pigz_read_pipe(file_path, pigz_threads);
+                    if (fp_pigz) {
+                        fd = fileno(fp_pigz);
+                        seq_fd = kseq_fd::kseq_init(fd);
+                        using_pigz = true;
+                        return;
+                    }
+                }
+
+                // Fallback to single-threaded gzip
+                fp_gzip = gzopen(file_path.c_str(), "r");
+                if (fp_gzip) {
+                    gzbuffer(fp_gzip, 1 << 22);  // 4 MiB buffer
+                    seq_gz = kseq_gz::kseq_init(fp_gzip);
+                    using_pigz = false;
+                }
+            } else {
+                // Uncompressed file - use regular file descriptor
+                fp_pigz = fopen(file_path.c_str(), "r");
+                if (fp_pigz) {
+                    fd = fileno(fp_pigz);
+                    seq_fd =  kseq_fd::kseq_init(fd);
+                    setvbuf(fp_pigz, nullptr, _IOFBF, 1 << 22);  // 4 MiB buffer
+                    using_pigz = true;  // Using FILE*, not gzFile
+                }
+            }
         }
 
         ~file_pointer() {
-            if (seq) kseq_destroy(seq);
-            if (fp) gzclose(fp);
+            if (seq_fd) kseq_destroy(seq_fd);
+            if (seq_gz) kseq_destroy(seq_gz);
+            if (using_pigz && fp_pigz) {
+                pigz_reader.close_pigz_read_pipe(fp_pigz);
+            } else if (fp_gzip) {
+                gzclose(fp_gzip);
+            }
+        }
+
+        bool is_valid() const {
+            return (using_pigz && fp_pigz && seq_fd) || (fp_gzip && seq_gz);
+        }
+
+    private:
+        static bool has_gz_extension(const std::string& path) {
+            return path.size() >= 3 && 
+                   path.substr(path.size() - 3) == ".gz";
         }
     };
 
@@ -33,15 +207,17 @@ public:
     std::filesystem::directory_iterator dir_iter;
     bool dir_status;
     std::string path;
+    int pigz_threads;
 
-    file_streaming(const std::string& input_path) : path(input_path) {
+    explicit file_streaming(const std::string& input_path, int threads = 4) 
+        : path(input_path), pigz_threads(threads) {
         dir_status = is_directory(path);
         if (dir_status) {
             dir_iter = std::filesystem::directory_iterator(path);
             open_next_file();
         } else if (is_fastqa(path)) {
-            current_file = std::make_unique<file_pointer>(path);
-            if (!current_file->fp || !current_file->seq) {
+            current_file = std::make_unique<file_pointer>(path, pigz_threads);
+            if (!current_file->is_valid()) {
                 throw std::runtime_error("Failed to open sequence file: " + path);
             }
         } else {
@@ -57,8 +233,8 @@ public:
             
             std::string file_path = entry.path().string();
             if (is_fastqa(file_path)) {
-                current_file = std::make_unique<file_pointer>(file_path);
-                if (current_file->fp && current_file->seq) {
+                current_file = std::make_unique<file_pointer>(file_path, pigz_threads);
+                if (current_file->is_valid()) {
                     return true;
                 }
             }
@@ -98,38 +274,46 @@ public:
     std::string current_file_path() const {
         return current_file ? current_file->path : "";
     }
-
 };
 
+/**
+ * @brief Read streaming for FASTQ/FASTA sequences
+ */
 class read_streaming {
 public:
-    //structure of a sequence that gets streamed in 
     struct sequence {
-        std::string id; // read id (whatever comes out of the sequencer)
-        std::string comment; // any comments that come in
-        std::string seq; // actual sequence
-        std::string qual; // qual score 
-        bool is_fastq; // is this a fastq read
+        std::string id;
+        std::string comment;
+        std::string seq;
+        std::string qual;
+        bool is_fastq;
     };
 
     file_streaming& files;
-    read_streaming(file_streaming& f) : files(f) {}
+    
+    explicit read_streaming(file_streaming& f) : files(f) {}
+    
     std::optional<sequence> next_sequence() {
         while (files.current_file || files.open_next_file()) {
-            int l = kseq_read(files.current_file->seq);
+            auto& fp = files.current_file;
+            int l = fp->kseq_read_any();
             if (l >= 0) {
-                sequence seq;
-                seq.id = files.current_file->seq->name.s;
-                seq.seq = files.current_file->seq->seq.s;
-                seq.is_fastq = files.current_file->seq->qual.l > 0;
-                if (files.current_file->seq->comment.l) {
-                    seq.comment = files.current_file->seq->comment.s;
+                sequence r;
+                r.id = fp->name_s();
+                r.seq = fp->seq_s();
+                r.is_fastq = fp->qual_len() > 0;
+
+                if (const char* c = fp->comment_s()){
+                    r.comment = c;
                 }
-                if (seq.is_fastq) {
-                    seq.qual = files.current_file->seq->qual.s;
+                if (r.is_fastq){
+                    r.qual = fp->qual_s();
                 }
-                return seq;
-            } else if (files.dir_status) {
+                return r;
+            }
+
+            // Move to next file if in directory mode
+            if (files.dir_status) {
                 files.current_file.reset();
             } else {
                 break;
@@ -139,80 +323,208 @@ public:
     }
 };
 
+/**
+ * @brief Chunk-based streaming with parallel decompression
+ * 
+ * Processes input files in chunks, using pigz for parallel decompression
+ * and OpenMP tasks for parallel processing.
+ */
 template<typename T, typename Function> 
 class chunk_streaming {
 public:
-    // Construct with the max number of sequences per chunk
-    explicit chunk_streaming(size_t chunk_size) : chunk_size(chunk_size), seqs_processed(0)
-    {}
+    explicit chunk_streaming(size_t chunk_size, int pigz_threads = 4, int max_in_flight = -1) 
+        : chunk_size_(chunk_size), pigz_threads_(pigz_threads), 
+          max_in_flight_(max_in_flight), seqs_processed_(0), peak_in_flight_(0) {}
 
-    // Change the chunk size on the fly
     void modify_chunk_size(size_t new_size) {
-        chunk_size = new_size;
+        chunk_size_ = new_size;
     }
 
-    /// Query the current chunk size
     size_t get_chunk_size() const {
-        return chunk_size;
+        return chunk_size_;
     }
 
-    /**
-     *  Read sequences from `input_path` and for each chunk
-     *  of up to chunk_size call the chunk_func on one of
-     *  an OpenMP thread pool.
-     *
-     *  @param input_path   FASTQ or similar to stream from
-     *  @param chunk_func   Fn(vector<T> const&, string const&)
-     *  @param num_threads  # of OpenMP worker threads
-     *  @param max_seqs     stop after this many total reads (or <0 for no limit)
-     */
-    void process_chunks(const std::string& input_path, Function chunk_func, int num_threads, int64_t max_seqs = -1) {
-        // Open the file/stream handles
-        file_streaming files(input_path);
+    int get_mif() const {
+        return max_in_flight_;
+    }
+
+    void process_chunks_by_task(const std::string& input_path, 
+                       Function chunk_func, 
+                       int num_threads, 
+                       int64_t max_seqs = -1) {
+        file_streaming files(input_path, pigz_threads_);
         read_streaming reader(files);
-        // pre-allocate one chunk buffer
+        
+        std::atomic<int> chunks_in_flight{0};
+        std::atomic<int> peak_in_flight{0};
+        std::mutex flight_mutex;
+        std::condition_variable cv_flight;
+        
         std::vector<T> chunk;
-        chunk.reserve(chunk_size);
-        // Launch OpenMP parallel region
+        chunk.reserve(chunk_size_);
+        
+        // Only use backpressure if max_in_flight is positive
+        bool use_backpressure = (max_in_flight_ > 0);
+        
         #pragma omp parallel num_threads(num_threads)
         #pragma omp single
         {
             while (true) {
                 chunk.clear();
-                // Fill up to chunk_size or until max_seqs reached
-                while (chunk.size() < chunk_size
-                       && (max_seqs < 0 || seqs_processed < (size_t)max_seqs))
-                {
+                
+                while (chunk.size() < chunk_size_ &&
+                       (max_seqs < 0 || seqs_processed_ < (size_t)max_seqs)) {
                     auto seq = reader.next_sequence();
                     if (!seq) break;
                     chunk.push_back(std::move(*seq));
-                    ++seqs_processed;
+                    seqs_processed_.fetch_add(1, std::memory_order_relaxed);
                 }
-                if (chunk.empty()) {
-                    // no more data -> exit loop
-                    break;
+                
+                if (chunk.empty()) break;
+                
+                // Apply backpressure only if enabled
+                if (use_backpressure) {
+                    std::unique_lock<std::mutex> flight_lock(flight_mutex);
+                    cv_flight.wait(flight_lock, [&]{ 
+                        return chunks_in_flight.load() < max_in_flight_; 
+                    });
                 }
-                // Make a copy for the task
+                
+                // Track concurrency (even if backpressure disabled, for stats)
+                int current_in_flight = chunks_in_flight.fetch_add(1, std::memory_order_relaxed) + 1;
+                int current_peak = peak_in_flight.load(std::memory_order_relaxed);
+                while (current_in_flight > current_peak) {
+                    if (peak_in_flight.compare_exchange_weak(current_peak, current_in_flight)) {
+                        break;
+                    }
+                }
+                
                 auto this_chunk = std::move(chunk);
-                // Dispatch an OpenMP task to handle it
-                #pragma omp task firstprivate(this_chunk)
+                #pragma omp task firstprivate(this_chunk, current_in_flight)
                 {
-                    chunk_func(this_chunk, input_path);
+                    chunk_func(this_chunk, input_path);  // ← Always call with 2 params
+                    
+                    chunks_in_flight.fetch_sub(1, std::memory_order_relaxed);
+                    if (use_backpressure) {
+                        cv_flight.notify_one();
+                    }
                 }
             }
-            // Wait for all outstanding tasks to complete
+            
             #pragma omp taskwait
+        }
+        
+        if (use_backpressure) {
+            std::cout << "\n[chunk_streaming] Concurrency Statistics:\n";
+            std::cout << "  Max in-flight limit: " << max_in_flight_ << "\n";
+            std::cout << "  Peak in-flight observed: " << peak_in_flight.load() << "\n";
+        } else {
+            std::cout << "\n[chunk_streaming] Concurrency Statistics:\n";
+            std::cout << "  No in-flight limit (unlimited concurrency)\n";
+            std::cout << "  Peak in-flight observed: " << peak_in_flight.load() << "\n";
         }
     }
 
-private:
-    size_t chunk_size; //< max reads per chunk
-    std::atomic<size_t> seqs_processed; //< global counter
+    void process_chunks_unsteady_depr_v2(const std::string& input_path, 
+                   Function chunk_func, 
+                   int num_threads, 
+                   int64_t max_seqs = -1) {
+        file_streaming files(input_path, pigz_threads_);
+        read_streaming reader(files);
+        
+        // Collect ALL chunks first
+        std::vector<std::vector<T>> all_chunks;
+        
+        while (true) {
+            std::vector<T> chunk;
+            chunk.reserve(chunk_size_);
+            
+            while (chunk.size() < chunk_size_ &&
+                (max_seqs < 0 || seqs_processed_ < (size_t)max_seqs)) {
+                auto seq = reader.next_sequence();
+                if (!seq) break;
+                chunk.push_back(std::move(*seq));
+                seqs_processed_.fetch_add(1, std::memory_order_relaxed);
+            }
+            
+            if (chunk.empty()) break;
+            all_chunks.push_back(std::move(chunk));
+        }
+        
+        // Now process with stable thread mapping
+        #pragma omp parallel num_threads(num_threads)
+        {
+            #pragma omp for schedule(dynamic)
+            for (size_t i = 0; i < all_chunks.size(); ++i) {
+                chunk_func(all_chunks[i], input_path);
+            }
+        }
+    }
+
+    void process_chunks(const std::string& input_path, 
+                    Function chunk_func, 
+                    int num_threads, 
+                    int64_t max_seqs = -1) {
+            file_streaming files(input_path, pigz_threads_);
+            read_streaming reader(files);
+
+            std::mutex reader_mutex;
+            std::atomic<bool>   more_data{true};
+            std::atomic<size_t> seqs_processed{0};
+
+            #pragma omp parallel num_threads(num_threads)
+            {
+                while (true) {
+                    std::vector<T> chunk;
+                    {
+                        std::lock_guard<std::mutex> lock(reader_mutex);
+                        // if another thread already signaled "no more data", bail
+                        if (!more_data.load(std::memory_order_acquire)) {
+                            break;
+                        }
+                        chunk.reserve(chunk_size_);
+                        while (chunk.size() < chunk_size_) {
+                            if (max_seqs >= 0 && seqs_processed.load(std::memory_order_relaxed) >= static_cast<size_t>(max_seqs)) {
+                                more_data.store(false, std::memory_order_release);
+                                break;
+                            }
+                            // try to read
+                            auto rec = reader.next_sequence();
+                            if (!rec) {
+                                more_data.store(false, std::memory_order_release);
+                                break;
+                            }
+                            chunk.push_back(std::move(*rec));
+                            seqs_processed.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    } 
+                    if (chunk.empty()) {
+                        if (!more_data.load(std::memory_order_acquire)){
+                            break;
+                        }
+                        continue;
+                    }
+                    chunk_func(chunk, input_path);
+                }
+            }
+        }
+
+
+    private:
+    size_t chunk_size_;
+    int pigz_threads_;
+    int max_in_flight_;  // -1 = unlimited, >0 = limited
+    std::atomic<size_t> seqs_processed_;
+    std::atomic<int> peak_in_flight_;
 };
 
+// ============================================================================
+// OUTPUT STREAMING (PIGZ COMPRESSION)
+// ============================================================================
+
 class pigz_writing {
-    public:
-    inline FILE* open_pigz_pipe(const std::string& out_path, int threads=1, int level=6) {
+public:
+    inline FILE* open_pigz_pipe(const std::string& out_path, int threads, int level=1) {
         if (const char* no = std::getenv("RAD_NO_PIGZ"); no && *no) return nullptr;
 
     #ifndef PIGZ_PATH
@@ -234,11 +546,13 @@ class pigz_writing {
     inline void pigz_write(FILE* fp, const char* data, size_t n) {
         if (!n) return;
         size_t w = std::fwrite(data, 1, n, fp);
-        if (w != n) throw std::runtime_error("Short write to pigz");
+        if (w != n) {
+            throw std::runtime_error("pigz_write: partial write");
+        }
     }
 
     inline int close_pigz_pipe(FILE* fp) {
-        if (!fp) return 0;
+        if (!fp) return -1;
         std::fflush(fp);
         return pclose(fp);
     }
@@ -273,7 +587,6 @@ private:
         if (pigz_buf_.size() >= pigz_flush_threshold_) {
             pigz_.pigz_write(pigz_fp_, pigz_buf_.data(), pigz_buf_.size());
             pigz_buf_.clear();
-            // keep capacity or shrink if you want:
             // pigz_buf_.shrink_to_fit();
         }
     }
@@ -301,9 +614,10 @@ public:
     /// @param output_format which of the three formats to emit
     /// @param compress      if true, writes gzipped output (pigz if available; else zlib/boost)
     /// @param append        if true, opens in append mode; otherwise truncates
-    /// @param level         gzip compression level [1..9]
     /// @param pigz_threads  pigz worker threads (ignored if not using pigz)
-    sigstring_writing(std::string output_path, format output_format, bool compress, bool append, int level=6, int pigz_threads=1)
+    /// @param level         gzip compression level [1..9]
+
+    sigstring_writing(std::string output_path, format output_format, bool compress, bool append, int pigz_threads, int level=1)
         : fmt(output_format), compress_(compress)
     {
         std::ios_base::openmode mode =
@@ -322,7 +636,7 @@ public:
                 return;
             }
 
-            // Fallback: your existing Boost gzip chain (single-threaded zlib)
+            // Fallback: existing Boost gzip chain (single-threaded zlib)
             file_.open(output_path, mode);
             if (!file_.is_open()) throw std::runtime_error("Failed to open file: " + output_path);
 
@@ -373,615 +687,215 @@ public:
         } catch (...) {
         }
     }
+
+    // in sigstring_writing (public)
+    void operator()(const std::string& slab) {
+        if (slab.empty()) return;
+        if (use_pigz_) {
+            pigz_buf_.append(slab);
+            pigz_flush_if_big_();
+        } else {
+            out_.write(slab.data(), slab.size());
+        }
+    }
+
+     // reuses the existing std::string overload
+    void operator()(const std::vector<std::string>& slabs) {
+        if (slabs.empty()) return;
+        for (auto const& s : slabs) {
+            (*this)(s); 
+        }
+    }
+
 };
 
+// ============================================================================
+// PARALLEL WRITER
+// ============================================================================
 
 class parallel_writer {
-    public:
-        parallel_writer() : running(true), queue_size(0), total_write_time_ms(0), total_queue_time_ms(0) {
-            writer_thread = std::thread([this]() {
-                this->process_jobs();
-            });
-        }
-        
-        ~parallel_writer() {
-            stop();
-        }
-        
-        template<typename T>
-        void write_all(sigstring_writing& sig_writer, sigstring_writing& csv_writer, sigstring_writing& fastqa_writer, std::vector<T>& data) {
-            // Check if empty
-            if (data.empty()) return;
-            
-            // Create a type-erased job using std::function
-            auto job_function = [
-                sig_ptr=&sig_writer, 
-                csv_ptr=&csv_writer, 
-                fastq_ptr=&fastqa_writer, 
-                data_vec=std::move(data)  // Move the data
-            ]() mutable {
-                (*sig_ptr)(data_vec);
-                (*csv_ptr)(data_vec);
-                (*fastq_ptr)(data_vec);
-                
-                // Clear data to free memory
-                std::vector<T>().swap(data_vec);
-            };
-            
-            // Create a job
-            auto job = std::make_shared<WriteJob>();
-            job->func = std::move(job_function);
-            job->chunk_id = next_chunk_id++;
-            job->size = data.size();
-            
-            // Control queue size to limit memory usage
-            constexpr size_t MAX_QUEUE_SIZE = 10;
-            
-            // Add job to the queue
-            {
-                std::unique_lock<std::mutex> lock(queue_mutex);
-                
-                // Wait if queue gets too large (backpressure)
-                queue_cv.wait(lock, [this, MAX_QUEUE_SIZE]() {
-                    return queue_size < MAX_QUEUE_SIZE || !running;
-                });
-                
-                if (!running) return;
-                
-                // Add job to queue
-                job->queued_time = std::chrono::high_resolution_clock::now();
-                write_queue.push_back(job);
-                queue_size++;
-            }
-            
-            queue_cv.notify_one();
-        }
-        
-        template<typename T>
-        void write(sigstring_writing& fastqa_writer, std::vector<T>& data) {
-            // Check if empty
-            if (data.empty()) return;
-            // Create a type-erased job using std::function
-            auto job_function = [
-                fastq_ptr=&fastqa_writer,
-                data_vec=std::move(data) // Move the data
-            ]() mutable {
-                (*fastq_ptr)(data_vec);
-                // Clear data to free memory
-                std::vector<T>().swap(data_vec);
-            };
-            // Create a job
-            auto job = std::make_shared<WriteJob>();
-            job->func = std::move(job_function);
-            job->chunk_id = next_chunk_id++;
-            job->size = data.size();
-            // Control queue size to limit memory usage
-            constexpr size_t MAX_QUEUE_SIZE = 50;
-            // Add job to the queue
-            {
-                std::unique_lock<std::mutex> lock(queue_mutex);
-                // Wait if queue gets too large (backpressure)
-                queue_cv.wait(lock, [this, MAX_QUEUE_SIZE]() {
-                    return queue_size < MAX_QUEUE_SIZE || !running;
-                });
-                if (!running) return;
-                // Add job to queue
-                job->queued_time = std::chrono::high_resolution_clock::now();
-                write_queue.push_back(job);
-                queue_size++;
-            }
-            queue_cv.notify_one();
-        }
-
-        void stop() {
-            if (!running) return;
-            
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex);
-                running = false;
-            }
-            queue_cv.notify_all();
-            
-            if (writer_thread.joinable()) {
-                writer_thread.join();
-            }
-            
-            // Print write statistics
-            std::cout << "\n[Writer Thread] Statistics:" << std::endl;
-            std::cout << "  Total jobs processed: " << jobs_processed << std::endl;
-            std::cout << "  Total write time: " << total_write_time_ms / 1000.0 << " seconds" << std::endl;
-            if (jobs_processed > 0) {
-                std::cout << "  Average write time per chunk: " << total_write_time_ms / jobs_processed << " ms" << std::endl;
-                std::cout << "  Average queue time per chunk: " << total_queue_time_ms / jobs_processed << " ms" << std::endl;
-            }
-        }
-        
-        // Get total write time in milliseconds
-        double get_total_write_time_ms() const {
-            return total_write_time_ms;
-        }
-        
-        // Get number of jobs processed
-        size_t get_jobs_processed() const {
-            return jobs_processed;
-        }
-        
-    private:
-        struct WriteJob {
-            std::function<void()> func; //  function that does the writing
-            size_t chunk_id;
-            size_t size;
-            std::chrono::time_point<std::chrono::high_resolution_clock> queued_time;
-        };
-        
-        //std::vector<std::shared_ptr<WriteJob>> write_queue;
-        std::deque<std::shared_ptr<WriteJob>> write_queue;
-
-        std::mutex queue_mutex;
-        std::condition_variable queue_cv;
-        std::thread writer_thread;
-        std::atomic<bool> running;
-        std::atomic<size_t> queue_size;
-        std::atomic<size_t> next_chunk_id{1};
-        std::atomic<size_t> jobs_processed{0};
-        
-        // Use regular doubles with mutex for thread safety
-        double total_write_time_ms;
-        double total_queue_time_ms;
-        std::mutex timing_mutex;
-        
-        // For logging write times
-        std::mutex log_mutex;
-        
-        void process_jobs() {
-            while (running || queue_size > 0) {
-                std::shared_ptr<WriteJob> job;
-                
-                // Get a job from the queue
-                {
-                    std::unique_lock<std::mutex> lock(queue_mutex);
-                    
-                    if (write_queue.empty()) {
-                        if (!running) break;
-                        
-                        // Wait for more jobs
-                        queue_cv.wait(lock, [this]() {
-                            return !write_queue.empty() || !running;
-                        });
-                        
-                        if (write_queue.empty() && !running) break;
-                    }
-                    
-                    if (!write_queue.empty()) {
-                        //job = write_queue.front();
-                        //write_queue.erase(write_queue.begin());
-                        //queue_size--;
-                        job = write_queue.front();
-                        write_queue.pop_front();
-                        queue_size--;
-                        
-                        // Notify that queue has space
-                        lock.unlock();
-                        queue_cv.notify_one();
-                    }
-                }
-                
-                // Process the job
-                if (job) {
-                    // Calculate queue time
-                    auto start_time = std::chrono::high_resolution_clock::now();
-                    auto queue_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        start_time - job->queued_time).count();
-                    // Update queue time with mutex protection
-                    {
-                        std::lock_guard<std::mutex> lock(timing_mutex);
-                        total_queue_time_ms += queue_time_ms;
-                    }
-                    
-                    // Execute the job function (which does the writing)
-                    job->func();
-                    
-                    // Calculate write time
-                    auto end_time = std::chrono::high_resolution_clock::now();
-                    auto write_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        end_time - start_time).count();
-                    
-                    // Update write time with mutex protection
-                    {
-                        std::lock_guard<std::mutex> lock(timing_mutex);
-                        total_write_time_ms += write_time_ms;
-                    }
-                    
-                    jobs_processed++;
-                    
-                    // Log the write time
-                    {
-                        std::lock_guard<std::mutex> lock(log_mutex);
-                        std::cout << "[io_writer] chunk " << job->chunk_id << " written in " << write_time_ms << " ms" << std::endl;
-                    }
-                    // Release the job (shared_ptr will clean up the memory)
-                    job.reset();
-                }
-            }
-        }
-    };
-
-namespace io_bc_split_utils {
-    // Extract barcode from FASTQ header line
-    std::string extract_header_bcs(const std::string& header) {
-        size_t cb_pos = header.find("CB:Z:");
-        if (cb_pos == std::string::npos) return "";
-        
-        size_t start = cb_pos + 5;
-        size_t end = header.find(' ', start);
-        if (end == std::string::npos) end = header.length();
-        
-        return header.substr(start, end - start);
-    }
-
-    // Fix messy bcs for filename safety
-    std::string fix_messy_header_bcs(const std::string& barcode) {
-        std::string sanitized = barcode;
-        std::replace(sanitized.begin(), sanitized.end(), '/', '_');
-        std::replace(sanitized.begin(), sanitized.end(), '\\', '_');
-        std::replace(sanitized.begin(), sanitized.end(), ':', '_');
-        std::replace(sanitized.begin(), sanitized.end(), '*', '_');
-        std::replace(sanitized.begin(), sanitized.end(), '?', '_');
-        std::replace(sanitized.begin(), sanitized.end(), '"', '_');
-        std::replace(sanitized.begin(), sanitized.end(), '<', '_');
-        std::replace(sanitized.begin(), sanitized.end(), '>', '_');
-        std::replace(sanitized.begin(), sanitized.end(), '|', '_');
-        
-        if (sanitized.empty() || std::all_of(sanitized.begin(), sanitized.end(), ::isspace)) {
-            return "unknown";
-        }
-        return sanitized;
-    }
-
-    /**
-     * @brief Load whitelist barcodes from CSV file (second column after header)
-     */
-    std::unordered_set<std::string> load_whitelist_barcodes(const std::string& whitelist_path, bool verbose = false) {
-        std::unordered_set<std::string> whitelist;
-        
-        if (whitelist_path.empty() || !boost::filesystem::exists(whitelist_path)) {
-            if (verbose) {
-                std::cout << "[split_fastqas] No whitelist file found, processing all barcodes" << std::endl;
-            }
-            return whitelist; // Empty set means no filtering
-        }
-        
-        if (verbose) {
-            std::cout << "[split_fastqas] Loading whitelist from: " << whitelist_path << std::endl;
-        }
-        
-        std::ifstream file(whitelist_path);
-        std::string line;
-        bool first_line = true;
-        
-        while (std::getline(file, line)) {
-            if (first_line) {
-                first_line = false;
-                continue; // Skip header
-            }
-            
-            if (line.empty()) continue;
-            
-            // Get second column (barcode) - skip first column
-            size_t first_comma = line.find(',');
-            if (first_comma == std::string::npos) continue; // No comma found, skip line
-            
-            size_t second_comma = line.find(',', first_comma + 1);
-            std::string barcode;
-            
-            if (second_comma != std::string::npos) {
-                // Extract between first and second comma
-                barcode = line.substr(first_comma + 1, second_comma - first_comma - 1);
-            } else {
-                // Extract from first comma to end of line
-                barcode = line.substr(first_comma + 1);
-            }
-            
-            // Trim whitespace
-            barcode.erase(0, barcode.find_first_not_of(" \t\r\n"));
-            barcode.erase(barcode.find_last_not_of(" \t\r\n") + 1);
-            
-            if (!barcode.empty()) {
-                whitelist.insert(barcode);
-                // Also add reverse complement to whitelist for matching
-                whitelist.insert(seq_utils::revcomp(barcode));
-            }
-        }
-        
-        if (verbose) {
-            std::cout << "[split_fastqas] Loaded " << whitelist.size() / 2 << " barcodes (with reverse complements)" << std::endl;
-        }
-        
-        return whitelist;
-    }
-
-class parallel_barcode_writer {
 public:
-    explicit parallel_barcode_writer(std::string out_dir,
-                                     int gzip_level = 1,
-                                     std::size_t max_open = 1024,
-                                     std::size_t filebuf_bytes = 1 << 20)
-        : output_dir_(std::move(out_dir)),
-          gzip_level_(gzip_level),
-          max_open_files_(max_open),
-          filebuf_bytes_(filebuf_bytes) {}
-
-    // Thread-safe: callers can invoke concurrently.
-    void write_records(const std::unordered_map<std::string, std::vector<std::string>>& barcode_records) {
-        // Phase 1: resolve Writer* for each barcode while holding the global lock ONCE.
-        std::vector<std::pair<Writer*, const std::vector<std::string>*>> work;
-        work.reserve(barcode_records.size());
-
-        {
-            std::lock_guard<std::mutex> lock(writers_mutex_);  // global map/LRU lock
-
-            if (writers_.size() >= max_open_files_) {
-                close_lru_locked_(max_open_files_ / 3);
-            }
-
-            for (const auto& [bc, recs] : barcode_records) {
-                if (recs.empty()) continue;
-                Writer* w = get_or_create_locked_(bc);  // lock precondition is satisfied here
-                w->last_access = ++access_tick_;
-                work.emplace_back(w, &recs);
-            }
-        } // global lock released here
-
-        // Phase 2: do I/O per file, each with its own small lock, in parallel across barcodes.
-        for (auto& [w, recs] : work) {
-            std::lock_guard<std::mutex> lk(w->mtx);   // per-writer serialization only
-            auto& out = *(w->out);
-            for (const auto& r : *recs) out << r;
-        }
+    parallel_writer() : running(true), jobs_processed(0), total_write_time_ms(0), total_queue_time_ms(0) {
+        writer_thread = std::thread([this]() {
+            this->process_jobs();
+        });
+    }
+    
+    ~parallel_writer() {
+        stop();
     }
 
-    void close_all() {
-        std::lock_guard<std::mutex> lock(writers_mutex_);
-        for (auto& kv : writers_) finalize_locked_(kv.second.get());
-        writers_.clear();
-    }
-
-    ~parallel_barcode_writer() { try { close_all(); } catch (...) {} }
-
-private:
-    struct Writer {
-        std::mutex mtx;   // guards I/O to this file only
-        std::unique_ptr<boost::iostreams::filtering_ostream> out;
-        std::unique_ptr<std::ofstream> file;
-        std::vector<char> filebuf;   // big buffer owned by streambuf
-        std::size_t last_access = 0;
-        std::string path;
-    };
-
-    // PRECONDITION: writers_mutex_ is held.
-    Writer* get_or_create_locked_(const std::string& barcode) {
-        auto it = writers_.find(barcode);
-        if (it != writers_.end()) return it->second.get();
-
-        auto w = std::make_unique<Writer>();
-        w->path = output_dir_ + "/" + barcode + ".fastq.gz";
-
-        // prepare large buffer before open
-        w->file = std::make_unique<std::ofstream>();
-        w->filebuf.resize(filebuf_bytes_);
-        w->file->rdbuf()->pubsetbuf(w->filebuf.data(), static_cast<std::streamsize>(w->filebuf.size()));
-
-        w->file->open(w->path, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!w->file->is_open()) throw std::runtime_error("Failed to open for write: " + w->path);
-
-        w->out = std::make_unique<boost::iostreams::filtering_ostream>();
-        boost::iostreams::gzip_params gz; gz.level = gzip_level_;
-        w->out->push(boost::iostreams::gzip_compressor(gz));
-        w->out->push(*(w->file));
-
-        Writer* raw = w.get();
-        writers_.emplace(barcode, std::move(w));
-        return raw;
-    }
-
-    // PRECONDITION: writers_mutex_ is held.
-    void close_lru_locked_(std::size_t n_close) {
-        if (!n_close || writers_.empty()) return;
-        n_close = std::min(n_close, writers_.size());
-
-        std::vector<Writer*> vec;
-        vec.reserve(writers_.size());
-        for (auto& kv : writers_) vec.push_back(kv.second.get());
-
-        std::nth_element(vec.begin(), vec.begin() + n_close, vec.end(),
-            [](const Writer* a, const Writer* b){ return a->last_access < b->last_access; });
-
-        // erase those with smallest last_access
-        std::unordered_set<const Writer*> kill;
-        kill.reserve(n_close * 2 + 1);
-        for (std::size_t i = 0; i < n_close; ++i) kill.insert(vec[i]);
-
-        for (auto it = writers_.begin(); it != writers_.end(); ) {
-            if (kill.count(it->second.get())) {
-                finalize_locked_(it->second.get());
-                it = writers_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-
-    // PRECONDITION: writers_mutex_ is held.
-    static void finalize_locked_(Writer* w) {
-        if (!w) return;
-        if (w->out) { try { w->out->reset(); } catch (...) {} w->out.reset(); }
-        if (w->file) {
-            try { w->file->flush(); } catch (...) {}
-            try { w->file->close(); } catch (...) {}
-            w->file.reset();
-        }
-        w->filebuf.clear();
-        w->filebuf.shrink_to_fit();
-    }
-
-private:
-    std::string output_dir_;
-    int         gzip_level_;
-    std::size_t max_open_files_;
-    std::size_t filebuf_bytes_;
-
-    std::mutex writers_mutex_;  // protects writers_ map + LRU + fd budget
-    std::unordered_map<std::string, std::unique_ptr<Writer>> writers_;
-    std::size_t access_tick_ = 0;
-};
-
-    /**
-     * @brief Parallel barcode splitter using kseq with chunk_streaming
-     */
-    size_t split_fastqa_file(const std::string& input_fastq_path, const std::string& output_dir_path,
-                             int num_threads, const std::string& whitelist_path = "", bool verbose = false,
-                             size_t chunk_size = 50000, int compression_level = 1) {
+    template<typename T>
+    void write_all(sigstring_writing& sig_writer, sigstring_writing& csv_writer, sigstring_writing& fastqa_writer, std::vector<T>& data) {
+        if (data.empty()) return;
         
-        if (verbose) {
-            std::cout << "[split_fastqas] Starting parallel barcode splitting for: " << input_fastq_path << std::endl;
-            std::cout << "[split_fastqas] Using " << num_threads << " threads with chunk size " << chunk_size << std::endl;
-        }
-        
-        // Load whitelist
-        auto whitelist = load_whitelist_barcodes(whitelist_path, verbose);
-        bool use_whitelist = !whitelist.empty();
-        
-        // Create parallel barcode writer with specified compression level
-        parallel_barcode_writer bc_writer(output_dir_path, verbose, 500, compression_level);
-        
-        // Shared data structures (thread-safe)
-        std::unordered_set<std::string> seen_barcodes;
-        std::mutex seen_barcodes_mutex;
-        std::atomic<size_t> total_reads{0};
-        std::atomic<size_t> reads_with_barcodes{0};
-        std::atomic<size_t> filtered_reads{0};
-        
-        // Chunk processing function
-        using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
-        chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(chunk_size);
-        
-        ChunkFunc process_chunk = [&](const std::vector<read_streaming::sequence>& chunk, const std::string& /*file*/) {
-            // Group records by target barcode within this chunk
-            std::unordered_map<std::string, std::vector<std::string>> chunk_records;
-            
-            for (const auto& seq : chunk) {
-                total_reads++;
-                
-                // Build header string
-                std::string header = "@" + seq.id;
-                if (!seq.comment.empty()) {
-                    header += " " + seq.comment;
-                }
-                
-                std::string raw_barcode = extract_header_bcs(header);
-                if (raw_barcode.empty()) {
-                    continue; // Skip reads without barcodes
-                }
-                
-                raw_barcode = fix_messy_header_bcs(raw_barcode);
-                reads_with_barcodes++;
-                
-                // Apply whitelist filter if enabled
-                if (use_whitelist && whitelist.find(raw_barcode) == whitelist.end()) {
-                    filtered_reads++;
-                    continue; // Skip reads not in whitelist
-                }
-                
-                // Determine target barcode and suffix
-                std::string target_barcode = raw_barcode;
-                std::string read_suffix = "";
-                
-                {
-                    std::lock_guard<std::mutex> lock(seen_barcodes_mutex);
-                    std::string revcomp_barcode = seq_utils::revcomp(raw_barcode);
-                    
-                    if (seen_barcodes.count(raw_barcode)) {
-                        target_barcode = raw_barcode;
-                    } else if (seen_barcodes.count(revcomp_barcode)) {
-                        target_barcode = revcomp_barcode;
-                        read_suffix = "_rc";
-                    } else {
-                        // First time seeing this barcode
-                        seen_barcodes.insert(raw_barcode);
-                        target_barcode = raw_barcode;
-                    }
-                }
-                
-                // Build FASTQ record string
-                std::string fastq_record = "@" + seq.id + read_suffix;
-                if (!seq.comment.empty()) {
-                    fastq_record += " " + seq.comment;
-                }
-                fastq_record += "\n" + seq.seq + "\n+\n";
-                fastq_record += (seq.is_fastq ? seq.qual : std::string(seq.seq.length(), 'I')) + "\n";
-                
-                chunk_records[target_barcode].push_back(fastq_record);
-            }
-            
-            // Write all records for this chunk
-            if (!chunk_records.empty()) {
-                bc_writer.write_records(chunk_records);
-            }
-            
-            // Progress reporting
-            if (verbose && total_reads % 500000 == 0) {
-                std::cout << "[split_fastqas] Processed " << total_reads << " reads, "
-                          << seen_barcodes.size() << " unique barcodes" << std::endl;
-            }
+        auto job_function = [
+            sig_ptr=&sig_writer,
+            csv_ptr=&csv_writer,
+            fastq_ptr=&fastqa_writer,
+            data_vec=std::move(data)
+        ]() mutable {
+            (*sig_ptr)(data_vec);
+            (*csv_ptr)(data_vec);
+            (*fastq_ptr)(data_vec);
+            std::vector<T>().swap(data_vec);
         };
         
-        // Process the file in parallel chunks using your existing infrastructure
-        streamer.process_chunks(input_fastq_path, process_chunk, num_threads, -1);
+        auto* job = new WriteJob();
+        job->func = std::move(job_function);
+        job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
+        job->size = data.size();
+        job->queued_time = std::chrono::high_resolution_clock::now();
         
-        // Explicit cleanup of writer
-        bc_writer.close_all();
-        
-        if (verbose) {
-            std::cout << "[split_fastqas] Complete! Processed " << total_reads << " total reads" << std::endl;
-            std::cout << "[split_fastqas] Reads with barcodes: " << reads_with_barcodes << std::endl;
-            if (use_whitelist) {
-                std::cout << "[split_fastqas] Reads filtered by whitelist: " << filtered_reads << std::endl;
-                std::cout << "[split_fastqas] Reads written: " << (reads_with_barcodes - filtered_reads) << std::endl;
-            }
-            std::cout << "[split_fastqas] Unique barcode files created: " << seen_barcodes.size() << std::endl;
+        while (!write_queue.push(job)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        
-        return seen_barcodes.size();
     }
 
-    /**
-     * @brief Enhanced wrapper function with whitelist support
-     */
-    void split_fastqas(const std::string& output_base, bool verbose, int num_threads, int compression_level = 1) {
-        std::string fastq_file = output_base + ".fq.gz";
-        std::string split_dir = output_base + "_split_bcs";
-        std::string whitelist_file = output_base + "_whitelist.csv";
+    template<typename T>
+    void write(sigstring_writing& fastqa_writer, std::vector<T>& data) {
+        if (data.empty()) return;
         
-        if (!boost::filesystem::exists(fastq_file)) {
-            fastq_file = output_base + ".fq";
-            if (!boost::filesystem::exists(fastq_file)) {
-                throw std::runtime_error("Output FASTQ file not found: " + output_base + ".fq[.gz]");
-            }
-        }
+        auto job_function = [
+            fastq_ptr=&fastqa_writer,
+            data_vec=std::move(data)
+        ]() mutable {
+            (*fastq_ptr)(data_vec);
+            std::vector<T>().swap(data_vec);
+        };
         
-        // Check for whitelist file
-        if (!boost::filesystem::exists(whitelist_file)) {
-            if (verbose) {
-                std::cout << "[split_fastqas] No whitelist file found at: " << whitelist_file << std::endl;
-                std::cout << "[split_fastqas] Processing all barcodes without filtering" << std::endl;
-            }
-            whitelist_file = ""; // Empty means no filtering
+        auto* job = new WriteJob();
+        job->func = std::move(job_function);
+        job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
+        job->size = data.size();
+        job->queued_time = std::chrono::high_resolution_clock::now();
+        
+        while (!write_queue.push(job)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        auto start_time = std::chrono::steady_clock::now();
-        size_t num_barcodes = split_fastqa_file(fastq_file, split_dir, num_threads, whitelist_file, verbose);
-        auto duration = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - start_time);
-        std::cout << "[split_fastqas] Split into " << num_barcodes 
-                  << " barcode files in " << duration.count() << " seconds" << std::endl;
     }
-}
+    
+    void write_slabs(sigstring_writing& fastqa_writer, std::vector<std::string>&& slabs) {
+        size_t total_bytes = 0;
+        for (auto const& s : slabs) total_bytes += s.size();
+        if (total_bytes == 0) return;
+        
+        auto* job = new WriteJob();
+        job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
+        job->size = total_bytes;
+        job->queued_time = std::chrono::high_resolution_clock::now();
+        job->func = [fastq_ptr=&fastqa_writer, slabs_vec=std::move(slabs)]() mutable {
+            (*fastq_ptr)(slabs_vec);
+            std::vector<std::string>().swap(slabs_vec);
+        };
+        
+        while (!write_queue.push(job)) std::this_thread::yield();
+    }
+    
+    void write_raw_string(sigstring_writing& writer, std::string&& data) {
+        if (data.empty()) return;
+        
+        size_t data_size = data.size();
+        
+        auto job_function = [
+            writer_ptr=&writer,
+            data_str=std::move(data)
+        ]() mutable {
+            (*writer_ptr)(data_str);
+            std::string().swap(data_str);
+        };
+        
+        auto* job = new WriteJob();
+        job->func = std::move(job_function);
+        job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
+        job->size = data_size;
+        job->queued_time = std::chrono::high_resolution_clock::now();
+        
+        while (!write_queue.push(job)) {
+            std::this_thread::yield();
+        }
+    }
+
+    void stop() {
+        if (!running.load()) return;
+        
+        running.store(false, std::memory_order_release);
+        
+        if (writer_thread.joinable()) {
+            writer_thread.join();
+        }
+        
+        std::cout << "\n[Writer Thread] Statistics:" << std::endl;
+        std::cout << "  Total jobs processed: " << jobs_processed.load() << std::endl;
+        std::cout << "  Total write time: " << total_write_time_ms / 1000.0 << " seconds" << std::endl;
+        if (jobs_processed.load() > 0) {
+            std::cout << "  Average write time per chunk: " << total_write_time_ms / jobs_processed.load() << " ms" << std::endl;
+            std::cout << "  Average queue time per chunk: " << total_queue_time_ms / jobs_processed.load() << " ms" << std::endl;
+        }
+    }
+    
+    double get_total_write_time_ms() const {
+        return total_write_time_ms;
+    }
+    
+    size_t get_jobs_processed() const {
+        return jobs_processed.load();
+    }
+
+private:
+    struct WriteJob {
+        std::function<void()> func;
+        size_t chunk_id;
+        size_t size;
+        std::chrono::time_point<std::chrono::high_resolution_clock> queued_time;
+    };
+    
+    boost::lockfree::queue<WriteJob*, boost::lockfree::capacity<64>> write_queue;
+    std::atomic<bool> running;
+    std::atomic<size_t> next_chunk_id{1};
+    std::atomic<size_t> jobs_processed{0};
+    std::thread writer_thread;
+    
+    double total_write_time_ms;
+    double total_queue_time_ms;
+    
+    void process_jobs() {
+        while (running.load(std::memory_order_acquire)) {
+            WriteJob* job = nullptr;
+            
+            if (write_queue.pop(job)) {
+                auto start_time = std::chrono::high_resolution_clock::now();
+                auto queue_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    start_time - job->queued_time).count();
+                total_queue_time_ms += queue_time_ms;
+                
+                job->func();
+                
+                auto end_time = std::chrono::high_resolution_clock::now();
+                auto write_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    end_time - start_time).count();
+                total_write_time_ms += write_time_ms;
+                
+                jobs_processed.fetch_add(1, std::memory_order_relaxed);
+                
+                std::cout << "\n[io_writer] chunk=" << job->chunk_id
+                          << " bytes=" << job->size
+                          << " queued_ms=" << queue_time_ms
+                          << " wrote_ms=" << write_time_ms
+                          << std::endl;
+                
+                delete job;
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+        }
+        
+        // Drain remaining jobs
+        WriteJob* job = nullptr;
+        while (write_queue.pop(job)) {
+            job->func();
+            delete job;
+            jobs_processed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+};

@@ -1,6 +1,5 @@
 #include "include/rad/rad_headers.h"
 
-
 class BarcodeErrorModel {
 private:
     int k_size;

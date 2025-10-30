@@ -1,5 +1,8 @@
 #include "include/rad/rad_headers.h"
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI + helpers (unchanged)
+// ─────────────────────────────────────────────────────────────────────────────
 struct Options {
     std::string input  = "-";      // "-" = stdin
     std::string output = "-";      // "-" = stdout (uncompressed)
@@ -12,7 +15,7 @@ struct Options {
 static void usage(const char* prog) {
     std::cerr
       << "Usage: " << prog << " [options]\n"
-      << "  -i, --input   FILE     Input FASTQ(.gz) or '-' for stdin\n"
+      << "  -i, --input   FILE     Input FASTQ(.gz) or '-' for stdin (file or directory ok)\n"
       << "  -o, --output  FILE     Output FASTQ(.gz) or '-' for stdout\n"
       << "  -t, --threads INT      OpenMP threads (default: OMP default)\n"
       << "  -k, --chunk   INT      Reads per chunk (default: 50000)\n"
@@ -32,7 +35,6 @@ struct FqRec {
 };
 
 // Find CB/UB values from a tab-separated tail using zero-copy string_view.
-// Looks for "CB:Z:" and "UB:Z:" and returns the value up to next '\t' or end.
 static inline std::string_view find_tag(std::string_view tail, std::string_view key) {
     size_t pos = tail.find(key);
     if (pos == std::string_view::npos) return {};
@@ -60,7 +62,7 @@ static inline std::string make_new_id(const std::string& qname,
     return out;
 }
 
-// Output sink: plain or .gz, or stdout
+// Output sink: plain or .gz, or stdout (zlib for .gz)
 class FastqWriter {
 public:
     explicit FastqWriter(const std::string& path) {
@@ -98,6 +100,9 @@ private:
     std::ofstream out;
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN: uses your file_streaming + read_streaming to support pigz/fd + gz/zlib
+// ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
     Options opt;
     static struct option long_opts[] = {
@@ -132,13 +137,19 @@ int main(int argc, char** argv) {
 
     if (opt.threads > 0) omp_set_num_threads(opt.threads);
 
-    // Open input via zlib for both plain and .gz
-    gzFile in = nullptr;
-    if (opt.input == "-" || opt.input.empty()) in = gzdopen(fileno(stdin), "rb");
-    else in = gzopen(opt.input.c_str(), "rb");
-    if (!in) { std::cerr << "Error: cannot open input " << opt.input << "\n"; return 1; }
+    // If input is stdin ("-"), we cannot run pigz; fall back to zlib path via your reader.
+    // Otherwise, your file_streaming picks pigz for .gz if available, else gz/zlib, else plain.
+    std::unique_ptr<file_streaming> files_ptr;
+    std::unique_ptr<read_streaming> reader_ptr;
 
-    kseq_t* ks = kseq_init(in);
+    try {
+        files_ptr = std::make_unique<file_streaming>(opt.input, std::max(1, opt.threads));
+        reader_ptr = std::make_unique<read_streaming>(*files_ptr);
+    } catch (const std::exception& e) {
+        std::cerr << "Error opening input: " << e.what() << "\n";
+        return 1;
+    }
+
     FastqWriter writer(opt.output);
 
     std::vector<FqRec> chunk;
@@ -146,24 +157,26 @@ int main(int argc, char** argv) {
 
     std::atomic<size_t> total{0};
 
+    // Stream → chunk → transform headers (parallel) → ordered write
     while (true) {
         chunk.clear();
-        // Read a chunk
-        for (int i = 0; i < opt.chunk_size; ++i) {
-            int l = kseq_read(ks);
-            if (l < 0) break; // EOF or error
-            FqRec r;
-            r.name = (ks->name.s ? ks->name.s : "");
-            r.seq  = (ks->seq.s  ? ks->seq.s  : "");
-            if (ks->qual.l > 0 && ks->qual.s) r.qual.assign(ks->qual.s, ks->qual.l);
-            else r.qual.assign(r.seq.size(), 'I'); // synthesize if missing
 
-            // kseq stores everything after first space/tab into comment
-            if (ks->comment.l > 0 && ks->comment.s) {
-                r.aux.assign(ks->comment.s, ks->comment.l); // tabs preserved
+        // Fill a chunk from the reader
+        for (int i = 0; i < opt.chunk_size; ++i) {
+            auto rec = reader_ptr->next_sequence();
+            if (!rec) break;
+
+            FqRec r;
+            r.name = std::move(rec->id);
+            r.seq  = std::move(rec->seq);
+
+            if (rec->is_fastq && !rec->qual.empty()) {
+                r.qual = std::move(rec->qual);
             } else {
-                r.aux.clear(); // no tags available
+                continue;
             }
+
+            r.aux = std::move(rec->comment); // comment contains the tabbed tags tail
             chunk.push_back(std::move(r));
         }
         if (chunk.empty()) break;
@@ -173,7 +186,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < chunk.size(); ++i) {
             auto& rec = chunk[i];
 
-            // Tail is tab-separated tags (user guarantee)
+            // Tail is tab-separated tags
             std::string_view tail(rec.aux.data(), rec.aux.size());
 
             // Zero-copy extract CB/UB
@@ -182,8 +195,7 @@ int main(int argc, char** argv) {
 
             // Build final ID; if tags missing/empty, they’re simply omitted
             std::string newid = make_new_id(rec.name, cb, ub, opt.delim, opt.keep_umi);
-
-            rec.name.swap(newid); // replace
+            rec.name.swap(newid);
         }
 
         // Ordered write
@@ -195,8 +207,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    kseq_destroy(ks);
-    gzclose(in);
     std::cerr << "[fq_header_rewriter] done. total reads: " << total.load() << "\n";
     return 0;
 }
