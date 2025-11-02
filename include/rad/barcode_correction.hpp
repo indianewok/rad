@@ -89,86 +89,6 @@ struct counter {
     }
 };
 
-// storage for per-barcode statistics
-// ncpm = normalized counts per million
-// log1p_ncpm = log(1 + ncpm) - log-plus-one transformation
-// log1p_ncpm_ztpois = log1p_transformed ncpm with ztpois adjustment
-struct bc_stats {
-    double ncpm;         // Normalized counts per million
-    double log1p_ncpm;   // log(1 + ncpm) - log-plus-one transformation
-    double log1p_ncpm_ztpois; // log1p_transformed ncpm with ztpois adjustment
-    double log1p_ncpm_density; // double-pass density calculation
-
-
-    //default constructor
-    bc_stats() : ncpm(0.0), log1p_ncpm(0.0), log1p_ncpm_ztpois(0.0), log1p_ncpm_density(0.0) {}
-
-    //constructor w/ values
-    bc_stats(
-        double ncpm_val,
-        double log1p_ncpm_val, 
-        double log1p_ncpm_ztpois_val,
-        double log1p_ncpm_density_val
-    ) 
-        :   ncpm(ncpm_val),
-            log1p_ncpm(log1p_ncpm_val),
-            log1p_ncpm_ztpois(log1p_ncpm_ztpois_val),
-            log1p_ncpm_density(log1p_ncpm_density_val) {}
-
-    // calculating ncpm per-barcode
-    void calculate_bc_ncpm(int barcode_count, double total_reads) {
-        if (total_reads > 0.0) {
-            ncpm = (static_cast<double>(barcode_count) / total_reads) * 1e6;
-        } else {
-            ncpm = 0.0;
-        }
-    }
-
-    // calculating log1p_ncpm per-barcode
-    void calculate_bc_log1p_ncpm() {
-        log1p_ncpm = std::log1p(ncpm);
-    }
-
-    void calculate_bc_ztpois_pct(double k, double lambda) {
-        if (k <= 0.0) {
-            log1p_ncpm_ztpois = 0.0;
-            return; // no zeroes allowed 
-        }
-        if (lambda <= 0.0) {
-            log1p_ncpm_ztpois = 0.0;
-            return;
-        }
-        
-        // Convert to integer for discrete distribution
-        int k_int = static_cast<int>(std::floor(k));
-        if (k_int <= 0) {
-            log1p_ncpm_ztpois = 0.0;
-            return;
-        }
-        
-        // Pre-calculate zero probability for truncation
-        double prob_zero = std::exp(-lambda);
-        double truncation_denom = 1.0 - prob_zero;
-        
-        // Calculate regular Poisson CDF: P(X <= k)
-        double regular_cdf = 0.0;
-        for (int j = 0; j <= k_int; j++) {
-            // Poisson PMF: P(X = j) = (lambda^j * exp(-lambda)) / j!
-            double log_pmf = j * std::log(lambda) - lambda - std::lgamma(j + 1.0);
-            regular_cdf += std::exp(log_pmf);
-        }
-        
-        // Zero-truncated CDF: P(X <= k | X > 0) = [P(X <= k) - P(X = 0)] / [1 - P(X = 0)]
-        double zt_cdf = (regular_cdf - prob_zero) / truncation_denom;
-        
-        // Clamp to [0, 1] and convert to percentage
-        zt_cdf = std::max(0.0, std::min(1.0, zt_cdf));
-        log1p_ncpm_ztpois = zt_cdf * 100.0; // Scale to percentage
-    }
-
-
-};
-
 // set up the int64_seq class to handle bit-to-sequence & sequence-to-bit
 class int64_seq {
     public:
@@ -796,6 +716,301 @@ namespace mutation_tools {
     }
 };
 
+   // === bc_flat_set: lean index for huge whitelists =======================
+    struct bc_flat_set {
+        using key = int64_seq;
+        using value = barcode_entry;
+
+        phmap::parallel_flat_hash_set<value,
+            phmap::Hash<value>,       // uses std::hash<barcode_entry>
+            phmap::EqualTo<value>     // uses operator==(barcode_entry)
+        > s;
+
+        bc_flat_set() = default;
+    private:
+        static inline const key& key_of(const key& k) noexcept { return k; }
+        static inline const key& key_of(const value& v) noexcept { return v.barcode; }
+
+    template <typename U>
+    static inline const key& key_of_any(const U& u) {
+        if constexpr (std::is_pointer_v<std::decay_t<U>>) {
+            return key_of(*u);
+        } else {
+            return key_of(u);
+        }
+    }
+
+    template <typename T, typename = void>
+    struct is_range : std::false_type {};
+    template <typename T>
+    struct is_range<T,
+        std::void_t<
+            decltype(std::begin(std::declval<const T&>())),
+            decltype(std::end  (std::declval<const T&>()))
+        >
+    > : std::true_type {};
+
+    template <typename T>
+    static constexpr bool is_key_or_value_v =
+        std::is_same_v<std::decay_t<T>, key> ||
+        std::is_same_v<std::decay_t<T>, value> ||
+        (std::is_pointer_v<std::decay_t<T>> &&
+        (std::is_same_v<std::remove_pointer_t<std::decay_t<T>>, key> ||
+        std::is_same_v<std::remove_pointer_t<std::decay_t<T>>, value>));
+
+    bool contains_key(const key& k) const {
+        if (!k.is_valid()) return false;
+        value probe; probe.barcode = k;
+        return s.find(probe) != s.end();
+    }
+
+    
+    public:
+        // ---- Size & housekeeping (names to minimize churn) ----
+        size_t size()             const { return s.size(); }
+        size_t association_size() const { return s.size(); }
+        size_t unique_val_size()  const { return s.size(); }
+        bool   empty()            const { return s.empty(); }
+        void   clear()                  { s.clear(); }
+
+        // ---- Membership (keep names consistent with existing code) ----
+        template<typename T> bool check_wl_for(const T& x) const {
+            if constexpr (is_key_or_value_v<T>) {
+                const key& k = key_of_any(x);
+                return contains_key(k);
+            } else if constexpr (is_range<T>::value) {
+                for (const auto& y : x) {
+                    const key& ky = key_of_any(y);
+                    if (!ky.is_valid()) continue;
+                    if (contains_key(ky)) return true;
+                }
+                return false;
+            }
+            return false;
+        }
+
+        template<typename T> std::unordered_set<key> return_matching_barcodes(const T& x) const {
+            std::unordered_set<key> out;
+            if constexpr (is_key_or_value_v<T>) {
+                const key& k = key_of_any(x);
+                if (contains_key(k)) out.insert(k);
+            } else if constexpr (is_range<T>::value) {
+                for (const auto& y : x) {
+                    const key& ky = key_of_any(y);
+                    if (!ky.is_valid()) continue;
+                    if (contains_key(ky)) out.insert(ky);
+                }
+            } 
+            return out;
+        }
+
+        template<typename T> std::unordered_set<key> return_putative_correct_bcs(const T& x) const {
+            return return_matching_barcodes(x);
+        }
+
+        // ---- Insert (observed ignored; we store by true/correct barcode) ----
+        template<typename T> void insert_bc_entry(const T& /*observed*/, const value& correct) {
+            if (!correct.is_valid()) return;
+            s.lazy_emplace_l(correct,
+                [&](auto& it) { /* present: no-op */ },
+                [&](const auto& ctor){ ctor(correct); });
+        }
+        template<typename T> void insert_bc_entry(const T& /*observed*/, value&& correct) {
+            if (!correct.is_valid()) return;
+            s.lazy_emplace_l(correct,
+                [&](auto& it) { /* present */ },
+                [&](const auto& ctor){ ctor(std::move(correct)); });
+        }
+        template<typename T> void insert_bc_entry(const T& observed) {
+            value v{}; v.barcode = key_of(observed);
+            if (!v.is_valid()) return;
+            insert_bc_entry(observed, std::move(v));
+        }
+
+        // ---- Remove by key ----
+        template<typename T> void remove_bc_entry(const T& observed) {
+            value probe; probe.barcode = key_of(observed);
+            s.erase(probe);
+        }
+        template<typename T> size_t erase(const T& observed) {
+            value probe; probe.barcode = key_of(observed);
+            return s.erase(probe);
+        }
+
+        // ---- Counters (mutate atomics in-place; discard refs immediately) ----
+        template<typename T> counter get_all_bc_counts(const T& x) const {
+            value probe; probe.barcode = key_of(x);
+            if (!probe.is_valid()) return counter(0);
+            auto it = s.find(probe);
+            return (it!=s.end()) ? it->count : counter(0);
+        }
+
+        template<typename T> void update_bc_count(const T& x, barcode_counts slot = barcode_counts::total) const {
+            value probe; probe.barcode = key_of(x);
+            if (!probe.is_valid()) return;
+            auto it = s.find(probe);
+            if (it != s.end()) const_cast<value&>(*it).count.increment(slot);
+        }
+
+        template<typename T> void subtract_bc_count(const T& x, barcode_counts slot = barcode_counts::total) const {
+            value probe; probe.barcode = key_of(x);
+            if (!probe.is_valid()) return;
+            auto it = s.find(probe);
+            if (it != s.end()) const_cast<value&>(*it).count.subtract(slot);
+        }
+
+        template<typename T> int get_bc_count(const T& x, barcode_counts slot = barcode_counts::total) const {
+            value probe; probe.barcode = key_of(x);
+            if (!probe.is_valid()) return 0;
+            auto it = s.find(probe);
+            return (it != s.end()) ? it->count.load(slot) : 0;
+        }
+
+        template<typename T> void set_bc_count(const T& x, int new_count, barcode_counts slot = barcode_counts::total) const {
+            value probe; probe.barcode = key_of(x);
+            if (!probe.is_valid()) return;
+            auto it = s.find(probe);
+            if (it != s.end()) const_cast<value&>(*it).count.counts[slot].store(new_count, std::memory_order_relaxed);
+        }
+
+        // ==== Utility Methods ====
+        std::vector<const value*> get_unique_entries() const {
+            std::vector<const value*> result;
+            result.reserve(s.size());
+            for (const auto& val : s) {
+                result.push_back(&val);
+            }
+            return result;
+        }
+
+        // ---- Equal-range compatibility (return 0/1 element range) ----
+        struct value_iterator {
+            const value* p = nullptr;
+            bool end_ = true;
+            value_iterator() = default;
+            explicit value_iterator(const value* pv, bool e=false) : p(pv), end_(e) {}
+            const value& operator*()  const { return *p; }
+            const value* operator->() const { return p; }
+            value_iterator& operator++(){ end_=true; return *this; }
+            bool operator!=(const value_iterator& o) const { return end_!=o.end_ || p!=o.p; }
+            bool operator==(const value_iterator& o) const { return !(*this!=o); }
+        };
+        std::pair<value_iterator,value_iterator> equal_range(const key& k) const {
+            value probe; probe.barcode = k;
+            auto it = s.find(probe);
+            if (it == s.end()) return { value_iterator(nullptr,true), value_iterator(nullptr,true) };
+            return { value_iterator(&*it,false), value_iterator(nullptr,true) };
+        }
+
+        // ---- Summaries (for your CSV writers) ----
+        std::vector<std::tuple<std::string,int,int,int,int,int,int,int,int>>
+        summarize_counts(const std::unordered_set<key>* filter_keys=nullptr) const {
+            using row = std::tuple<std::string,int,int,int,int,int,int,int,int>;
+            std::vector<row> rows;
+            if (filter_keys) {
+                rows.reserve(filter_keys->size());
+                for (auto const& k : *filter_keys) {
+                    value probe; probe.barcode = k;
+                    auto it = s.find(probe);
+                    int raw=0, tot=0, corr=0, fwd=0, rev=0, fwd_c=0, rev_c=0, filt=0;
+                    if (it!=s.end()) {
+                        auto const& c = it->count;
+                        raw   = c.load(barcode_counts::raw);
+                        tot   = c.load(barcode_counts::total);
+                        corr  = c.load(barcode_counts::corrected);
+                        fwd   = c.load(barcode_counts::forw);
+                        rev   = c.load(barcode_counts::rev);
+                        fwd_c = c.load(barcode_counts::forw_concat);
+                        rev_c = c.load(barcode_counts::rev_concat);
+                        filt  = c.load(barcode_counts::filtered);
+                    }
+                    rows.emplace_back(k.bits_to_sequence(),raw,tot,corr,fwd,rev,fwd_c,rev_c,filt);
+                }
+            } else {
+                rows.reserve(s.size());
+                for (auto const& be : s) {
+                    auto const& k = be.barcode;
+                    auto const& c = be.count;
+                    rows.emplace_back(
+                        k.bits_to_sequence(),
+                        c.load(barcode_counts::raw),
+                        c.load(barcode_counts::total),
+                        c.load(barcode_counts::corrected),
+                        c.load(barcode_counts::forw),
+                        c.load(barcode_counts::rev),
+                        c.load(barcode_counts::forw_concat),
+                        c.load(barcode_counts::rev_concat),
+                        c.load(barcode_counts::filtered)
+                    );
+                }
+            }
+            return rows;
+        }
+
+        // ---- Minimal debug hooks so your memory report still compiles ----
+        // (We fake “unique/associations” views since it’s a set)
+        const auto& debug_unique_values() const noexcept { return s; }
+        struct fake_assoc_view {
+            struct node { key k; std::vector<const value*> vals; };
+            std::vector<node> rows;
+            size_t bucket_count() const { return rows.size(); }
+            size_t subcnt()       const { return 1; }
+            struct H { size_t operator()(const key& k) const {
+                return std::hash<int64_t>{}(k.bits.empty()?0:k.bits[0]); } };
+            auto hash_function() const { return H{}; }
+            auto begin() const { return rows.begin(); }
+            auto end()   const { return rows.end(); }
+        };
+        fake_assoc_view debug_associations() const noexcept {
+            fake_assoc_view v;
+            v.rows.reserve(s.size());
+            for (auto const& be : s) {
+                typename fake_assoc_view::node n;
+                n.k = be.barcode;
+                n.vals.push_back(&be);
+                v.rows.push_back(std::move(n));
+            }
+            return v;
+        }
+        size_t validate_association_keys()   const noexcept { return 0; }
+        size_t validate_association_values() const noexcept { return 0; }
+
+        template<typename K, typename V>
+        void emplace(K&& k, V&& v) { insert_bc_entry(std::forward<K>(k), std::forward<V>(v)); }
+
+        // 2) Range-for support so you can iterate like `for (auto const& kv : entry.global_bcs)`
+        auto begin() const { return s.begin(); }
+        auto end()   const { return s.end();   }
+
+        void write_wl_summary(
+            std::ostream &out,
+            const std::string class_id,
+            const std::unordered_set<key> *filter_keys = nullptr,
+            bool write_header = true
+        ) const {
+            static bool header_printed = false;
+            if (write_header && header_printed) header_printed = false;
+            if (!header_printed) {
+                out << "class_id,true_barcode,raw_count,total_count,corrected_count,forw_count,rev_count,"
+                    "forw_concat_count,rev_concat_count,filtered_count\n";
+                header_printed = true;
+            }
+            auto rows = summarize_counts(filter_keys);
+            for (auto const & tpl : rows) {
+                out << class_id << ','
+                    << std::get<0>(tpl) << ','
+                    << std::get<1>(tpl) << ','
+                    << std::get<2>(tpl) << ','
+                    << std::get<3>(tpl) << ','
+                    << std::get<4>(tpl) << ','
+                    << std::get<5>(tpl) << ','
+                    << std::get<6>(tpl) << ','
+                    << std::get<7>(tpl) << ','
+                    << std::get<8>(tpl) << '\n';
+            }
+        }
+    };
+
 template<typename key, typename value>
 struct bc_multimap {
 private:
@@ -1102,7 +1317,6 @@ public:
     }
 
     // ==== Count Management Methods ====
-    // In barcode_correction.hpp
     template<typename T>
     counter get_all_bc_counts(T const &x) const {
         const auto& k = key_of(x);
@@ -1323,9 +1537,18 @@ class whitelist {
         ~whitelist() = default;
 
     struct wl_entry {
-        //std::unordered_set<int64_seq> true_ref;
-        bc_multimap<int64_seq, barcode_entry> true_bcs, global_bcs, filter_bcs;
-        
+        bc_multimap<int64_seq, barcode_entry> true_bcs, filter_bcs;
+        bc_flat_set global_bcs;
+
+        template<class F> decltype(auto) with_wl(std::string_view src, F&& f) {
+            if (src == "global") return f(global_bcs);
+            return f(true_bcs);
+        }
+        template<class F> decltype(auto) with_wl(std::string_view src, F&& f) const {
+            if (src == "global") return f(global_bcs);
+            return f(true_bcs);
+        }
+
         void generate_mismatch_barcodes(int mutation_rounds, bool verbose, int nthreads = 1) {
                 using namespace std::chrono;
                 auto start_total = high_resolution_clock::now();
@@ -1505,7 +1728,7 @@ class whitelist {
                 }
             }
     };
-    
+
     std::unordered_map<std::string, std::reference_wrapper<whitelist::wl_entry>> maps;
     std::unordered_map<std::string, whitelist::wl_entry> lists;
     // operator[] for easy insert/access: W["barcode_1"].insert_bc_entry(obs, corr);
@@ -1575,14 +1798,21 @@ class whitelist {
     void populate_entry(wl_entry &out, std::vector<std::unordered_set<int64_seq>> const &sets){
         if (sets.size() == 1) {
             auto const &A = sets[0];
+            bool populate_global = false;
+            if (A.size() >= 100000) {
+                populate_global = true;
+            }
             for (auto const &seq : A) {
                 if (seq.bits.empty()) continue;
                 barcode_entry be;
                 be.barcode = seq;
                 be.filtered = false;
                 //be.flags = "flag";
-                out.true_bcs.emplace(seq, std::move(be));
-                //out.true_ref.insert(seq);
+                if(populate_global){
+                    out.global_bcs.emplace(seq, std::move(be));
+                } else {
+                    out.true_bcs.emplace(seq, std::move(be));
+                }
             }
             return;
         }
@@ -1674,250 +1904,364 @@ class whitelist {
 
 //needed to include this down here because of the definitions above that I couldn't make work by movign this to the misc utils, though I sure would love for this to be there
 // Fixed memory calculation functions
+// ===== bc_mem_utils: flat-set aware overloads =====
 namespace bc_mem_utils {
-    
-    // Get actual memory of int64_seq including vector allocation
-    inline std::size_t get_int64seq_mem(const int64_seq& seq) {
-        std::size_t base = sizeof(int64_seq);  // 16 bytes (uint16_t + vector overhead)
-        std::size_t vec_capacity = seq.bits.capacity() * sizeof(int64_t);  // Actual heap allocation
-        return base + vec_capacity;
-    }
-    
-    // Get actual memory of barcode_entry including nested structures
-    inline std::size_t get_bc_entry_mem(const barcode_entry& entry) {
-        std::size_t base = sizeof(barcode_entry);
-        
-        // Add int64_seq's vector allocation
-        std::size_t seq_vec = entry.barcode.bits.capacity() * sizeof(int64_t);
-        
-        // Add string allocations (flags field)
-        //std::size_t flags_mem = entry.flags.capacity();
-        
-        return base + seq_vec;// + flags_mem;
+
+// ---------- helpers used by both containers ----------
+inline std::size_t get_int64seq_mem(const int64_seq& seq) {
+    std::size_t base = sizeof(int64_seq);
+    std::size_t vec_capacity = seq.bits.capacity() * sizeof(int64_t);
+    return base + vec_capacity;
+}
+
+inline std::size_t get_bc_entry_mem(const barcode_entry& entry) {
+    std::size_t base = sizeof(barcode_entry);
+    std::size_t seq_vec = entry.barcode.bits.capacity() * sizeof(int64_t);
+    return base + seq_vec;
+}
+
+// ===================================================
+// =============== bc_multimap versions ==============
+// ===================================================
+
+template<typename Key, typename Value>
+std::size_t approx_unique(const bc_multimap<Key, Value>& m) {
+    const auto& set = m.debug_unique_values();
+    if (set.empty()) return 0;
+
+    std::size_t total_element_size = 0;
+    std::size_t sample_count = 0;
+    constexpr std::size_t max_samples = 100;
+
+    for (const auto& elem : set) {
+        total_element_size += get_bc_entry_mem(elem);
+        if (++sample_count >= max_samples) break;
     }
 
-    // Updated approx_unique with correct per-element sizing
-    template<typename Key, typename Value>
-    std::size_t approx_unique(const bc_multimap<Key, Value>& m) {
-        const auto& set = m.debug_unique_values();
-        if (set.empty()) return 0;
-        
-        // Calculate actual element sizes by sampling
-        std::size_t total_element_size = 0;
-        std::size_t sample_count = 0;
-        constexpr std::size_t max_samples = 100;
-        
-        for (const auto& elem : set) {
-            total_element_size += get_bc_entry_mem(elem);
-            if (++sample_count >= max_samples) break;
+    std::size_t avg_element_size = sample_count > 0
+        ? total_element_size / sample_count
+        : sizeof(Value);
+
+    constexpr size_t node_overhead = 16;
+    std::size_t element_memory = set.size() * (avg_element_size + node_overhead);
+
+    std::size_t estimated_buckets = static_cast<size_t>(set.size() / 0.875);
+    std::size_t bucket_memory = estimated_buckets * sizeof(void*);
+
+    constexpr size_t num_submaps = 64;
+    std::size_t submap_overhead = num_submaps * 128;
+
+    return element_memory + bucket_memory + submap_overhead;
+}
+
+template<typename Key, typename Value>
+std::size_t approx_assoc(const bc_multimap<Key, Value>& m) {
+    const auto& mm = m.debug_associations();
+    if (mm.empty()) return 0;
+
+    std::size_t total_key_size = 0;
+    std::size_t key_sample_count = 0;
+    constexpr std::size_t max_key_samples = 100;
+
+    for (const auto& [key, value_set] : mm) {
+        if constexpr (std::is_same_v<Key, int64_seq>) {
+            total_key_size += get_int64seq_mem(key);
+        } else {
+            total_key_size += sizeof(Key);
         }
-        
-        // Average element size
-        std::size_t avg_element_size = sample_count > 0 
-            ? total_element_size / sample_count 
-            : sizeof(Value);
-        
-        // Total element memory (actual heap allocations)
-        constexpr size_t node_overhead = 16;  // malloc overhead per node
-        std::size_t element_memory = set.size() * (avg_element_size + node_overhead);
-        
-        // Bucket array (load factor ~0.875)
-        std::size_t estimated_buckets = static_cast<size_t>(set.size() / 0.875);
-        std::size_t bucket_memory = estimated_buckets * sizeof(void*);
-        
-        // 64 submaps with metadata
-        constexpr size_t num_submaps = 64;
-        std::size_t submap_overhead = num_submaps * 128;
-        
-        return element_memory + bucket_memory + submap_overhead;
+        if (++key_sample_count >= max_key_samples) break;
     }
-    
-    // Updated approx_assoc with correct Key sizing
-    template<typename Key, typename Value>
-    std::size_t approx_assoc(const bc_multimap<Key, Value>& m) {
-        const auto& mm = m.debug_associations();
-        if (mm.empty()) return 0;
-        
-        // Sample keys to get average size (they contain vectors too!)
-        std::size_t total_key_size = 0;
-        std::size_t key_sample_count = 0;
-        constexpr std::size_t max_key_samples = 100;
-        
-        for (const auto& [key, value_set] : mm) {
-            if constexpr (std::is_same_v<Key, int64_seq>) {
-                total_key_size += get_int64seq_mem(key);
+
+    std::size_t avg_key_size = key_sample_count > 0
+        ? total_key_size / key_sample_count
+        : sizeof(Key);
+
+    std::size_t outer_buckets = mm.bucket_count() * sizeof(void*);
+
+    constexpr size_t node_overhead = 16;
+    std::size_t outer_nodes = mm.size() * (avg_key_size + sizeof(void*) + node_overhead);
+
+    std::size_t inner_set_memory = 0;
+    for (const auto& [key, value_set] : mm) {
+        std::size_t inner_buckets = value_set.bucket_count() * sizeof(void*);
+        std::size_t inner_elements = value_set.size() * sizeof(const Value*);
+        constexpr std::size_t set_overhead = 64;
+        inner_set_memory += inner_buckets + inner_elements + set_overhead;
+    }
+
+    constexpr size_t num_submaps = 64;
+    std::size_t submap_overhead = num_submaps * 128;
+
+    return outer_buckets + outer_nodes + inner_set_memory + submap_overhead;
+}
+
+template<typename Key, typename Value>
+void print_submap_distribution(const bc_multimap<Key, Value>& m) {
+    const auto& associations = m.debug_associations();
+    if (associations.empty()) {
+        std::cout << "No associations to analyze\n";
+        return;
+    }
+    size_t num_submaps = associations.subcnt();
+    std::vector<size_t> submap_sizes(num_submaps, 0);
+    size_t total_entries = 0;
+    try {
+        for (const auto& [k, value_set] : associations) {
+            auto hash_val = associations.hash_function()(k);
+            size_t submap_idx = hash_val & (num_submaps - 1);
+            submap_sizes[submap_idx]++;
+            total_entries++;
+        }
+    } catch (...) {
+        std::cout << "Error analyzing submap distribution\n";
+        return;
+    }
+    std::cout << "Submap distribution (" << total_entries << " total, "
+              << num_submaps << " submaps):\n";
+
+    size_t grid_cols = static_cast<size_t>(std::ceil(std::sqrt(num_submaps)));
+    size_t grid_rows = static_cast<size_t>(std::ceil(static_cast<double>(num_submaps) / grid_cols));
+
+    for (size_t row = 0; row < grid_rows; ++row) {
+        for (size_t col = 0; col < grid_cols; ++col) {
+            size_t idx = row * grid_cols + col;
+            if (idx < num_submaps) {
+                double pct = (static_cast<double>(submap_sizes[idx]) /
+                             (total_entries ? total_entries : 1)) * 100.0;
+                std::cout << std::fixed << std::setprecision(1) << std::setw(6) << pct << "%";
             } else {
-                total_key_size += sizeof(Key);
+                std::cout << "      ";
             }
-            if (++key_sample_count >= max_key_samples) break;
+            if (col < grid_cols - 1) std::cout << " ";
         }
-        
-        std::size_t avg_key_size = key_sample_count > 0 
-            ? total_key_size / key_sample_count 
-            : sizeof(Key);
-        
-        // Outer map bucket array
-        std::size_t outer_buckets = mm.bucket_count() * sizeof(void*);
-        
-        // Outer map nodes (key + ptr to inner set + malloc overhead)
-        constexpr size_t node_overhead = 16;
-        std::size_t outer_nodes = mm.size() * (avg_key_size + sizeof(void*) + node_overhead);
-        
-        // Inner flat_hash_sets - THIS IS THE BIG ONE
-        std::size_t inner_set_memory = 0;
-        for (const auto& [key, value_set] : mm) {
-            // Inner set bucket array
-            std::size_t inner_buckets = value_set.bucket_count() * sizeof(void*);
-            
-            // Pointers stored in inner set
-            std::size_t inner_elements = value_set.size() * sizeof(const Value*);
-            
-            // Set object overhead (the flat_hash_set itself)
-            constexpr std::size_t set_overhead = 64;
-            
-            inner_set_memory += inner_buckets + inner_elements + set_overhead;
-        }
-        
-        // Submap overhead
-        constexpr size_t num_submaps = 64;
-        std::size_t submap_overhead = num_submaps * 128;
-        
-        return outer_buckets + outer_nodes + inner_set_memory + submap_overhead;
-    }
-    
-        template<typename Key, typename Value>
-    void print_submap_distribution(const bc_multimap<Key, Value>& m) {
-        const auto& associations = m.debug_associations();
-        if (associations.empty()) {
-            std::cout << "No associations to analyze\n";
-            return;
-        }
-        // Get number of submaps
-        size_t num_submaps = associations.subcnt();
-        std::vector<size_t> submap_sizes(num_submaps, 0);
-        size_t total_entries = 0;
-        try {
-            // Since subsize() isn't available, count manually by iterating
-            for (const auto& [k, value_set] : associations) {
-                // Calculate which submap this key belongs to
-                auto hash_val = associations.hash_function()(k);
-                size_t submap_idx = hash_val & (num_submaps - 1);  // Assuming power of 2 submaps
-                submap_sizes[submap_idx]++;
-                total_entries++;
-            }
-        } catch (...) {
-            std::cout << "Error analyzing submap distribution\n";
-            return;
-        }
-        std::cout << "Submap distribution (" << total_entries << " total, "
-                  << num_submaps << " submaps):\n";
-        // Auto-size the grid
-        size_t grid_cols = static_cast<size_t>(std::ceil(std::sqrt(num_submaps)));
-        size_t grid_rows = static_cast<size_t>(std::ceil(static_cast<double>(num_submaps) / grid_cols));
-        // Print as grid
-        for (size_t row = 0; row < grid_rows; ++row) {
-            for (size_t col = 0; col < grid_cols; ++col) {
-                size_t idx = row * grid_cols + col;
-                if (idx < num_submaps) {
-                    double percentage = (static_cast<double>(submap_sizes[idx]) / total_entries) * 100.0;
-                    std::cout << std::fixed << std::setprecision(1) << std::setw(6) << percentage << "%";
-                } else {
-                    std::cout << "      ";
-                }
-                if (col < grid_cols - 1) std::cout << " ";
-            }
-            std::cout << "\n";
-        }
-        // Print raw counts and balance
-        std::cout << "Raw counts: [";
-        for (size_t i = 0; i < num_submaps; ++i) {
-            std::cout << submap_sizes[i];
-            if (i < num_submaps - 1) std::cout << ", ";
-        }
-        std::cout << "]\n";
-        if (num_submaps > 1) {
-            auto [min_it, max_it] = std::minmax_element(submap_sizes.begin(), submap_sizes.end());
-            double min_pct = (*min_it * 100.0) / total_entries;
-            double max_pct = (*max_it * 100.0) / total_entries;
-            double balance_ratio = (*min_it > 0) ? static_cast<double>(*max_it) / (*min_it) : 0.0;
-            std::cout << "Balance: min=" << std::fixed << std::setprecision(1) << min_pct
-                      << "%, max=" << max_pct << "%, ratio=" << std::setprecision(2) << balance_ratio << "\n";
-        }
-    }
-
-    // Enhanced memory report with breakdown
-    template<typename Key, typename Value>
-    void print_memory_report(const bc_multimap<Key, Value>& m, const std::string& name = "") {
-        if (!name.empty()) std::cout << "=== " << name << " ===\n";
-        
-        std::size_t unique_mem = approx_unique(m);
-        std::size_t assoc_mem = approx_assoc(m);
-        std::size_t total_mem = unique_mem + assoc_mem;
-        
-        std::cout << "Counts:\n";
-        std::cout << "  Unique values:    " << m.unique_val_size() << "\n";
-        std::cout << "  Associations:     " << m.association_size() << "\n";
-        
-        std::cout << "\nMemory breakdown:\n";
-        std::cout << "  Unique storage:   " << std::setw(10) << (unique_mem / 1024) << " KB  ("
-                  << std::fixed << std::setprecision(1) 
-                  << (100.0 * unique_mem / total_mem) << "%)\n";
-        std::cout << "  Association map:  " << std::setw(10) << (assoc_mem / 1024) << " KB  ("
-                  << (100.0 * assoc_mem / total_mem) << "%)\n";
-        std::cout << "  Total:            " << std::setw(10) << (total_mem / 1024) << " KB  ("
-                  << std::setprecision(2) << (total_mem / 1024.0 / 1024.0) << " MB)\n";
-        
-        // Per-entry analysis
-        if (m.unique_val_size() > 0) {
-            std::cout << "\nPer-entry costs:\n";
-            std::cout << "  Unique storage:   " << (unique_mem / m.unique_val_size()) << " bytes/entry\n";
-        }
-        if (m.association_size() > 0) {
-            std::cout << "  Association:      " << (assoc_mem / m.association_size()) << " bytes/assoc\n";
-        }
-        
-        // Sample a few entries to show actual sizes
-        std::cout << "\nSample element sizes:\n";
-        size_t sample = 0;
-        for (const auto& elem : m.debug_unique_values()) {
-            std::size_t elem_size = get_bc_entry_mem(elem);
-            std::cout << "  Entry " << sample << ": " << elem_size << " bytes "
-                      << "(barcode vec capacity: " << elem.barcode.bits.capacity() << " bits\n";
-                      //<< ", flags: " << elem.flags.capacity() << " chars)\n";
-            if (++sample >= 5) break;
-        }
-        
-        // Validation
-        size_t bad_keys = m.validate_association_keys();
-        size_t null_vals = m.validate_association_values();
-        if (bad_keys > 0 || null_vals > 0) {
-            std::cout << "\n Issues: " << bad_keys << " bad keys, " << null_vals << " null values\n";
-        }
-        
-        print_submap_distribution(m);
         std::cout << "\n";
     }
-
-    // Add this to diagnose the mutation generation memory explosion
-    inline void print_mem_snapshot(
-        const bc_multimap<int64_seq, barcode_entry>& true_bcs,
-        const bc_multimap<int64_seq, barcode_entry>& global_bcs,
-        size_t iteration) 
-    {
-        std::cout << "\n--- Iteration " << iteration << " Memory Snapshot ---\n";
-        
-        std::size_t true_unique = approx_unique(true_bcs);
-        std::size_t true_assoc = approx_assoc(true_bcs);
-        std::size_t global_unique = approx_unique(global_bcs);
-        std::size_t global_assoc = approx_assoc(global_bcs);
-        std::size_t total = true_unique + true_assoc + global_unique + global_assoc;
-        
-        std::cout << "true_bcs:   " << std::setw(8) << true_bcs.unique_val_size() << " unique, "
-                  << std::setw(8) << true_bcs.association_size() << " assoc, "
-                  << std::setw(8) << ((true_unique + true_assoc) / 1024 / 1024) << " MB\n";
-        std::cout << "global_bcs: " << std::setw(8) << global_bcs.unique_val_size() << " unique, "
-                  << std::setw(8) << global_bcs.association_size() << " assoc, "
-                  << std::setw(8) << ((global_unique + global_assoc) / 1024 / 1024) << " MB\n";
-        std::cout << "TOTAL: " << (total / 1024 / 1024) << " MB\n";
+    std::cout << "Raw counts: [";
+    for (size_t i = 0; i < num_submaps; ++i) {
+        std::cout << submap_sizes[i] << (i + 1 < num_submaps ? ", " : "");
     }
-};
+    std::cout << "]\n";
+    if (num_submaps > 1) {
+        auto [min_it, max_it] = std::minmax_element(submap_sizes.begin(), submap_sizes.end());
+        double min_pct = (total_entries ? (*min_it * 100.0 / total_entries) : 0.0);
+        double max_pct = (total_entries ? (*max_it * 100.0 / total_entries) : 0.0);
+        double balance_ratio = (*min_it > 0) ? static_cast<double>(*max_it) / (*min_it) : 0.0;
+        std::cout << "Balance: min=" << std::fixed << std::setprecision(1) << min_pct
+                  << "%, max=" << max_pct << "%, ratio=" << std::setprecision(2) << balance_ratio << "\n";
+    }
+}
+
+template<typename Key, typename Value>
+void print_memory_report(const bc_multimap<Key, Value>& m, const std::string& name = "") {
+    if (!name.empty()) std::cout << "=== " << name << " ===\n";
+
+    std::size_t unique_mem = approx_unique(m);
+    std::size_t assoc_mem  = approx_assoc(m);
+    std::size_t total_mem  = unique_mem + assoc_mem;
+
+    std::cout << "Counts:\n";
+    std::cout << "  Unique values:    " << m.unique_val_size() << "\n";
+    std::cout << "  Associations:     " << m.association_size() << "\n";
+
+    std::cout << "\nMemory breakdown:\n";
+    std::cout << "  Unique storage:   " << std::setw(10) << (unique_mem / 1024) << " KB  ("
+              << std::fixed << std::setprecision(1) << (total_mem ? (100.0 * unique_mem / total_mem) : 0.0) << "%)\n";
+    std::cout << "  Association map:  " << std::setw(10) << (assoc_mem / 1024) << " KB  ("
+              << (total_mem ? (100.0 * assoc_mem / total_mem) : 0.0) << "%)\n";
+    std::cout << "  Total:            " << std::setw(10) << (total_mem / 1024) << " KB  ("
+              << std::setprecision(2) << (total_mem / 1024.0 / 1024.0) << " MB)\n";
+
+    if (m.unique_val_size() > 0) {
+        std::cout << "\nPer-entry costs:\n";
+        std::cout << "  Unique storage:   " << (unique_mem / m.unique_val_size()) << " bytes/entry\n";
+    }
+    if (m.association_size() > 0) {
+        std::cout << "  Association:      " << (assoc_mem / m.association_size()) << " bytes/assoc\n";
+    }
+
+    std::cout << "\nSample element sizes:\n";
+    size_t sample = 0;
+    for (const auto& elem : m.debug_unique_values()) {
+        std::size_t elem_size = get_bc_entry_mem(elem);
+        std::cout << "  Entry " << sample << ": " << elem_size << " bytes "
+                  << "(barcode vec capacity: " << elem.barcode.bits.capacity() << ")\n";
+        if (++sample >= 5) break;
+    }
+
+    size_t bad_keys = m.validate_association_keys();
+    size_t null_vals = m.validate_association_values();
+    if (bad_keys > 0 || null_vals > 0) {
+        std::cout << "\n Issues: " << bad_keys << " bad keys, " << null_vals << " null values\n";
+    }
+
+    print_submap_distribution(m);
+    std::cout << "\n";
+}
+
+// ===================================================
+// ================ bc_flat_set versions =============
+// ===================================================
+
+// More direct estimate for a set: element objects + buckets
+inline std::size_t approx_unique(const bc_flat_set& fs) {
+    const auto& set = fs.debug_unique_values();
+    if (set.empty()) return 0;
+
+    std::size_t total_element_size = 0;
+    std::size_t sample_count = 0;
+    constexpr std::size_t max_samples = 100;
+
+    // Sample actual entry size (barcode_entry includes the int64_seq vector)
+    for (const auto& elem : set) {
+        total_element_size += get_bc_entry_mem(elem);
+        if (++sample_count >= max_samples) break;
+    }
+    std::size_t avg_element_size = sample_count > 0
+        ? total_element_size / sample_count
+        : sizeof(barcode_entry);
+
+    // Per-node allocator overhead (rough heuristic)
+    constexpr size_t node_overhead = 16;
+    std::size_t element_memory = set.size() * (avg_element_size + node_overhead);
+
+    // Bucket array (phmap keeps LF <= ~0.875; we just estimate)
+    std::size_t estimated_buckets = static_cast<size_t>(set.size() / 0.875);
+    std::size_t bucket_memory = estimated_buckets * sizeof(void*);
+
+    // Metadata overhead for parallel shards (phmap): estimate similar scale
+    constexpr size_t shard_overhead = 64 * 64; // 64 shards * ~64B each
+    return element_memory + bucket_memory + shard_overhead;
+}
+
+// Associations concept does not apply to a pure set.
+inline std::size_t approx_assoc(const bc_flat_set&) {
+    return 0;
+}
+
+// Reuse the fake view emitted by bc_flat_set::debug_associations()
+inline void print_submap_distribution(const bc_flat_set& fs) {
+    auto mm = fs.debug_associations();
+    if (mm.rows.empty()) {
+        std::cout << "No associations to analyze\n";
+        return;
+    }
+    size_t num_submaps = mm.subcnt(); // returns 1 in your fake view
+    std::vector<size_t> submap_sizes(num_submaps, 0);
+    size_t total_entries = 0;
+
+    for (const auto& row : mm.rows) {
+        auto hash_val = mm.hash_function()(row.k);
+        size_t submap_idx = hash_val & (num_submaps - 1);
+        submap_sizes[submap_idx]++;
+        total_entries++;
+    }
+
+    std::cout << "Submap distribution (" << total_entries << " total, "
+              << num_submaps << " submaps):\n";
+    size_t grid_cols = static_cast<size_t>(std::ceil(std::sqrt(num_submaps)));
+    size_t grid_rows = static_cast<size_t>(std::ceil(static_cast<double>(num_submaps) / grid_cols));
+    for (size_t row = 0; row < grid_rows; ++row) {
+        for (size_t col = 0; col < grid_cols; ++col) {
+            size_t idx = row * grid_cols + col;
+            if (idx < num_submaps) {
+                double pct = (static_cast<double>(submap_sizes[idx]) /
+                             (total_entries ? total_entries : 1)) * 100.0;
+                std::cout << std::fixed << std::setprecision(1) << std::setw(6) << pct << "%";
+            } else {
+                std::cout << "      ";
+            }
+            if (col < grid_cols - 1) std::cout << " ";
+        }
+        std::cout << "\n";
+    }
+    std::cout << "Raw counts: [";
+    for (size_t i = 0; i < num_submaps; ++i) {
+        std::cout << submap_sizes[i] << (i + 1 < num_submaps ? ", " : "");
+    }
+    std::cout << "]\n";
+    if (num_submaps > 1) {
+        auto [min_it, max_it] = std::minmax_element(submap_sizes.begin(), submap_sizes.end());
+        double min_pct = (total_entries ? (*min_it * 100.0 / total_entries) : 0.0);
+        double max_pct = (total_entries ? (*max_it * 100.0 / total_entries) : 0.0);
+        double balance_ratio = (*min_it > 0) ? static_cast<double>(*max_it) / (*min_it) : 0.0;
+        std::cout << "Balance: min=" << std::fixed << std::setprecision(1) << min_pct
+                  << "%, max=" << max_pct << "%, ratio=" << std::setprecision(2) << balance_ratio << "\n";
+    }
+}
+
+inline void print_memory_report(const bc_flat_set& fs, const std::string& name = "") {
+    if (!name.empty()) std::cout << "=== " << name << " ===\n";
+
+    std::size_t unique_mem = approx_unique(fs);
+    std::size_t assoc_mem  = approx_assoc(fs); // 0
+    std::size_t total_mem  = unique_mem + assoc_mem;
+
+    std::cout << "Counts:\n";
+    std::cout << "  Unique values:    " << fs.unique_val_size() << "\n";
+    std::cout << "  Associations:     " << fs.association_size() << "\n";
+
+    std::cout << "\nMemory breakdown:\n";
+    std::cout << "  Unique storage:   " << std::setw(10) << (unique_mem / 1024) << " KB  ("
+              << std::fixed << std::setprecision(1) << (total_mem ? (100.0 * unique_mem / total_mem) : 0.0) << "%)\n";
+    std::cout << "  Association map:  " << std::setw(10) << (assoc_mem / 1024) << " KB  ("
+              << (total_mem ? (100.0 * assoc_mem / total_mem) : 0.0) << "%)\n";
+    std::cout << "  Total:            " << std::setw(10) << (total_mem / 1024) << " KB  ("
+              << std::setprecision(2) << (total_mem / 1024.0 / 1024.0) << " MB)\n";
+
+    if (fs.unique_val_size() > 0) {
+        std::cout << "\nPer-entry costs:\n";
+        std::cout << "  Unique storage:   " << (unique_mem / fs.unique_val_size()) << " bytes/entry\n";
+    }
+    if (fs.association_size() > 0) {
+        std::cout << "  Association:      " << (assoc_mem / fs.association_size()) << " bytes/assoc\n";
+    }
+
+    std::cout << "\nSample element sizes:\n";
+    size_t sample = 0;
+    for (const auto& elem : fs.debug_unique_values()) {
+        std::size_t elem_size = get_bc_entry_mem(elem);
+        std::cout << "  Entry " << sample << ": " << elem_size << " bytes "
+                  << "(barcode vec capacity: " << elem.barcode.bits.capacity() << ")\n";
+        if (++sample >= 5) break;
+    }
+
+    // Flat set fake view returns 0 for validations (by design)
+    size_t bad_keys = fs.validate_association_keys();
+    size_t null_vals = fs.validate_association_values();
+    if (bad_keys > 0 || null_vals > 0) {
+        std::cout << "\n Issues: " << bad_keys << " bad keys, " << null_vals << " null values\n";
+    }
+
+    print_submap_distribution(fs);
+    std::cout << "\n";
+}
+
+// ===================================================
+// ============ Mixed/symmetric snapshot API =========
+// ===================================================
+
+// Generic snapshot that works for *any* wl types that overloads support
+// T must have unique_val_size(), association_size() and be accepted by approx_* overloads
+template <typename WLTrue, typename WLGlobal>
+inline void print_mem_snapshot(const WLTrue& true_bcs,
+                               const WLGlobal& global_bcs,
+                               size_t iteration)
+{
+    std::cout << "\n--- Iteration " << iteration << " Memory Snapshot ---\n";
+
+    std::size_t true_unique  = approx_unique(true_bcs);
+    std::size_t true_assoc   = approx_assoc(true_bcs);
+    std::size_t global_unique= approx_unique(global_bcs);
+    std::size_t global_assoc = approx_assoc(global_bcs);
+    std::size_t total        = true_unique + true_assoc + global_unique + global_assoc;
+
+    std::cout << "true_bcs:   " << std::setw(8) << true_bcs.unique_val_size() << " unique, "
+              << std::setw(8) << true_bcs.association_size() << " assoc, "
+              << std::setw(8) << ((true_unique + true_assoc) / 1024 / 1024) << " MB\n";
+    std::cout << "global_bcs: " << std::setw(8) << global_bcs.unique_val_size() << " unique, "
+              << std::setw(8) << global_bcs.association_size() << " assoc, "
+              << std::setw(8) << ((global_unique + global_assoc) / 1024 / 1024) << " MB\n";
+    std::cout << "TOTAL: " << (total / 1024 / 1024) << " MB\n";
+}
+
+} // namespace bc_mem_utils

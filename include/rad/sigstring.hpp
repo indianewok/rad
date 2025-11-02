@@ -418,10 +418,11 @@ namespace barcode_correction {
             const std::string& whitelist_source,
             const std::string& mode,
             bool verbose) {
-        
-            // Get the appropriate whitelist reference
-            const auto& whitelist = (whitelist_source == "global") ? wl->global_bcs : wl->true_bcs;
-            counter all_counts = whitelist.get_all_bc_counts(candidate);
+
+            auto all_counts = wl->with_wl(whitelist_source, [&](const auto& typed_wl) {
+                return typed_wl.get_all_bc_counts(candidate);
+            });
+
             int raw_count = all_counts.load(barcode_counts::raw);
             int total_count = all_counts.load(barcode_counts::total);
             int filtered_count = all_counts.load(barcode_counts::filtered);
@@ -430,9 +431,6 @@ namespace barcode_correction {
             if(total_count < 0 & raw_count < 2){
                return false;
             }
-
-            // KEY FIX: If this barcode has no history (total_count = 0), always pass
-            // This handles the case where we're correcting to a barcode that doesn't exist yet
 
             if (total_count == 0) {
                 if (verbose) {
@@ -450,7 +448,11 @@ namespace barcode_correction {
             //reset the counter for low-set whitelist barcodes 
             //if they accrue over a certain number of reads after getting their freebies
             if(raw_count >= 2 && total_count < 0) {
-                whitelist.set_bc_count(candidate, raw_count);
+                //whitelist_source == "global" ? wl->global_bcs.set_bc_count(candidate, raw_count) : wl->true_bcs.set_bc_count(candidate, raw_count);
+                (void) wl->with_wl(whitelist_source, [&](const auto& typed_wl) {
+                    typed_wl.set_bc_count(candidate, raw_count);
+                });
+
                 return true;
             }
 
@@ -466,8 +468,10 @@ namespace barcode_correction {
             if(total_count >= 10 & raw_count >= 2){
                 overall_pass = correction_ratio <= 0.8;
             } else if (total_count >= threshold & raw_count < 2){
+                (void) wl->with_wl(whitelist_source, [&](const auto& typed_wl) {
+                    typed_wl.set_bc_count(candidate, -1);
+                });
                 //kill it if it gets 10 freebies with no associated raw counts
-                whitelist.set_bc_count(candidate, -1);
                 return false;
             }
         return overall_pass;
@@ -485,14 +489,15 @@ resolve_multiple_hits_simple(
     auto sorted = mutation_tools::int64_lvdist(query, candidates, max_dist);
     if (sorted.empty()) return {std::nullopt, std::nullopt};
 
-    const auto& target_whitelist = (wl_type == "global") ? wl->global_bcs : wl->true_bcs;
-
     // Find candidates with raw_count > 0 at lowest edit distance
     for (const auto& [edit_dist, candidate_set] : sorted) {
         std::vector<int64_seq> valid_candidates;
-        
         for (const auto& candidate : candidate_set) {
-            int raw_count = target_whitelist.get_bc_count(candidate, barcode_counts::raw);
+
+            int raw_count = wl->with_wl(wl_type, [&](const auto& typed_wl) {
+                return typed_wl.get_bc_count(candidate, barcode_counts::raw);
+            });
+
             if (raw_count > 0) {
                 valid_candidates.push_back(candidate);
             }
@@ -529,11 +534,18 @@ resolve_multiple_hits_simple(
         const std::string& mode,
         const whitelist::wl_entry* wl = nullptr) {
         
-        // Select the appropriate whitelist based on type
-        const auto& whitelist = (whitelist_type == "global") ? wl->global_bcs : wl->true_bcs;
+
         // Early exit if whitelist is empty or no candidates match
-        auto matched = whitelist.return_putative_correct_bcs(candidates);
-        if (whitelist.empty() || matched.empty()) {
+
+        auto matched = wl->with_wl(whitelist_type, [&](const auto& typed_wl) {
+            if(!typed_wl.empty()){
+                return typed_wl.return_putative_correct_bcs(candidates);
+            } else {
+                return std::unordered_set<int64_seq>{};
+            }
+        });
+
+        if (matched.empty()) {
             return std::nullopt;
         }
         if (verbose) {
@@ -627,35 +639,27 @@ resolve_multiple_hits_simple(
     const std::string& mode,
     const whitelist::wl_entry* wl = nullptr) {
     
-    // Select the appropriate whitelist based on type
-    const auto& whitelist = (whitelist_type == "global") ? wl->global_bcs : wl->true_bcs;
-    
-    // Early exit if whitelist is empty
-    if (whitelist.empty()) {
-        return std::nullopt;
-    }
-    
-    if (verbose) {
+    auto matches = wl->with_wl(whitelist_type, [&](const auto& typed_wl) {
+        std::vector<std::pair<int64_seq, int>> match;
+        if (verbose) {
         #pragma omp critical
-        {
-            std::ostringstream oss;
-            oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK" : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK")
-                << " (checking " << whitelist.size() << " sequences)\n";
-            std::cout << oss.str();
+            {
+                std::ostringstream oss;
+                oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK" : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK")
+                    << " (checking " << typed_wl.size() << " sequences)\n";
+                std::cout << oss.str();
+            }
         }
-    }
-    
-    // Store all matches with their distances
-    std::vector<std::pair<int64_seq, int>> matches;
-    
-    // Check against all unique entries in whitelist
-    auto unique_entries = whitelist.get_unique_entries();
-    for (const auto* entry : unique_entries) {
-        int res = mutation_tools::int64_lvdist(bc, entry->barcode, max_dist);
-        if (res >= 0) {
-            matches.emplace_back(entry->barcode, res);
+
+        auto unique_entries = typed_wl.get_unique_entries();
+        for (const auto* entry : unique_entries) {
+            int res = mutation_tools::int64_lvdist(bc, entry->barcode, max_dist);
+            if (res >= 0) {
+                match.emplace_back(entry->barcode, res);
+            }
         }
-    }
+        return match;
+    });
     
     if (matches.empty()) {
         if (verbose) {
@@ -682,7 +686,6 @@ resolve_multiple_hits_simple(
     }
     
     if (matches.size() == 1) {
-        // Single match case
         auto [candidate, distance] = matches[0];
         
         if (verbose) {
@@ -726,8 +729,7 @@ resolve_multiple_hits_simple(
         // Multiple matches case - find best match(es)
         
         // Sort by distance (ascending)
-        std::sort(matches.begin(), matches.end(), 
-                 [](const auto& a, const auto& b) { return a.second < b.second; });
+        std::sort(matches.begin(), matches.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
         
         int best_distance = matches[0].second;
         
@@ -1992,6 +1994,7 @@ private:
         return direction_elements;
     }
 
+    /*
     //  update_bc_counts with whitelist selection and global filtering
     void update_bc_counts(
         SigString &sig, 
@@ -2032,6 +2035,11 @@ private:
             // Simple selection: true or global
             auto* target_whitelist = &wl.filter_bcs;
             std::string whitelist_used = "filtered";
+
+            (void) wl->with_wl(whitelist_used, [&](const auto& target_whitelist) {
+                    typed_wl.set_bc_count(candidate, -1);
+            });
+
             if (found_in_true) {
                 target_whitelist = &wl.true_bcs;
                 whitelist_used = "true";
@@ -2110,7 +2118,7 @@ private:
             }
             sig.set_type("skipped");
         }
-    }
+    }*/
 
     bool process_direction_basic(
         const std::string& direction,
@@ -2944,7 +2952,7 @@ public:
         determine_final_read_type(direction_valid, pass_counts, verbose);
         
         // Phase 5: Update barcode counts
-        update_bc_counts(*this, layout, verbose);
+        //update_bc_counts(*this, layout, verbose);
         
         if (verbose) {
             log_final_results(direction_valid, pass_counts);
@@ -3412,10 +3420,7 @@ public:
                 for (const auto& kv : layout.wl_map.maps) {
                     const std::string& class_id = kv.first;
                     auto& wl = kv.second.get();
-                    bc_mem_utils::print_memory_report(wl.true_bcs, class_id + ":true_bcs");
-                    bc_mem_utils::print_memory_report(wl.global_bcs, class_id + ":global_bcs");
-                    bc_mem_utils::print_memory_report(wl.filter_bcs, class_id + ":filter_bcs");
-
+                    bc_mem_utils::print_mem_snapshot(wl.true_bcs, wl.global_bcs, my_chunk_id);
                 }
             }
         }

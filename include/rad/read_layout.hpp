@@ -940,13 +940,13 @@ public:
 
                 std::cout << "Bad keys: " << bad_keys << ", Null values: " << null_values << std::endl;
             
-                std::printf(
+                /*std::printf(
                     "[%s] unique_set = %.2fMiB, associations = %.2fMiB, total = %.2fMiB\n",
                         kv.first.c_str(),
                     
                         memory_utils::to_mib(bc_mem_utils::approx_unique(E.true_bcs)),
                         memory_utils::to_mib(bc_mem_utils::approx_assoc(E.true_bcs))
-                );
+                );*/
                 bc_mem_utils::print_memory_report(E.true_bcs, "true_bcs");
                 memory_utils::get_rss();
 
@@ -986,9 +986,9 @@ public:
             std::unordered_set<int64_seq> seen_global;
             seen_global.reserve(entry.global_bcs.size());
             for (auto const &kv : entry.global_bcs) {
-                auto cnt = kv.second.count.load(barcode_counts::total);
+                auto cnt = kv.count.load(barcode_counts::total);
                 if (cnt > 0) {
-                    seen_global.insert(kv.second.barcode);
+                    seen_global.insert(kv.barcode);
                 }
             }
             
