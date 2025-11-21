@@ -438,6 +438,225 @@ public:
         }
     }
 
+
+    void discover_layout(const std::string& parts_csv, const std::string& fastq_path,
+                                    const std::string& output_base, size_t max_reads = 100000,
+                                    size_t chunk_size = 10000,
+                                    int num_threads = 1,
+                                    bool verbose = false) {
+        layout.clear();
+        position_map.clear();
+
+        struct PartStats {
+            std::string id;
+            std::string seq;
+            std::string rc_seq;
+            std::vector<double> forward_starts;
+            std::vector<double> forward_stops;
+            std::vector<double> reverse_starts;
+            std::vector<double> reverse_stops;
+        };
+
+        auto parts = [&]() {
+            std::vector<PartStats> parsed;
+            csv::CSVFormat fmt;
+            fmt.delimiter(',').quote('"').header_row(0);
+            csv::CSVReader reader(parts_csv, fmt);
+
+            for (auto& row : reader) {
+                if (row["id"].is_null() || row["sequence"].is_null()) {
+                    continue;
+                }
+                std::string id = row["id"].get<std::string>();
+                std::string seq = row["sequence"].get<std::string>();
+                if (id.empty() || seq.empty()) {
+                    continue;
+                }
+                std::transform(seq.begin(), seq.end(), seq.begin(), ::toupper);
+                if (verbose) {
+                    std::cout << "[generate_layout_from_parts] Found part " << id
+                              << " with length " << seq.length() << "\n";
+                }
+                parsed.push_back({id, seq, seq_utils::revcomp(seq), {}, {}, {}, {}});
+            }
+
+            if (parsed.empty()) {
+                throw std::runtime_error("No parts parsed from parts list CSV");
+            }
+            return parsed;
+        }();
+
+        auto record_alignment = [](const std::string& query,
+                                   const std::string& read_seq,
+                                   std::vector<double>& starts,
+                                   std::vector<double>& stops) {
+            if (read_seq.empty()) return;
+
+            static const EdlibEqualityPair kWildcardEqualities[] = {
+                {'N', 'A'}, {'N', 'C'}, {'N', 'G'}, {'N', 'T'},
+                {'A', 'N'}, {'C', 'N'}, {'G', 'N'}, {'T', 'N'}
+            };
+
+            EdlibAlignResult result = edlibAlign(
+                query.c_str(), query.length(),
+                read_seq.c_str(), read_seq.length(),
+                edlibNewAlignConfig(-1,
+                                    EDLIB_MODE_HW,
+                                    EDLIB_TASK_LOC,
+                                    kWildcardEqualities,
+                                    static_cast<int>(sizeof(kWildcardEqualities) / sizeof(kWildcardEqualities[0])))
+            );
+
+            if (result.status == EDLIB_STATUS_OK &&
+                result.editDistance == 0 &&
+                result.numLocations > 0) {
+                double norm_start = (static_cast<double>(result.startLocations[0]) / read_seq.length()) * 100.0;
+                double norm_stop = (static_cast<double>(result.endLocations[0]) / read_seq.length()) * 100.0;
+                starts.push_back(norm_start);
+                stops.push_back(norm_stop);
+            }
+            edlibFreeAlignResult(result);
+        };
+
+        using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
+        chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(chunk_size);
+        ChunkFunc chunk_func = [&](const std::vector<read_streaming::sequence>& chunk, const std::string&) {
+            for (const auto& read : chunk) {
+                for (auto& part : parts) {
+                    record_alignment(part.seq, read.seq, part.forward_starts, part.forward_stops);
+                    record_alignment(part.rc_seq, read.seq, part.reverse_starts, part.reverse_stops);
+                }
+            }
+        };
+        streamer.process_chunks(fastq_path, chunk_func, num_threads, max_reads);
+
+        struct OrderedPart {
+            std::string id;
+            std::string seq;
+            std::string direction;
+            double mean_start;
+            size_t dominant_hits;
+            size_t alternate_hits;
+        };
+
+        auto mean_or_zero = [](const std::vector<double>& vals) {
+            if (vals.empty()) return 0.0;
+            return std::accumulate(vals.begin(), vals.end(), 0.0) / static_cast<double>(vals.size());
+        };
+
+        auto direction_label = [](size_t fwd_hits, size_t rev_hits) {
+            double total = static_cast<double>(fwd_hits + rev_hits);
+            if (total == 0.0) return std::string("forward");
+
+            double fwd_ratio = fwd_hits / total;
+            double rev_ratio = rev_hits / total;
+            constexpr double kMinorOrientationThreshold = 0.05;  // 5%
+
+            if (fwd_hits > 0 && rev_ratio <= kMinorOrientationThreshold) return std::string("forward_only");
+            if (rev_hits > 0 && fwd_ratio <= kMinorOrientationThreshold) return std::string("reverse_only");
+
+            return (rev_hits > fwd_hits) ? std::string("reverse") : std::string("forward");
+        };
+
+        std::vector<OrderedPart> ordered_parts;
+
+        for (const auto& part : parts) {
+            size_t fwd_hits = part.forward_starts.size();
+            size_t rev_hits = part.reverse_starts.size();
+            if (fwd_hits == 0 && rev_hits == 0) {
+                if (verbose) {
+                    std::cout << "[generate_layout_from_parts] Skipping part " << part.id
+                              << " (no perfect alignments found)\n";
+                }
+                continue;
+            }
+
+            bool use_reverse = rev_hits > fwd_hits;
+            std::string chosen_direction = direction_label(fwd_hits, rev_hits);
+
+            ordered_parts.push_back({
+                part.id,
+                use_reverse ? part.rc_seq : part.seq,
+                chosen_direction,
+                use_reverse ? mean_or_zero(part.reverse_starts) : mean_or_zero(part.forward_starts),
+                use_reverse ? rev_hits : fwd_hits,
+                use_reverse ? fwd_hits : rev_hits
+            });
+        }
+
+        auto share_same_site = [](const OrderedPart& a, const OrderedPart& b) {
+            double pos_diff = std::abs(a.mean_start - b.mean_start);
+            if (pos_diff > 1.0) return false;  // within ~1% of the read length
+
+            size_t min_len = std::min(a.seq.size(), b.seq.size());
+            return a.seq.compare(0, min_len, b.seq, 0, min_len) == 0;
+        };
+
+        auto prefer_part = [](const OrderedPart& a, const OrderedPart& b) {
+            if ((a.dominant_hits + a.alternate_hits) != (b.dominant_hits + b.alternate_hits)) {
+                return (a.dominant_hits + a.alternate_hits) > (b.dominant_hits + b.alternate_hits);
+            }
+            if (a.seq.size() != b.seq.size()) {
+                return a.seq.size() > b.seq.size();
+            }
+            if (a.dominant_hits != b.dominant_hits) {
+                return a.dominant_hits > b.dominant_hits;
+            }
+            return a.id < b.id;
+        };
+
+        std::vector<OrderedPart> deduped_parts;
+        for (const auto& part : ordered_parts) {
+            bool merged = false;
+            for (auto& kept : deduped_parts) {
+                if (share_same_site(part, kept)) {
+                    if (prefer_part(part, kept)) {
+                        kept = part;
+                    }
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) {
+                deduped_parts.push_back(part);
+            }
+        }
+
+        if (deduped_parts.empty()) {
+            throw std::runtime_error("No alignments found for any parts; cannot build layout");
+        }
+
+        std::sort(deduped_parts.begin(), deduped_parts.end(), [](const OrderedPart& a, const OrderedPart& b) {
+            return a.mean_start < b.mean_start;
+        });
+
+        size_t total_forward_hits = 0;
+        size_t total_reverse_hits = 0;
+        for (const auto& part : deduped_parts) {
+            bool is_reverse = (part.direction == "reverse" || part.direction == "reverse_only");
+            total_forward_hits += is_reverse ? 0 : part.dominant_hits;
+            total_reverse_hits += is_reverse ? part.dominant_hits : 0;
+        }
+
+        std::string dominant_direction = (total_forward_hits >= total_reverse_hits) ? "forward" : "reverse";
+        int order_counter = 1;
+        layout.insert({"seq_start", "", "", 0, "static", order_counter++, dominant_direction, "start"});
+
+        for (const auto& part : deduped_parts) {
+            ReadElement elem(part.id, part.seq, "MASKED", static_cast<int>(part.seq.length()),
+                             "static", order_counter++, part.direction, part.id);
+            layout.insert(elem);
+            if (verbose) {
+                std::cout << "[generate_layout_from_parts] Inserted " << part.id
+                          << " at ~" << part.mean_start << "% (" << part.direction << ")\n";
+            }
+        }
+
+        layout.insert({"seq_stop", "", "", 0, "static", order_counter++, dominant_direction, "stop"});
+        write_to_csv(output_base, "layout");
+    }
+
+
     // Export layout to CSV
     void write_to_csv(const std::string& base_path = "", const std::string& which_file = "both") const {
         std::string path_prefix = base_path.empty() ?

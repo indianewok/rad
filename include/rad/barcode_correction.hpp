@@ -125,6 +125,11 @@ class int64_seq {
                 case 'C': result |= 1; break;
                 case 'T': result |= 2; break;
                 case 'G': result |= 3; break;
+                default:
+                    length = 0;
+                    bits.clear();
+                    bits = {0};
+                    return; // Invalid character, reset and exit
                 }
               }
               results.push_back(result);
@@ -766,14 +771,14 @@ namespace mutation_tools {
 
     
     public:
-        // ---- Size & housekeeping (names to minimize churn) ----
+        //  Size & housekeeping (names to minimize churn)
         size_t size()             const { return s.size(); }
         size_t association_size() const { return s.size(); }
         size_t unique_val_size()  const { return s.size(); }
         bool   empty()            const { return s.empty(); }
         void   clear()                  { s.clear(); }
 
-        // ---- Membership (keep names consistent with existing code) ----
+        //  Membership
         template<typename T> bool check_wl_for(const T& x) const {
             if constexpr (is_key_or_value_v<T>) {
                 const key& k = key_of_any(x);
@@ -808,7 +813,7 @@ namespace mutation_tools {
             return return_matching_barcodes(x);
         }
 
-        // ---- Insert (observed ignored; we store by true/correct barcode) ----
+        //  Insert 
         template<typename T> void insert_bc_entry(const T& /*observed*/, const value& correct) {
             if (!correct.is_valid()) return;
             s.lazy_emplace_l(correct,
@@ -827,7 +832,7 @@ namespace mutation_tools {
             insert_bc_entry(observed, std::move(v));
         }
 
-        // ---- Remove by key ----
+        // Remove by key 
         template<typename T> void remove_bc_entry(const T& observed) {
             value probe; probe.barcode = key_of(observed);
             s.erase(probe);
@@ -837,7 +842,7 @@ namespace mutation_tools {
             return s.erase(probe);
         }
 
-        // ---- Counters (mutate atomics in-place; discard refs immediately) ----
+        // Counters
         template<typename T> counter get_all_bc_counts(const T& x) const {
             value probe; probe.barcode = key_of(x);
             if (!probe.is_valid()) return counter(0);
@@ -902,7 +907,7 @@ namespace mutation_tools {
             return { value_iterator(&*it,false), value_iterator(nullptr,true) };
         }
 
-        // ---- Summaries (for your CSV writers) ----
+        // ---- Summaries (for CSV writers) ----
         std::vector<std::tuple<std::string,int,int,int,int,int,int,int,int>>
         summarize_counts(const std::unordered_set<key>* filter_keys=nullptr) const {
             using row = std::tuple<std::string,int,int,int,int,int,int,int,int>;
@@ -947,8 +952,7 @@ namespace mutation_tools {
             return rows;
         }
 
-        // ---- Minimal debug hooks so your memory report still compiles ----
-        // (We fake “unique/associations” views since it’s a set)
+        // ---- Minimal debug hooks so memory report still compiles ----
         const auto& debug_unique_values() const noexcept { return s; }
         struct fake_assoc_view {
             struct node { key k; std::vector<const value*> vals; };
@@ -978,7 +982,6 @@ namespace mutation_tools {
         template<typename K, typename V>
         void emplace(K&& k, V&& v) { insert_bc_entry(std::forward<K>(k), std::forward<V>(v)); }
 
-        // 2) Range-for support so you can iterate like `for (auto const& kv : entry.global_bcs)`
         auto begin() const { return s.begin(); }
         auto end()   const { return s.end();   }
 
@@ -1767,9 +1770,9 @@ class whitelist {
 
         // read all lines (skipping header)  
         auto lines = streaming_utils::import_text(path, SIZE_MAX);
-        if (!lines.empty()){
+        /*if (!lines.empty()){
             lines.erase(lines.begin());
-        }
+        }*/
         std::unordered_set<int64_seq> out;
         for (auto &ln : lines) {
             if (ln.empty()) continue;
@@ -1779,13 +1782,11 @@ class whitelist {
             int64_seq seq;
             if (isBitlist) {
                 try {
-                    //if(verbose) std::cout << "[load_barcodes] Loading bitlist...\n";
                     int64_t code = std::stoll(tok);
                     seq.length = default_length;
                     seq.bits   = { code };
                 } catch (...) { continue; }
             } else {
-                //if(verbose) std::cout << "[load_barcodes] Converting characters to bits...\n";
                 seq.sequence_to_bits(tok);
                 if (seq.bits.empty()) continue;
             }
@@ -1799,21 +1800,27 @@ class whitelist {
         if (sets.size() == 1) {
             auto const &A = sets[0];
             bool populate_global = false;
+            size_t data_size = A.size();
+            std::cout << "[populate_entry] Single whitelist with " << data_size << " barcodes detected.\n";
             if (A.size() >= 100000) {
                 populate_global = true;
             }
+            std::cout << "[populate_entry] Populating " << (populate_global ? "global_bcs" : "true_bcs") << "...\n";
             for (auto const &seq : A) {
                 if (seq.bits.empty()) continue;
                 barcode_entry be;
                 be.barcode = seq;
                 be.filtered = false;
-                //be.flags = "flag";
                 if(populate_global){
                     out.global_bcs.emplace(seq, std::move(be));
                 } else {
                     out.true_bcs.emplace(seq, std::move(be));
                 }
             }
+            std::cout << "[populate_entry] Population complete. Size of "
+                      << (populate_global ? "global_bcs: " + std::to_string(out.global_bcs.size())
+                                          : "true_bcs: " + std::to_string(out.true_bcs.associations.size()))
+                      << "\n";
             return;
         }
         // two lists
@@ -1830,9 +1837,7 @@ class whitelist {
                 barcode_entry be;
                 be.barcode = seq;
                 be.filtered = false;
-                //be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
-                //out.true_ref.insert(seq);
             }
             for (auto const &seq : large) {
                 //this line trims duplicate entries in global bcs
@@ -1841,7 +1846,6 @@ class whitelist {
                     barcode_entry be{};
                     be.barcode   = seq;
                     be.filtered  = false;
-                    //be.flags     = "";
                     out.global_bcs.emplace(seq, be);
                 }
             }
@@ -1855,7 +1859,6 @@ class whitelist {
                 be.filtered = false;
                 //be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
-                //out.true_ref.insert(seq);
             }
             for (auto const &seq : B) {
                 if (seq.bits.empty()) continue;
@@ -1864,7 +1867,6 @@ class whitelist {
                 be.filtered = false;
                 //be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
-                //out.true_ref.insert(seq);
             }
         }
     }

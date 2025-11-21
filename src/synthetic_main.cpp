@@ -3,5 +3,5 @@
 #include "include/rad/synthetic_generator.hpp"
 
 int main(int argc, char* argv[]) {
-    return main_synthetic_simple(argc, argv);
+    return main_synth_gen(argc, argv);
 }

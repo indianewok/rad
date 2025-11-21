@@ -323,6 +323,82 @@ public:
     }
 };
 
+// ====== minimal memory probe (no extra headers/files) ======
+namespace readmem_utils {
+    // enable/disable logging quickly
+    constexpr bool ENABLE = true;
+
+    // --- size helpers using capacity() (no fudge) ---
+    static inline size_t bytes_of(const std::string& s) noexcept { return s.capacity(); }
+
+    // specialize for your record type: read_streaming::sequence
+    static inline size_t bytes_of_rec(const read_streaming::sequence& r) noexcept {
+        return bytes_of(r.id) + bytes_of(r.comment) + bytes_of(r.seq) + bytes_of(r.qual) + sizeof(r);
+    }
+
+    template <class Vec>
+    static inline size_t bytes_of_vec(const Vec& v) noexcept {
+        using T = typename Vec::value_type;
+        size_t total = v.capacity() * sizeof(T);     // vector buffer itself
+        for (auto const& e : v) total += bytes_of_rec(e); // payloads (strings' capacities)
+        return total;
+    }
+
+    // --- global in-flight counters (bytes/chunks) ---
+    struct InFlight {
+        std::atomic<size_t> bytes{0};
+        std::atomic<size_t> chunks{0};
+        std::atomic<size_t> peak_bytes{0};
+        std::atomic<size_t> peak_chunks{0};
+
+        void add(size_t b) noexcept {
+            const size_t nb = bytes.fetch_add(b, std::memory_order_relaxed) + b;
+            const size_t nc = chunks.fetch_add(1, std::memory_order_relaxed) + 1;
+            size_t pb = peak_bytes.load(std::memory_order_relaxed);
+            while (nb > pb && !peak_bytes.compare_exchange_weak(pb, nb, std::memory_order_relaxed)) {}
+            size_t pc = peak_chunks.load(std::memory_order_relaxed);
+            while (nc > pc && !peak_chunks.compare_exchange_weak(pc, nc, std::memory_order_relaxed)) {}
+        }
+        void sub(size_t b) noexcept {
+            bytes.fetch_sub(b, std::memory_order_relaxed);
+            chunks.fetch_sub(1, std::memory_order_relaxed);
+        }
+    };
+    inline InFlight& inflight() { static InFlight g; return g; }
+
+    struct ScopedInFlight {
+        size_t b{0}; bool active{false};
+        explicit ScopedInFlight(size_t bytes) : b(bytes), active(true) { inflight().add(b); }
+        ~ScopedInFlight(){ if (active) inflight().sub(b); }
+        ScopedInFlight(const ScopedInFlight&) = delete;
+        ScopedInFlight& operator=(const ScopedInFlight&) = delete;
+    };
+
+    static inline double rss_gib() {
+        FILE* f = std::fopen("/proc/self/statm", "r");
+        if (!f) return -1.0;
+        long long size_pages=0, res_pages=0;
+        if (std::fscanf(f, "%lld %lld", &size_pages, &res_pages) != 2) { std::fclose(f); return -1.0; }
+        std::fclose(f);
+        const double page_kb = double(::sysconf(_SC_PAGESIZE)) / 1024.0;
+        const double rss_kb = res_pages * page_kb;
+        return rss_kb / (1024.0 * 1024.0);
+    }
+
+    // --- tiny logger ---
+    static inline void log_chunk(std::size_t chunk_bytes, std::size_t chunk_id=0) {
+        if (!ENABLE) return;
+        const double mb = double(chunk_bytes) / (1024.0*1024.0);
+        const double inflight_gib = double(inflight().bytes.load(std::memory_order_relaxed)) / (1024.0*1024.0*1024.0);
+        const std::size_t inflight_chunks = inflight().chunks.load(std::memory_order_relaxed);
+        const double rss = rss_gib();
+        std::fprintf(stderr,
+            "[radmem] chunk=%zu size_mb=%.2f inflight_chunks=%zu inflight_gib=%.3f rss_gib=%.3f\n",
+            chunk_id, mb, inflight_chunks, inflight_gib, rss);
+    }
+}
+
+
 /**
  * @brief Chunk-based streaming with parallel decompression
  * 
@@ -347,120 +423,7 @@ public:
     int get_mif() const {
         return max_in_flight_;
     }
-
-    void process_chunks_by_task(const std::string& input_path, 
-                       Function chunk_func, 
-                       int num_threads, 
-                       int64_t max_seqs = -1) {
-        file_streaming files(input_path, pigz_threads_);
-        read_streaming reader(files);
-        
-        std::atomic<int> chunks_in_flight{0};
-        std::atomic<int> peak_in_flight{0};
-        std::mutex flight_mutex;
-        std::condition_variable cv_flight;
-        
-        std::vector<T> chunk;
-        chunk.reserve(chunk_size_);
-        
-        // Only use backpressure if max_in_flight is positive
-        bool use_backpressure = (max_in_flight_ > 0);
-        
-        #pragma omp parallel num_threads(num_threads)
-        #pragma omp single
-        {
-            while (true) {
-                chunk.clear();
-                
-                while (chunk.size() < chunk_size_ &&
-                       (max_seqs < 0 || seqs_processed_ < (size_t)max_seqs)) {
-                    auto seq = reader.next_sequence();
-                    if (!seq) break;
-                    chunk.push_back(std::move(*seq));
-                    seqs_processed_.fetch_add(1, std::memory_order_relaxed);
-                }
-                
-                if (chunk.empty()) break;
-                
-                // Apply backpressure only if enabled
-                if (use_backpressure) {
-                    std::unique_lock<std::mutex> flight_lock(flight_mutex);
-                    cv_flight.wait(flight_lock, [&]{ 
-                        return chunks_in_flight.load() < max_in_flight_; 
-                    });
-                }
-                
-                // Track concurrency (even if backpressure disabled, for stats)
-                int current_in_flight = chunks_in_flight.fetch_add(1, std::memory_order_relaxed) + 1;
-                int current_peak = peak_in_flight.load(std::memory_order_relaxed);
-                while (current_in_flight > current_peak) {
-                    if (peak_in_flight.compare_exchange_weak(current_peak, current_in_flight)) {
-                        break;
-                    }
-                }
-                
-                auto this_chunk = std::move(chunk);
-                #pragma omp task firstprivate(this_chunk, current_in_flight)
-                {
-                    chunk_func(this_chunk, input_path);  // ← Always call with 2 params
-                    
-                    chunks_in_flight.fetch_sub(1, std::memory_order_relaxed);
-                    if (use_backpressure) {
-                        cv_flight.notify_one();
-                    }
-                }
-            }
-            
-            #pragma omp taskwait
-        }
-        
-        if (use_backpressure) {
-            std::cout << "\n[chunk_streaming] Concurrency Statistics:\n";
-            std::cout << "  Max in-flight limit: " << max_in_flight_ << "\n";
-            std::cout << "  Peak in-flight observed: " << peak_in_flight.load() << "\n";
-        } else {
-            std::cout << "\n[chunk_streaming] Concurrency Statistics:\n";
-            std::cout << "  No in-flight limit (unlimited concurrency)\n";
-            std::cout << "  Peak in-flight observed: " << peak_in_flight.load() << "\n";
-        }
-    }
-
-    void process_chunks_unsteady_depr_v2(const std::string& input_path, 
-                   Function chunk_func, 
-                   int num_threads, 
-                   int64_t max_seqs = -1) {
-        file_streaming files(input_path, pigz_threads_);
-        read_streaming reader(files);
-        
-        // Collect ALL chunks first
-        std::vector<std::vector<T>> all_chunks;
-        
-        while (true) {
-            std::vector<T> chunk;
-            chunk.reserve(chunk_size_);
-            
-            while (chunk.size() < chunk_size_ &&
-                (max_seqs < 0 || seqs_processed_ < (size_t)max_seqs)) {
-                auto seq = reader.next_sequence();
-                if (!seq) break;
-                chunk.push_back(std::move(*seq));
-                seqs_processed_.fetch_add(1, std::memory_order_relaxed);
-            }
-            
-            if (chunk.empty()) break;
-            all_chunks.push_back(std::move(chunk));
-        }
-        
-        // Now process with stable thread mapping
-        #pragma omp parallel num_threads(num_threads)
-        {
-            #pragma omp for schedule(dynamic)
-            for (size_t i = 0; i < all_chunks.size(); ++i) {
-                chunk_func(all_chunks[i], input_path);
-            }
-        }
-    }
-
+  
     void process_chunks(const std::string& input_path, 
                     Function chunk_func, 
                     int num_threads, 
@@ -504,6 +467,10 @@ public:
                         }
                         continue;
                     }
+
+                    const size_t __chunk_bytes = readmem_utils::bytes_of_vec(chunk);
+                    readmem_utils::ScopedInFlight __guard(__chunk_bytes);
+                    readmem_utils::log_chunk(__chunk_bytes /*, optional_chunk_id */);
                     chunk_func(chunk, input_path);
                 }
             }

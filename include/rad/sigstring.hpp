@@ -12,7 +12,6 @@ struct seq_element {
     std::string type;                   // Element type
     int order;                          // Position in layout
     std::string direction;              // Orientation
-    std::string flags;
     std::optional<bool> element_pass;  // Whether element passed validation
     std::optional<std::string> seq;    // Element sequence if available
     std::optional<std::string> qual;   // Element quality scores if available
@@ -25,7 +24,6 @@ struct seq_element {
         std::pair<int, int> position,
         std::string type,
         int order,
-        std::string flags,
         std::string direction,
         std::optional<bool> element_pass = std::nullopt,
         std::optional<std::string> seq = std::nullopt,
@@ -37,7 +35,6 @@ struct seq_element {
         position(position),
         type(std::move(type)),
         order(order),
-        flags(std::move(flags)),
         direction(std::move(direction)),
         element_pass(element_pass),
         seq(std::move(seq)),
@@ -2359,7 +2356,7 @@ private:
             );
             
             if (!barcode_passed) {
-                mark_element_failed(elem.class_id, "filter");
+                mark_element_failed(elem.class_id);
                 //add_failed_barcode_to_filter(elem, layout, verbose);
                 // If single barcode fails, direction fails
                 if (!has_multiple_barcodes) {
@@ -2419,7 +2416,6 @@ private:
             e.original_seq = e.seq;
             e.seq = final_bc;
             e.element_pass = true;
-            e.flags = final_wl;
         });
         
         if (verbose) {
@@ -2487,15 +2483,12 @@ private:
     }
     
     // Utility functions
-    void mark_element_failed(const std::string& class_id, const std::string& flags = "") 
-    {
+    inline void mark_element_failed(const std::string& class_id) {
         auto& id_index = sig_elements.get<sig_id_tag>();
-        id_index.modify(id_index.find(class_id), [flags](seq_element& e) {
-            e.element_pass = false;
-            if (!flags.empty()) {
-                e.flags = flags;
-            }
-        });
+        auto it = id_index.find(class_id);
+        if (it != id_index.end()) {
+            id_index.modify(it, [](seq_element& e) noexcept { e.element_pass = false; });
+        }
     }
     
     void add_failed_barcode_to_filter(const seq_element& elem, const ReadLayout& layout, bool verbose
@@ -2518,7 +2511,6 @@ private:
                 barcode_entry failed_entry;
                 failed_entry.barcode = failed_bc;
                 failed_entry.filtered = true;
-                //failed_entry.flags = "filtered";
                 
                 // Double-check that it's still not present
                 auto failed_range = wl.filter_bcs.equal_range(failed_bc);
@@ -2643,7 +2635,6 @@ public:
                     : std::make_pair(static_cast<int>(read_length), static_cast<int>(read_length)),
                 "static",
                 it->order,
-                "",
                 it->direction,
                 std::nullopt,
                 std::nullopt
@@ -2672,7 +2663,6 @@ public:
                         positions,
                         "static",
                         it->order,
-                        "",
                         it->direction,
                         true,
                         mutable_seq.substr(positions.first - 1,
@@ -2745,7 +2735,6 @@ public:
                         adjusted_positions,
                         "static",
                         it->order,
-                        "",
                         it->direction,
                         true,
                         mutable_seq.substr(adj_start - 1,
@@ -2789,7 +2778,6 @@ public:
                 {-1, -1},
                 "variable",
                 it->order,
-                "",
                 it->direction,
                 std::nullopt,
                 std::nullopt

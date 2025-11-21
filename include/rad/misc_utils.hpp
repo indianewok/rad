@@ -484,10 +484,10 @@ namespace whitelist_utils {
         //skip the header and keep it moving
         auto lines = streaming_utils::import_text(path, N + 1);
         if (lines.empty()) {
-            if(verbose) std::cerr << "[check_if_bitlist] ERROR: no lines read from “" << path << "”\n";
+            if(verbose) std::cerr << "[check_if_bitlist] ERROR: no lines read from " << path << "\n";
             return false;
         }
-        if(verbose) std::cout << "[check_if_bitlist] debug: first " << lines.size() << " raw lines from “" << path << "”:\n";
+        if(verbose) std::cout << "[check_if_bitlist] debug: first " << lines.size() << " raw lines from " << path << ":\n";
 
         for (size_t i = 0; i < lines.size(); ++i) {
             if(verbose) std::cout << "  [" << i << "]: " << lines[i] << "\n";

@@ -118,87 +118,65 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
 
 // Parse FASTQ file (regular or gzipped) and extract barcodes with OpenMP parallelization
 std::vector<extracted_bc> process_fastq(const std::string& filename, 
-                                        const std::string& primer,
-                                        int n_bases, int m_left, int m_right,
-                                        int max_reads,
-                                        int num_threads,
-                                        double max_edit_distance_ratio = 0.2,
-                                        int chunk_size = 10000
-                                        )
-{
+                                          const std::string& primer,
+                                          int n_bases, int m_left, int m_right,
+                                          int max_reads, double max_edit_distance_ratio = 0.2,
+                                          int chunk_size = 10000, int num_threads = 0) {
     std::vector<extracted_bc> results;
-
-    if (num_threads > 1) omp_set_num_threads(num_threads);
-    const int pigz_threads = (num_threads > 1 ? num_threads : 4);
-
-    std::unique_ptr<file_streaming> files_ptr;
-    std::unique_ptr<read_streaming> reader_ptr;
-    try {
-        files_ptr  = std::make_unique<file_streaming>(filename, pigz_threads);
-        reader_ptr = std::make_unique<read_streaming>(*files_ptr);
-    } catch (const std::exception& e) {
-        std::cerr << "Error: Could not open file " << filename << " (" << e.what() << ")\n";
+    gzFile fp = gzopen(filename.c_str(), "r");
+    if (!fp) {
+        std::cerr << "Error: Could not open file " << filename << std::endl;
         return results;
     }
-
-    std::cout << "Using " << omp_get_max_threads()
-              << " threads for parallel processing\n";
-
-    const std::string primer_rc = reverse_complement(primer);
-    std::vector<read_chunk> chunk;
-    chunk.reserve(chunk_size);
-
-    int64_t reads_processed  = 0;
-    int64_t chunks_processed = 0;
-
-    auto should_stop = [&](int64_t processed) -> bool {
-        return (max_reads > 0 && processed >= max_reads);
-    };
-
-    while (!should_stop(reads_processed)) {
-        chunk.clear();
-
-        // Fill a chunk (no synthetic quals; we only need id + seq)
-        for (int i = 0; i < chunk_size; ++i) {
-            if (should_stop(reads_processed)) break;
-            auto rec = reader_ptr->next_sequence();
-            if (!rec) break; // EOF
-
-            // push only id + seq (FASTQ/FASTA both OK)
-            chunk.push_back({ std::move(rec->id), std::move(rec->seq) });
-            ++reads_processed;
-        }
-
-        if (chunk.empty()) break;
-
-        ++chunks_processed;
-        if (chunks_processed % 100 == 0) {
-            std::cout << "Processed " << reads_processed << " reads in "
-                      << chunks_processed << " chunks, found "
-                      << results.size() << " barcodes so far\n";
-        }
-
-        // Process this chunk in parallel (your existing function)
-        auto chunk_results = process_read_chunk(
-            chunk,          // vector<read_chunk> {name, seq}
-            primer,
-            primer_rc,
-            n_bases,
-            m_left,
-            m_right,
-            max_edit_distance_ratio
-        );
-
-        // Merge
-        results.insert(results.end(),
-                       std::make_move_iterator(chunk_results.begin()),
-                       std::make_move_iterator(chunk_results.end()));
+    
+    // Set number of OpenMP threads
+    if (num_threads > 0) {
+        omp_set_num_threads(num_threads);
     }
-
-    std::cout << "Processing complete: " << reads_processed
-              << " reads processed, " << results.size()
-              << " barcodes extracted\n";
-
+    
+    std::cout << "Using " << omp_get_max_threads() << " threads for parallel processing" << std::endl;
+    
+    kseq_gz::kseq_t *seq = kseq_gz::kseq_init(fp);
+    std::string primer_rc = reverse_complement(primer);
+    int reads_processed = 0;
+    int chunks_processed = 0;
+    
+    while (reads_processed < max_reads || max_reads <= 0) {
+        // Read a chunk of data
+        std::vector<read_chunk> chunk;
+        chunk.reserve(chunk_size);
+        
+        for (int i = 0; i < chunk_size && (kseq_read(seq) >= 0); ++i) {
+            if (max_reads > 0 && reads_processed >= max_reads) break;
+            
+            chunk.push_back({seq->name.s, seq->seq.s});
+            reads_processed++;
+        }
+        
+        if (chunk.empty()) break;
+        
+        chunks_processed++;
+        if (chunks_processed % 100 == 0) {
+            std::cout << "Processed " << reads_processed << " reads in " 
+                      << chunks_processed << " chunks, found " << results.size() 
+                      << " barcodes so far" << std::endl;
+        }
+        
+        // Process chunk in parallel
+        auto chunk_results = process_read_chunk(chunk, primer, primer_rc, 
+                                               n_bases, m_left, m_right, 
+                                               max_edit_distance_ratio);
+        
+        // Merge results
+        results.insert(results.end(), chunk_results.begin(), chunk_results.end());
+    }
+    
+    kseq_destroy(seq);
+    gzclose(fp);
+    
+    std::cout << "Processing complete: " << reads_processed 
+              << " reads processed, " << results.size() << " barcodes extracted" << std::endl;
+    
     return results;
 }
 
@@ -1009,7 +987,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Extracting " << n_bases << " bases with margins: left=" << m_left << ", right=" << m_right << "\n";
     std::cout << "Chunk size: " << chunk_size << " reads per chunk\n";
     
-    auto barcodes = process_fastq(input_file, primer, n_bases, m_left, m_right, max_reads, num_threads, max_error, chunk_size);
+    auto barcodes = process_fastq(input_file, primer, n_bases, m_left, m_right, max_reads, max_error, chunk_size, num_threads);
     
     std::cout << "Found " << barcodes.size() << " barcodes\n";
     
