@@ -2946,263 +2946,6 @@ public:
             log_final_results(direction_valid, pass_counts);
         }
     }
-
-    //metrics parallelized over reads
-    static void sigalign_old(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
-                         std::optional<int> gen_mut, bool verbose, 
-                         int num_threads, size_t chunk_size, size_t max_reads, bool write_debug, std::string mode) {
-
-    // Output file paths
-    std::string sig_path, csv_path, metrics_path, file_out;
-    file_out = path_utils::get_fastqa_type(fastq_path);
-    std::string fastq_output_path = output_prefix + file_out;
-    bool compress_fastq = true;
-    // Initialize writers
-    std::unique_ptr<std::ofstream> metrics_file_ptr;
-    std::unique_ptr<sigstring_writing> sig_writer, csv_writer, metrics_file;
-    sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, compress_fastq, /*append=*/false, num_threads);
-
-    //auto& wl = layout.wl_map.maps.at("barcode").get();
-
-    // Initialize the parallel writer
-    parallel_writer writer;
-    
-    if(write_debug){
-        sig_path = output_prefix + ".sig";
-        csv_path = output_prefix + ".csv";
-        metrics_path = output_prefix + ".metrics.tsv";
-        sig_writer = std::make_unique<sigstring_writing>(sig_path, sigstring_writing::format::SIGSTRING, /*compress=*/false, /*append=*/false, num_threads);
-        csv_writer = std::make_unique<sigstring_writing>(csv_path, sigstring_writing::format::CSV, /*compress=*/false, /*append=*/false, num_threads);
-        // Write CSV header
-        {
-            SigString header("", 0);
-            (*csv_writer)(std::vector<SigString>{header});
-        }
-        // Open metrics file
-        metrics_file_ptr = std::make_unique<std::ofstream>(metrics_path);
-        *metrics_file_ptr << "chunk_id\tseqs_in_chunk\tseqs_passed\tread_time_ms\tprocess_time_ms\tqueue_time_ms\ttotal_time_ms\n";    
-    }
-    // Initialize file and reader
-    file_streaming files(fastq_path, num_threads);
-    read_streaming reader(files);
-    
-    // Counters
-    size_t total_reads = 0;
-    size_t total_passed = 0;
-    size_t chunk_id = 0;
-    
-    // Timing totals
-    double total_read_time = 0;
-    double total_process_time = 0;
-    double total_queue_time = 0;
-    
-    // Process chunks sequentially
-    while (true) {
-        chunk_id++;
-
-        // Start timing
-        auto start_time = std::chrono::high_resolution_clock::now();
-        
-        // Read a chunk of sequences
-        std::vector<read_streaming::sequence> chunk;
-        chunk.reserve(chunk_size);
-        
-        size_t local_count = 0;
-        while (local_count < chunk_size) {
-            if (max_reads > 0 && total_reads >= max_reads){
-                break;
-            }
-            auto seq = reader.next_sequence();
-            if (!seq) break;
-            
-            chunk.push_back(*seq);
-            local_count++;
-            total_reads++;
-        }
-        
-        // If no more sequences, break
-        if (chunk.empty()){
-            break;
-        }
-        // Read time ends here
-        auto read_end_time = std::chrono::high_resolution_clock::now();
-        
-        std::vector<SigString> results;
-        results.resize(chunk.size()); 
-        // Pre-allocate space for results
-        std::atomic<size_t> passed_count{0};
-
-        // Add counter for all processed reads
-        std::vector<SigString> full_results;
-        std::atomic<size_t> total_count{0};
-        if(write_debug) {
-            full_results.reserve(chunk.size());  // Reserve space for all results if debugging
-        }
-
-        
-        // Process the sequences in parallel
-        #pragma omp parallel num_threads(num_threads)
-        {
-            // Thread-local vector to collect passed SigStrings
-            std::vector<SigString> thread_results;
-            std::vector<SigString> debug_results;
-
-            thread_results.reserve(chunk.size() / num_threads);
-            if(write_debug){
-                debug_results.reserve(chunk.size() / num_threads);
-            }
-
-            #pragma omp for schedule(dynamic) nowait
-            for (size_t i = 0; i < chunk.size(); i++) {
-                const auto& read = chunk[i];
-                SigString sig(read.id, read.seq.length());
-                sig.sigalign_static(read, layout, verbose);
-                sig.sigalign_variable(read, layout, verbose);
-                sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode);
-                
-                //full length debug results
-                if(write_debug) {
-                    debug_results.push_back(sig);
-                }
-
-                //counting everything that's not filtered, but could be skipped
-                if (sig.read_type != "filtered") {
-                    thread_results.push_back(std::move(sig));
-                }
-            }
-
-            // Merge thread results into global results vector
-            #pragma omp critical
-            {
-                if(write_debug) {
-                    for (auto& sig : debug_results) {
-                        full_results.push_back(sig);
-                    }
-                }
-
-                for (auto& sig : thread_results) {
-                       results[passed_count++] = std::move(sig);
-                }
-                // If debugging is enabled, merge debug results
-            }
-        }
-        
-        // Resize results to actual number of passed reads
-        results.resize(passed_count);
-        total_passed += passed_count;
-        
-        // Process time ends here
-        auto process_end_time = std::chrono::high_resolution_clock::now();
-        
-        // Queue results for writing (non-blocking)
-        if (!results.empty()) {
-            if (write_debug && sig_writer && csv_writer) {
-                writer.write_all(*sig_writer, *csv_writer, fastqa_writer, full_results);
-            } else {
-                // serialize FASTQ in parallel, then enqueue once
-                auto serialize_start = std::chrono::high_resolution_clock::now();
-                // Build FASTQ strings in parallel from results
-                std::vector<std::string> fq(results.size());
-
-                #pragma omp parallel for schedule(static, 1024) num_threads(num_threads)
-                for (size_t i = 0; i < results.size(); ++i) {
-                    fq[i] = results[i].to_fastqa();
-                }
-
-                // Compact empties (sequential, cheap)
-                auto it = std::remove_if(fq.begin(), fq.end(),[](const std::string& s){ return s.empty(); });
-                fq.erase(it, fq.end());
-                auto serialize_done = std::chrono::high_resolution_clock::now();
-                // Enqueue one write job that streams each string into the sink
-                writer.write_slabs(fastqa_writer, std::move(fq));
-
-                auto enqueue_done = std::chrono::high_resolution_clock::now();
-                auto serialize_ms = std::chrono::duration_cast<std::chrono::milliseconds>(serialize_done - serialize_start).count();
-                // (2) time to push job into queue (nearly 0 unless backpressure)
-                auto enqueue_ms = std::chrono::duration_cast<std::chrono::milliseconds>(enqueue_done - serialize_done).count();
-            }
-        }
-
-        // Move queue_end_time *after* serialization+enqueue to keep accounting consistent
-        auto queue_end_time = std::chrono::high_resolution_clock::now();
-
-        // Calculate timing information
-        auto read_time_ms    = std::chrono::duration_cast<std::chrono::milliseconds>(read_end_time    - start_time).count();
-        auto process_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(process_end_time - read_end_time).count();
-        auto queue_time_ms   = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time   - process_end_time).count();
-        auto total_time_ms   = std::chrono::duration_cast<std::chrono::milliseconds>(queue_end_time   - start_time).count();
-
-        // Update totals
-        total_read_time    += read_time_ms;
-        total_process_time += process_time_ms;
-        total_queue_time   += queue_time_ms;
-    
-        // Log metrics
-        if(write_debug && metrics_file_ptr){
-            *metrics_file_ptr << chunk_id << "\t" << chunk.size() << "\t" << passed_count << "\t"
-            << read_time_ms << "\t" << process_time_ms << "\t" << queue_time_ms << "\t" << total_time_ms << "\n";
-        }
-
-        
-        // Print progress
-        std::cout << "[chunk_stats] " << chunk_id << ": processed " << chunk.size() << " reads in " 
-                  << total_time_ms / 1000.0 << " seconds ("
-                  << read_time_ms / 1000.0 << "s read, "
-                  << process_time_ms / 1000.0 << "s process, "
-                  << queue_time_ms / 1000.0 << "s queue), "
-                  << passed_count << " passed (" << (double)passed_count / chunk.size() * 100.0 << "%)" << std::endl;
-       
-            if (chunk_id % 100 == 0) {
-                // loop over all classes present in wl_map, fix for the hardcoded barcodes up top
-                for (const auto& kv : layout.wl_map.maps) {
-                    const std::string& class_id = kv.first;
-                    auto& wl = kv.second.get();
-                    bc_mem_utils::print_memory_report(wl.true_bcs, class_id + ":true_bcs");
-                }
-            }
-        // Free memory explicitly
-        std::vector<read_streaming::sequence>().swap(chunk);
-        //std::vector<read_streaming::sequence>().clear();
-        std::vector<SigString>().swap(results);
-    }
-    
-    // Wait for writer to finish all queued writes
-    writer.stop();
-    // Close metrics file
-    if (write_debug && metrics_file_ptr) {
-        metrics_file_ptr->close();
-    }
-
-   // Calculate total time
-    double total_time = total_read_time + total_process_time + total_queue_time;
-    
-    // Print summary
-    std::cout << "\n[sigalign] Performance Summary:" << std::endl;
-    std::cout << "────────────────────────────────────────────────────" << std::endl;
-    std::cout << "[sigalign] Total runtime: " << total_time / 1000.0 << " seconds" << std::endl;
-    std::cout << "[sigalign] Total chunks processed: " << chunk_id << std::endl;
-    std::cout << "[sigalign] Total reads processed: " << total_reads << std::endl;
-    std::cout << "[sigalign] Reads passing filter: " << total_passed << " (" 
-              << (total_reads > 0 ? (total_passed * 100.0 / total_reads) : 0) << "%)" << std::endl;
-    std::cout << "[sigalign] Timing breakdown:" << std::endl;
-    std::cout << "  - Read time: " << total_read_time / 1000.0 << " seconds (" 
-              << (total_read_time * 100.0 / total_time) << "%)" << std::endl;
-    std::cout << "  - Process time: " << total_process_time / 1000.0 << " seconds (" 
-              << (total_process_time * 100.0 / total_time) << "%)" << std::endl;
-    std::cout << "  - Queue time: " << total_queue_time / 1000.0 << " seconds (" 
-              << (total_queue_time * 100.0 / total_time) << "%)" << std::endl;
-    
-    if(write_debug){
-            std::cout << "\n[sigalign] Output written to:\n"
-            << "[sigalign] [sigstring]: " << sig_path << "\n"
-            << "[sigalign]       [csv]: " << csv_path << "\n"
-            << "[sigalign]     [fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n"
-            << "[sigalign]   [metrics]: " << metrics_path << std::endl;
-    } else {
-        std::cout << "\n[sigalign] Output written to:\n"
-                  << "[sigalign][fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n";
-    }
-}
     
 // metrics parallelized over reads
     static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
@@ -3214,35 +2957,39 @@ public:
     bool compress_fastq = true;
 
     std::unique_ptr<std::ofstream> metrics_file_ptr;
-    std::unique_ptr<sigstring_writing> sig_writer, csv_writer;
-    sigstring_writing fastqa_writer(
-        fastq_output_path,
-        sigstring_writing::format::FASTQA,
-        compress_fastq,
-        false,
-        num_threads
-    );
+    std::unique_ptr<sigstring_writing> debug_sig_writer, debug_csv_writer, debug_fastqa_writer;
 
-    parallel_writer writer;
+    sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, compress_fastq, false, num_threads);
 
     if (write_debug) {
-        std::string sig_path = output_prefix + ".sig";
-        std::string csv_path = output_prefix + ".csv";
+        std::string sig_path = output_prefix + "_dbg.sig";
+        std::string csv_path = output_prefix + "_dbg.csv";
+        std::string fastq_debug_path = output_prefix + "_dbg" + file_out;
         std::string metrics_path = output_prefix + ".metrics.tsv";
 
-        sig_writer = std::make_unique<sigstring_writing>(
-            sig_path, sigstring_writing::format::SIGSTRING, false, false, num_threads);
-        csv_writer = std::make_unique<sigstring_writing>(
-            csv_path, sigstring_writing::format::CSV, false, false, num_threads);
+        debug_sig_writer = std::make_unique<sigstring_writing>(sig_path, sigstring_writing::format::SIGSTRING,
+            compress_fastq, false, num_threads
+        );
 
+        debug_csv_writer = std::make_unique<sigstring_writing>(csv_path, sigstring_writing::format::CSV,
+            compress_fastq, false, num_threads
+        );
+
+        //adding header to the debug csv
         {
             SigString header("", 0);
-            (*csv_writer)(std::vector<SigString>{header});
+            (*debug_csv_writer)(std::vector<SigString>{header});
         }
-        
+
+        debug_fastqa_writer = std::make_unique<sigstring_writing>(fastq_debug_path, sigstring_writing::format::FASTQA,
+            compress_fastq, false, num_threads
+        );
+
         metrics_file_ptr = std::make_unique<std::ofstream>(metrics_path);
         *metrics_file_ptr << "chunk_id\tseqs_in_chunk\tseqs_passed\tin_flight\tprocess_time_ms\tqueue_time_ms\ttotal_time_ms\trss_mb\n";
     }
+
+    parallel_writer writer;
 
     int pigz_threads = (num_threads > 0 ? num_threads : 1);
     if (const char* e = std::getenv("RAD_PIGZ_THREADS")) {
@@ -3345,8 +3092,25 @@ public:
 
         // === CONSOLIDATE AND WRITE ===
         if (passed_count > 0) {
-            if (write_debug && sig_writer && csv_writer) {
-                writer.write_all(*sig_writer, *csv_writer, fastqa_writer, debug_sigs);
+            if (write_debug) {
+                /*size_t total_size = 0;
+
+                for (auto& buf : thread_buffers) {
+                    total_size += buf.size();
+                }
+
+                std::string consolidated;
+                consolidated.reserve(total_size);
+                for (auto& buf : thread_buffers) {
+                    consolidated.append(buf);
+                    std::string().swap(buf);
+                }*/
+
+                // Now serialize sigstrings / csv
+                //std::vector<std::string> slabs;
+                //slabs.emplace_back(std::move(consolidated));
+                writer.write_debug(debug_sig_writer.get(), debug_csv_writer.get(), debug_fastqa_writer.get(), debug_sigs);
+
             } else {
                 size_t total_size = 0;
                 for (const auto& buf : thread_buffers) {
@@ -3362,7 +3126,6 @@ public:
                         std::string().swap(buf);
                     }
                 }
-                
                 writer.write_raw_string(fastqa_writer, std::move(consolidated));
             }
         }

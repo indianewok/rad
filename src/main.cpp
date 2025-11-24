@@ -19,6 +19,7 @@ static void usage(const char* prog) {
       << "  -d, --dir                         output directory (default: current directory)\n"
       << "  -w, --write_dbg                   writes all debug .sig files, metrics.tsv, and .csv (debug only)\n"
       << "  -b, --bc_split                    write reads into per-barcode FASTQ files\n"
+      << "  -L, --layout-only                 display layout structure and exit (no processing)\n"
       << "  -t, --threads                     number of threads (default: 1)\n"
       << "  -v, --verbose                     verbose mode\n"
       << "  -D, --max_verbose                 max verbose level (debug only)\n"
@@ -27,14 +28,14 @@ static void usage(const char* prog) {
 
 int main(int argc, char* argv[]) {
     std::string layout_key, fastq_path, custom_kit, global_whitelist_path, custom_whitelist_path, output_prefix, output_dir;
-    bool verbose = false, max_verbose = false, split_bc = false, write_debug = false;
+    bool verbose = false, max_verbose = false, split_bc = false, write_debug = false, layout_only = false;
     std::optional<int> wl_mut, gen_mut;
     int nthreads = 1;
     size_t max_reads = -1;  // -1 means unlimited
     size_t chunk_size = 5000;  // Default chunk size
     std::string bc_corr_mode = "offensive"; // default mode
 
-    const char* optstring = "l:q:k:g:c:R:M:m:S:s:n:z:o:d:w:bt:vDh";
+    const char* optstring = "l:q:k:g:c:R:M:m:S:s:n:z:o:d:wbLt:vDh";
     struct option longopts[] = {
         {"layout",                      required_argument, nullptr, 'l'},
         {"fastq",                       required_argument, nullptr, 'q'},
@@ -50,6 +51,7 @@ int main(int argc, char* argv[]) {
         {"dir",                         required_argument, nullptr, 'd'},
         {"write_dbg",                   no_argument,       nullptr, 'w'},
         {"bc_split",                    no_argument,       nullptr, 'b'},
+        {"layout-only",                 no_argument,       nullptr, 'L'},
         {"threads",                     required_argument, nullptr, 't'},
         {"verbose",                     no_argument,       nullptr, 'v'},
         {"max_verbose",                 no_argument,       nullptr, 'D'},
@@ -74,6 +76,7 @@ int main(int argc, char* argv[]) {
           case 'd': output_dir             = optarg;            break;
           case 'w': write_debug            = true;              break;
           case 'b': split_bc               = true;              break;
+          case 'L': layout_only            = true;              break;
           case 't': nthreads               = std::stoi(optarg); break;
           case 'v': verbose                = true;              break;
           case 'D': max_verbose            = true;              break;
@@ -82,6 +85,53 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // For layout-only mode, we only need the layout file
+    if (layout_only) {
+        if (layout_key.empty()) {
+            std::cerr << "[ERROR] --layout is required for --layout-only mode\n\n";
+            usage(argv[0]);
+            return 1;
+        }
+
+        std::cout << "[layout-only] Displaying layout structure...\n\n";
+        
+        try {
+            ReadLayout read_layout;
+            std::string layout_csv;
+            
+            // Determine if it's a built-in layout or custom path
+            if (!config_utils::check_if_custom_rl(layout_key)) {
+                layout_csv = config_utils::get_read_layout(layout_key);
+                std::cout << "[layout-only] Using built-in layout: " << layout_key << "\n";
+            } else {
+                layout_csv = layout_key;
+                std::cout << "[layout-only] Using custom layout: " << layout_key << "\n";
+            }
+            
+            // Prep layout with full verbosity
+            read_layout.prep_new_layout(layout_csv, true);
+            
+            std::cout << "\n";
+            std::cout << "========================================\n";
+            std::cout << "         LAYOUT STRUCTURE               \n";
+            std::cout << "========================================\n\n";
+            
+            // Display the layout
+            read_layout.display_read_layout();
+            
+            std::cout << "\n========================================\n";
+            std::cout << "Layout contains " << read_layout.size() << " elements\n";
+            std::cout << "========================================\n";
+            
+            return 0;
+        }
+        catch (const std::exception &ex) {
+            std::cerr << "[ERROR] Failed to display layout: " << ex.what() << "\n";
+            return 1;
+        }
+    }
+
+    // Normal mode requires both layout and fastq
     if (layout_key.empty() || fastq_path.empty()) {
         std::cerr << "[ERROR] --layout and --fastq are required\n\n";
         usage(argv[0]);

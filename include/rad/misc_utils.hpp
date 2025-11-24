@@ -551,8 +551,8 @@ namespace config_utils {
         {"three_prime", "resources/read_layout/three_prime_read_layout.csv" },
         {"splitseq", "resources/read_layout/splitseq_read_layout.csv" },
         {"curio_sc", "resources/read_layout/curio_sc_read_layout.csv" },
-        {"curio_trekker", "resources/read_layout/curio_trekker_read_layout.csv"}
-
+        {"curio_trekker", "resources/read_layout/curio_trekker_read_layout.csv"},
+        {"nb_nanopore_bulk", "resources/read_layout/np_bulk_read_layout.csv" }
     };
 
     // check if the layout is a custom one

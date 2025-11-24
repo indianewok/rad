@@ -3,6 +3,10 @@
 
 /**
  * @brief Represents a position in the ReadLayout. Each string from position strings is processed in this manner.
+ * @param ref_id Reference element ID this position is based on
+ * @param is_start True if this is a start position, false for stop
+ * @param offset Offset from the reference position
+ * @param add_flags Additional flags (e.g., "terminal_linked", "skipped")
  */
 struct ParsedPosition {
     std::string ref_id; // Reference element ID this position is based on
@@ -99,10 +103,12 @@ struct ReferencePositions {
 
 /**
  * @brief These are alignment positions for start and stop info in non-variable regions.
+ * @param start_stats `std::pair<double,double>` Mean and variance of start positions
+ * @param stop_stats `std::pair<double,double>` Mean and variance of stop positions
  */
 struct AlignmentPositions {
-    std::pair<double, double> start_stats;  // mean, variance
-    std::pair<double, double> stop_stats;   // mean, variance
+    std::pair<double, double> start_stats;
+    std::pair<double, double> stop_stats;
 };
 
 // Multi-index container tags
@@ -114,7 +120,6 @@ struct direction_tag {};        // Tag for accessing by direction
 struct global_class_tag {};     // Tag for accessing by global class
 struct dir_order_tag {};        // Tag for accessing by order...and direction
 
-
 /**
  * @brief Core element structure for read processing.
  * @brief This structure is used to store information about each element in the read layout.
@@ -125,6 +130,7 @@ struct dir_order_tag {};        // Tag for accessing by order...and direction
  * @param type Element type (e.g., "static", "variable")
  * @param order Position in the layout
  * @param direction Orientation ("forward" or "reverse")
+ * @param unidirectional Whether the element is unidirectional ("forward_only" or "reverse_only")
  * @param global_class Global classification
  * @param whitelist_path Path to whitelist file (if applicable)
  * @param misalignment_threshold Threshold for misalignment detection
@@ -141,6 +147,7 @@ struct ReadElement {
     std::string type;            // Element type (e.g., "static", "variable")
     int order;                   // Position in the layout
     std::string direction;       // Orientation ("forward" or "reverse")
+    bool unidirectional;     // Whether the element is unidirectional
     std::string global_class;    // Global classification
     std::string whitelist_path;     //path to whitelist_file (if applicable)
     std::optional<std::tuple<int, int, int>> misalignment_threshold;  // Threshold for misalignment detection
@@ -158,6 +165,7 @@ struct ReadElement {
         const std::string& direction,
         const std::string& global_class,
         const std::string& whitelist_path = "",
+        const bool unidirectional = false,
         const std::optional<std::tuple<int, int, int>>& misalignment_threshold = std::nullopt,
         const std::optional<AlignmentPositions>& aligned_positions = std::nullopt,
         const std::optional<AlignmentPositions>& misaligned_positions = std::nullopt,
@@ -171,6 +179,7 @@ struct ReadElement {
         direction(std::move(direction)),
         global_class(std::move(global_class)),
         whitelist_path(std::move(whitelist_path)),
+        unidirectional(unidirectional),
         aligned_positions(aligned_positions),
         misaligned_positions(misaligned_positions),
         misalignment_threshold(misalignment_threshold),
@@ -220,6 +229,9 @@ typedef boost::multi_index::multi_index_container<
 
 /**
  * @brief Class for managing ReadLayout operations
+ * @param wl_map Whitelist map for barcode correction
+ * @param layout Multi-index container for read layout elements
+ * @param position_map Map of reference positions
  */
 class ReadLayout {
 public:
@@ -276,6 +288,8 @@ public:
         std::unordered_map<std::string, int> class_id_counts;
         std::unordered_map<std::string, int> class_id_total_counts;
         bool build_forward_only, build_reverse_only = false;
+        std::vector<std::pair<ReadElement, size_t>> deferred_reverse_only;
+        std::unordered_set<std::string> single_sided_ids;
 
         auto log_elem = [&](const ReadElement &e){
             std::cout << "[element] order=" << e.order
@@ -302,6 +316,9 @@ public:
         format.delimiter(',').header_row(1);
         csv::CSVReader reader(input_file, format);
 
+        const auto& headers = reader.get_col_names();
+        bool has_direction = std::find(headers.begin(), headers.end(), "direction") != headers.end();
+
         // First pass: Collect total counts of class_ids
         std::vector<csv::CSVRow> rows;
         for (auto& row : reader) {
@@ -316,6 +333,7 @@ public:
         ReadElement seq_start("seq_start", "", "", 0, "static", order_counter++, "forward", "start");
         //if(!build_reverse_only) 
         layout.insert(seq_start);
+        size_t row_idx = 0;
 
         // Process forward elements
         for (auto& row : rows) {
@@ -324,9 +342,24 @@ public:
             std::transform(seq.begin(), seq.end(), seq.begin(), ::toupper);
             std::string type = row["type"].is_null() ? "variable" : row["type"].get<std::string>();
             std::string global_class = row["class"].is_null() ? "" : row["class"].get<std::string>();
-            std::string direction = "forward";
+            std::string direction = (!has_direction || row["direction"].is_null()) ? "forward" : row["direction"].get<std::string>();
+            std::transform(direction.begin(), direction.end(), direction.begin(), ::tolower);
             std::string class_id = row["class"].is_null() ? id : row["class"].get<std::string>();
             std::string whitelist_path = row["whitelist"].is_null() ? "" : row["whitelist"].get<std::string>();
+
+            bool is_forward_only = (direction == "forward_only");
+            bool is_reverse_only = (direction == "reverse_only");
+            bool unidirectional = is_forward_only || is_reverse_only;
+            
+            std::string normalized_direction = direction;
+
+            if (is_forward_only){
+                normalized_direction = "forward";
+            }
+            if (is_reverse_only) {
+                normalized_direction = "reverse";
+            }
+
 
             // Fill empty class, class_id, or expected length
             std::optional<int> expected_length;
@@ -367,17 +400,32 @@ public:
             }
             std::string masked_seq = (type == "static" && global_class != "poly_tail") ? "MASKED" : "";
 
-            ReadElement elem(class_id, seq, masked_seq, expected_length, type, order_counter++, direction, global_class, whitelist_path);
-            //if(!build_reverse_only) 
-            layout.insert(elem);
-            if (verbose) {
-                std::cout << "[read_layout] Inserted element: ";
-                log_elem(elem);
+           ReadElement elem(class_id, seq, masked_seq, expected_length, type, order_counter, normalized_direction, global_class, whitelist_path, unidirectional);
+
+            if (is_forward_only) {
+                single_sided_ids.insert(elem.class_id);
+                ++order_counter;
+                layout.insert(elem);
+                if (verbose) {
+                    std::cout << "[read_layout] Inserted element: ";
+                    log_elem(elem);
+                }
+            } else if (is_reverse_only) {
+                single_sided_ids.insert(elem.class_id);
+                deferred_reverse_only.push_back({elem, row_idx});
+            } else {
+                ++order_counter;
+                layout.insert(elem);
+                if (verbose) {
+                    std::cout << "[read_layout] Inserted element: ";
+                    log_elem(elem);
+                }
             }
+            ++row_idx;
         }
+
         // Insert seq_stop
         ReadElement seq_stop("seq_stop", "", "", 0, "static", order_counter++, "forward", "stop");
-        //if(!build_reverse_only) 
         layout.insert(seq_stop);
         if(build_forward_only){
             std::cout << "[prep_new_layout] Forward-only (R1) layout generated.\n";
@@ -390,6 +438,13 @@ public:
         const auto& ordered_index = by_order();
 
         for (const auto& elem : ordered_index) {
+            if (single_sided_ids.count(elem.class_id) || elem.direction != "forward") {
+                if (verbose) {
+                    std::cout << "[prep_new_layout] Skipping reverse-complement generation for "
+                              << elem.class_id << " (direction = " << elem.direction << ")\n";
+                }
+                continue;
+            }
             ReadElement reverse_elem = elem;
             reverse_elem.direction = "reverse";
             if (elem.class_id == "poly_t") {
@@ -401,7 +456,9 @@ public:
                 reverse_elem.seq = "T{" + std::to_string(elem.expected_length.value_or(12)) + ",}+";
                 reverse_elem.class_id = "poly_t";
             } else {
-                reverse_elem.seq = seq_utils::revcomp(elem.seq);
+                if(!elem.unidirectional){
+                    reverse_elem.seq = seq_utils::revcomp(elem.seq);
+                }
                 reverse_elem.class_id = "rc_" + elem.class_id;
             }
             reverse_elements.push_back(reverse_elem);
@@ -423,6 +480,20 @@ public:
                 log_elem(reverse_elem);
             }
         }
+
+        order_counter = reverse_order_start;
+        std::sort(deferred_reverse_only.begin(), deferred_reverse_only.end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
+        for (auto elem_pair : deferred_reverse_only) {
+            auto elem = elem_pair.first;
+            elem.order = order_counter++;
+            layout.insert(elem);
+            if (verbose) {
+                std::cout << "[read_layout] Inserted element: ";
+                log_elem(elem);
+            }
+        }
+
         if (build_reverse_only) {
             // Get the index keyed on direction:
             auto& dir_index = layout.get<direction_tag>();
@@ -438,12 +509,8 @@ public:
         }
     }
 
-
-    void discover_layout(const std::string& parts_csv, const std::string& fastq_path,
-                                    const std::string& output_base, size_t max_reads = 100000,
-                                    size_t chunk_size = 10000,
-                                    int num_threads = 1,
-                                    bool verbose = false) {
+    void discover_layout(const std::string& parts_csv, const std::string& fastq_path, const std::string& output_base, 
+        size_t max_reads = 25000, size_t chunk_size = 2000, int num_threads = 1, bool verbose = false) {
         layout.clear();
         position_map.clear();
 
@@ -464,18 +531,18 @@ public:
             csv::CSVReader reader(parts_csv, fmt);
 
             for (auto& row : reader) {
-                if (row["id"].is_null() || row["sequence"].is_null()) {
+                if (row["id"].is_null() || row["seq"].is_null()) {
                     continue;
                 }
                 std::string id = row["id"].get<std::string>();
-                std::string seq = row["sequence"].get<std::string>();
+                std::string seq = row["seq"].get<std::string>();
                 if (id.empty() || seq.empty()) {
                     continue;
                 }
                 std::transform(seq.begin(), seq.end(), seq.begin(), ::toupper);
                 if (verbose) {
-                    std::cout << "[generate_layout_from_parts] Found part " << id
-                              << " with length " << seq.length() << "\n";
+                    std::cout << "[generate_layout_from_parts] Part: " << id
+                              << " Length:  " << seq.length() << " Seq: " << seq << "\n";
                 }
                 parsed.push_back({id, seq, seq_utils::revcomp(seq), {}, {}, {}, {}});
             }
@@ -504,11 +571,12 @@ public:
                                     EDLIB_MODE_HW,
                                     EDLIB_TASK_LOC,
                                     kWildcardEqualities,
-                                    static_cast<int>(sizeof(kWildcardEqualities) / sizeof(kWildcardEqualities[0])))
+                                    8)
             );
+            int max_allowed_edits = static_cast<int>(query.length() * 0.1);
 
             if (result.status == EDLIB_STATUS_OK &&
-                result.editDistance == 0 &&
+                result.editDistance <= max_allowed_edits &&
                 result.numLocations > 0) {
                 double norm_start = (static_cast<double>(result.startLocations[0]) / read_seq.length()) * 100.0;
                 double norm_stop = (static_cast<double>(result.endLocations[0]) / read_seq.length()) * 100.0;
@@ -520,7 +588,10 @@ public:
 
         using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
         chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(chunk_size);
+        size_t total_reads = 0;
+
         ChunkFunc chunk_func = [&](const std::vector<read_streaming::sequence>& chunk, const std::string&) {
+            total_reads += chunk.size();
             for (const auto& read : chunk) {
                 for (auto& part : parts) {
                     record_alignment(part.seq, read.seq, part.forward_starts, part.forward_stops);
@@ -532,6 +603,7 @@ public:
 
         struct OrderedPart {
             std::string id;
+            std::string class_id;
             std::string seq;
             std::string direction;
             double mean_start;
@@ -570,18 +642,37 @@ public:
                 }
                 continue;
             }
+            auto forw_ratio = static_cast<double>(fwd_hits) /
+                               static_cast<double>(fwd_hits + rev_hits);
+                               
+            auto rev_ratio = static_cast<double>(rev_hits) /
+                               static_cast<double>(fwd_hits + rev_hits);
 
-            bool use_reverse = rev_hits > fwd_hits;
-            std::string chosen_direction = direction_label(fwd_hits, rev_hits);
+            // Record a forward-oriented entry if it has any support.
+            if (fwd_hits > 0) {
+                ordered_parts.push_back({
+                    part.id,
+                    part.id,
+                    part.seq,
+                    (forw_ratio >= 0.95 ? std::string("forward_only") : std::string("forward")),
+                    mean_or_zero(part.forward_starts),
+                    fwd_hits,
+                    rev_hits
+                });
+            }
 
-            ordered_parts.push_back({
-                part.id,
-                use_reverse ? part.rc_seq : part.seq,
-                chosen_direction,
-                use_reverse ? mean_or_zero(part.reverse_starts) : mean_or_zero(part.forward_starts),
-                use_reverse ? rev_hits : fwd_hits,
-                use_reverse ? fwd_hits : rev_hits
-            });
+            // Record a reverse-oriented entry if it has any support.
+            if (rev_hits > 0) {
+                ordered_parts.push_back({
+                    part.id,
+                    "rc_" + part.id,
+                    part.rc_seq,
+                    (rev_ratio >= 0.95 ? std::string("reverse_only") : std::string("reverse")),
+                    mean_or_zero(part.reverse_starts),
+                    rev_hits,
+                    fwd_hits
+                });
+            }
         }
 
         auto share_same_site = [](const OrderedPart& a, const OrderedPart& b) {
@@ -622,40 +713,243 @@ public:
             }
         }
 
+        // Remove subset/overlapping elements that sit at the same site but are weaker.
+        std::vector<bool> drop(deduped_parts.size(), false);
+        for (size_t i = 0; i < deduped_parts.size(); ++i) {
+            if (drop[i]) continue;
+            for (size_t j = i + 1; j < deduped_parts.size(); ++j) {
+                if (drop[j]) continue;
+
+                const auto& a = deduped_parts[i];
+                const auto& b = deduped_parts[j];
+                if (std::abs(a.mean_start - b.mean_start) > 1.0) continue;
+
+                bool a_contains_b = a.seq.find(b.seq) != std::string::npos;
+                bool b_contains_a = b.seq.find(a.seq) != std::string::npos;
+                if (!a_contains_b && !b_contains_a) continue;
+
+                const auto& keep = prefer_part(a, b) ? a : b;
+                const auto& drop_elem = (&keep == &a) ? b : a;
+
+                drop[(&keep == &a) ? j : i] = true;
+                if (verbose) {
+                    std::cout << "[generate_layout_from_parts] Dropping subset element "
+                              << drop_elem.class_id << " at ~" << drop_elem.mean_start
+                              << "% in favor of " << keep.class_id << "\n";
+                }
+            }
+        }
+        {
+            std::vector<OrderedPart> kept;
+            for (size_t i = 0; i < deduped_parts.size(); ++i) {
+                if (!drop[i]) kept.push_back(deduped_parts[i]);
+            }
+            deduped_parts.swap(kept);
+        }
+
         if (deduped_parts.empty()) {
             throw std::runtime_error("No alignments found for any parts; cannot build layout");
         }
 
-        std::sort(deduped_parts.begin(), deduped_parts.end(), [](const OrderedPart& a, const OrderedPart& b) {
-            return a.mean_start < b.mean_start;
-        });
-
-        size_t total_forward_hits = 0;
-        size_t total_reverse_hits = 0;
+        const double min_hit_fraction = 0.5;      // At least 50% of sampled reads
+        const size_t min_absolute_hits = 3;         // And at least 3 total hits
+        std::vector<OrderedPart> filtered_parts;
         for (const auto& part : deduped_parts) {
-            bool is_reverse = (part.direction == "reverse" || part.direction == "reverse_only");
-            total_forward_hits += is_reverse ? 0 : part.dominant_hits;
-            total_reverse_hits += is_reverse ? part.dominant_hits : 0;
+            size_t total_hits = part.dominant_hits + part.alternate_hits;
+            bool keep = total_hits >= min_absolute_hits;
+            if (total_reads > 0) {
+                keep = keep &&
+                       (static_cast<double>(total_hits) >= min_hit_fraction * static_cast<double>(total_reads));
+            }
+
+            if (!keep) {
+                if (verbose) {
+                    std::cout << "[generate_layout_from_parts] Filtering " << part.class_id
+                              << " (support=" << total_hits
+                              << ", sampled_reads=" << total_reads << ")\n";
+                }
+                continue;
+            } else {
+                if (verbose) {
+                    std::cout << "[generate_layout_from_parts] Keeping " << part.class_id
+                              << " (support=" << total_hits
+                              << ", sampled_reads=" << total_reads << ")\n";
+                }
+            }
+            filtered_parts.push_back(part);
         }
 
-        std::string dominant_direction = (total_forward_hits >= total_reverse_hits) ? "forward" : "reverse";
-        int order_counter = 1;
-        layout.insert({"seq_start", "", "", 0, "static", order_counter++, dominant_direction, "start"});
+        if (filtered_parts.empty()) {
+            throw std::runtime_error("All candidate parts were filtered as spurious; cannot build layout");
+        }
+
+        deduped_parts.swap(filtered_parts);
+
+        std::unordered_map<std::string, OrderedPart> base_parts_by_id;
+        std::unordered_map<std::string, OrderedPart> forward_only_by_id;
+        std::unordered_map<std::string, OrderedPart> reverse_only_by_id;
 
         for (const auto& part : deduped_parts) {
-            ReadElement elem(part.id, part.seq, "MASKED", static_cast<int>(part.seq.length()),
-                             "static", order_counter++, part.direction, part.id);
-            layout.insert(elem);
-            if (verbose) {
-                std::cout << "[generate_layout_from_parts] Inserted " << part.id
-                          << " at ~" << part.mean_start << "% (" << part.direction << ")\n";
+            if (part.direction == "forward_only") {
+                auto it = forward_only_by_id.find(part.id);
+                if (it == forward_only_by_id.end() || prefer_part(part, it->second)) {
+                    forward_only_by_id[part.id] = part;
+                }
+                continue;
+            }
+            if (part.direction == "reverse_only") {
+                auto it = reverse_only_by_id.find(part.class_id);
+                if (it == reverse_only_by_id.end() || prefer_part(part, it->second)) {
+                    reverse_only_by_id[part.class_id] = part;
+                }
+                continue;
+            }
+            if (part.direction != "forward") {
+                continue;
+            }
+
+            auto it = base_parts_by_id.find(part.id);
+            if (it == base_parts_by_id.end() || prefer_part(part, it->second)) {
+                base_parts_by_id[part.id] = part;
             }
         }
 
-        layout.insert({"seq_stop", "", "", 0, "static", order_counter++, dominant_direction, "stop"});
+        std::vector<OrderedPart> base_parts;
+        base_parts.reserve(base_parts_by_id.size());
+        for (const auto& kv : base_parts_by_id) {
+            base_parts.push_back(kv.second);
+        }
+
+        if (base_parts.empty()) {
+            throw std::runtime_error("No forward-oriented parts available to seed layout");
+        }
+
+        std::sort(base_parts.begin(), base_parts.end(), [](const OrderedPart& a, const OrderedPart& b) {
+            return a.mean_start < b.mean_start;
+        });
+
+        std::filesystem::path tmp_layout =
+            std::filesystem::temp_directory_path() / "rad_parts_forward_layout.csv";
+        {
+            std::ofstream tmp(tmp_layout);
+            tmp << "Read Layout\nid,seq,masked_seq,expected_length,type,class,direction,class_id,whitelist,order\n";
+            int tmp_order = 1;
+            for (const auto& part : base_parts) {
+                std::string seq = part.seq;
+                if (part.direction == "reverse") {
+                    continue;
+                }
+                tmp << part.id << ","
+                    << seq << ","
+                    << "" << ","
+                    << seq.length() << ","
+                    << "static,"
+                    << part.id << ","
+                    << "forward,"
+                    << part.id << ",,"
+                    << tmp_order++ << "\n";
+            }
+        }
+
+        prep_new_layout(tmp_layout.string(), verbose);
+
+        auto forward_only_parts = [&]() {
+            std::vector<OrderedPart> parts;
+            parts.reserve(forward_only_by_id.size());
+            for (const auto& kv : forward_only_by_id) parts.push_back(kv.second);
+            std::sort(parts.begin(), parts.end(), [](const OrderedPart& a, const OrderedPart& b) {
+                return a.mean_start < b.mean_start;
+            });
+            return parts;
+        }();
+
+        auto reverse_only_parts = [&]() {
+            std::vector<OrderedPart> parts;
+            parts.reserve(reverse_only_by_id.size());
+            for (const auto& kv : reverse_only_by_id) parts.push_back(kv.second);
+            std::sort(parts.begin(), parts.end(), [](const OrderedPart& a, const OrderedPart& b) {
+                return a.mean_start > b.mean_start;
+            });
+            return parts;
+        }();
+
+        // Rebuild the layout to insert single-sided elements in the right spots.
+        std::vector<ReadElement> ordered_elements;
+        ordered_elements.reserve(layout.size());
+        for (const auto& elem : by_order()) {
+            ordered_elements.push_back(elem);
+        }
+
+        auto find_stop_index = [&](const std::string& dir) {
+            for (size_t i = 0; i < ordered_elements.size(); ++i) {
+                if (ordered_elements[i].direction == dir && ordered_elements[i].global_class == "stop") {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        };
+
+        int fwd_stop_idx = find_stop_index("forward");
+        int rev_stop_idx = find_stop_index("reverse");
+
+        if (fwd_stop_idx == -1) {
+            throw std::runtime_error("prep_new_layout did not produce a forward stop element");
+        }
+
+        std::vector<ReadElement> rebuilt;
+        rebuilt.reserve(ordered_elements.size() + forward_only_parts.size() + reverse_only_parts.size());
+
+        // Forward block (without the forward stop)
+        for (int i = 0; i < fwd_stop_idx; ++i) {
+            rebuilt.push_back(ordered_elements[i]);
+        }
+
+        for (const auto& part : forward_only_parts) {
+            rebuilt.emplace_back(part.id, part.seq, "", static_cast<int>(part.seq.length()),
+                                 "static", 0, "forward", part.id);
+            if (verbose) {
+                int total_cts = part.dominant_hits + part.alternate_hits;
+                std::cout << "[generate_layout_from_parts] Inserted forward_only " << part.class_id
+                          << " with " << total_cts << " hits at ~" << part.mean_start << "% in the sequence\n";
+            }
+        }
+
+        // Forward stop goes after forward-only inserts
+        rebuilt.push_back(ordered_elements[fwd_stop_idx]);
+
+        // Reverse block (everything after forward stop up to reverse stop if present)
+        size_t reverse_start = static_cast<size_t>(fwd_stop_idx + 1);
+        size_t reverse_end = (rev_stop_idx == -1) ? ordered_elements.size() : static_cast<size_t>(rev_stop_idx);
+        for (size_t i = reverse_start; i < reverse_end; ++i) {
+            rebuilt.push_back(ordered_elements[i]);
+        }
+
+        for (const auto& part : reverse_only_parts) {
+            rebuilt.emplace_back(part.class_id, part.seq, "", static_cast<int>(part.seq.length()),
+                                 "static", 0, "reverse", part.id);
+            if (verbose) {
+                int total_cts = part.dominant_hits + part.alternate_hits;
+                std::cout << "[generate_layout_from_parts] Inserted reverse_only " << part.class_id
+                          << " with " << total_cts << " hits at ~" << part.mean_start << "% in the sequence\n";
+            }
+        }
+
+        if (rev_stop_idx != -1) {
+            rebuilt.push_back(ordered_elements[rev_stop_idx]);
+            for (size_t i = static_cast<size_t>(rev_stop_idx + 1); i < ordered_elements.size(); ++i) {
+                rebuilt.push_back(ordered_elements[i]);
+            }
+        }
+
+        layout.clear();
+        int new_order = 1;
+        for (auto& elem : rebuilt) {
+            elem.order = new_order++;
+            layout.insert(elem);
+        }
+
         write_to_csv(output_base, "layout");
     }
-
 
     // Export layout to CSV
     void write_to_csv(const std::string& base_path = "", const std::string& which_file = "both") const {
@@ -1511,25 +1805,53 @@ private:
 
 /**
  * @brief This class contains all of the setup for the misalignment threshold, as well as the masked adapters.
+ * @brief contains structures for perfect matches, misalignment statistics, and position statistics.
+ * @struct perfect_match
+ * @struct misalignment_stats
+ * @struct PositionStats
  */
 class Misalignment_Setup {
 public:
+    /**
+     * @brief information on perfect matches
+     * @param read read sequence
+     * @param direction The direction of the read ("forward" or "reverse")
+     */
     struct perfect_match {
         read_streaming::sequence read;
-        std::string direction; // "forward" or "reverse"
+        std::string direction;
     };
 
+    /**
+     * @brief structure for containing alignment and misalignments statistics--the name is kinda a legacy holdover
+     * @param mean mean edit distance
+     * @param sum_squares sum of squares for standard deviation calculation
+     * @param count number of reads considered
+     * @param total_reads_seen total number of reads processed
+     * @param is_stable whether the statistics have stabilized
+     * @param dir_counts pair of counts for forward and reverse directions
+     */
     struct misalignment_stats {
-    double mean;
-    double sum_squares;
-    size_t count;
-    size_t total_reads_seen;
-    bool is_stable;
+        double mean;
+        double sum_squares;
+        size_t count;
+        size_t total_reads_seen;
+        bool is_stable;
+        std::pair<size_t, size_t> dir_counts;
 
+    /**
+     * @brief nested structure for storing position statistics
+     * @param start_positions vector of start positions
+     * @param stop_positions vector of stop positions
+     */
     struct PositionStats {
         std::vector<double> start_positions;
         std::vector<double> stop_positions;
-        
+        /**
+         * @brief helper function to calculate mean and standard deviation
+         * @param positions vector of positions
+         * @return pair of mean and standard deviation
+         */
         std::pair<double, double> get_stats(const std::vector<double>& positions) {
             if (positions.empty()) return {0.0, 0.0};
             
@@ -1546,37 +1868,61 @@ public:
             double sd = std::sqrt(sum_squares / (positions.size() - 1));
             return {mean, sd};
         }
+        /**
+         * @brief calculate mean and standard deviation for start and stop positions
+         * @return AlignmentPositions containing statistics for start and stop positions
+         */
         AlignmentPositions calculate() {
-            return {get_stats(start_positions), get_stats(stop_positions)};
+            return {
+                get_stats(start_positions), 
+                get_stats(stop_positions)
+            };
         }
     } position_stats;
 
-    misalignment_stats() : mean(0), sum_squares(0), count(0), total_reads_seen(0), is_stable(false) {}
+    misalignment_stats() : mean(0), sum_squares(0), count(0), total_reads_seen(0), is_stable(false), dir_counts({0, 0}) {}
 
     //contains defaults for the misalignment stats
-    void update_stats(int new_edit_distance, size_t total_reads) {
+    /**
+     * @brief update statistics with a new edit distance
+     * @param new_edit_distance the new edit distance to incorporate
+     * @param total_reads total number of reads processed
+     */
+    void update_stats(int new_edit_distance, size_t total_reads, size_t forward_count, size_t reverse_count) {
             double old_mean = mean;
             count++;
             total_reads_seen = total_reads;
             mean = mean + (new_edit_distance - mean) / count;
-            
             sum_squares += (new_edit_distance - old_mean) * (new_edit_distance - mean);
-            
             double sample_ratio = static_cast<double>(count) / total_reads_seen;
             is_stable = ((std::abs(mean - old_mean) < 0.5) && (sample_ratio > 0.01)|| count >= 10000);
+            dir_counts = {forward_count, reverse_count};
         }
 
+    /**
+     * @brief calculate standard deviation of edit distances
+     * @return standard deviation
+     */
     double get_sd() const {
             if (count < 2) return 0.0;
             return std::sqrt(sum_squares / (count - 1));
         }
 
+    /**
+     * @brief calculate confidence score based on count
+     * @return confidence score
+     */
     double confidence() const {
             return 1.0 - std::exp(-static_cast<double>(count) / 100.0);
         }
     
     };
 
+    /**
+     * @brief structure for consensus matrix
+     * @param position_counts vector of maps counting bases at each position
+     * @param max_edit_distance maximum edit distance for sequences in this matrix
+     */
     struct consensus_matrix {
         std::vector<std::map<char, int>> position_counts;  // For each position, count of each base
         int max_edit_distance;  // Maximum edit distance for sequences in this matrix
@@ -1611,7 +1957,10 @@ public:
         }
     }
 
-    void generate_misalignment_data(const std::string& fastq_path, ReadLayout& layout, int num_threads = 1, size_t max_reads = 50000) {
+    void generate_misalignment_data(
+        const std::string& fastq_path, ReadLayout& layout, int num_threads = 1, size_t max_reads = 50000
+    ) {
+
         using ChunkFunc = std::function<bool(const std::vector<read_streaming::sequence>&, const std::string&)>;
         chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(max_reads);
         
@@ -1655,9 +2004,9 @@ public:
                     );
                 }
                 if (all_stable || forward_count + reverse_count >= max_reads) {
-                    return false;  // Signal to stop processing.
+                    return false;  // Signal to stop processing
                 }
-                return true;  // Continue processing.
+                return true;  // Continue processing
         };
 
         streamer.process_chunks(fastq_path, process_func, num_threads, max_reads);
@@ -1670,12 +2019,22 @@ public:
 
 private:
     std::unordered_map<std::string, std::vector<consensus_matrix>> consensus_matrices;
-    std::vector<std::pair<std::string, std::string>> forward_adapters;
-    std::vector<std::pair<std::string, std::string>> reverse_adapters;
-    std::vector<perfect_match> perfect_matches;
+    std::vector<std::pair<std::string, std::string>> forward_adapters; /// vector of forward adapters, stored as `pair:[class_id, seq]`
+    std::vector<std::pair<std::string, std::string>> reverse_adapters; /// vector of reverse adapters, stored as `pair:[class_id, seq]`
+    std::vector<perfect_match> perfect_matches; /// vector of perfect matches
 
+    /**
+     * @brief process a chunk of reads to find perfect matches and update misalignment statistics
+     * @param chunk vector of read sequences
+     * @param forward_count count of perfect forward matches
+     * @param reverse_count count of perfect reverse matches
+     * @param adapter_stats map of adapter IDs to their misalignment statistics
+     * @param misalignment_stats map of adapter IDs to their misalignment position statistics
+     * @param total_reads total number of reads processed
+     */
     void process_misalignment_chunk(const std::vector<read_streaming::sequence>& chunk, 
-        size_t& forward_count, size_t& reverse_count,
+        size_t& forward_count, 
+        size_t& reverse_count,
         std::unordered_map<std::string, misalignment_stats>& adapter_stats,
         std::unordered_map<std::string, misalignment_stats>& misalignment_stats,
                       size_t total_reads) {
@@ -1686,7 +2045,7 @@ private:
             
             if (perfect_forward) {
                 // Update misalignment stats for reverse adapters
-                update_misalignment_stats(read.seq, reverse_adapters, adapter_stats, misalignment_stats, total_reads);
+                update_misalignment_stats(read.seq, reverse_adapters, adapter_stats, misalignment_stats, total_reads, forward_count, reverse_count);
                 #pragma omp critical
                 {
                     perfect_matches.push_back({read, "forward"});
@@ -1696,7 +2055,7 @@ private:
             }
             if (perfect_reverse) {
                 // Update misalignment stats for forward adapters
-                update_misalignment_stats(read.seq, forward_adapters, adapter_stats, misalignment_stats, total_reads);
+                update_misalignment_stats(read.seq, forward_adapters, adapter_stats, misalignment_stats, total_reads, forward_count, reverse_count);
                 #pragma omp critical
                 {
                     perfect_matches.push_back({read, "reverse"});
@@ -1707,10 +2066,22 @@ private:
         }
     }
 
-    void update_misalignment_stats(const std::string& read_seq, const std::vector<std::pair<std::string, std::string>>& adapters,
+    /**
+     * @brief update misalignment statistics for a given read sequence and adapters
+     * @param read_seq the read sequence to check
+     * @param adapters vector of adapter ID and sequence pairs
+     * @param adapter_stats map of adapter IDs to their misalignment statistics
+     * @param misalignment_stats map of adapter IDs to their misalignment position statistics
+     * @param total_reads total number of reads processed
+     * @param forward_counts count of perfect forward matches
+     * @param reverse_counts count of perfect reverse matches
+     */
+    void update_misalignment_stats(const std::string& read_seq, 
+                       const std::vector<std::pair<std::string, std::string>>& adapters,
                        std::unordered_map<std::string, misalignment_stats>& adapter_stats,
                        std::unordered_map<std::string, misalignment_stats>& misalignment_stats,
-                       size_t total_reads) {
+                       size_t total_reads, size_t forward_counts, size_t reverse_counts
+                    ) {
         for (const auto& [id, seq] : adapters) {
             EdlibAlignResult result = edlibAlign(
                 seq.c_str(), seq.length(),
@@ -1718,10 +2089,9 @@ private:
                 edlibNewAlignConfig(-1, EDLIB_MODE_HW, EDLIB_TASK_LOC, nullptr, 0)
             );
             std::string aligned_seq = collect_aligned_seq(read_seq, seq, result);
-            //something crashes every once in a while during original generation
             #pragma omp critical
             {
-                adapter_stats[id].update_stats(result.editDistance, total_reads);
+                adapter_stats[id].update_stats(result.editDistance, total_reads, forward_counts, reverse_counts);
                 //this calculates the misalignment positions for the reverse primers in forward locations, and vice versa
                     double norm_misal_start = (static_cast<double>(result.startLocations[0]) / read_seq.length()) * 100.0;
                     double norm_misal_stop = (static_cast<double>(result.endLocations[0]) / read_seq.length()) * 100.0;
@@ -1734,6 +2104,10 @@ private:
         }
     }
 
+    /**
+     * @brief write perfect match reads to FASTQ files to the desktop
+     * @param write whether to write the files (default: false)
+     */
     void write_perfect_matches(bool write = false) {
         std::string home = std::getenv("HOME");
         std::string desktop = home + "/Desktop/";
@@ -1765,14 +2139,22 @@ private:
         }
     }
 
+    /**
+     * @brief find perfect matches of adapters in a read sequence and update position statistics
+     * @param read_seq the read sequence to check
+     * @param adapters vector of adapter ID and sequence pairs
+     * @param adapter_stats map of adapter IDs to their misalignment statistics
+     * @return true if a perfect match is found for all adapters, false otherwise
+     */
     bool find_perfect_match(const std::string& read_seq,const std::vector<std::pair<std::string, std::string>>& adapters,
                             std::unordered_map<std::string, misalignment_stats>& adapter_stats) {
         for (const auto& [id, seq] : adapters) {
             EdlibAlignResult result = edlibAlign(
                 seq.c_str(), seq.length(),
                 read_seq.c_str(), read_seq.length(),
-                edlibNewAlignConfig(-1, EDLIB_MODE_HW, EDLIB_TASK_LOC, nullptr, 0)
+                edlibNewAlignConfig(0, EDLIB_MODE_HW, EDLIB_TASK_LOC, nullptr, 0)
             );
+            //modified when i was playing, this is just sloppy redundant code
             bool is_perfect = (result.editDistance == 0 && result.status == EDLIB_STATUS_OK);
             if(is_perfect){
                 double normalized_start = (static_cast<double>(result.startLocations[0]) / read_seq.length()) * 100.0;
@@ -1903,21 +2285,86 @@ private:
          std::unordered_map<std::string, misalignment_stats>& adapter_stats,
          std::unordered_map<std::string, misalignment_stats>& misalignment_stats) {
         auto& by_id_index = layout.by_id();
+        bool remove_forward_direction = false;
+        bool remove_reverse_direction = false;
+
+        //find the first occurrence of a a direction in which perfect matches could not be found
+        for(auto& [adapter_id, stats] : adapter_stats) {
+            if(stats.dir_counts.first == 0 && stats.dir_counts.second != 0){
+                remove_forward_direction = true;
+                break;
+            }
+            if(stats.dir_counts.second == 0 && stats.dir_counts.first != 0){
+                remove_reverse_direction = true;
+                break;
+            }
+        }
+
+        if(remove_forward_direction || remove_reverse_direction){
+            for(auto it = by_id_index.begin(); it != by_id_index.end(); ) {
+                if((remove_forward_direction && it->direction == "forward") ||
+                   (remove_reverse_direction && it->direction == "reverse")) {
+                    std::string dir = it->direction;
+                    std::cout << "[update_read_layout] Removing element " << it->class_id << " due to lack of perfect matches in the " << dir << " direction.\n";
+                    it = by_id_index.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
         for(auto& [adapter_id, stats] : adapter_stats) {
             auto it = by_id_index.find(adapter_id);
             if(it != by_id_index.end()) {
                 std::string seq = it->seq;
                 std::string masked = generate_masked_adapter(adapter_id, seq, stats);
-                
                 double sd = stats.get_sd();
-                std::tuple<int, int, int> threshold{
-                    static_cast<int>(std::round(stats.mean - sd)),
-                    static_cast<int>(std::floor(stats.mean)),
-                    static_cast<int>(std::round(stats.mean + sd))
-                };
-                
+
                 AlignmentPositions align_pos = stats.position_stats.calculate();
                 AlignmentPositions misalign_pos = misalignment_stats[adapter_id].position_stats.calculate();
+
+                if(align_pos.start_stats.first == 0 && align_pos.stop_stats.first == 0){
+                    std::cout << "[update_read_layout] Removing element " << adapter_id << " due to insufficient alignment data.\n";
+                    by_id_index.erase(it);
+                    continue;
+                }
+
+                double mean = stats.mean;
+                if(mean < 1.0){
+                    mean = seq.length() * 0.25;
+                }
+
+                double misal_start = 0.0;
+                double misal_stop = 0.0;
+                if(misalign_pos.start_stats.first == 0.0 && misalign_pos.stop_stats.first == 0.0){
+                    misal_start = std::abs(100.0 - align_pos.start_stats.first);
+                    misal_stop =  std::abs(100 - align_pos.stop_stats.first);
+                    misalign_pos.start_stats = {misal_start, sd};
+                    misalign_pos.stop_stats = {misal_stop, sd};
+                }
+
+                std::cout
+                << "\n[update_read_layout] Adapter: " << adapter_id << "\n"
+                << "+------------------------------+----------------------+\n"
+                << "| Metric                       | Value                |\n"
+                << "+------------------------------+----------------------+\n"
+                << "| original seq                 | " << seq << "\n"
+                << "| misalignment mean            | " << mean << "\n"
+                << "| misalignment sd              | " << sd << "\n"
+                << "| forward_count                | " << adapter_stats[adapter_id].dir_counts.first << "\n"
+                << "| reverse_count                | " << adapter_stats[adapter_id].dir_counts.second << "\n"
+                << "| aligned start pos (mean)     | " << align_pos.start_stats.first << "\n"
+                << "| aligned stop pos (mean)      | " << align_pos.stop_stats.first << "\n"
+                << "| misaligned start pos (mean)  | " << misalign_pos.start_stats.first << "\n"
+                << "| misaligned stop pos (mean)   | " << misalign_pos.stop_stats.first << "\n"
+                << "+------------------------------+----------------------+\n";
+
+                std::tuple<int, int, int> threshold{
+                    static_cast<int>(std::round(mean - sd)),
+                    static_cast<int>(std::floor(mean)),
+                    static_cast<int>(std::round(mean + sd))
+                };
+                
 
                 by_id_index.modify(it, [&](ReadElement& elem) {
                     elem.masked_seq = masked;
@@ -1928,5 +2375,4 @@ private:
             }
         }
     }
-
 };

@@ -59,22 +59,22 @@ struct counter {
         counts[index].fetch_add(-1, std::memory_order_relaxed);
     }
     
-    // Overload: decrement using an enum value for clarity.
+    // Overload: decrement using an enum value for clarity
     void subtract(barcode_counts index) {
         counts[static_cast<int>(index)].fetch_add(-1, std::memory_order_relaxed);
     }
 
-    // Load the value of the counter at the specified index.
+    // Load the value of the counter at the specified index
     int load(int index) const {
         return counts[index].load(std::memory_order_relaxed);
     }
 
-    // Overload: load using an enum value for clarity.
+    // Overload: load using an enum value for clarity
     int load(barcode_counts index) const {
         return counts[static_cast<int>(index)].load(std::memory_order_relaxed);
     }
 
-    // Load all counter values into a tuple.
+    // Load all counter values into a tuple
     std::tuple<int, int, int, int, int, int, int, int> load_all() const {
         return std::make_tuple(
             counts[barcode_counts::raw].load(std::memory_order_relaxed),
@@ -90,10 +90,17 @@ struct counter {
 };
 
 // set up the int64_seq class to handle bit-to-sequence & sequence-to-bit
+/**
+ * @class int64_seq
+ * @brief Class to represent DNA sequences using int64_t bit encoding (2 bits per nucleotide, up to 32 bases per chunk)
+ * @param length `uint16_t` total number of bases in the sequence
+ * @param bits `std::vector<int64_t>` vector of int64_t chunks encoding the sequence
+ * @note Each nucleotide is encoded as follows: A=00, C=01, T=10, G=11
+ */
 class int64_seq {
     public:
-        uint16_t length;            // Total number of bases in the sequence.
-        std::vector<int64_t> bits;  // Each int64_t encodes a chunk (2 bits per nucleotide, up to 32 bases per chunk).
+        uint16_t length; // `uint16_t` total number of bases in the sequence
+        std::vector<int64_t> bits;  // `std::vector<int64_t>` vector of int64_t chunks encoding the sequence
         int64_seq() : length(0), bits{} {}
 
         explicit int64_seq(int64_t raw_bits, uint16_t seq_length) : length(seq_length) {
@@ -228,13 +235,14 @@ namespace std {
 }
 
 namespace mutation_tools {
-
-    // Myers's bit-parallel algorithm for edit distance, followed from the edlib comments for making a better version for shorter strings
-    // and taking int64 values as input 
-    // p:  bitmask where bit j=1 means pattern[j] matches '1'
-    // t:  bitmask for text only used to select p or np per column
-    // n:  number of columns (<=64)
-    // max_dist: as soon as even the best possible remaining score exceeds max_dist, we return -1 as a sentinel.
+/** 
+    * @brief Myers's bit-parallel algorithm for edit distance, followed from the edlib comments for making a better version for shorter strings and taking int64 values as input 
+    * @param p:  `int64_t` bitmask where bit j=1 means pattern[j] matches '1'
+    * @param t:  `int64_t` bitmask for text only used to select p or np per column
+    * @param n:  number of columns (<=64)
+    * @param max_dist: as soon as even the best possible remaining score exceeds max_dist, return -1 as a sentinel
+    * @return `int` minimum edit distance if <= max_dist, else -1
+*/
     int bit_ld(int64_t pattern, int64_t text, int n, int max_dist) {
     // build pattern equality vectors
     int64_t Peq[4] = {0, 0, 0, 0};
@@ -275,7 +283,15 @@ namespace mutation_tools {
     return score;
 }
 
-    // Bit-parallel partial matching: find best match of pattern within text
+/**
+ * @brief Myers's bit-parallel algorithm for partial edit distance (finding best match of pattern within text)
+ * @param pattern: `int64_t` bitmask where bit j=1 means pattern[j] matches 1
+ * @param text: `int64_t` bitmask for text only used to select p or np per column
+ * @param pattern_len: `int` length of the pattern (currently <=32 bases)
+ * @param text_len: `int` length of the text (currently <=32 bases)
+ * @param max_dist: maximum allowed distance
+ * @return `int` minimum edit distance if <= max_dist, else -1
+ */
     int bit_partial_match(int64_t pattern, int64_t text, int pattern_len, int text_len, int max_dist) {
         if (pattern_len <= 0 || text_len <= 0 || pattern_len > 32 || text_len > 32) {
             return -1;
@@ -321,61 +337,79 @@ namespace mutation_tools {
         return (min_score <= max_dist) ? min_score : -1;
     }
 
-    // calculating levenshtein distance between one query and a set of multiple strings (partial matching)
+/**
+ * @brief Calculate Levenshtein distance between one query and a set of multiple strings (partial matching)
+ * @param query: the query sequence as an `int64_seq`
+ * @param targets: a `unordered_set<int64_seq>` of target sequences
+ * @param max_dist: maximum allowed distance
+ * @return `map<int, unordered_set<int64_seq>>` from edit distance to sets of sequences within that distance
+ */
     std::map<int, std::unordered_set<int64_seq>> int64_lvdist(const int64_seq &query, const std::unordered_set<int64_seq> &targets, int max_dist = 4) {
-    std::map<int, std::unordered_set<int64_seq>> results;
-    if (query.bits.empty()){
+        std::map<int, std::unordered_set<int64_seq>> results;
+        if (query.bits.empty()){
+            return results;
+        }
+        for (const auto &target : targets) {
+            if (target.bits.empty()){
+                continue;
+            }
+            
+            int dist;
+            if (query.length <= target.length) {
+                // Query is shorter or equal, search query in target
+                dist = bit_partial_match(query.bits[0], target.bits[0], query.length, target.length, max_dist);
+            } else {
+                // Target is shorter, search target in query
+                dist = bit_partial_match(target.bits[0], query.bits[0], target.length, query.length, max_dist);
+            }
+            
+            if(dist >= 0){
+                results[dist].insert(target);
+            }
+        }
         return results;
     }
-    for (const auto &target : targets) {
-        if (target.bits.empty()){
-            continue;
-        }
-        
-        int dist;
-        if (query.length <= target.length) {
-            // Query is shorter or equal, search query in target
-            dist = bit_partial_match(query.bits[0], target.bits[0], query.length, target.length, max_dist);
-        } else {
-            // Target is shorter, search target in query
-            dist = bit_partial_match(target.bits[0], query.bits[0], target.length, query.length, max_dist);
-        }
-        
-        if(dist >= 0){
-            results[dist].insert(target);
-        }
-    }
-    return results;
-}
 
-    // calculating levenshtein distance between one query and a set of multiple barcodes (wrapper for vectors of barcode_entries versus unordered sets)
+/**
+ * @brief Calculate Levenshtein distance between one query and a set of barcode entries (partial matching)
+ * @param query The query sequence to search for as an `int64_seq`
+ * @param targets a `vector<barcode_entry>` of target sequences
+ * @param max_dist Maximum allowed edit distance (default: 4)
+ * @return `map<int, unordered_set<int64_seq>>` from edit distance to sets of sequences within that distance
+ */
     std::map<int, std::unordered_set<int64_seq>> int64_lvdist(const int64_seq &query, const std::vector<barcode_entry> &targets, int max_dist = 4) {
-    std::map<int, std::unordered_set<int64_seq>> results;
-    if (query.bits.empty()){
+        std::map<int, std::unordered_set<int64_seq>> results;
+        if (query.bits.empty()){
+            return results;
+        }
+        for (const auto &target : targets) {
+            if (target.barcode.bits.empty()){
+                continue;
+            }
+            
+            int dist;
+            if (query.length <= target.barcode.length) {
+                // Query is shorter or equal, search query in target
+                dist = bit_partial_match(query.bits[0], target.barcode.bits[0], query.length, target.barcode.length, max_dist);
+            } else {
+                // Target is shorter, search target in query
+                dist = bit_partial_match(target.barcode.bits[0], query.bits[0], target.barcode.length, query.length, max_dist);
+            }
+            
+            if(dist >= 0){
+                results[dist].insert(target.barcode);
+            }
+        }
         return results;
     }
-    for (const auto &target : targets) {
-        if (target.barcode.bits.empty()){
-            continue;
-        }
-        
-        int dist;
-        if (query.length <= target.barcode.length) {
-            // Query is shorter or equal, search query in target
-            dist = bit_partial_match(query.bits[0], target.barcode.bits[0], query.length, target.barcode.length, max_dist);
-        } else {
-            // Target is shorter, search target in query
-            dist = bit_partial_match(target.barcode.bits[0], query.bits[0], target.barcode.length, query.length, max_dist);
-        }
-        
-        if(dist >= 0){
-            results[dist].insert(target.barcode);
-        }
-    }
-    return results;
-}
 
-    // calculating levenshtein distance between one query and a target sequence (int64_seq)
+/**
+ * @brief Calculate Levenshtein distance between two `int64_seq` sequences (partial matching)
+ * * @param query The query sequence as an `int64_seq`
+ * @param target The target sequence as an `int64_seq`
+ * @param max_dist Maximum allowed edit distance
+ * @return `int` minimum edit distance if <= max_dist, else -1
+ */
     int int64_lvdist(const int64_seq &query, const int64_seq &target, int max_dist) {
         if (query.bits.empty() || target.bits.empty()){
             return -1;
@@ -389,8 +423,13 @@ namespace mutation_tools {
             return bit_partial_match(target.bits[0], query.bits[0], target.length, query.length, max_dist);
         }
     }
-    
-// generate point mutations for a given int64_seq sequence
+
+/**
+ * @brief Generate all single-point mutations for a given `int64_seq`. 
+ * @brief Works by iterating over each position in the sequence and substituting each possible nucleotide except the original and uses bitmasks to efficiently create mutated sequences.
+ * @param seq The original sequence as an `int64_seq`
+ * @return `unordered_set<int64_seq>` containing all unique single-point mutations of the input
+ */
     std::unordered_set<int64_seq> generate_point_mutations(const int64_seq &seq) {
         std::unordered_set<int64_seq> mutations;
         if (seq.bits.empty()){
@@ -413,8 +452,39 @@ namespace mutation_tools {
         }
         return mutations;
     } 
-
-    //raw pt mutation gen
+/**
+     * @brief Generate all single-nucleotide point mutations of a 2-bit encoded DNA sequence
+     * @param original_value `int64_t` encoded DNA sequence (2 bits per nucleotide)
+     * @param sequence_length Number of nucleotides in the sequence (max 32)
+     * @return `unordered_set<int64_t>` of all possible single point mutations (3 × sequence_length mutations)
+     * 
+     * This function creates all possible single point mutations of a DNA sequence that is
+     * encoded as a 64-bit integer where each nucleotide occupies 2 bits (allowing sequences
+     * up to 32bp in length).
+     * 
+     * Bit encoding (per nucleotide):
+     * - Each nucleotide is represented by 2 bits
+     * - Position 0 is stored in bits [1:0], position 1 in bits [3:2], etc.
+     * - Nucleotides are encoded as: A=00, C=01, T=10, G=11
+     * 
+     * Mutation generation process:
+     * 1. For each position in the sequence (0 to sequence_length-1):
+     *    - Extract the original 2-bit nucleotide at that position
+     *    - Generate 3 mutations by substituting with each of the other 3 nucleotides
+     * 2. Bit manipulation for each mutation:
+     *    - Create a clear_mask: Inverts 0b11 shifted to target position, zeroing those 2 bits
+     *    - Apply mask: (original_value & clear_mask) clears the target position
+     *    - Insert new nucleotide: OR with (new_nuc << (2 * pos)) to set the new value
+     * 
+     * Example for a 3bp sequence (6 bits total):
+     * Original: ATG = 00|10|11 (binary) = 0b001011 = 11 (decimal)
+     * Position 1 (T=10): Generate mutations with A(00), C(01), G(11)
+     * - Mask: ~(0b11 << 2) = ~0b1100 = ...11110011
+     * - Clear: 0b001011 & 0b11110011 = 0b000011
+     * - Mutate to A: 0b000011 | (0b00 << 2) = 0b000011 = AAG
+     * - Mutate to C: 0b000011 | (0b01 << 2) = 0b000111 = ACG  
+     * - Mutate to G: 0b000011 | (0b11 << 2) = 0b001111 = AGG
+ */
     std::unordered_set<int64_t> generate_point_mutations_raw(int64_t original_value, int sequence_length) {
         std::unordered_set<int64_t> mutations;
         mutations.reserve(sequence_length * 3); // Pre-reserve for efficiency
@@ -433,6 +503,13 @@ namespace mutation_tools {
     }
 
     //generating mutated barcodes using raw int64_t values for speed
+/**
+ * @brief Generate all possible mutated barcodes within a specified number of mutation rounds. Loops over each position in the sequence and substitutes each possible nucleotide except the original, accumulating unique mutated barcodes.
+  Uses raw int64_t values for efficient mutation generation and duplicate checking.
+ * @param seq The original barcode sequence as an `int64_seq`
+ * @param mutation_rounds Number of mutation rounds (default: 1)
+ * @return `unordered_set<int64_seq>` containing all unique mutated barcodes
+ */
     std::unordered_set<int64_seq> generate_mutated_barcodes(const int64_seq &seq, int mutation_rounds = 1) {
         if (seq.bits.empty()) return {};
         
@@ -509,7 +586,14 @@ namespace mutation_tools {
         return final_mutations;
     }
 
-    // Call this exactly the same way as before, but it will reuse its buffer
+/**
+ * @brief Generate all possible barcodes by shifting the original sequence left or right by a specified number of bases, filling in new bases with all combinations.
+ * This is a legacy function of k-merizing the bases adjacent to the actual sequence and using those instead. Kept because it might be useful later.
+ * Vaguely inspired by Lior Pachter's circular shift barcodes (https://github.com/pachterlab/sircel).
+ * @param seq The original barcode sequence as an `int64_seq`
+ * @param shift Number of bases to shift (must be >0 and < sequence length)
+ * @return `unordered_set<int64_seq>` containing all unique shifted barcodes
+ */
     std::unordered_set<int64_seq> generate_shifted_barcodes(const int64_seq &seq, int shift) {
         // 1) Keep one thread-local set so we only pay the bucket allocations once
         static thread_local std::unordered_set<int64_seq> result;
@@ -567,7 +651,16 @@ namespace mutation_tools {
         return result;
     }
 
-    // Generate Levenshtein barcodes
+/**
+ * @brief Generate all possible barcodes within a specified number of edit rounds (substitutions, insertions, deletions).
+ * @param seq The original barcode sequence as an `int64_seq`
+ * @param edit_rounds Number of edit rounds (default: 1)
+ * @return `unordered_set<int64_seq>` containing all unique barcodes within the specified edit distance (excluding the original)
+ * @brief Generate all DNA sequences within a specified edit distance using substitutions, deletions, and insertions
+ * 
+ * This function generates all possible DNA sequences that can be reached from the input sequence within the specified number of edit
+ * operations. Each round explores sequences one additional edit away from the original.
+*/
     std::unordered_set<int64_seq> generate_lv_barcodes(const int64_seq &seq, int edit_rounds = 1) {
         if (seq.bits.empty()) return {};
         
@@ -907,7 +1000,7 @@ namespace mutation_tools {
             return { value_iterator(&*it,false), value_iterator(nullptr,true) };
         }
 
-        // ---- Summaries (for CSV writers) ----
+        // ---- summaries for CSV ----
         std::vector<std::tuple<std::string,int,int,int,int,int,int,int,int>>
         summarize_counts(const std::unordered_set<key>* filter_keys=nullptr) const {
             using row = std::tuple<std::string,int,int,int,int,int,int,int,int>;
@@ -1378,7 +1471,7 @@ public:
         }
     }
 
-    // ==== Utility Methods ====
+    // ==== utility methods ====
     std::vector<const value*> get_unique_entries() const {
         std::vector<const value*> result;
         result.reserve(unique_values.size());

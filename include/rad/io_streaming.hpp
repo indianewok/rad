@@ -504,9 +504,11 @@ public:
                         " -" + std::to_string(level) + " > '" + out_path + "'";
         FILE* fp = popen(cmd.c_str(), "w");
         if (!fp) return nullptr;
-        // 16MB stdio buffer to reduce write() syscalls
-        static std::vector<char> buf(16u << 20);
-        setvbuf(fp, buf.data(), _IOFBF, buf.size());
+            // 16MB stdio buffer to reduce write() syscalls
+            // removed because in debug mode, the buffer gets shared between all of the thread outputs, so then everything gets scrambled
+            // TSPMO
+        //static std::vector<char> buf(16u << 20);
+        //setvbuf(fp, buf.data(), _IOFBF, buf.size());
         return fp;
     }
 
@@ -554,7 +556,6 @@ private:
         if (pigz_buf_.size() >= pigz_flush_threshold_) {
             pigz_.pigz_write(pigz_fp_, pigz_buf_.data(), pigz_buf_.size());
             pigz_buf_.clear();
-            // pigz_buf_.shrink_to_fit();
         }
     }
 
@@ -583,7 +584,6 @@ public:
     /// @param append        if true, opens in append mode; otherwise truncates
     /// @param pigz_threads  pigz worker threads (ignored if not using pigz)
     /// @param level         gzip compression level [1..9]
-
     sigstring_writing(std::string output_path, format output_format, bool compress, bool append, int pigz_threads, int level=1)
         : fmt(output_format), compress_(compress)
     {
@@ -691,34 +691,7 @@ public:
     ~parallel_writer() {
         stop();
     }
-
-    template<typename T>
-    void write_all(sigstring_writing& sig_writer, sigstring_writing& csv_writer, sigstring_writing& fastqa_writer, std::vector<T>& data) {
-        if (data.empty()) return;
-        
-        auto job_function = [
-            sig_ptr=&sig_writer,
-            csv_ptr=&csv_writer,
-            fastq_ptr=&fastqa_writer,
-            data_vec=std::move(data)
-        ]() mutable {
-            (*sig_ptr)(data_vec);
-            (*csv_ptr)(data_vec);
-            (*fastq_ptr)(data_vec);
-            std::vector<T>().swap(data_vec);
-        };
-        
-        auto* job = new WriteJob();
-        job->func = std::move(job_function);
-        job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
-        job->size = data.size();
-        job->queued_time = std::chrono::high_resolution_clock::now();
-        
-        while (!write_queue.push(job)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
-
+    
     template<typename T>
     void write(sigstring_writing& fastqa_writer, std::vector<T>& data) {
         if (data.empty()) return;
@@ -780,6 +753,33 @@ public:
         
         while (!write_queue.push(job)) {
             std::this_thread::yield();
+        }
+    }
+
+    template<typename T>
+    void write_debug(sigstring_writing* sig_writer, sigstring_writing* csv_writer, sigstring_writing* fastqa_writer, std::vector<T>& data) {
+        if (data.empty()) return;
+        
+        auto job_function = [
+            sig_ptr=sig_writer,
+            csv_ptr=csv_writer,
+            fastqa_ptr=fastqa_writer,
+            data_vec=std::move(data)
+        ]() mutable {
+            (*sig_ptr)(data_vec);
+            (*csv_ptr)(data_vec);
+            (*fastqa_ptr)(data_vec);
+            std::vector<T>().swap(data_vec);
+        };
+        
+        auto* job = new WriteJob();
+        job->func = std::move(job_function);
+        job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
+        job->size = data.size();
+        job->queued_time = std::chrono::high_resolution_clock::now();
+        
+        while (!write_queue.push(job)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 
