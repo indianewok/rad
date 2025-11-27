@@ -1,7 +1,13 @@
 #pragma once
 #include "rad_headers.h"
-// set up a counter class to handle atomic operations
-// Define an enum with unique indices
+
+/**
+ * @enum barcode_counts
+ * @brief enumeration for different barcode count types
+ * This enum defines indices for various barcode count categories used in the `counter` class.
+ * The categories include raw counts, forward and reverse counts, concatenation counts,
+ * total counts, corrected counts, and filtered counts.
+ */
 enum barcode_counts {
     raw = 0,          // Raw count
     forw = 1,         // Forward count
@@ -13,10 +19,14 @@ enum barcode_counts {
     filtered = 7       // filtered count
 };
 
-// building a thread-safe counter to be used during count updating processes
-// needed to make something that was thread-safe to update in a shared location and couldn't figure out how to do it
-// ended up making an array of atomic ints, but then atomics aren't constructable in the way i wanted them to be
-// at least at load time, so i set it up so each counter value (to initialize) copies itself 
+/**
+ * @struct counter
+ * @brief Thread-safe counter class using atomic integers for multiple barcode count types
+ * This class provides atomic operations for counting various barcode-related metrics.
+ * It uses an array of 8 atomic integers to store counts for different categories defined in the
+ * `barcode_counts` enum. The class supports incrementing, decrementing, loading individual counts,
+ * and loading all counts as a tuple.
+ */
 struct counter {
     // Use an array of 8 atomic ints
     std::array<std::atomic<int>, 8> counts;
@@ -89,7 +99,6 @@ struct counter {
     }
 };
 
-// set up the int64_seq class to handle bit-to-sequence & sequence-to-bit
 /**
  * @class int64_seq
  * @brief Class to represent DNA sequences using int64_t bit encoding (2 bits per nucleotide, up to 32 bases per chunk)
@@ -185,20 +194,22 @@ class int64_seq {
         }
     };
 
-// class structure to hold barcode information and its associated count
+/**
+ * @struct barcode_entry
+ * @brief Struct representing a barcode entry with its sequence, count, and filtering status
+ * @param barcode `int64_seq` representing the barcode sequence
+ * @param count `counter` atomic counter for tracking counts
+ * @param filtered `bool` flag indicating if the barcode is filtered
+ */
 struct barcode_entry {
-    int64_seq barcode;         // barcode sequence
-    mutable counter count;     // atomic counter for count
-    bool filtered;             // flag for filtering
-   //std::string flags;         // additional flags
-    // bc_stats stats;            // statistics
+    int64_seq barcode;
+    mutable counter count;
+    bool filtered;
     
     barcode_entry()
       : barcode(0,1), 
        count(0),
        filtered(false) 
-       //,flags(""),
-       //stats()
        { }
 
     bool operator==(const barcode_entry &o) const noexcept {
@@ -804,6 +815,12 @@ namespace mutation_tools {
 }
 
     // Overload for int64_seq objects
+/**
+ * @brief Detect homopolymers at the start or end of a DNA sequence represented as an `int64_seq`
+ * @param sequence The DNA sequence as an `int64_seq`
+ * @param max_hp Maximum allowed homopolymer length
+ * @return `bool` true if a homopolymer of length >= max_hp is detected, false otherwise
+ */
     bool detect_hp(const int64_seq& sequence, int max_hp) {
         if (!sequence.is_valid() || max_hp <= 0) {
             return false;
@@ -815,20 +832,32 @@ namespace mutation_tools {
 };
 
    // === bc_flat_set: lean index for huge whitelists =======================
+/**
+* @brief memory-efficient barcode whitelist using parallel flat hash set
+* @param key: `int64_seq` representing barcode sequences
+* @param value: `barcode_entry` containing barcode and associated data
+*/
     struct bc_flat_set {
         using key = int64_seq;
         using value = barcode_entry;
 
-        phmap::parallel_flat_hash_set<value,
-            phmap::Hash<value>,       // uses std::hash<barcode_entry>
-            phmap::EqualTo<value>     // uses operator==(barcode_entry)
-        > s;
+        phmap::parallel_flat_hash_set<value, phmap::Hash<value>, phmap::EqualTo<value>> s;
 
         bc_flat_set() = default;
     private:
-        static inline const key& key_of(const key& k) noexcept { return k; }
-        static inline const key& key_of(const value& v) noexcept { return v.barcode; }
+        static inline const key& key_of(const key& k) noexcept { 
+            return k; 
+        }
+        static inline const key& key_of(const value& v) noexcept { 
+            return v.barcode; 
+        }
 
+    /**
+     * @brief Extract the key (barcode) from either a key or value type, handling pointers as well
+     * @tparam U Type which can be either key, value, or pointer to either
+     * @param u The input object from which to extract the key
+     * @return const reference to the extracted key
+     */
     template <typename U>
     static inline const key& key_of_any(const U& u) {
         if constexpr (std::is_pointer_v<std::decay_t<U>>) {
@@ -838,15 +867,18 @@ namespace mutation_tools {
         }
     }
 
+    /**
+     * @brief Trait to check if a type is a range (has begin() and end() methods)
+     * @tparam T Type to check
+     */
     template <typename T, typename = void>
     struct is_range : std::false_type {};
     template <typename T>
     struct is_range<T,
-        std::void_t<
-            decltype(std::begin(std::declval<const T&>())),
-            decltype(std::end  (std::declval<const T&>()))
-        >
-    > : std::true_type {};
+    std::void_t<
+    decltype(std::begin(std::declval<const T&>())),
+    decltype(std::end(std::declval<const T&>()))
+    >> : std::true_type {};
 
     template <typename T>
     static constexpr bool is_key_or_value_v =
@@ -862,7 +894,6 @@ namespace mutation_tools {
         return s.find(probe) != s.end();
     }
 
-    
     public:
         //  Size & housekeeping (names to minimize churn)
         size_t size()             const { return s.size(); }
@@ -871,7 +902,12 @@ namespace mutation_tools {
         bool   empty()            const { return s.empty(); }
         void   clear()                  { s.clear(); }
 
-        //  Membership
+/**
+ * @brief Check if any barcode in the input matches an entry in the whitelist
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param x The input object to check for matches
+ * @return `bool` true if any barcode matches, false otherwise
+ */
         template<typename T> bool check_wl_for(const T& x) const {
             if constexpr (is_key_or_value_v<T>) {
                 const key& k = key_of_any(x);
@@ -887,6 +923,12 @@ namespace mutation_tools {
             return false;
         }
 
+/**
+ * @brief Return all barcodes from the input that match entries in the whitelist
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param x The input object to check for matches
+ * @return `unordered_set<key>` of matching barcodes
+ */
         template<typename T> std::unordered_set<key> return_matching_barcodes(const T& x) const {
             std::unordered_set<key> out;
             if constexpr (is_key_or_value_v<T>) {
@@ -901,41 +943,75 @@ namespace mutation_tools {
             } 
             return out;
         }
-
+/**
+ * @brief Return all putative correct barcodes from the input that match entries in the whitelist
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param x The input object to check for matches
+ * @return `unordered_set<key>` of putative correct barcodes
+ */
         template<typename T> std::unordered_set<key> return_putative_correct_bcs(const T& x) const {
             return return_matching_barcodes(x);
         }
 
-        //  Insert 
+/**
+ * @brief Insert a barcode entry into the whitelist
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param observed The observed barcode (not used in this implementation)
+ * @param correct The correct barcode entry to insert
+ */
         template<typename T> void insert_bc_entry(const T& /*observed*/, const value& correct) {
             if (!correct.is_valid()) return;
             s.lazy_emplace_l(correct,
                 [&](auto& it) { /* present: no-op */ },
                 [&](const auto& ctor){ ctor(correct); });
         }
+/**
+ * @brief Insert a barcode entry into the whitelist by constructing it from the observed barcode
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param observed The observed barcode from which to construct the entry
+ */
         template<typename T> void insert_bc_entry(const T& /*observed*/, value&& correct) {
             if (!correct.is_valid()) return;
             s.lazy_emplace_l(correct,
                 [&](auto& it) { /* present */ },
                 [&](const auto& ctor){ ctor(std::move(correct)); });
         }
+/**
+ * @brief Insert a barcode entry into the whitelist using only the observed barcode
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param observed The observed barcode from which to create the entry
+ */
         template<typename T> void insert_bc_entry(const T& observed) {
             value v{}; v.barcode = key_of(observed);
             if (!v.is_valid()) return;
             insert_bc_entry(observed, std::move(v));
         }
-
+/**
+ * @brief Remove a barcode entry from the whitelist by observed barcode
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param observed The observed barcode to remove
+ */
         // Remove by key 
         template<typename T> void remove_bc_entry(const T& observed) {
             value probe; probe.barcode = key_of(observed);
             s.erase(probe);
         }
+/**
+ * @brief Erase a barcode entry from the whitelist by observed barcode and return the number of elements removed
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param observed The observed barcode to erase
+ */
         template<typename T> size_t erase(const T& observed) {
             value probe; probe.barcode = key_of(observed);
             return s.erase(probe);
         }
 
-        // Counters
+/**
+ * @brief Get the total barcode count for a given barcode
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param x The input object for which to get the barcode count
+ * @return `counter` object containing all barcode counts
+ */
         template<typename T> counter get_all_bc_counts(const T& x) const {
             value probe; probe.barcode = key_of(x);
             if (!probe.is_valid()) return counter(0);
@@ -943,27 +1019,50 @@ namespace mutation_tools {
             return (it!=s.end()) ? it->count : counter(0);
         }
 
+/**
+ * @brief Update the barcode count for a given barcode
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param x The input object for which to update the barcode count
+ * @param slot The specific barcode count slot to update (default is total)
+ */
         template<typename T> void update_bc_count(const T& x, barcode_counts slot = barcode_counts::total) const {
             value probe; probe.barcode = key_of(x);
             if (!probe.is_valid()) return;
             auto it = s.find(probe);
             if (it != s.end()) const_cast<value&>(*it).count.increment(slot);
         }
-
+/**
+ * @brief Subtract from the barcode count for a given barcode
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param x The input object for which to subtract from the barcode count
+ * @param slot The specific barcode count slot to update (default is total)
+ */
         template<typename T> void subtract_bc_count(const T& x, barcode_counts slot = barcode_counts::total) const {
             value probe; probe.barcode = key_of(x);
             if (!probe.is_valid()) return;
             auto it = s.find(probe);
             if (it != s.end()) const_cast<value&>(*it).count.subtract(slot);
         }
-
+/**
+ * @brief Get the barcode count for a given barcode
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param x The input object for which to get the barcode count
+ * @param slot The specific barcode count slot to retrieve (default is total)
+ * @return `int` barcode count for the specified slot
+ */
         template<typename T> int get_bc_count(const T& x, barcode_counts slot = barcode_counts::total) const {
             value probe; probe.barcode = key_of(x);
             if (!probe.is_valid()) return 0;
             auto it = s.find(probe);
             return (it != s.end()) ? it->count.load(slot) : 0;
         }
-
+/**
+ * @brief Set the barcode count for a given barcode
+ * @tparam T Type which can be a key, value, or a range of either
+ * @param x The input object for which to set the barcode count
+ * @param new_count The new count value to set
+ * @param slot The specific barcode count slot to update (default is total)
+ */
         template<typename T> void set_bc_count(const T& x, int new_count, barcode_counts slot = barcode_counts::total) const {
             value probe; probe.barcode = key_of(x);
             if (!probe.is_valid()) return;
@@ -971,7 +1070,10 @@ namespace mutation_tools {
             if (it != s.end()) const_cast<value&>(*it).count.counts[slot].store(new_count, std::memory_order_relaxed);
         }
 
-        // ==== Utility Methods ====
+/**
+ * @brief Get all unique barcode entries in the whitelist
+ * @return `vector<const value*>` of pointers to all unique barcode entries
+ */
         std::vector<const value*> get_unique_entries() const {
             std::vector<const value*> result;
             result.reserve(s.size());
@@ -993,6 +1095,11 @@ namespace mutation_tools {
             bool operator!=(const value_iterator& o) const { return end_!=o.end_ || p!=o.p; }
             bool operator==(const value_iterator& o) const { return !(*this!=o); }
         };
+/**
+ * @brief Get the equal range for a given barcode key
+ * @param k The barcode key to search for
+ * @return `pair<value_iterator,value_iterator>` representing the range of matching entries (0 or 1 element)
+ */
         std::pair<value_iterator,value_iterator> equal_range(const key& k) const {
             value probe; probe.barcode = k;
             auto it = s.find(probe);
@@ -1000,7 +1107,11 @@ namespace mutation_tools {
             return { value_iterator(&*it,false), value_iterator(nullptr,true) };
         }
 
-        // ---- summaries for CSV ----
+/**
+ * @brief Summarize barcode counts for all entries or a filtered set of barcodes
+ * @param filter_keys Optional pointer to a set of barcode keys to filter the summary
+ * @return `vector<tuple<string,int,int,int,int,int,int,int,int>>` containing barcode summaries
+ */
         std::vector<std::tuple<std::string,int,int,int,int,int,int,int,int>>
         summarize_counts(const std::unordered_set<key>* filter_keys=nullptr) const {
             using row = std::tuple<std::string,int,int,int,int,int,int,int,int>;
@@ -1078,6 +1189,13 @@ namespace mutation_tools {
         auto begin() const { return s.begin(); }
         auto end()   const { return s.end();   }
 
+/**
+ * @brief Write a summary of barcode counts to an output stream
+ * @param out The output stream to write to
+ * @param class_id A string identifier for the barcode class
+ * @param filter_keys Optional pointer to a set of barcode keys to filter the summary
+ * @param write_header Whether to write the header line (default: true)
+ */
         void write_wl_summary(
             std::ostream &out,
             const std::string class_id,
@@ -1107,8 +1225,12 @@ namespace mutation_tools {
         }
     };
 
-template<typename key, typename value>
-struct bc_multimap {
+/**
+* @brief concurrent multimap for barcode corrections
+* @param key: `int64_seq` representing barcode sequences
+* @param value: `barcode_entry` containing barcode and associated data
+*/
+template<typename key, typename value> struct bc_multimap {
 private:
     static inline const key& key_of(const key &k) noexcept { 
         return k; 
@@ -1627,11 +1749,21 @@ public:
 
 };
 
+/**
+ * @brief Whitelist class managing true and filtered barcodes
+ * @param wl_entry: Struct containing true barcodes, filtered barcodes, and global barcodes
+ */
 class whitelist {
     public:
         whitelist() = default;
         ~whitelist() = default;
 
+/**
+ * @brief Struct representing a whitelist entry with true barcodes, filtered barcodes, and global barcodes
+ * @param true_bcs: `bc_multimap<int64_seq, barcode_entry>` for true barcodes
+ * @param filter_bcs: `bc_multimap<int64_seq, barcode_entry>` for filtered barcodes
+ * @param global_bcs: `bc_flat_set` for global barcodes
+ */
     struct wl_entry {
         bc_multimap<int64_seq, barcode_entry> true_bcs, filter_bcs;
         bc_flat_set global_bcs;
@@ -1644,7 +1776,10 @@ class whitelist {
             if (src == "global") return f(global_bcs);
             return f(true_bcs);
         }
-
+/** 
+ * @brief Generate mismatch barcodes by applying mutations and shifts to existing true barcodes
+ * @param mutation_rounds Number of mutation rounds to apply 
+*/
         void generate_mismatch_barcodes(int mutation_rounds, bool verbose, int nthreads = 1) {
                 using namespace std::chrono;
                 auto start_total = high_resolution_clock::now();
@@ -1840,8 +1975,12 @@ class whitelist {
             out.push_back(kv.first);
         return out;
     }
-    
-      // for one spec (kit name or file path), load its int64_seq set
+/**
+ * @brief Load barcodes from a specified kit name or file path
+ * @param spec: Kit name or file path to load barcodes from
+ * @param default_length: Default length of barcodes if not specified
+ * @return Unordered set of `int64_seq` representing loaded barcodes
+ */
     static std::unordered_set<int64_seq> load_barcodes(std::string const &spec, uint16_t default_length, bool verbose) {
         if (verbose) std::cout << "[load_barcodes] Loading barcodes from path/kit: " << spec << "\n";
         // check if spec is a kit name or a file path
@@ -1887,8 +2026,11 @@ class whitelist {
         }
         return out;
     }
-
-    // populate a wl_entry with the given barcode set
+/**
+ * @brief Populate a whitelist entry with true and global barcodes based on provided sets
+ * @param out: Reference to the `wl_entry` to populate
+ * @param sets: Vector of unordered sets of `int64_seq` representing barcode sets
+ */
     void populate_entry(wl_entry &out, std::vector<std::unordered_set<int64_seq>> const &sets){
         if (sets.size() == 1) {
             auto const &A = sets[0];
@@ -1968,7 +2110,15 @@ class whitelist {
     //cheap but easy way to import b/w both global or custom--just set
     //an arbitrary threshold for the number of true barcodes to be kept because ideally after a certain size of barcodes
     //you really just want to treat them both the same way
-    
+/**
+ * @brief Import a whitelist from a specified field (kit name or file path)
+ * @param field: Kit name or file path to import the whitelist from
+ * @param default_length: Default length of barcodes if not specified
+ * @return `wl_entry` containing the imported whitelist
+ * @brief cheap but easy way to import b/w both global or custom--just set
+ * an arbitrary threshold for the number of true barcodes to be kept because ideally after a certain size of barcodes
+ * you really just want to treat them both the same way
+ */
     wl_entry import_whitelist(std::string const &field, bool verbose, uint16_t default_length = 16) {
         if(verbose) std::cout << "[import_whitelist] Importing whitelist from " << field << "\n";
         // split into 1 or 2 specs
@@ -1997,11 +2147,11 @@ class whitelist {
 
 };
 
-//needed to include this down here because of the definitions above that I couldn't make work by movign this to the misc utils, though I sure would love for this to be there
-// Fixed memory calculation functions
-// ===== bc_mem_utils: flat-set aware overloads =====
+/**
+ * @namespace bc_mem_utils
+ * @brief Namespace for memory utility functions related to barcode containers
+ */
 namespace bc_mem_utils {
-
 // ---------- helpers used by both containers ----------
 inline std::size_t get_int64seq_mem(const int64_seq& seq) {
     std::size_t base = sizeof(int64_seq);

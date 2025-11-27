@@ -28,6 +28,7 @@ std::string reverse_complement(const std::string& seq) {
 std::string extract_barcode(
     const std::string& sequence, int primer_pos, int primer_len, int n_bases, int m_left, int m_right, bool is_rc) {
     int start_pos, end_pos; 
+    std::string final_bc;
     if (is_rc) {
         // For reverse complement, extract before the primer
         start_pos = std::max(0, primer_pos - m_right - n_bases);
@@ -40,7 +41,13 @@ std::string extract_barcode(
     if (start_pos >= end_pos || start_pos < 0 || end_pos > (int)sequence.length()) {
         return "";
     }
-    return sequence.substr(start_pos, end_pos - start_pos);
+    if(is_rc){
+        std::string bc_seq = sequence.substr(start_pos, end_pos - start_pos);
+        final_bc = seq_utils::revcomp(bc_seq);
+    } else {
+        final_bc = sequence.substr(start_pos, end_pos - start_pos);
+    }
+    return final_bc;
 }
 
 // Structure to hold a read for processing
@@ -991,8 +998,8 @@ int main(int argc, char* argv[]) {
     
     std::cout << "Found " << barcodes.size() << " barcodes\n";
     
-    write_fasta(barcodes, output_file);
-    std::cout << "Results written to " << output_file << "\n";
+    //write_fasta(barcodes, output_file);
+    //std::cout << "Results written to " << output_file << "\n";
     
     if (!whitelist_file.empty()) {
         std::cout << "\nLoading whitelist and performing perfect match analysis...\n";
@@ -1001,6 +1008,5 @@ int main(int argc, char* argv[]) {
         std::string csv_output = csv_file.empty() ? "perfect_matches.csv" : csv_file;
         count_perfect_matches_with_stats(barcodes, whitelist, csv_output);
     }
-    
     return 0;
 }

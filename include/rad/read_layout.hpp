@@ -30,7 +30,7 @@ struct ParsedPosition {
         if(pos_str.empty()){
             std::cout << "[from_string] Empty position string\n"; 
             return pos;
-        } 
+        }
 
         // First split by pipes to see what we're dealing with
         std::vector<std::string> parts;
@@ -49,11 +49,7 @@ struct ParsedPosition {
                 std::cout << "[from_string] Found part: '" << temp << "'\n";
             }
         }
-
-        // parts[0] = ref_id
-        // parts[1] = start/stop+offset or start/stop-offset
-        // parts[2] = flags (if exists)
-        
+                
         if(parts.size() >= 1) {
             pos.ref_id = parts[0];
             if(verbose) std::cout << "[from_string] Set ref_id: " << pos.ref_id << "\n";      
@@ -1936,6 +1932,10 @@ public:
         }
     };
 
+/**
+ * @brief Constructor that initializes the Misalignment_Setup with a given ReadLayout.
+ * @param layout ReadLayout object
+ */
     Misalignment_Setup(const ReadLayout& layout) {
         // Extract static adapters (non poly-tail, non start/stop)
         // guards against empty seq -- need to update for static indexing
@@ -2171,13 +2171,25 @@ private:
         return true;
     }
 
+/**
+ * @brief initialize consensus matrices for a given adapter
+ * @param adapter_id the ID of the adapter
+ * @param adapter_length the length of the adapter sequence
+ * @param max_errors the maximum number of errors to consider
+ * @brief initializes consensus matrices for edit distances from 0 to max_errors
+ */
     void init_consensus_matrices(const std::string& adapter_id, size_t adapter_length, int max_errors) {
         consensus_matrices[adapter_id].clear();
         for(int ed = 0; ed <= max_errors; ed++) {
             consensus_matrices[adapter_id].emplace_back(adapter_length, ed);
         }
     }
-
+/**
+ * @brief update consensus matrices with a new aligned sequence and its edit distance
+ * @param adapter_id the ID of the adapter
+ * @param aligned_seq the aligned sequence
+ * @param edit_distance the edit distance of the aligned sequence
+ */
     void update_consensus_matrices(const std::string& adapter_id, const std::string& aligned_seq, int edit_distance) {
             // Add sequence to all matrices that accept this edit distance or higher
             for(auto& matrix : consensus_matrices[adapter_id]) {
@@ -2189,7 +2201,13 @@ private:
                 }
             }
         }
-
+/**
+ * @brief collect the aligned portion of a read sequence based on alignment result
+ * @param read_seq the read sequence
+ * @param adapter_seq the adapter sequence
+ * @param result the Edlib alignment result
+ * @return the aligned portion of the read sequence
+ */
     std::string collect_aligned_seq(const std::string& read_seq, const std::string& adapter_seq, EdlibAlignResult& result) {
         // Get CIGAR string
         char* cigar = edlibAlignmentToCigar(
@@ -2206,7 +2224,13 @@ private:
         free(cigar);
         return aligned;
     }
-
+/**
+ * @brief generate a masked adapter sequence based on consensus matrices and misalignment statistics
+ * @param adapter_id the ID of the adapter
+ * @param adapter_seq the original adapter sequence
+ * @param stats the misalignment statistics for the adapter
+ * @return the masked adapter sequence
+ */
     std::string generate_masked_adapter(const std::string& adapter_id, const std::string adapter_seq, const misalignment_stats& stats) {
     int threshold = static_cast<int>(std::floor(stats.mean - stats.get_sd()));
     // Define max consecutive N's allowed as (threshold - 1), with a minimum of 1.
@@ -2280,6 +2304,12 @@ private:
     return masked_seq;
 }
 
+/**
+ * @brief update the ReadLayout with misalignment thresholds and masked adapters
+ * @param layout the ReadLayout to update
+ * @param adapter_stats map of adapter IDs to their misalignment statistics
+ * @param misalignment_stats map of adapter IDs to their misalignment position statistics
+ */
     void update_read_layout(
         ReadLayout& layout,
          std::unordered_map<std::string, misalignment_stats>& adapter_stats,

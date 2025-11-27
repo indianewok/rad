@@ -1,7 +1,14 @@
 #pragma once
 #include "rad_headers.h"
 
-//simplest solution i could figure out 
+
+// needed a way for IO to work on .gz and non .gz files, and needed a PIGZ/non-PIGZ solution for files.
+// finangled a way to deal with this by just opening two kseq instantiations because you can't trade them off once opened.
+// so just open two, kseq_fd and kseq_gz, and use the appropriate one based on whether pigz is being used or not/filetype.
+
+/**
+ * @brief kseq intialization for regular file
+ */
 namespace kseq_fd {
     #ifndef KSEQ_INIT_INT_READ
     #define KSEQ_INIT_INT_READ
@@ -9,6 +16,9 @@ namespace kseq_fd {
     #endif
 }
 
+/**
+ * @brief kseq initialization for gzFile
+ */
 namespace kseq_gz {
     #ifndef KSEQ_INIT_GZFILE_GZREAD  
     #define KSEQ_INIT_GZFILE_GZREAD
@@ -19,7 +29,7 @@ namespace kseq_gz {
 /**
  * @brief Parallel decompression reading using pigz
  * 
- * Manages pigz subprocess for multi-threaded decompression of gzipped files.
+ * Manages pigz subprocess for multi-threaded decompression of gzipped files
  */
 class pigz_reading {
 public:
@@ -54,9 +64,14 @@ public:
             return nullptr;
         }
         
+        //removed because if you set a static thread_local buffer, it messes with multiple files opened in different threads.
+        // will cause issues streaming from multiple files in parallel
+        // had originally set it up trying to debug, TSPMTFO
+
         // Large read buffer (16 MB) to reduce read() syscalls
-        static thread_local std::vector<char> read_buf(16u << 20);
-        setvbuf(fp, read_buf.data(), _IOFBF, read_buf.size());
+        
+        //static thread_local std::vector<char> read_buf(16u << 20);
+       // setvbuf(fp, read_buf.data(), _IOFBF, read_buf.size());
         
         return fp;
     }
@@ -98,6 +113,17 @@ public:
  */
 class file_streaming {
 public:
+/**
+ * @brief File pointer structure for kseq reading
+ * @param fp_pigz Pigz pipe handle or regular file handle
+ * @param fp_gzip Fallback gzip handle
+ * @param seq_fd kseq for FILE* (pigz path or uncompressed)
+ * @param seq_gz kseq for gzFile (fallback path)
+ * @param fd File descriptor for kseq
+ * @param path File path
+ * @param using_pigz Flag indicating if pigz is used
+ * @param pigz_reader pigz reading manager
+ */
     struct file_pointer {
         FILE* fp_pigz;      // Pigz pipe handle or regular file handle
         gzFile fp_gzip;     // Fallback gzip handle
@@ -331,7 +357,7 @@ namespace readmem_utils {
     // --- size helpers using capacity() (no fudge) ---
     static inline size_t bytes_of(const std::string& s) noexcept { return s.capacity(); }
 
-    // specialize for your record type: read_streaming::sequence
+    // specialize for record type: read_streaming::sequence
     static inline size_t bytes_of_rec(const read_streaming::sequence& r) noexcept {
         return bytes_of(r.id) + bytes_of(r.comment) + bytes_of(r.seq) + bytes_of(r.qual) + sizeof(r);
     }
@@ -366,12 +392,12 @@ namespace readmem_utils {
     };
     inline InFlight& inflight() { static InFlight g; return g; }
 
-    struct ScopedInFlight {
+    struct scoped_in_flight {
         size_t b{0}; bool active{false};
-        explicit ScopedInFlight(size_t bytes) : b(bytes), active(true) { inflight().add(b); }
-        ~ScopedInFlight(){ if (active) inflight().sub(b); }
-        ScopedInFlight(const ScopedInFlight&) = delete;
-        ScopedInFlight& operator=(const ScopedInFlight&) = delete;
+        explicit scoped_in_flight(size_t bytes) : b(bytes), active(true) { inflight().add(b); }
+        ~scoped_in_flight(){ if (active) inflight().sub(b); }
+        scoped_in_flight(const scoped_in_flight&) = delete;
+        scoped_in_flight& operator=(const scoped_in_flight&) = delete;
     };
 
     static inline double rss_gib() {
@@ -469,7 +495,7 @@ public:
                     }
 
                     const size_t __chunk_bytes = readmem_utils::bytes_of_vec(chunk);
-                    readmem_utils::ScopedInFlight __guard(__chunk_bytes);
+                    readmem_utils::scoped_in_flight __guard(__chunk_bytes);
                     readmem_utils::log_chunk(__chunk_bytes /*, optional_chunk_id */);
                     chunk_func(chunk, input_path);
                 }
@@ -626,7 +652,7 @@ public:
             // Build big uncompressed buffer for pigz (few syscalls, fewer context switches)
             for (auto const& item : chunk) write_one_(item);
         } else {
-            // Your legacy path (ostream through Boost chain)
+            // legacy path (ostream through Boost chain)
             for (auto const& item : chunk) write_one_(item);
         }
     }

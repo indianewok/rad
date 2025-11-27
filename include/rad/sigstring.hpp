@@ -3,6 +3,17 @@
 
 /**
  * @brief Represents a processed element with alignment information
+ * @param class_id ``std::string`` Unique identifier for the element
+ * @param global_class ``std::string`` Global classification
+ * @param edit_distance ``std::optional<int>`` Edit distance from alignment
+ * @param position ``std::pair<int, int>`` Start and stop positions
+ * @param type ``std::string`` Element type (variable or static)
+ * @param order ``int`` Position in layout
+ * @param direction ``std::string`` Orientation (forward or reverse)
+ * @param element_pass ``std::optional<bool>`` Whether element passed validation--optional for variable elements
+ * @param seq ``std::optional<std::string>`` sequence for this element
+ * @param qual ``std::optional<std::string>`` quality scores for sequencing data (if fastq)
+ * @param original_seq ``std::optional<std::string>`` original (pre-corrected) sequence if available
  */
 struct seq_element {
     std::string class_id;               // Unique identifier for the element
@@ -13,9 +24,9 @@ struct seq_element {
     int order;                          // Position in layout
     std::string direction;              // Orientation
     std::optional<bool> element_pass;  // Whether element passed validation
-    std::optional<std::string> seq;    // Element sequence if available
-    std::optional<std::string> qual;   // Element quality scores if available
-    std::optional<std::string> original_seq;  // corrected sequence if available
+    std::optional<std::string> seq;    // sequence for this element
+    std::optional<std::string> qual;   // quality scores for sequencing data (if fastq)
+    std::optional<std::string> original_seq;  // original (pre-corrected) sequence if available
 
     seq_element(
         std::string class_id,
@@ -44,6 +55,13 @@ struct seq_element {
 
 /**
  * @brief Represents a static processed element with alignment information
+ * @param positions ``std::vector<std::pair<int, int>>`` List of start and stop positions for multiple alignments
+ * @param edit_distance ``int`` Edit distance from alignment
+ * @param success ``bool`` Whether alignment was successful
+ * @param seq ``std::string`` Aligned sequence
+ * @param cigar ``std::string`` CIGAR string representing alignment
+ * @param score ``int`` Alignment score
+ * @param pos ``std::pair<int, int>`` Start and stop positions of the best alignment
  */
 struct static_alignments {
     std::vector<std::pair<int, int>> positions;
@@ -64,7 +82,10 @@ struct sig_order_tag {};
 struct sig_pass_tag {};
 struct sig_read_tag {};
 
-// Define the multi-index container
+/**
+ * @brief Multi-index container for seq_element
+ * 
+ */
 typedef boost::multi_index::multi_index_container<
     seq_element,
     boost::multi_index::indexed_by<
@@ -106,6 +127,11 @@ typedef boost::multi_index::multi_index_container<
 
 class aligner_tools {
 private:
+/**
+ * @brief Get the maximum number of consecutive matches from a CIGAR string
+ * @param cigar CIGAR string
+ * @return Maximum number of consecutive matches
+ */
     int get_max_consecutive_matches(const char* cigar) {
         int max_matches = 0;
         int current_matches = 0;
@@ -127,7 +153,12 @@ private:
         }
         return max_matches;
     }
-    
+
+/**
+ * @brief Get the maximum number of consecutive matches allowing for small indels from a CIGAR string
+ * @param cigar CIGAR string
+ * @return Maximum number of consecutive matches with at most one indel
+ */
     int get_max_consecutive_matches_with_indels(const char* cigar) {
         // First, parse the cigar string into segments.
         std::vector<std::pair<int, char>> segments;
@@ -172,7 +203,11 @@ private:
         }
         return best;
     }
-
+/**
+ * @brief Compute the edit distance from a CIGAR string
+ * @param cigar CIGAR string
+ * @return Edit distance
+ */
     int compute_edit_distance(const char* cigar) {
         int edit_distance = 0;
         int number = 0;
@@ -195,10 +230,33 @@ private:
         return edit_distance;
     }
 
-public:   
-    static_alignments align_static_elements(const std::string& query, const std::string& target, bool verbose,
-                                        int max_edit_distance = -1, const std::string& masked_query = "", 
-                                        bool primary = true, int expected_start = 1, int expected_end = -1) {
+public:
+/**
+ * @brief This is the master alignment function for static elements, using Edlib and SSW.
+ * @param query ``std::string`` Query sequence
+ * @param target ``std::string`` Target sequence
+ * @param verbose ``bool`` Whether to print verbose output
+ * @param max_edit_distance ``int`` Maximum allowed edit distance for Edlib alignment
+ * @param masked_query ``std::string`` Masked query sequence (optional)
+ * @param primary ``bool`` Whether this is the primary alignment attempt
+ * @param expected_start ``int`` Expected start position
+ * @param expected_end ``int`` Expected end position
+ * @return ``static_alignments`` Struct containing alignment results for this element
+ * 
+ * @brief This function first attempts to align the query to the target using Edlib with specified parameters.
+ * If Edlib returns exactly one candidate alignment within the expected region, that alignment is used.
+ * If multiple candidates or no candidates are found, the function falls back to using the Striped Smith-Waterman (SSW)
+ * algorithm for alignment. Scoring:
+ * - Match: +2
+ * - Mismatch: -2
+ * - Gap Open: -3
+ * - Gap Extend: -2
+ *  The function returns a `static_alignments` struct containing the results of the alignment.
+ */
+    static_alignments align_static_elements(
+        const std::string& query, const std::string& target, bool verbose, int max_edit_distance = -1, 
+        const std::string& masked_query = "", bool primary = true, int expected_start = 1, 
+        int expected_end = -1) {
 
         static_alignments alignment;
         alignment.success = false;
@@ -214,6 +272,7 @@ public:
         // Custom equality rules:
         // Uppercase A, C, T, G match their lowercase forms and also the pad character 'x'.
         // The masked letter N matches uppercase A, C, T, G and 'x', but not lowercase.
+        //this isn't used here, but will be useful (N-masking for barcodes, etc.)
         const int numEq = 13;
         EdlibEqualityPair customEqualities[numEq] = {
             {'A','a'}, {'C','c'}, {'T','t'}, {'G','g'},
@@ -248,7 +307,7 @@ public:
                     [](const std::pair<int,int>& a, const std::pair<int,int>& b) {
                         return a.first < b.first;
                     });
-            // Collapse overlapping intervals.
+            // Collapse overlapping intervals
             if (!intervals.empty()) {
                 std::pair<int,int> current = intervals[0];
                 for (size_t i = 1; i < intervals.size(); ++i) {
@@ -291,7 +350,6 @@ public:
         //defaults of match/mismatch/gap_open/gap_extend is 2/2/3/1
         //thoughts for a shorter sequence--i'm okay with a gap being opened, but the longer the gap goes the 
         //more it should cost. so if we score gap open as a mismatch, but then gap extend as a mismatch as well?
-        //playing with 2,2,3,2 and 2,2,3,1
         StripedSmithWaterman::Aligner ssw_aligner(2, 2, 3, 2);
         StripedSmithWaterman::Filter ssw_filter;
         ssw_filter.report_cigar = true;
@@ -350,7 +408,18 @@ public:
         }
     return alignment;
 }
-
+/**
+ * @brief Find poly-base tails in a sequence
+ * @param query ``std::string`` Query sequence (to determine poly-base)
+ * @param sequence ``std::string`` Target sequence to search for poly-base tails
+ * @param window_size ``int`` Size of the sliding window
+ * @return ``static_alignments`` Struct containing positions of poly-base tails and edit distance
+ * 
+ * @brief This function scans the target sequence using a sliding window approach to identify regions
+ * that are predominantly composed of a single base (the poly-base). It allows for small gaps (default: up to 3 bases)
+ * between these regions (``min_gap``). If a window contains at least (default: 90%) of the poly-base (``min_count``), 
+ * it is considered a potential poly-tail. 
+ */
     static_alignments find_poly_tails(const std::string& query, const std::string& sequence, int window_size) {
         static_alignments result;
         result.success = false;
@@ -406,14 +475,25 @@ public:
     }
 };
 
+/**
+ * @namespace barcode_correction
+ * @brief Namespace for barcode correction functions and utilities
+ */
 namespace barcode_correction {
-
-    // barcode correction result(s)
-    // Count-based quality check for barcodes, looking at total summated counts to curb against false positives and spurious corrections
-    bool passes_quality_check(const int64_seq& candidate, 
-            const whitelist::wl_entry* wl,
-            const std::string& whitelist_source,
-            const std::string& mode,
+    /**
+     * @brief Check if a candidate barcode passes quality checks based on counts from the whitelist
+     * @param candidate ``int64_seq`` Candidate barcode sequence
+     * @param wl ``const whitelist::wl_entry*`` Pointer to the whitelist entry
+     * @param whitelist_source ``std::string`` Source of the whitelist ("global" or "true")
+     * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive"), 
+     * determines whether barcode is scanned against the global or true whitelist first and 
+     * strictness of the quality checks (defensive = more strict, offensive = less strict)
+     * Default quality parameter is 80% correction ratio for barcodes with >=10 total counts and >=2 raw counts
+     * @param verbose ``bool`` Whether to print verbose output
+     * @return ``bool`` True if the candidate passes quality checks
+     */
+    bool passes_quality_check(const int64_seq& candidate, const whitelist::wl_entry* wl, const std::string& whitelist_source, 
+        const std::string& mode,
             bool verbose) {
 
             auto all_counts = wl->with_wl(whitelist_source, [&](const auto& typed_wl) {
@@ -474,62 +554,81 @@ namespace barcode_correction {
         return overall_pass;
     }
 
-std::pair<std::optional<int64_seq>, std::optional<int>> 
-resolve_multiple_hits_simple(
-    const int64_seq& query,
-    const std::unordered_set<int64_seq>& candidates,
-    int max_dist,
-    bool verbose,
-    const std::string& wl_type,
-    const whitelist::wl_entry* wl = nullptr
-) {
-    auto sorted = mutation_tools::int64_lvdist(query, candidates, max_dist);
-    if (sorted.empty()) return {std::nullopt, std::nullopt};
+/**
+ * @brief Tiebreaker for multiple candidate barcodes by selecting the best one based on edit distance and quality checks
+ * @param query ``int64_seq`` Query barcode sequence
+ * @param candidates ``const std::unordered_set<int64_seq>&`` Set of candidate barcode sequences
+ * @param max_dist ``int`` Maximum allowed edit distance
+ * @param verbose ``bool`` Whether to print verbose output
+ * @param wl_type ``std::string`` Type of whitelist ("global" or "true")
+ * @param wl ``const whitelist::wl_entry*`` Pointer to the whitelist entry
+ * @return ``std::pair<std::optional<int64_seq>, std::optional<int>> Pair containing the resolved barcode (if any) and its edit distance
+ */
+    std::pair<std::optional<int64_seq>, std::optional<int>> 
+    resolve_multiple_hits_simple(const int64_seq& query, const std::unordered_set<int64_seq>& candidates,
+        int max_dist, bool verbose, const std::string& wl_type, const whitelist::wl_entry* wl = nullptr
+    ) {
+        auto sorted = mutation_tools::int64_lvdist(query, candidates, max_dist);
+        if (sorted.empty()) return {std::nullopt, std::nullopt};
 
-    // Find candidates with raw_count > 0 at lowest edit distance
-    for (const auto& [edit_dist, candidate_set] : sorted) {
-        std::vector<int64_seq> valid_candidates;
-        for (const auto& candidate : candidate_set) {
+        // Find candidates with raw_count > 0 at lowest edit distance
+        for (const auto& [edit_dist, candidate_set] : sorted) {
+            std::vector<int64_seq> valid_candidates;
+            for (const auto& candidate : candidate_set) {
 
-            int raw_count = wl->with_wl(wl_type, [&](const auto& typed_wl) {
-                return typed_wl.get_bc_count(candidate, barcode_counts::raw);
-            });
+                int raw_count = wl->with_wl(wl_type, [&](const auto& typed_wl) {
+                    return typed_wl.get_bc_count(candidate, barcode_counts::raw);
+                });
 
-            if (raw_count > 0) {
-                valid_candidates.push_back(candidate);
+                if (raw_count > 0) {
+                    valid_candidates.push_back(candidate);
+                }
             }
-        }
-        
-        if (valid_candidates.empty()) {
-            continue; // Try next edit distance
-        }
-        
-        if (valid_candidates.size() == 1) {
-            if (verbose) std::cout << "Winner: unique candidate at distance " << edit_dist << "\n";
-            if(passes_quality_check(valid_candidates[0], wl, wl_type, "offensive", verbose)) {
-                return {valid_candidates[0], edit_dist};
+            
+            if (valid_candidates.empty()) {
+                continue; // Try next edit distance
+            }
+            
+            if (valid_candidates.size() == 1) {
+                if (verbose) std::cout << "Winner: unique candidate at distance " << edit_dist << "\n";
+                if(passes_quality_check(valid_candidates[0], wl, wl_type, "offensive", verbose)) {
+                    return {valid_candidates[0], edit_dist};
+                } else {
+                    if (verbose) std::cout << "Quality check failed for candidate, rejecting\n";
+                    return {std::nullopt, edit_dist};
+                }
             } else {
-                if (verbose) std::cout << "Quality check failed for candidate, rejecting\n";
+                if (verbose) std::cout << "Multiple candidates at distance " << edit_dist << ", rejecting\n";
                 return {std::nullopt, edit_dist};
             }
-        } else {
-            if (verbose) std::cout << "Multiple candidates at distance " << edit_dist << ", rejecting\n";
-            return {std::nullopt, edit_dist};
         }
+        
+        if (verbose) std::cout << "No candidates with raw_count > 0, rejecting\n";
+        return {std::nullopt, std::nullopt};
     }
-    
-    if (verbose) std::cout << "No candidates with raw_count > 0, rejecting\n";
-    return {std::nullopt, std::nullopt};
-}
 
-    std::optional<int64_seq> check_against_wl(
-        const int64_seq& bc,
-        const std::unordered_set<int64_seq>& candidates,
-        const std::string& whitelist_type,
-        int max_dist,
-        bool verbose,
-        const std::string& mode,
-        const whitelist::wl_entry* wl = nullptr) {
+/**
+ * @brief Check a barcode against a whitelist and return a corrected barcode if found
+ * @param bc ``int64_seq`` Barcode sequence to check
+ * @param candidates ``const std::unordered_set<int64_seq>&`` Set of candidate barcode sequences
+ * @param whitelist_type ``std::string`` Type of whitelist ("global" or "true")
+ * @param max_dist ``int`` Maximum allowed edit distance
+ * @param verbose ``bool`` Whether to print verbose output
+ * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive")
+ * @param wl ``const whitelist::wl_entry*`` Pointer to the whitelist entry
+ * @return ``std::optional<int64_seq>`` Corrected barcode sequence if found, otherwise std::nullopt
+ * 
+ * @brief This function checks the provided barcode against a set of candidate barcodes derived from the specified whitelist.
+ * It first identifies candidates that match the barcode within the allowed edit distance.
+ * If no candidates are found, it returns std::nullopt.
+ * If a single candidate is found, it calculates the Levenshtein distance to confirm the match and performs a quality check before returning the corrected barcode.
+ * In cases where multiple candidates are found, the function employs an enhanced resolution strategy to identify the best match.
+ * If a single best match is identified, it also undergoes a quality check before being returned.
+ * If no suitable match is found or if quality checks fail, the function returns std::nullopt.
+ */
+    std::optional<int64_seq> check_against_wl(const int64_seq& bc, const std::unordered_set<int64_seq>& candidates,
+        const std::string& whitelist_type, int max_dist, bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr
+    ) {
         
 
         // Early exit if whitelist is empty or no candidates match
@@ -627,184 +726,203 @@ resolve_multiple_hits_simple(
         return std::nullopt;
     }
 
-    //this one works best, edit distance of 2
-    std::optional<int64_seq> check_against_wl_exhaustive_v1(
-    const int64_seq& bc,
-    const std::string& whitelist_type,
-    int max_dist,
-    bool verbose,
-    const std::string& mode,
-    const whitelist::wl_entry* wl = nullptr) {
-    
-    auto matches = wl->with_wl(whitelist_type, [&](const auto& typed_wl) {
-        std::vector<std::pair<int64_seq, int>> match;
-        if (verbose) {
-        #pragma omp critical
-            {
-                std::ostringstream oss;
-                oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK" : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK")
-                    << " (checking " << typed_wl.size() << " sequences)\n";
-                std::cout << oss.str();
-            }
-        }
-
-        auto unique_entries = typed_wl.get_unique_entries();
-        for (const auto* entry : unique_entries) {
-            int res = mutation_tools::int64_lvdist(bc, entry->barcode, max_dist);
-            if (res >= 0) {
-                match.emplace_back(entry->barcode, res);
-            }
-        }
-        return match;
-    });
-    
-    if (matches.empty()) {
-        if (verbose) {
-            #pragma omp critical
-            {
-                std::ostringstream oss;
-                oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_NO_MATCHES" 
-                                                 : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_NO_MATCHES") << "\n";
-                std::cout << oss.str();
-            }
-        }
-        return std::nullopt;
-    }
-    
-    if (verbose) {
-        #pragma omp critical
-        {
-            std::ostringstream oss;
-            oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_FOUND" 
-                                             : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_FOUND")
-                << " (" << matches.size() << " matches)\n";
-            std::cout << oss.str();
-        }
-    }
-    
-    if (matches.size() == 1) {
-        auto [candidate, distance] = matches[0];
-        
-        if (verbose) {
-            #pragma omp critical
-            {
-                std::ostringstream oss;
-                oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_CANDIDATE::" 
-                                                 : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_CANDIDATE::")
-                    << candidate.bits_to_sequence() << "\n";
-                std::cout << oss.str();
-            }
-        }
-        
-        // Quality check
-        if (passes_quality_check(candidate, wl, whitelist_type, mode, verbose)) {
+/**
+ * @brief Exhaustively check a barcode against all entries in the whitelist
+ * @param bc ``int64_seq`` Barcode sequence to check
+ * @param whitelist_type ``std::string`` Type of whitelist ("global" or "true")
+ * @param max_dist ``int`` Maximum allowed edit distance 
+ * @param verbose ``bool`` Whether to print verbose output
+ * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive")
+ * @param wl ``const whitelist::wl_entry*`` Pointer to the whitelist entry
+ * @return ``std::optional<int64_seq>`` Corrected barcode sequence if found, otherwise std::nullopt
+ * 
+ * @brief This function performs an exhaustive search of the provided barcode against all entries in the specified whitelist.
+ * It calculates the Levenshtein distance between the input barcode and each whitelist entry, collecting those within the specified maximum distance.
+ * If exactly one match is found, it undergoes a quality check before being returned as the corrected barcode.
+ * In cases of multiple matches, the function identifies the best matches based on the smallest edit distance.
+ * If a single best match is identified, it also undergoes a quality check before being returned.
+ * If no matches are found or if quality checks fail, the function returns std::nullopt.
+ */ 
+    std::optional<int64_seq> exhaustive_check_against_wl(const int64_seq& bc, const std::string& whitelist_type,
+        int max_dist,bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr
+    ) {
+        auto matches = wl->with_wl(whitelist_type, [&](const auto& typed_wl) {
+            std::vector<std::pair<int64_seq, int>> match;
             if (verbose) {
-                #pragma omp critical
+            #pragma omp critical
                 {
                     std::ostringstream oss;
-                    oss << "LVDIST::" << distance << "\n"
-                        << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_MATCHED" 
-                                                     : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_MATCHED")
-                        << "\n";
+                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK" : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK")
+                        << " (checking " << typed_wl.size() << " sequences)\n";
                     std::cout << oss.str();
                 }
             }
-            return candidate;
-        } else {
+
+            auto unique_entries = typed_wl.get_unique_entries();
+            for (const auto* entry : unique_entries) {
+                int res = mutation_tools::int64_lvdist(bc, entry->barcode, max_dist);
+                if (res >= 0) {
+                    match.emplace_back(entry->barcode, res);
+                }
+            }
+            return match;
+        });
+        
+        if (matches.empty()) {
             if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
-                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_QUALITY_FAILED - rejecting barcode" 
-                                                     : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_QUALITY_FAILED - rejecting barcode") << "\n";
+                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_NO_MATCHES" 
+                                                    : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_NO_MATCHES") << "\n";
                     std::cout << oss.str();
                 }
             }
             return std::nullopt;
         }
-    } else {
-        // Multiple matches case - find best match(es)
-        
-        // Sort by distance (ascending)
-        std::sort(matches.begin(), matches.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
-        
-        int best_distance = matches[0].second;
-        
-        // Collect all matches with the best distance
-        std::vector<int64_seq> best_matches;
-        for (const auto& [candidate, distance] : matches) {
-            if (distance == best_distance) {
-                best_matches.push_back(candidate);
-            } else {
-                break; // Since sorted, no more best matches
-            }
-        }
         
         if (verbose) {
             #pragma omp critical
             {
                 std::ostringstream oss;
-                oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_FOUND" 
-                                                 : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_FOUND")
-                    << " (" << best_matches.size() << " at distance " << best_distance << ")\n";
+                oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_FOUND" 
+                                                : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_FOUND")
+                    << " (" << matches.size() << " matches)\n";
                 std::cout << oss.str();
             }
         }
         
-        if (best_matches.size() == 1) {
-            // Single best match
-            int64_seq best_candidate = best_matches[0];
+        if (matches.size() == 1) {
+            auto [candidate, distance] = matches[0];
             
-           if(passes_quality_check(best_candidate, wl, whitelist_type, mode, verbose)){
+            if (verbose) {
+                #pragma omp critical
+                {
+                    std::ostringstream oss;
+                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_CANDIDATE::" 
+                                                    : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_CANDIDATE::")
+                        << candidate.bits_to_sequence() << "\n";
+                    std::cout << oss.str();
+                }
+            }
+            
+            // Quality check
+            if (passes_quality_check(candidate, wl, whitelist_type, mode, verbose)) {
                 if (verbose) {
                     #pragma omp critical
                     {
                         std::ostringstream oss;
-                        oss << "LVDIST::" << best_distance << "\n"
-                            << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_MATCHED_RESOLVED" 
-                                                         : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_MATCHED_RESOLVED") << "\n";
+                        oss << "LVDIST::" << distance << "\n"
+                            << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_MATCHED" 
+                                                        : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_MATCHED")
+                            << "\n";
                         std::cout << oss.str();
                     }
                 }
-                return best_candidate;
+                return candidate;
             } else {
                 if (verbose) {
                     #pragma omp critical
                     {
                         std::ostringstream oss;
-                        oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_RESOLVED_QUALITY_FAILED - rejecting barcode" 
-                                                         : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_RESOLVED_QUALITY_FAILED - rejecting barcode") << "\n";
+                        oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_QUALITY_FAILED - rejecting barcode" 
+                                                        : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_QUALITY_FAILED - rejecting barcode") << "\n";
                         std::cout << oss.str();
                     }
                 }
                 return std::nullopt;
             }
         } else {
-            // Multiple equally good matches - ambiguous
+            // Multiple matches case - find best match(es),sort by distance (ascending)
+            std::sort(matches.begin(), matches.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+            int best_distance = matches[0].second;
+            // Collect all matches with the best distance
+            std::vector<int64_seq> best_matches;
+            for (const auto& [candidate, distance] : matches) {
+                if (distance == best_distance) {
+                    best_matches.push_back(candidate);
+                } else {
+                    break; // Since sorted, no more best matches
+                }
+            }
+            
             if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
-                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_AMBIGUOUS" 
-                                                     : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_AMBIGUOUS")
-                        << " (" << best_matches.size() << " equally good matches)\n";
+                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_FOUND" 
+                                                    : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_FOUND")
+                        << " (" << best_matches.size() << " at distance " << best_distance << ")\n";
                     std::cout << oss.str();
                 }
             }
-            return std::nullopt;
+            
+            if (best_matches.size() == 1) {
+                // Single best match
+                int64_seq best_candidate = best_matches[0];
+                
+            if(passes_quality_check(best_candidate, wl, whitelist_type, mode, verbose)){
+                    if (verbose) {
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << "LVDIST::" << best_distance << "\n"
+                                << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_MATCHED_RESOLVED" 
+                                                            : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_MATCHED_RESOLVED") << "\n";
+                            std::cout << oss.str();
+                        }
+                    }
+                    return best_candidate;
+                } else {
+                    if (verbose) {
+                        #pragma omp critical
+                        {
+                            std::ostringstream oss;
+                            oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_RESOLVED_QUALITY_FAILED - rejecting barcode" 
+                                                            : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_RESOLVED_QUALITY_FAILED - rejecting barcode") << "\n";
+                            std::cout << oss.str();
+                        }
+                    }
+                    return std::nullopt;
+                }
+            } else {
+                // Multiple equally good matches - ambiguous
+                if (verbose) {
+                    #pragma omp critical
+                    {
+                        std::ostringstream oss;
+                        oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_AMBIGUOUS" 
+                                                        : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_AMBIGUOUS")
+                            << " (" << best_matches.size() << " equally good matches)\n";
+                        std::cout << oss.str();
+                    }
+                }
+                return std::nullopt;
+            }
         }
+        return std::nullopt;
     }
-    return std::nullopt;
-}
 
-    std::optional<int64_seq> kmer_fuzzy_wl_search_v2(
-    const int64_seq& original_barcode, 
-    const std::string& expanded_seq, 
-    int bc_len,
-    const std::string& mode,
-    const whitelist::wl_entry& wl,
-    bool verbose,
-    int max_dist) {
+/**
+ * @brief Perform k-mer based fuzzy search for barcode correction
+ * @param original_barcode ``int64_seq`` Original barcode sequence
+ * @param expanded_seq ``std::string`` Expanded sequence region to generate k-mers from
+ * @param bc_len ``int`` Length of the barcode
+ * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive")
+ * @param wl ``const whitelist::wl_entry&`` Reference to the whitelist entry
+ * @param verbose ``bool`` Whether to print verbose output
+ * @param max_dist ``int`` Maximum allowed edit distance
+ * @return ``std::optional<int64_seq>`` Corrected barcode sequence if found, otherwise std::nullopt
+ * 
+ * @brief This function implements a k-mer based fuzzy search strategy for barcode correction.
+ * It generates k-mers from the provided expanded sequence region and checks them against the whitelist
+ * using existing barcode correction logic. The search is performed in either "defensive" or "offensive" mode,
+ * determining the order of whitelist checks. If no direct k-mer matches are found, the function attempts
+ * to find matches through k-mer mutations using an exhaustive search approach.
+ */
+    std::optional<int64_seq> kmer_fuzzy_search(const int64_seq& original_barcode, const std::string& expanded_seq, int bc_len,
+        const std::string& mode, const whitelist::wl_entry& wl, bool verbose, int max_dist
+    ) {
     
     if (verbose) {
         #pragma omp critical
@@ -817,7 +935,6 @@ resolve_multiple_hits_simple(
     // Step 1: Generate k-mers from expanded sequence
     std::vector<std::string> kmer_strings = seq_utils::kmerize(expanded_seq, bc_len);
     std::unordered_set<int64_seq> all_candidates;
-
 
     for (const auto& kmer_str : kmer_strings) {
         int64_seq kmer;
@@ -848,7 +965,6 @@ resolve_multiple_hits_simple(
             }
             return global_result;
         }
-        
         auto true_result = check_against_wl(original_barcode, all_candidates, "true", max_dist, verbose, mode, &wl);
         if (true_result.has_value()) {
             if (verbose) {
@@ -862,7 +978,6 @@ resolve_multiple_hits_simple(
         }
     } else { // offensive mode
         // Check true first, then global
-        
         auto true_result = check_against_wl(original_barcode, all_candidates, "true", max_dist, verbose, mode, &wl);
         if (true_result.has_value()) {
             if (verbose) {
@@ -899,10 +1014,9 @@ resolve_multiple_hits_simple(
     exp_bc.sequence_to_bits(expanded_seq);
        //BEST VERSION WORKS HERE @ ED 2, check_against_wl_exhaustive regular
        //totally arbitrary sizing of the whitelist to scan under, chosen bc i guesstimate that's the max of a sc expt
-       //also if this number gets big it goes slow
        //case in point, nearly a 2x speedup going from ~5k barcodes to 12k barcodes in the wl
     if(wl.true_bcs.size() <= 30000){
-       auto true_result = check_against_wl_exhaustive_v1(exp_bc, "true", 2, verbose, mode, &wl);
+       auto true_result = exhaustive_check_against_wl(exp_bc, "true", 2, verbose, mode, &wl);
        if (true_result.has_value()) {
             if (verbose) {
                 #pragma omp critical
@@ -922,15 +1036,19 @@ resolve_multiple_hits_simple(
     }
     return std::nullopt;
 }
+/**
+ * @brief Correct a barcode sequence using the provided layout and read information
+ * @param elem ``const seq_element&`` Sequence element containing barcode information
+ * @param layout ``const ReadLayout&`` Read layout containing whitelist mappings
+ * @param full_read ``const read_streaming::sequence&`` Full read sequence
+ * @param verbose ``bool`` Whether to print verbose output
+ * @param mut_dist ``int`` Maximum allowed edit distance for mutation checks
+ * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive")
+ * @return ``std::optional<int64_seq>`` Corrected barcode sequence if found, otherwise std::nullopt
+ */
 
-    //  correct_barcode function with quality checking
-    std::optional<int64_seq> correct_barcode_v2(
-        const seq_element& elem, 
-        const ReadLayout& layout, 
-        const read_streaming::sequence& full_read, 
-        bool verbose, 
-        int mut_dist, 
-        std::string mode) {
+    std::optional<int64_seq> correct_barcode(const seq_element& elem,  const ReadLayout& layout, 
+        const read_streaming::sequence& full_read,  bool verbose, int mut_dist, std::string mode) {
         // pick the right whitelist
         auto key = seq_utils::remove_rc(elem.class_id);
         auto &wl = layout.wl_map.maps.at(key).get();
@@ -1048,8 +1166,15 @@ resolve_multiple_hits_simple(
         }
         
         // === exact match in true barcodes ===
-        if (!wl.true_bcs.empty() && (wl.true_bcs.check_wl_for(bc) || wl.true_bcs.check_wl_for(rc_bc))) {
-            auto matched = wl.true_bcs.return_putative_correct_bcs(bc);
+        bool found_forw_bc = wl.true_bcs.check_wl_for(bc);
+        bool found_rev_bc = wl.true_bcs.check_wl_for(rc_bc);
+        if (!wl.true_bcs.empty() && (found_forw_bc || found_rev_bc)) {
+            std::unordered_set<int64_seq> matched;
+            if(found_forw_bc){
+                matched = wl.true_bcs.return_putative_correct_bcs(bc);
+            } else {
+                matched = wl.true_bcs.return_putative_correct_bcs(rc_bc);
+            }
             if (verbose) {
                 #pragma omp critical
                 {
@@ -1138,7 +1263,7 @@ resolve_multiple_hits_simple(
         // generate mutations
         // === k-mer fuzzy search ===
 
-      auto kmer_fuzzy_result = kmer_fuzzy_wl_search_v2(bc, expanded_seq, bc_len, mode, wl, verbose, max_dist);
+      auto kmer_fuzzy_result = kmer_fuzzy_search(bc, expanded_seq, bc_len, mode, wl, verbose, max_dist);
       if (verbose) {
             #pragma omp critical
             {
@@ -1209,17 +1334,22 @@ resolve_multiple_hits_simple(
 };
 
 /**
- * @brief a sequence with its associated metadata and elements
+ * @class SigString
+ * @brief Container for a sequencing read and its aligned elements with multi-indexed access
+ * 
+ * SigString represents a single sequencing read along with all its identified and aligned
+ * elements (barcodes, UMIs, adapters, etc.). It uses a SigElement multi-index container
+ * to efficiently store and query elements by various criteria such as class ID, order,
+ * direction, and validation status.
  */
 class SigString {
-    SigElement sig_elements;
-    std::string sequence_id;
-    int sequence_length;
-    std::string read_type;
-    std::string additional_info;
+    SigElement sig_elements; /// Multi-index container for SigElement objects
+    std::string sequence_id; /// Identifier for the sequencing read (sequencing ID)
+    int sequence_length; /// Length of the sequencing read (`int`)
+    std::string read_type; /// read type--forward, reverse, or concatenate
+    std::string additional_info; /// Additional information about the read
 
 public:
-    // Constructor
     SigString(std::string id = "", int length = 0, std::string type = "undefined", std::string info = "")
         : sequence_id(std::move(id)),
           sequence_length(length),
@@ -1991,139 +2121,8 @@ private:
         return direction_elements;
     }
 
-    /*
-    //  update_bc_counts with whitelist selection and global filtering
-    void update_bc_counts(
-        SigString &sig, 
-        const ReadLayout &layout, 
-        bool verbose, 
-        bool skip_global_writes = true
-    ) {
-        auto type = sig.read_type; // "forward", "reverse", "concatenate", or "filtered"
-        bool has_global_only_barcodes = false;
-    
-        for (auto const &elem : sig.elements()) {
-            if (elem.global_class != "barcode" || !elem.seq.has_value()) {
-                continue;
-            }
-            
-            // Get current sequence and original sequence
-            std::string bc_seq = elem.seq.value();
-            std::string original_seq = elem.original_seq.value_or("");
-            int64_seq bc(bc_seq);
-            
-            // Look up the right whitelist
-            auto key = seq_utils::remove_rc(elem.class_id);
-            auto &wl = layout.wl_map.maps.at(key).get();
-            
-            // Determine if this was corrected or raw
-            bool is_corrected = false;
-            if (!original_seq.empty() && original_seq != "") {
-                std::string original_for_comparison = original_seq;
-                std::string original_revcomp = seq_utils::revcomp(original_seq);
-                if (bc_seq != original_for_comparison && bc_seq != original_revcomp) {
-                    is_corrected = true;
-                }
-            }
-
-            // === select the right wl ===
-            bool found_in_true = wl.true_bcs.check_wl_for(bc);
-            bool found_in_global = wl.global_bcs.check_wl_for(bc);
-            // Simple selection: true or global
-            auto* target_whitelist = &wl.filter_bcs;
-            std::string whitelist_used = "filtered";
-
-            (void) wl->with_wl(whitelist_used, [&](const auto& target_whitelist) {
-                    typed_wl.set_bc_count(candidate, -1);
-            });
-
-            if (found_in_true) {
-                target_whitelist = &wl.true_bcs;
-                whitelist_used = "true";
-            } else if (found_in_global) {
-                target_whitelist = &wl.global_bcs;
-                whitelist_used = "global";
-                has_global_only_barcodes = true;
-            }
-
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << "Updating " << bc.bits_to_sequence() << " in " << whitelist_used 
-                        << " whitelist (" << (is_corrected ? "CORRECTED" : "RAW") << ")" << std::endl;
-                    std::cout << oss.str();
-                }
-            }
-            // === update counts in selected wl ===
-            if (type == "filtered" || type != elem.direction && type != "concatenate") {
-                target_whitelist->update_bc_count(bc, barcode_counts::filtered);
-            }
-
-            if (type == "forward" && elem.direction == "forward") {
-                target_whitelist->update_bc_count(bc, barcode_counts::total);
-                target_whitelist->update_bc_count(bc, barcode_counts::forw);
-                if (is_corrected) {
-                    target_whitelist->update_bc_count(bc, barcode_counts::corrected);
-                } else {
-                    target_whitelist->update_bc_count(bc, barcode_counts::raw);
-                }
-            }
-
-            if (type == "reverse" && elem.direction == "reverse") {
-                target_whitelist->update_bc_count(bc, barcode_counts::total);
-                target_whitelist->update_bc_count(bc, barcode_counts::rev);
-                if (is_corrected) {
-                    target_whitelist->update_bc_count(bc, barcode_counts::corrected);
-                } else {
-                    target_whitelist->update_bc_count(bc, barcode_counts::raw);
-                }
-            }
-
-            if (type == "concatenate") {
-                if (elem.direction == "forward") {
-                    target_whitelist->update_bc_count(bc, barcode_counts::total);
-                    target_whitelist->update_bc_count(bc, barcode_counts::forw_concat);
-                    if (is_corrected) {
-                        target_whitelist->update_bc_count(bc, barcode_counts::corrected);
-                    } else {
-                        target_whitelist->update_bc_count(bc, barcode_counts::raw);
-                    }
-                }
-
-                if (elem.direction == "reverse") {
-                    target_whitelist->update_bc_count(bc, barcode_counts::total);
-                    target_whitelist->update_bc_count(bc, barcode_counts::rev_concat);
-                    if (is_corrected) {
-                        target_whitelist->update_bc_count(bc, barcode_counts::corrected);
-                    } else {
-                        target_whitelist->update_bc_count(bc, barcode_counts::raw);
-                    }
-                }
-            }
-        }
-        // === handle global filters ===
-        if (skip_global_writes && has_global_only_barcodes && sig.read_type != "filtered") {
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::ostringstream oss;
-                    oss << "Read " << sig.sequence_id << " has global-only barcodes."
-                        << "Setting read_type to 'skipped' due to skip_global_writes = true" << std::endl;
-                    std::cout << oss.str();
-                }
-            }
-            sig.set_type("skipped");
-        }
-    }*/
-
-    bool process_direction_basic(
-        const std::string& direction,
-        std::vector<std::reference_wrapper<const seq_element>>& elements,
-        const read_streaming::sequence& read,
-        const ReadLayout& layout,
-        std::string& filtered_because,
-        bool verbose
+    bool process_direction_basic(const std::string& direction, std::vector<std::reference_wrapper<const seq_element>>& elements,
+            const read_streaming::sequence& read, const ReadLayout& layout, std::string& filtered_because, bool verbose
     ) {
         
         // Length filtering
@@ -2145,10 +2144,8 @@ private:
         return validate_element_positions(elements, direction, filtered_because, verbose);
     }
 
-    void mask_and_trim_elements(
-        std::vector<std::reference_wrapper<const seq_element>>& elements,
-        const read_streaming::sequence& read,
-        bool verbose
+    void mask_and_trim_elements(std::vector<std::reference_wrapper<const seq_element>>& elements, 
+            const read_streaming::sequence& read, bool verbose
     ) {
 
         std::string masked_read = read.seq;
@@ -2175,11 +2172,7 @@ private:
         }
     }
     
-    void mask_element_in_sequence(
-        std::string& masked_read, 
-        std::string& masked_qual,
-        const seq_element& elem
-    ) {
+    void mask_element_in_sequence(std::string& masked_read, std::string& masked_qual, const seq_element& elem) {
         size_t start = elem.position.first - 1;
         size_t length = elem.position.second - elem.position.first + 1;
         
@@ -2191,12 +2184,8 @@ private:
         }
     }
     
-    void extract_and_clean_read_element(
-        const seq_element& elem,
-        const std::string& masked_read,
-        const std::string& masked_qual,
-        const read_streaming::sequence& read,
-        bool verbose
+    void extract_and_clean_read_element(const seq_element& elem, const std::string& masked_read, const std::string& masked_qual,
+        const read_streaming::sequence& read, bool verbose
     ) {
         
         size_t start = elem.position.first - 1;
@@ -2230,11 +2219,8 @@ private:
         }
     }
     
-    std::pair<std::string, std::string> 
-    remove_masked_positions(
-        const std::string& window,
-        const std::string& window_qual,
-        bool is_fastq
+    std::pair<std::string, std::string> remove_masked_positions(const std::string& window, 
+        const std::string& window_qual, bool is_fastq
     ) {
         std::string cleaned_seq, cleaned_qual;
         cleaned_seq.reserve(window.size());
@@ -2252,10 +2238,8 @@ private:
         return {cleaned_seq, cleaned_qual};
     }
     
-    bool validate_element_positions(
-        std::vector<std::reference_wrapper<const seq_element>>& elements,
-        const std::string& direction,
-        std::string& filtered_because,
+    bool validate_element_positions(std::vector<std::reference_wrapper<const seq_element>>& elements,
+        const std::string& direction, std::string& filtered_because,
         bool verbose
     ) {
 
@@ -2281,10 +2265,8 @@ private:
         return check_variable_element_overlaps(elements, direction, filtered_because, verbose);
     }
     
-    bool check_variable_element_overlaps(
-        std::vector<std::reference_wrapper<const seq_element>>& elements,
-        const std::string& direction,
-        std::string& filtered_because,
+    bool check_variable_element_overlaps(std::vector<std::reference_wrapper<const seq_element>>& elements,
+        const std::string& direction, std::string& filtered_because,
         bool verbose
     ) {
         
@@ -2317,8 +2299,7 @@ private:
         return true;
     }
     
-    int count_valid_reads(
-        const std::vector<std::reference_wrapper<const seq_element>>& elements
+    int count_valid_reads(const std::vector<std::reference_wrapper<const seq_element>>& elements
     ) {
         int count = 0;
         for (const auto& elem_ref : elements) {
@@ -2333,14 +2314,8 @@ private:
         return count;
     }
     
-    bool process_barcodes_for_direction(
-        const std::string& direction,
-        std::vector<std::reference_wrapper<const seq_element>>& elements,
-        const read_streaming::sequence& read,
-        const ReadLayout& layout,
-        int gen_mut, 
-        const std::string& mode,
-        bool verbose
+    bool process_barcodes_for_direction(const std::string& direction, std::vector<std::reference_wrapper<const seq_element>>& elements,
+        const read_streaming::sequence& read, const ReadLayout& layout, int gen_mut,  const std::string& mode, bool verbose
     ) {
         
         bool has_multiple_barcodes = count_barcodes_in_direction(elements) > 1;
@@ -2368,20 +2343,15 @@ private:
         return all_barcodes_passed;
     }
     
-    bool process_single_barcode(
-        const seq_element& elem,
-        const ReadLayout& layout,
-        const read_streaming::sequence& read,
-        int gen_mut,
-        const std::string& mode,
-        bool verbose
+    bool process_single_barcode(const seq_element& elem, const ReadLayout& layout, const read_streaming::sequence& read,
+        int gen_mut, const std::string& mode, bool verbose
     ) {
 
         if (verbose) {
             log_verbose("Processing barcode: " + elem.seq.value());
         }
         
-        auto correction_result = barcode_correction::correct_barcode_v2(
+        auto correction_result = barcode_correction::correct_barcode(
             elem, layout, read, verbose, gen_mut, mode
         );
 
@@ -2394,10 +2364,7 @@ private:
         return true;
     }
     
-    void apply_barcode_correction(
-        const seq_element& elem,
-        const int64_seq& corrected_barcode,
-        const ReadLayout& layout,
+    void apply_barcode_correction(const seq_element& elem, const int64_seq& corrected_barcode,const ReadLayout& layout,
         bool verbose
     ) {
 
@@ -2424,9 +2391,7 @@ private:
     }
     
     std::pair<std::string, std::string> determine_read_direction(
-        const std::map<std::string, bool>& direction_valid,
-        const std::map<std::string, int>& pass_counts,
-        bool verbose
+        const std::map<std::string, bool>& direction_valid, const std::map<std::string, int>& pass_counts, bool verbose
     ) {
         
         int forward_count = (direction_valid.count("forward") && direction_valid.at("forward")) 
@@ -2574,7 +2539,6 @@ private:
     }
 
 public:
-    //sigalign_static
    void sigalign_static(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose) {
     aligner_tools aligner;
     auto& type_index = layout.by_type();

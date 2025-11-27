@@ -1,9 +1,9 @@
 ﻿Read Layout,,,,,
 id,seq,expected_length,type,class,whitelist
 linker_1,AATGTACTTCGTTCAGTTACGTATTGCTAAGGTTAA,,static,,
-barcode_1,,24,variable,barcode,/Users/cmv/Desktop/forward_barcodes.txt
+barcode_1,,24,variable,barcode,/Users/cmv/Desktop/extraneous/forward_barcodes.txt
 linker_2,CAGCACCT,,static,,
 read,,,variable,read,
 linker_3,AGGTGCTG,,static,,
-barcode_2,,24,variable,barcode,/Users/cmv/Desktop/forward_barcodes.txt
+barcode_2,,24,variable,barcode,/Users/cmv/Desktop/extraneous/reverse_barcodes.txt
 linker_4,TTAACCTTAGCAATACGTAACTGAACGAAGT,,static,,

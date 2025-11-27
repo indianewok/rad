@@ -1,7 +1,7 @@
 #include "include/rad/rad_headers.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLI + helpers (unchanged)
+// CLI + helpers
 // ─────────────────────────────────────────────────────────────────────────────
 struct Options {
     std::string input  = "-";      // "-" = stdin
@@ -101,7 +101,7 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MAIN: uses your file_streaming + read_streaming to support pigz/fd + gz/zlib
+// MAIN: uses file_streaming + read_streaming to support pigz/fd + gz/zlib
 // ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
     Options opt;
@@ -137,8 +137,8 @@ int main(int argc, char** argv) {
 
     if (opt.threads > 0) omp_set_num_threads(opt.threads);
 
-    // If input is stdin ("-"), we cannot run pigz; fall back to zlib path via your reader.
-    // Otherwise, your file_streaming picks pigz for .gz if available, else gz/zlib, else plain.
+    // If input is stdin ("-"),  cannot run pigz; fall back to zlib path via reader.
+    // Otherwise, file_streaming picks pigz for .gz if available, else gz/zlib, else plain.
     std::unique_ptr<file_streaming> files_ptr;
     std::unique_ptr<read_streaming> reader_ptr;
 
