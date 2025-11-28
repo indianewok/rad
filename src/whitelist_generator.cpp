@@ -7,23 +7,6 @@ struct extracted_bc {
     bool is_reverse_complement;
 };
 
-// Simple reverse complement function
-std::string reverse_complement(const std::string& seq) {
-    std::string rc = seq;
-    std::reverse(rc.begin(), rc.end());
-    for (char& c : rc) {
-        switch (c) {
-            case 'A': case 'a': c = 'T'; break;
-            case 'T': case 't': c = 'A'; break;
-            case 'G': case 'g': c = 'C'; break;
-            case 'C': case 'c': c = 'G'; break;
-            case 'N': case 'n': c = 'N'; break;
-            default: break;
-        }
-    }
-    return rc;
-}
-
 // Extract barcode sequence given primer position
 std::string extract_barcode(
     const std::string& sequence, int primer_pos, int primer_len, int n_bases, int m_left, int m_right, bool is_rc) {
@@ -123,18 +106,13 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
     return chunk_results;
 }
 
-// Parse FASTQ file (regular or gzipped) and extract barcodes with OpenMP parallelization
-std::vector<extracted_bc> process_fastq(const std::string& filename, 
+// Parse FASTQ file (regular or gzipped) and extract barcodes
+std::vector<extracted_bc> process_fastq(const std::string& input_path, 
                                           const std::string& primer,
                                           int n_bases, int m_left, int m_right,
                                           int max_reads, double max_edit_distance_ratio = 0.2,
                                           int chunk_size = 10000, int num_threads = 0) {
     std::vector<extracted_bc> results;
-    gzFile fp = gzopen(filename.c_str(), "r");
-    if (!fp) {
-        std::cerr << "Error: Could not open file " << filename << std::endl;
-        return results;
-    }
     
     // Set number of OpenMP threads
     if (num_threads > 0) {
@@ -142,30 +120,45 @@ std::vector<extracted_bc> process_fastq(const std::string& filename,
     }
     
     std::cout << "Using " << omp_get_max_threads() << " threads for parallel processing" << std::endl;
+
+    std::unique_ptr<file_streaming> files_ptr;
+    std::unique_ptr<read_streaming> reader_ptr;
+
+    try {
+        files_ptr = std::make_unique<file_streaming>(input_path, std::max(1, num_threads));
+        reader_ptr = std::make_unique<read_streaming>(*files_ptr);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: Could not open input " << input_path << ": " << e.what() << "\n";
+        return results;
+    }
     
-    kseq_gz::kseq_t *seq = kseq_gz::kseq_init(fp);
-    std::string primer_rc = reverse_complement(primer);
+    std::string primer_rc = seq_utils::revcomp(primer);
     int reads_processed = 0;
     int chunks_processed = 0;
     
-    while (reads_processed < max_reads || max_reads <= 0) {
+    while (max_reads <= 0 || reads_processed < max_reads) {
         // Read a chunk of data
         std::vector<read_chunk> chunk;
         chunk.reserve(chunk_size);
         
-        for (int i = 0; i < chunk_size && (kseq_read(seq) >= 0); ++i) {
-            if (max_reads > 0 && reads_processed >= max_reads) break;
-            
-            chunk.push_back({seq->name.s, seq->seq.s});
+        for (int i = 0; i < chunk_size; ++i) {
+            if (max_reads > 0 && reads_processed >= max_reads) {
+                break;
+            }
             reads_processed++;
+            auto rec = reader_ptr->next_sequence();
+            if (!rec) {
+                break;
+            }
+            chunk.push_back({rec->id, rec->seq});
+
         }
         
         if (chunk.empty()) break;
         
         chunks_processed++;
         if (chunks_processed % 100 == 0) {
-            std::cout << "Processed " << reads_processed << " reads in " 
-                      << chunks_processed << " chunks, found " << results.size() 
+            std::cout << "Processed " << reads_processed << " reads in " << chunks_processed << " chunks, found " << results.size() 
                       << " barcodes so far" << std::endl;
         }
         
@@ -176,10 +169,7 @@ std::vector<extracted_bc> process_fastq(const std::string& filename,
         
         // Merge results
         results.insert(results.end(), chunk_results.begin(), chunk_results.end());
-    }
-    
-    kseq_destroy(seq);
-    gzclose(fp);
+    };
     
     std::cout << "Processing complete: " << reads_processed 
               << " reads processed, " << results.size() << " barcodes extracted" << std::endl;
@@ -593,23 +583,32 @@ compute_saddle_cut_af(const std::vector<double>& af_x,
 
 void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted_barcodes,
                                       const std::vector<std::string>& whitelist,
-                                      const std::string& output_csv)
+                                      const std::string& output_csv, const std::string text_out)
 {
     std::cout << "Building hash map of extracted sequences...\n";
 
     // 1) Collapse read-level to barcode counts
     std::unordered_map<std::string, int> extracted_counts;
     extracted_counts.reserve(extracted_barcodes.size());
-    for (const auto& x : extracted_barcodes) extracted_counts[x.sequence]++;
+
+    for (const auto& x : extracted_barcodes){ 
+        extracted_counts[x.sequence]++; 
+    }
 
     std::cout << "Found " << extracted_counts.size() << " unique sequences from "
               << extracted_barcodes.size() << " total extractions\n";
 
-    // 2) Whitelist lookup
-    std::unordered_set<std::string> whitelist_set(whitelist.begin(), whitelist.end());
-    std::cout << "Built whitelist hash set with " << whitelist_set.size() << " barcodes\n";
+    // 2) Whitelist lookup (optional - if empty, analyze all sequences)
+    bool use_whitelist = !whitelist.empty();
+    std::unordered_set<std::string> whitelist_set;
+    if (use_whitelist) {
+        whitelist_set.insert(whitelist.begin(), whitelist.end());
+        std::cout << "Built whitelist hash set with " << whitelist_set.size() << " barcodes\n";
+    } else {
+        std::cout << "No whitelist provided - analyzing all sequences\n";
+    }
 
-    // 3) Build stats (only WL barcodes)
+    // 3) Build stats (WL barcodes if provided, otherwise all)
     std::vector<bc_wl_stats> barcode_stats;
     barcode_stats.reserve(extracted_counts.size());
 
@@ -620,7 +619,9 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
     for (const auto& kv : extracted_counts) {
         const std::string& seq = kv.first;
         int cnt = kv.second;
-        if (whitelist_set.find(seq) == whitelist_set.end()) continue;
+        
+        // Skip if whitelist provided and sequence not in whitelist
+        if (use_whitelist && whitelist_set.find(seq) == whitelist_set.end()) continue;
 
         bc_wl_stats s;
         s.sequence = seq;
@@ -709,7 +710,9 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
     lr_x.reserve(af_x.size());
     bg_x.reserve(af_x.size());
     for (const auto& s : barcode_stats) {
-        if (s.log1p_ncpm < FLOOR) continue;
+        if (s.log1p_ncpm < FLOOR) {
+            continue;
+        }
         if (s.log1p_ncpm_ztpois >= ZTPOIS_RULE) {
             lr_x.push_back(s.log1p_ncpm);
         } else {
@@ -849,6 +852,8 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
     //       - collapse_all_af: (log1p_ncpm >= FLOOR)
     //       - else:            (log1p_ncpm >= threshold)
     std::ofstream csv_out(output_csv);
+    std::vector<std::string> high_conf_barcodes;
+
     csv_out << "barcode,count,ncpm,log1p_ncpm,ztpois_percentile,above_floor,over_threshold,"
                "final_barcode,final_bc_annotation\n";
 
@@ -870,12 +875,12 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
         if (collapse_all_af) {
             if (final_barcode){
                 ann = "high_confidence";
+                high_conf_barcodes.push_back(s.sequence);
             }
         } else {
             if (over_threshold && above_floor) {
                 ann = "high_confidence";
-            } else if (have_band && above_floor &&
-                       s.log1p_ncpm >= band_lo && s.log1p_ncpm < band_hi) {
+            } else if (have_band && above_floor && s.log1p_ncpm >= band_lo && s.log1p_ncpm < band_hi) {
                 ann = "high_sensitivity";
             } else {
                 ann = "low_confidence";
@@ -905,23 +910,22 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
               << "Above-floor barcodes: " << n_above_floor << "\n"
               << "Final barcodes (TRUE): " << n_final << "\n"
               << "Results written to: " << output_csv << "\n";
-}
 
-// Write results to FASTA
-void write_fasta(const std::vector<extracted_bc>& barcodes, const std::string& output_file) {
-    std::ofstream out(output_file);
-    for (size_t i = 0; i < barcodes.size(); ++i) {
-        out << ">" << barcodes[i].read_id << "_pos" << barcodes[i].position 
-            << (barcodes[i].is_reverse_complement ? "_rc" : "_fwd") << "\n"
-            << barcodes[i].sequence << "\n";
+    if (!text_out.empty()) {
+        std::ofstream hc_out(text_out);
+        for (const auto& bc : high_conf_barcodes) {
+            hc_out << bc << "\n";
+        }
+        std::cout << "High-confidence barcodes written to: " << text_out << "\n";
     }
 }
+
 
 void print_usage(const char* program_name) {
     std::cout << "Usage: " << program_name << " [options]\n"
               << "Options:\n"
               << "  -i, --input FILE       Input FASTQ file\n"
-              << "  -o, --output FILE      Output FASTA file\n"
+              << "  -o, --output FILE      Output barcode text file\n"
               << "  -p, --primer SEQ       Primer sequence to search for\n"
               << "  -n, --n-bases INT      Number of bases to extract (barcode length)\n"
               << "  -l, --left-margin INT  Bases to include on left side [default: 0]\n"
@@ -949,7 +953,7 @@ int main(int argc, char* argv[]) {
         {"right-margin", required_argument, 0, 'r'},
         {"max-reads", required_argument, 0, 'm'},
         {"max-error", required_argument, 0, 'e'},
-        {"whitelist", required_argument, 0, 'w'},
+        {"whitelist", optional_argument, 0, 'w'},
         {"csv", required_argument, 0, 'c'},
         {"threads", required_argument, 0, 't'},
         {"chunk-size", required_argument, 0, 'k'},
@@ -977,17 +981,18 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    if (input_file.empty() || output_file.empty() || primer.empty()) {
+    if (input_file.empty() || primer.empty()) {
         std::cerr << "Error: Missing required arguments\n";
         print_usage(argv[0]);
         return 1;
     }
     
+    /*
     if (!csv_file.empty() && whitelist_file.empty()) {
         std::cerr << "Error: --csv requires --whitelist\n";
         print_usage(argv[0]);
         return 1;
-    }
+    }*/
     
     std::cout << "Processing " << input_file << "...\n";
     std::cout << "Primer: " << primer << "\n";
@@ -997,16 +1002,20 @@ int main(int argc, char* argv[]) {
     auto barcodes = process_fastq(input_file, primer, n_bases, m_left, m_right, max_reads, max_error, chunk_size, num_threads);
     
     std::cout << "Found " << barcodes.size() << " barcodes\n";
-    
-    //write_fasta(barcodes, output_file);
-    //std::cout << "Results written to " << output_file << "\n";
-    
+        
     if (!whitelist_file.empty()) {
         std::cout << "\nLoading whitelist and performing perfect match analysis...\n";
         auto whitelist = read_whitelist(whitelist_file);
         std::cout << "Loaded " << whitelist.size() << " whitelist barcodes\n";
         std::string csv_output = csv_file.empty() ? "perfect_matches.csv" : csv_file;
-        count_perfect_matches_with_stats(barcodes, whitelist, csv_output);
+        std::string text_output = output_file.empty() ? "barcodes.txt" : output_file;
+        count_perfect_matches_with_stats(barcodes, whitelist, csv_output, output_file);
+    } else {
+        std::vector<std::string> empty_whitelist; // empty
+        std::cout << " No whitelist provided; generating whitelist de novo.\n";
+        std::string csv_output = csv_file.empty() ? "perfect_matches.csv" : csv_file;
+        std::string text_output = output_file.empty() ? "barcodes.txt" : output_file;
+        count_perfect_matches_with_stats(barcodes, empty_whitelist, csv_output, output_file);
     }
     return 0;
 }

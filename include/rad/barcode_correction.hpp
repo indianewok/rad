@@ -513,7 +513,6 @@ namespace mutation_tools {
         return mutations;
     }
 
-    //generating mutated barcodes using raw int64_t values for speed
 /**
  * @brief Generate all possible mutated barcodes within a specified number of mutation rounds. Loops over each position in the sequence and substitutes each possible nucleotide except the original, accumulating unique mutated barcodes.
   Uses raw int64_t values for efficient mutation generation and duplicate checking.
@@ -767,54 +766,58 @@ namespace mutation_tools {
         return all_mutations;
     }
 
-    //detect homopolymers in a sequence
+/**
+ * @brief Detect homopolymers at the start or end of a DNA sequence represented as an `int64_seq`
+ * @param sequence The DNA sequence as a `string`
+ * @param max_hp Maximum allowed homopolymer length
+ * @return `bool` true if a homopolymer of length >= max_hp is detected, false otherwise
+ */
     bool detect_hp(const std::string& sequence, int max_hp) {
-    if (sequence.empty() || max_hp <= 0) {
+        if (sequence.empty() || max_hp <= 0) {
+            return false;
+        }
+        
+        int seq_len = static_cast<int>(sequence.length());
+        
+        // Check leading homopolymer
+        if (seq_len >= max_hp) {
+            char first_base = std::toupper(sequence[0]);
+            int leading_count = 1;
+            
+            for (int i = 1; i < seq_len && i < max_hp; ++i) {
+                if (std::toupper(sequence[i]) == first_base) {
+                    leading_count++;
+                } else {
+                    break;
+                }
+            }
+            
+            if (leading_count >= max_hp) {
+                return true;
+            }
+        }
+        
+        // Check trailing homopolymer
+        if (seq_len >= max_hp) {
+            char last_base = std::toupper(sequence[seq_len - 1]);
+            int trailing_count = 1;
+            
+            for (int i = seq_len - 2; i >= 0 && i >= seq_len - max_hp; --i) {
+                if (std::toupper(sequence[i]) == last_base) {
+                    trailing_count++;
+                } else {
+                    break;
+                }
+            }
+            
+            if (trailing_count >= max_hp) {
+                return true;
+            }
+        }
+        
         return false;
     }
-    
-    int seq_len = static_cast<int>(sequence.length());
-    
-    // Check leading homopolymer
-    if (seq_len >= max_hp) {
-        char first_base = std::toupper(sequence[0]);
-        int leading_count = 1;
-        
-        for (int i = 1; i < seq_len && i < max_hp; ++i) {
-            if (std::toupper(sequence[i]) == first_base) {
-                leading_count++;
-            } else {
-                break;
-            }
-        }
-        
-        if (leading_count >= max_hp) {
-            return true;
-        }
-    }
-    
-    // Check trailing homopolymer
-    if (seq_len >= max_hp) {
-        char last_base = std::toupper(sequence[seq_len - 1]);
-        int trailing_count = 1;
-        
-        for (int i = seq_len - 2; i >= 0 && i >= seq_len - max_hp; --i) {
-            if (std::toupper(sequence[i]) == last_base) {
-                trailing_count++;
-            } else {
-                break;
-            }
-        }
-        
-        if (trailing_count >= max_hp) {
-            return true;
-        }
-    }
-    
-    return false;
-}
 
-    // Overload for int64_seq objects
 /**
  * @brief Detect homopolymers at the start or end of a DNA sequence represented as an `int64_seq`
  * @param sequence The DNA sequence as an `int64_seq`
@@ -1229,6 +1232,11 @@ namespace mutation_tools {
 * @brief concurrent multimap for barcode corrections
 * @param key: `int64_seq` representing barcode sequences
 * @param value: `barcode_entry` containing barcode and associated data
+*
+* @brief A thread-safe multimap structure for managing barcode corrections,
+* allowing multiple values to be associated with a single key. Basically, there's a 
+* stable storage of unique barcode entries, and then a concurrent map that maps
+* keys to sets of pointers to those unique entries. 
 */
 template<typename key, typename value> struct bc_multimap {
 private:
@@ -1245,9 +1253,15 @@ public:
 
     // pointer map of associations, split up into 2^number_of_shards in there to allow for concurrent read-writes
     //if there's read-write, each submap gets its own mutex to avoid rehash failures
-    using pointer_map = phmap::parallel_node_hash_map<key, phmap::flat_hash_set<const value*>, phmap::Hash<key>,
-                        phmap::EqualTo<key>, std::allocator<std::pair<const key, phmap::flat_hash_set<const value*>>>,
-                        6, std::mutex>; 
+    using pointer_map = phmap::parallel_node_hash_map<
+    key,
+    phmap::flat_hash_set<const value*>, 
+    phmap::Hash<key>, 
+    phmap::EqualTo<key>, 
+    std::allocator<std::pair<const key, phmap::flat_hash_set<const value*>>>, 
+    6,
+    std::mutex
+    >; 
 
     pointer_map associations;
 
@@ -1900,16 +1914,6 @@ class whitelist {
                 
                 // TIMING: Sanity check
                 auto start_sanity = high_resolution_clock::now();
-                /*
-                size_t missing = 0;
-                for (auto const &orig_bits : true_ref) {
-                    if (!true_bcs.check_wl_for(orig_bits)) {
-                        ++missing;
-                        std::cerr << "[ERROR] Original barcode vanished: "
-                                << orig_bits.bits_to_sequence() << "\n";
-                    }
-                }
-                */
                 auto end_sanity = high_resolution_clock::now();
                 double sanity_ms = duration<double, std::milli>(end_sanity - start_sanity).count();
                 
@@ -1947,15 +1951,6 @@ class whitelist {
                             << ((final_memory_estimate - initial_memory_estimate) / 1024 / 1024) << " MB)\n";
                     std::cout << "Memory efficiency: " << (double)total_growth / (total_mutations_generated) * 100 
                             << "% of generated items were unique and added\n";
-                    /* 
-                    if (missing == 0) {
-                        std::cout << "\n[generate_mismatch_barcodes] All " << true_ref.size() 
-                                << " original barcodes are present\n";
-                    } else {
-                        std::cerr << "\n[generate_mismatch_barcodes] " << missing << "/" 
-                                << true_ref.size() << " originals missing!\n";
-                    }
-                    */
                 }
             }
     };

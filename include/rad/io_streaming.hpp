@@ -5,6 +5,10 @@
 // needed a way for IO to work on .gz and non .gz files, and needed a PIGZ/non-PIGZ solution for files.
 // finangled a way to deal with this by just opening two kseq instantiations because you can't trade them off once opened.
 // so just open two, kseq_fd and kseq_gz, and use the appropriate one based on whether pigz is being used or not/filetype.
+// this is all wrapped up in file_streaming and file_pointer classes below. Learned a lot about reader threads and async IO.
+// basically, the smart way to do things is to have pigz do the decompression in parallel with multiple threads (`pigz_reading`) 
+// and then have a reader class (`file_streaming`) that manages the file pointers and kseq instances 
+// for reading stuff through kseq.
 
 /**
  * @brief kseq intialization for regular file
@@ -170,6 +174,12 @@ public:
                             : (seq_gz->qual.l ? seq_gz->qual.s : nullptr);
         }
 
+        /**
+         * @brief Constructor to open file pointer
+         * @param file_path Path to input file
+         * @param pigz_threads Number of pigz threads for decompression
+         * @note Automatically detects .gz files and uses pigz/gzip as needed
+         */
         file_pointer(const std::string& file_path, int pigz_threads = 4) 
             : fp_pigz(nullptr), fp_gzip(nullptr), seq_fd(nullptr), seq_gz(nullptr),
               fd(-1), path(file_path), using_pigz(false) {
@@ -208,6 +218,9 @@ public:
             }
         }
 
+        /**
+         * @brief Destructor to clean up resources
+         */
         ~file_pointer() {
             if (seq_fd) kseq_destroy(seq_fd);
             if (seq_gz) kseq_destroy(seq_gz);
@@ -235,6 +248,12 @@ public:
     std::string path;
     int pigz_threads;
 
+    /**
+     * @brief Constructor to initialize file streaming
+     * @param input_path Path to input file or directory
+     * @param threads Number of pigz threads for decompression
+     * @throws std::runtime_error if file cannot be opened or path is invalid
+     */
     explicit file_streaming(const std::string& input_path, int threads = 4) 
         : path(input_path), pigz_threads(threads) {
         dir_status = is_directory(path);
@@ -307,6 +326,14 @@ public:
  */
 class read_streaming {
 public:
+    /**
+     * @brief structure of an incoming read
+     * @param id original read id `string`
+     * @param comment optional comment `string`
+     * @param seq  `string` sequence
+     * @param qual  `string` qual string for fastq
+     * @param is_fastq `bool` flag indicating if read is from FASTQ
+     */
     struct sequence {
         std::string id;
         std::string comment;
@@ -318,7 +345,10 @@ public:
     file_streaming& files;
     
     explicit read_streaming(file_streaming& f) : files(f) {}
-    
+    /**
+     * @brief get the next sequence from the stream
+     * @return sequence object, std::nullopt if end of stream
+     */
     std::optional<sequence> next_sequence() {
         while (files.current_file || files.open_next_file()) {
             auto& fp = files.current_file;
@@ -349,19 +379,35 @@ public:
     }
 };
 
-// ====== minimal memory probe (no extra headers/files) ======
+/**
+ * @brief Memory utilities for read streaming, designed for monitoring memory usage of read streaming
+ */
 namespace readmem_utils {
-    // enable/disable logging quickly
-    constexpr bool ENABLE = true;
 
-    // --- size helpers using capacity() (no fudge) ---
-    static inline size_t bytes_of(const std::string& s) noexcept { return s.capacity(); }
+    /**
+     * @brief Get the memory bytes used by a string
+     * @param s Input string
+     * @return Number of bytes used by the string
+     */
+    static inline size_t bytes_of(const std::string& s) noexcept { 
+        return s.capacity(); 
+    }
 
-    // specialize for record type: read_streaming::sequence
+    /**
+     * @brief Get the memory bytes used by a read_streaming::sequence
+     * @param r Input read_streaming::sequence
+     * @return Number of bytes used by the sequence
+     */
     static inline size_t bytes_of_rec(const read_streaming::sequence& r) noexcept {
         return bytes_of(r.id) + bytes_of(r.comment) + bytes_of(r.seq) + bytes_of(r.qual) + sizeof(r);
     }
 
+    /**
+     * @brief Get the memory bytes used by a vector of read_streaming::sequence
+     * @tparam Vec Vector type
+     * @param v Input vector
+     * @return Number of bytes used by the vector
+     */
     template <class Vec>
     static inline size_t bytes_of_vec(const Vec& v) noexcept {
         using T = typename Vec::value_type;
@@ -370,8 +416,14 @@ namespace readmem_utils {
         return total;
     }
 
-    // --- global in-flight counters (bytes/chunks) ---
-    struct InFlight {
+    /**
+     * @brief In-flight memory tracking for read streaming, tracks bytes and chunks in progress with `std::atomic<size_t>` counters
+     * @param bytes Number of bytes in flight
+     * @param chunks Number of chunks in flight
+     * @param peak_bytes Peak bytes in flight
+     * @param peak_chunks Peak chunks in flight
+     */
+    struct data_in_flight {
         std::atomic<size_t> bytes{0};
         std::atomic<size_t> chunks{0};
         std::atomic<size_t> peak_bytes{0};
@@ -385,13 +437,19 @@ namespace readmem_utils {
             size_t pc = peak_chunks.load(std::memory_order_relaxed);
             while (nc > pc && !peak_chunks.compare_exchange_weak(pc, nc, std::memory_order_relaxed)) {}
         }
+
         void sub(size_t b) noexcept {
             bytes.fetch_sub(b, std::memory_order_relaxed);
             chunks.fetch_sub(1, std::memory_order_relaxed);
         }
     };
-    inline InFlight& inflight() { static InFlight g; return g; }
 
+    inline data_in_flight& inflight() { 
+        static data_in_flight g; 
+        return g; 
+    }
+
+    //
     struct scoped_in_flight {
         size_t b{0}; bool active{false};
         explicit scoped_in_flight(size_t bytes) : b(bytes), active(true) { inflight().add(b); }
@@ -413,7 +471,6 @@ namespace readmem_utils {
 
     // --- tiny logger ---
     static inline void log_chunk(std::size_t chunk_bytes, std::size_t chunk_id=0) {
-        if (!ENABLE) return;
         const double mb = double(chunk_bytes) / (1024.0*1024.0);
         const double inflight_gib = double(inflight().bytes.load(std::memory_order_relaxed)) / (1024.0*1024.0*1024.0);
         const std::size_t inflight_chunks = inflight().chunks.load(std::memory_order_relaxed);
@@ -511,10 +568,9 @@ public:
     std::atomic<int> peak_in_flight_;
 };
 
-// ============================================================================
-// OUTPUT STREAMING (PIGZ COMPRESSION)
-// ============================================================================
-
+/**
+ * @brief pigz writing for parallel compression
+ */
 class pigz_writing {
 public:
     inline FILE* open_pigz_pipe(const std::string& out_path, int threads, int level=1) {
@@ -529,9 +585,13 @@ public:
         std::string cmd = "'" + pigz + "' -c -p " + std::to_string(threads) +
                         " -" + std::to_string(level) + " > '" + out_path + "'";
         FILE* fp = popen(cmd.c_str(), "w");
-        if (!fp) return nullptr;
+        if (!fp){
+            return nullptr;
+        } 
             // 16MB stdio buffer to reduce write() syscalls
-            // removed because in debug mode, the buffer gets shared between all of the thread outputs, so then everything gets scrambled
+
+            // removed because in debug mode, the buffer gets shared between all of the thread outputs
+            // so then everything gets scrambled
             // TSPMO
         //static std::vector<char> buf(16u << 20);
         //setvbuf(fp, buf.data(), _IOFBF, buf.size());
@@ -553,7 +613,7 @@ public:
     }
 };
 
-namespace bio = boost::iostreams;
+namespace boost_stream = boost::iostreams;
 class sigstring_writing {
 public:
     enum class format { 
@@ -576,7 +636,7 @@ private:
 
     // --- zlib/boost path ---
     std::ofstream file_;
-    bio::filtering_ostream out_; // chain: [gzip?] -> file_
+    boost_stream::filtering_ostream out_; // chain: [gzip?] -> file_
 
     inline void pigz_flush_if_big_() {
         if (pigz_buf_.size() >= pigz_flush_threshold_) {
@@ -633,9 +693,9 @@ public:
             file_.open(output_path, mode);
             if (!file_.is_open()) throw std::runtime_error("Failed to open file: " + output_path);
 
-            bio::gzip_params params;
+            boost_stream::gzip_params params;
             params.level = level;
-            out_.push(bio::gzip_compressor(params));
+            out_.push(boost_stream::gzip_compressor(params));
             out_.push(file_);
         } else {
             // Plain text (no compression)
@@ -702,12 +762,21 @@ public:
 
 };
 
-// ============================================================================
-// PARALLEL WRITER
-// ============================================================================
-
+/**
+ * @brief Parallel writer for asynchronous output--works by queuing jobs and processing them in a separate thread.
+ * Each write job is a function to perform the write operation, along with metadata.
+ * This class uses a lock-free queue to manage write jobs and a dedicated writer thread to process them. 
+ * 
+ * What that means is that the main thread lines up write jobs and the writer thread executes them in the background
+ * while the main thread continues processing. When single-threaded, the main thread does the writing itself. 
+ * 
+ * Lock-free means that there are no mutexes or locks used to synchronize the writing--that's handled by atomic operations internally.
+ */
 class parallel_writer {
 public:
+/**
+ * @brief Constructs a parallel_writer and starts the writer thread
+ */
     parallel_writer() : running(true), jobs_processed(0), total_write_time_ms(0), total_queue_time_ms(0) {
         writer_thread = std::thread([this]() {
             this->process_jobs();
@@ -718,6 +787,11 @@ public:
         stop();
     }
     
+    /**
+     * @brief Write multiple data items in parallel
+     * @param fastqa_writer Reference to `sigstring_writing` object for fastqa output
+     * @param data `vector` of data items to write
+     */
     template<typename T>
     void write(sigstring_writing& fastqa_writer, std::vector<T>& data) {
         if (data.empty()) return;
@@ -741,6 +815,11 @@ public:
         }
     }
     
+    /**
+     * @brief Write multiple string slabs in parallel
+     * @param fastqa_writer Reference to sigstring_writing object for FASTQ/A output
+     * @param slabs Vector of string slabs to write
+     */
     void write_slabs(sigstring_writing& fastqa_writer, std::vector<std::string>&& slabs) {
         size_t total_bytes = 0;
         for (auto const& s : slabs) total_bytes += s.size();
@@ -758,6 +837,11 @@ public:
         while (!write_queue.push(job)) std::this_thread::yield();
     }
     
+    /**
+     * @brief Write a raw string in parallel
+     * @param writer Reference to `sigstring_writing` object for output
+     * @param data `string` data to write
+     */
     void write_raw_string(sigstring_writing& writer, std::string&& data) {
         if (data.empty()) return;
         
@@ -782,6 +866,13 @@ public:
         }
     }
 
+    /**
+     * @brief Write debug information in parallel
+     * @param sig_writer Pointer to sigstring_writing for SIGSTRING output
+     * @param csv_writer Pointer to sigstring_writing for CSV output
+     * @param fastqa_writer Pointer to sigstring_writing for FASTQ/A output
+     * @param data Vector of data to write
+     */
     template<typename T>
     void write_debug(sigstring_writing* sig_writer, sigstring_writing* csv_writer, sigstring_writing* fastqa_writer, std::vector<T>& data) {
         if (data.empty()) return;
@@ -836,6 +927,13 @@ public:
     }
 
 private:
+/**
+ * @brief Structure representing a write job
+ * @param func Function to perform the write operation
+ * @param chunk_id Unique chunk identifier for logging
+ * @param size Size of data to write
+ * @param queued_time Time when job was queued
+ */
     struct WriteJob {
         std::function<void()> func;
         size_t chunk_id;
@@ -843,15 +941,18 @@ private:
         std::chrono::time_point<std::chrono::high_resolution_clock> queued_time;
     };
     
-    boost::lockfree::queue<WriteJob*, boost::lockfree::capacity<64>> write_queue;
-    std::atomic<bool> running;
-    std::atomic<size_t> next_chunk_id{1};
-    std::atomic<size_t> jobs_processed{0};
-    std::thread writer_thread;
+    boost::lockfree::queue<WriteJob*, boost::lockfree::capacity<64>> write_queue; /// lock-free queue for writing via boost
+    std::atomic<bool> running; /// we writing? y/n
+    std::atomic<size_t> next_chunk_id{1}; /// next chunk ID to assign
+    std::atomic<size_t> jobs_processed{0}; /// total jobs processed
+    std::thread writer_thread; /// writer thread
     
     double total_write_time_ms;
     double total_queue_time_ms;
     
+    /**
+     * @brief writer function per thread to process queued jobs
+     */
     void process_jobs() {
         while (running.load(std::memory_order_acquire)) {
             WriteJob* job = nullptr;

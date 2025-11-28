@@ -83,8 +83,17 @@ struct sig_pass_tag {};
 struct sig_read_tag {};
 
 /**
- * @brief Multi-index container for seq_element
- * 
+ * @brief Multi-index container for seq_element, indexed by various attributes. The intention was to make a structure that
+ * can efficiently store and index processed sequencing reads to be sorted in different ways. Each seq_element should represent
+ * a single element within a read, such as a barcode, UMI, or adapter, along with its alignment information and validation status.
+ * Gets a little tricky when there's more than one element with the same class_id in the same read (adapters).
+ *  
+ * @param class_id `std::string` unique id for the element
+ * @param global_class `std::string` global classification ('read', 'adapter', etc.)
+ * @param edit_distance `std::optional<int>` edit distance from alignment
+ * @param order `int` position in layout
+ * @param direction `std::string` orientation (forward or reverse)
+ * @param element_pass `std::optional<bool>` whether element passed validation
  */
 typedef boost::multi_index::multi_index_container<
     seq_element,
@@ -525,7 +534,6 @@ namespace barcode_correction {
             //reset the counter for low-set whitelist barcodes 
             //if they accrue over a certain number of reads after getting their freebies
             if(raw_count >= 2 && total_count < 0) {
-                //whitelist_source == "global" ? wl->global_bcs.set_bc_count(candidate, raw_count) : wl->true_bcs.set_bc_count(candidate, raw_count);
                 (void) wl->with_wl(whitelist_source, [&](const auto& typed_wl) {
                     typed_wl.set_bc_count(candidate, raw_count);
                 });
@@ -1046,7 +1054,6 @@ namespace barcode_correction {
  * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive")
  * @return ``std::optional<int64_seq>`` Corrected barcode sequence if found, otherwise std::nullopt
  */
-
     std::optional<int64_seq> correct_barcode(const seq_element& elem,  const ReadLayout& layout, 
         const read_streaming::sequence& full_read,  bool verbose, int mut_dist, std::string mode) {
         // pick the right whitelist
@@ -1064,10 +1071,12 @@ namespace barcode_correction {
         }
 
         int64_seq bc, rc_bc, exp_bc, exp_rcbc;
+
         bc.sequence_to_bits(raw);
         rc_bc.sequence_to_bits(seq_utils::revcomp(raw));
         exp_bc.sequence_to_bits(expanded_seq);
         exp_rcbc.sequence_to_bits(seq_utils::revcomp(expanded_seq));
+
         int bc_len = static_cast<int>(bc.length);
         int hp_threshold = std::max(4, static_cast<int>(bc_len * 0.4)); // 40% of barcode length, minimum 4
 
@@ -1341,13 +1350,19 @@ namespace barcode_correction {
  * elements (barcodes, UMIs, adapters, etc.). It uses a SigElement multi-index container
  * to efficiently store and query elements by various criteria such as class ID, order,
  * direction, and validation status.
+ * 
+ * @param sig_elements Multi-index container holding SigElement objects
+ * @param sequence_id Identifier for the sequencing read
+ * @param sequence_length Length of the sequencing read
+ * @param read_type Type of read (forward, reverse, concatenate)
+ * @param additional_info Additional information about the read
  */
 class SigString {
-    SigElement sig_elements; /// Multi-index container for SigElement objects
-    std::string sequence_id; /// Identifier for the sequencing read (sequencing ID)
-    int sequence_length; /// Length of the sequencing read (`int`)
-    std::string read_type; /// read type--forward, reverse, or concatenate
-    std::string additional_info; /// Additional information about the read
+    SigElement sig_elements;
+    std::string sequence_id;
+    int sequence_length;
+    std::string read_type;
+    std::string additional_info;
 
 public:
     SigString(std::string id = "", int length = 0, std::string type = "undefined", std::string info = "")
@@ -1423,7 +1438,14 @@ public:
     }
 
 private:
-    //switched from map to multimap to be able to reference multiple positions    
+/**
+ * @brief Generate variable elements in the SigElement container
+ * @param layout_elem `pointer` to the ReadElement defining the variable element layout
+ * @param static_refs multimap of static reference elements
+ * @param read_seq sequencing read 
+ * @param sig_elements sig_elements to look at
+ * @return true if variable elements were successfully generated and embedded into the order, false otherwise
+ */
     bool generate_variable_elements(const ReadElement* layout_elem,  const std::multimap<std::string, const seq_element*>& static_refs,
                                   const std::string& read_seq, SigElement& sig_elements, bool verbose) {
         auto& id_index = sig_elements.get<sig_id_tag>();
@@ -1445,6 +1467,12 @@ private:
         return map_positions(ref_pos, static_refs, read_seq, it, id_index, var_positions, verbose);
     }
 
+/**
+ * @brief Validate variable element positions within the read length by checking boundaries
+ * @param positions `std::pair<int, int>` where `std::first` is element start and `std::second` is element end
+ * @param read_length read length, `size_t`
+ * @return true if positions are valid, false otherwise
+ */
     bool validate_var_positions(const std::pair<int, int>& positions, size_t read_length) {
         return positions.first > 0 && 
                positions.second > 0 && 
@@ -1453,11 +1481,35 @@ private:
                positions.second > positions.first;
     }
 
-    // master function to map variable element positions--super bulky and unweldy, but works. needs to be broken up into constituents
-    bool map_positions(const ReferencePositions& ref_pos, const std::multimap<std::string, const seq_element*>& static_refs,
-                   const std::string& read_seq,  SigElement::index<sig_id_tag>::type::iterator var_it,
-                   SigElement::index<sig_id_tag>::type& id_index,  std::pair<int, int>& var_positions,
-                   bool verbose) {
+/**
+ * @brief Map variable element positions based on reference positions and static elements. 
+ * Incredibly bulky and complex, but works. Future refactor necessary.
+ * @param ref_pos `ReferencePositions` object containing primary and secondary reference positions
+ * @param static_refs `std::multimap <std::string, const seq_element*>` of static reference elements
+ * @param read_seq `std::string` sequenced read
+ * @param var_it iterator to the variable element in the SigElement container
+ * @param id_index index of SigElement container by sig_id_tag
+ * @param var_positions modifiable `std::pair<int, int>` pair to store calculated variable element positions
+ * @param verbose print verbose output
+ * @return true if mapping was successful and positions were set, false otherwise
+ * 
+ * @brief This function maps the positions of a variable element within a sequencing read
+ * based on provided reference positions and a set of static reference elements. It first
+ * constructs an ordered list of static elements that share the same direction as the variable element.
+ * It then attempts to determine the start position of the variable element using primary and secondary
+ * reference positions. If successful, it calculates the end position based on the length of the
+ * variable element's sequence. The function ensures that the calculated positions are valid
+ * within the bounds of the read length before updating the provided `var_positions` pair.
+ */
+    bool map_positions(
+        const ReferencePositions& ref_pos, 
+        const std::multimap<std::string, const seq_element*>& static_refs,
+        const std::string& read_seq,  
+        SigElement::index<sig_id_tag>::type::iterator var_it,
+        SigElement::index<sig_id_tag>::type& id_index,  
+        std::pair<int, int>& var_positions,
+        bool verbose
+    ) {
     // Build an ordered list of static elements with the same direction as the variable element.
     std::vector<const seq_element*> ordered_elements;
     for (const auto& [key, elem] : static_refs) {
@@ -2026,11 +2078,21 @@ private:
     return false;
 }
 
-    // check if the read is long enough to contain the expected length of static adapters
+/**
+ * @brief Check if read sequence length meets the summative expected length of adapters
+ * @param read_seq `std::string` sequencing read
+ * @param total_expected_length total expected length of adapters, `int`
+ * @return true if read length is at least 100 and meets or exceeds total expected length, false otherwise
+ */
     bool read_adapter_sum_comp(const std::string& read_seq, int total_expected_length) const {
         return (read_seq.length() >= 100 && read_seq.length() >= static_cast<size_t>(total_expected_length));
     }
     
+/**
+ * @brief Calculate the total expected length of static adapters from the ReadLayout
+ * @param layout `ReadLayout` object containing layout elements
+ * @return total expected length of static adapters, `int`
+ */
     // calculate the total expected length of static adapters
     int calc_total_static_len(const ReadLayout& layout) const {
         int total = 0;
@@ -2043,7 +2105,12 @@ private:
         return total;
     }
 
-    // filter reads that are shorter than adapter length summatively
+/**
+ * @brief Filter out reads that are shorter than the summative expected length of adapters
+ * @param elems vector of references to `seq_element` objects
+ * @param layout `ReadLayout` object containing layout elements
+ * @return true if read length meets or exceeds total expected adapter length, false otherwise
+ */
     bool filter_short_reads(const std::vector<std::reference_wrapper<const seq_element>>& elems, const ReadLayout& layout) const {
         size_t read_len = 0;
         // find the single "read" element
@@ -2064,11 +2131,19 @@ private:
         return read_len >= static_cast<size_t>(adapters);
     }
 
-    // validate the positions of the elements
+/**
+ * @brief Validate positions of a sequence element
+ * @param e reference to `seq_element` object
+ * @param direction direction string
+ * @param verbose print verbose output
+ * @return true if positions are valid, false otherwise
+ */
     bool validate_sig_positions(seq_element& e, const std::string& direction, bool verbose){
         if (e.position.first <= 0 || e.position.second <= 0 || e.position.second <= e.position.first) {
             auto& idx = sig_elements.get<sig_id_tag>();
-            idx.modify(idx.find(e.class_id), [](seq_element& x){ x.element_pass = false; });
+            idx.modify(idx.find(e.class_id), [](seq_element& x){ 
+                x.element_pass = false; 
+            });
             if (verbose) {
                     #pragma omp critical
                     {
@@ -2082,7 +2157,11 @@ private:
         return true;
     }
 
-    // filter out overlapping elements
+/**
+ * @brief Filter overlapping variable elements in a set of sequence elements
+ * @param elems vector of references to `seq_element` objects
+ * @param verbose print verbose output
+ */
     void filter_overlaps(const std::vector<std::reference_wrapper<seq_element>>& elems, bool verbose) {
         for (size_t i = 0; i < elems.size(); ++i) {
             auto &e1 = elems[i].get();
@@ -2113,7 +2192,10 @@ private:
         }
     }
 
-    // Group elements by direction
+/**
+ * @brief Group sequence elements by their direction
+ * @return map of direction strings to vectors of references to `seq_element` objects
+ */
     auto group_directionally(){
         std::map<std::string, std::vector<std::reference_wrapper<const seq_element>>> direction_elements;
         for (auto& elem : sig_elements)
@@ -2121,6 +2203,16 @@ private:
         return direction_elements;
     }
 
+/** 
+ * @brief Process sequence elements in a given direction: filter by length, mask overlaps, trim reads, and validate positions
+ * @param direction direction string
+ * @param elements vector of references to `seq_element` objects
+ * @param read `read_streaming::sequence` object containing the read sequence
+ * @param layout `ReadLayout` object containing layout elements
+ * @param filtered_because string to append filtering reasons
+ * @param verbose print verbose output
+ * @return true if processing is successful, false if read is filtered
+ */   
     bool process_direction_basic(const std::string& direction, std::vector<std::reference_wrapper<const seq_element>>& elements,
             const read_streaming::sequence& read, const ReadLayout& layout, std::string& filtered_because, bool verbose
     ) {
@@ -2144,6 +2236,12 @@ private:
         return validate_element_positions(elements, direction, filtered_because, verbose);
     }
 
+/**
+ *  @brief Mask non-read elements in the read sequence and trim read elements
+ * @param elements vector of references to `seq_element` objects
+ * @param read `read_streaming::sequence` object containing the read sequence
+ * @param verbose print verbose output
+ */    
     void mask_and_trim_elements(std::vector<std::reference_wrapper<const seq_element>>& elements, 
             const read_streaming::sequence& read, bool verbose
     ) {
@@ -2171,8 +2269,14 @@ private:
             break; // Only one read element per direction
         }
     }
-    
-    void mask_element_in_sequence(std::string& masked_read, std::string& masked_qual, const seq_element& elem) {
+
+/**
+ * @brief Mask a non-read element in the read sequence by replacing its positions with 'N' and quality scores with the highest value.
+ * @param masked_read reference to the masked read sequence string
+ * @param masked_qual reference to the masked quality string
+ * @param elem reference to the `seq_element` object to be masked
+ */  
+     void mask_element_in_sequence(std::string& masked_read, std::string& masked_qual, const seq_element& elem) {
         size_t start = elem.position.first - 1;
         size_t length = elem.position.second - elem.position.first + 1;
         
@@ -2183,7 +2287,15 @@ private:
             }
         }
     }
-    
+
+/**
+ * @brief Extract and clean a read element from the masked read sequence.
+ * @param elem reference to the `seq_element` object to be extracted and cleaned
+ * @param masked_read reference to the masked read sequence string
+ * @param masked_qual reference to the masked quality string
+ * @param read reference to the original `read_streaming::sequence` object
+ * @param verbose print verbose output
+ */
     void extract_and_clean_read_element(const seq_element& elem, const std::string& masked_read, const std::string& masked_qual,
         const read_streaming::sequence& read, bool verbose
     ) {
@@ -2218,7 +2330,14 @@ private:
             log_verbose("Cleaned read element: " + elem.class_id + " -> " + cleaned_seq);
         }
     }
-    
+
+/**
+ * @brief Remove masked positions ('N') from a sequence window and its corresponding quality scores.
+ * @param window sequence window strings
+ * @param window_qual quality scores string
+ * @param is_fastq boolean indicating if the read is in fastq format
+ * @return pair of cleaned sequence and quality strings
+ */
     std::pair<std::string, std::string> remove_masked_positions(const std::string& window, 
         const std::string& window_qual, bool is_fastq
     ) {
@@ -2237,7 +2356,15 @@ private:
         
         return {cleaned_seq, cleaned_qual};
     }
-    
+
+/**
+ * @brief Validate positions of sequence elements and check for overlaps
+ * @param elements vector of references to `seq_element` objects
+ * @param direction direction string
+ * @param filtered_because string to append filtering reasons
+ * @param verbose print verbose output
+ * @return true if positions are valid and no overlaps detected, false otherwise
+ */
     bool validate_element_positions(std::vector<std::reference_wrapper<const seq_element>>& elements,
         const std::string& direction, std::string& filtered_because,
         bool verbose
@@ -2264,7 +2391,15 @@ private:
         // Check for overlapping variable elements
         return check_variable_element_overlaps(elements, direction, filtered_because, verbose);
     }
-    
+
+/**
+ * @brief Check for overlapping variable elements in a set of sequence elements
+ * @param elements vector of references to `seq_element` objects
+ * @param direction direction string
+ * @param filtered_because string to append filtering reasons
+ * @param verbose print verbose output
+ * @return true if no overlaps detected, false otherwise
+ */
     bool check_variable_element_overlaps(std::vector<std::reference_wrapper<const seq_element>>& elements,
         const std::string& direction, std::string& filtered_because,
         bool verbose
@@ -2298,7 +2433,12 @@ private:
         }
         return true;
     }
-    
+
+/**
+ * @brief Count valid reads in a set of sequence elements
+ * @param elements vector of references to `seq_element` objects
+ * @return number of valid reads
+ */
     int count_valid_reads(const std::vector<std::reference_wrapper<const seq_element>>& elements
     ) {
         int count = 0;
@@ -2313,7 +2453,19 @@ private:
         }
         return count;
     }
-    
+
+/**
+ * @brief process barcodes in a given direction: apply corrections and validate
+ * @param direction direction string
+ * @param elements vector of references to `seq_element` objects
+ * @param read `read_streaming::sequence` object containing the read sequence
+ * @param layout `ReadLayout` object containing layout elements
+ * @param gen_mut general mutation rate for barcode correction
+ * @param mode correction mode for barcode correction (offensive or defensive, which whitelist to check first)
+ * @param verbose print verbose output
+ * @return true if all barcodes pass, false if any barcode fails
+ * @note If multiple barcodes are present, the direction passes if at least one barcode passes.
+ */
     bool process_barcodes_for_direction(const std::string& direction, std::vector<std::reference_wrapper<const seq_element>>& elements,
         const read_streaming::sequence& read, const ReadLayout& layout, int gen_mut,  const std::string& mode, bool verbose
     ) {
@@ -2342,7 +2494,18 @@ private:
         }
         return all_barcodes_passed;
     }
-    
+
+/**
+ * @brief Process a single barcode: apply correction and update element
+ * @param elem reference to `seq_element` object representing the barcode
+ * @param layout `ReadLayout` object containing layout elements
+ * @param read `read_streaming::sequence` object containing the read sequence
+ * @param gen_mut general mutation rate for barcode correction
+ * @param mode correction mode for barcode correction (offensive or defensive, which whitelist to check
+ * first)
+ * @param verbose print verbose output
+ * @return true if barcode correction is successful, false otherwise
+ */
     bool process_single_barcode(const seq_element& elem, const ReadLayout& layout, const read_streaming::sequence& read,
         int gen_mut, const std::string& mode, bool verbose
     ) {
@@ -2363,7 +2526,14 @@ private:
         apply_barcode_correction(elem, correction_result.value(), layout, verbose);
         return true;
     }
-    
+
+/**
+ * @brief Apply barcode correction to a sequence element and update its information
+ * @param elem reference to `seq_element` object representing the barcode
+ * @param corrected_barcode `int64_seq` object representing the corrected barcode
+ * @param layout `ReadLayout` object containing layout elements
+ * @param verbose print verbose output
+ */
     void apply_barcode_correction(const seq_element& elem, const int64_seq& corrected_barcode,const ReadLayout& layout,
         bool verbose
     ) {
@@ -2389,7 +2559,14 @@ private:
             log_verbose("Barcode corrected: " + elem.class_id + " -> " + final_bc + " (" + final_wl + ")");
         }
     }
-    
+
+/**
+ * @brief Determine preliminary read direction based on valid directions and pass counts
+ * @param direction_valid map of direction strings to boolean indicating validity
+ * @param pass_counts map of direction strings to integer counts of passing reads
+ * @param verbose print verbose output
+ * @return `std::pair<std::string, std::string>` containing preliminary read type and final read type
+ */
     std::pair<std::string, std::string> determine_read_direction(
         const std::map<std::string, bool>& direction_valid, const std::map<std::string, int>& pass_counts, bool verbose
     ) {
@@ -2421,7 +2598,13 @@ private:
         
         return {preliminary_type, preliminary_type};
     }
-    
+
+/**
+ * @brief Determine final read type based on valid directions and pass counts
+ * @param direction_valid map of direction strings to boolean indicating validity
+ * @param pass_counts map of direction strings to integer counts of passing reads
+ * @param verbose print verbose output
+ */
     void determine_final_read_type(
         const std::map<std::string, bool>& direction_valid,
         const std::map<std::string, int>& pass_counts,
@@ -2446,8 +2629,11 @@ private:
             set_type("filtered");
         }
     }
-    
-    // Utility functions
+
+/**
+ * @brief Mark a sequence element as failed based on its class ID
+ * @param class_id class ID string of the sequence element
+ */
     inline void mark_element_failed(const std::string& class_id) {
         auto& id_index = sig_elements.get<sig_id_tag>();
         auto it = id_index.find(class_id);
@@ -2539,6 +2725,22 @@ private:
     }
 
 public:
+/**
+ * @brief Master function for static sequence alignment and detection. 
+ * @param read `read_streaming::sequence` object containing the read sequence
+ * @param layout `ReadLayout` object containing layout elements
+ * @param verbose print verbose output
+ * 
+ * @brief This function aligns static sequence elements (e.g., adapters, poly-tails)
+ * within a sequencing read based on the provided layout. It handles special cases
+ * for 'start' and 'stop' elements, performs poly-tail detection, and uses alignment
+ * statistics to determine expected regions for other static elements. sigalign_static
+ * works as a two-pass system: the first pass uses edlib to quickly find candidates within
+ * expected regions, and the second pass uses the SSW aligner for the best alignment.
+ * Edlib will find the majority of cases, while SSW will detect adapters that are either in 
+ * misalignment regions or are truncated on the edges of reads.
+ * Aligned elements in the read are masked to prevent re-alignment or overlapping.
+ */
    void sigalign_static(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose) {
     aligner_tools aligner;
     auto& type_index = layout.by_type();
@@ -2714,8 +2916,22 @@ public:
             }
         }
     }
-   
-    //this version iterates across reverse elements in reverse order, which fixes issues with rc umi/rc barcode dependencies
+
+/**
+ * @brief Master function for variable sequence alignment and detection.
+ * @param read `read_streaming::sequence` object containing the read sequence
+ * @param layout `ReadLayout` object containing layout elements
+ * @param verbose print verbose output
+ * 
+ * @brief This function embeds variable sequence elements (e.g., barcodes, reads)
+ * within a sequencing read based on the provided layout. It first separates variable
+ * elements into read and non-read categories. Non-read variables are further partitioned
+ * by direction (forward/reverse) and processed accordingly. The function generates
+ * variable elements by referencing previously aligned static elements to determine
+ * their positions within the read. Elements to the left of a read are processed from top-down in terms
+ * of order, while those to the right are processed bottom-up.
+ * Read variables are processed last to ensure accurate positioning. 
+ */
     void sigalign_variable(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose) {
         if(verbose){
             #pragma omp critical
@@ -2844,7 +3060,24 @@ public:
         }
     }
    
-    // Refactored sigalign_filter 
+/**
+ * @brief Master function for filtering and barcode correction.
+ * @param read `read_streaming::sequence` object containing the read sequence
+ * @param layout `ReadLayout` object containing layout elements
+ * @param gen_mut general mutation rate for barcode correction
+ * @param verbose print verbose output
+ * @param mode correction mode for barcode correction (offensive or defensive, which whitelist to check first)
+ * 
+ * @brief Master function for barcode correction and sequence-level filtering. 
+ * This function processes variable sequence elements (e.g., barcodes, reads)
+ * within a sequencing read based on the provided layout. It first groups variable
+ * elements by direction (forward/reverse) and performs basic validation, including
+ * position checks and overlap detection. Valid directions are then assessed to
+ * determine the preliminary read type. Barcode correction is applied to barcode
+ * elements, and the direction validity is updated accordingly. Finally, the
+ * final read type is determined based on the updated direction validity. 
+ * This function also includes concatenate resolution logic.
+ */
     void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, int gen_mut, bool verbose, 
         std::string mode
     ) {
@@ -2900,10 +3133,10 @@ public:
             }
         }
         
-        // Phase 4: Final read type determination
+        // part 4: Final read type determination
         determine_final_read_type(direction_valid, pass_counts, verbose);
         
-        // Phase 5: Update barcode counts
+        // part 5: Update barcode counts
         //update_bc_counts(*this, layout, verbose);
         
         if (verbose) {
@@ -2911,11 +3144,24 @@ public:
         }
     }
     
-// metrics parallelized over reads
-    static void sigalign(const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
-                     std::optional<int> gen_mut, bool verbose, 
-                     int num_threads, size_t chunk_size, size_t max_reads, bool write_debug, std::string mode) 
-{
+/**
+ * @brief The main function to perform sigalign on a FASTQ file, producing aligned and demultiplexed outputs.
+ * @param fastq_path `std::string` path to the input FASTQ file
+ * @param layout `ReadLayout` object defining the layout of the reads
+ * @param output_prefix `std::string` prefix for the output files
+ * @param gen_mut `std::optional<int>` general mutation rate for barcode correction, default is 2
+ * @param verbose flag to enable verbose logging
+ * @param num_threads `int` number of threads to use for parallel processing
+ * @param chunk_size `size_t` number of reads to process in each chunk
+ * @param max_reads `size_t` maximum number of reads to process from the input file
+ * @param write_debug flag to enable writing debug output files
+ * @param mode `std::string` correction mode for barcode correction (offensive or defensive, which whitelist to check first)
+ */
+    static void sigalign(
+        const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
+        std::optional<int> gen_mut, bool verbose, int num_threads, size_t chunk_size, size_t max_reads, 
+        bool write_debug, std::string mode
+    ) {
     std::string file_out = path_utils::get_fastqa_type(fastq_path);
     std::string fastq_output_path = output_prefix + file_out;
     bool compress_fastq = true;
@@ -3011,7 +3257,7 @@ public:
             for (size_t i = 0; i < chunk.size(); ++i) {
                 const auto& read = chunk[i];
                 
-                // Process the read in tight scope
+                // process the read
                 {
                     SigString sig(read.id, read.seq.length());
                     sig.sigalign_static(read, layout, verbose);
@@ -3022,8 +3268,7 @@ public:
                     if (write_debug) {
                         thread_debug.push_back(sig);
                     }
-
-                    // Serialize directly to thread buffer if passed
+                    // Serialize directly to thread buffer--mod this to pigz_write later
                     if (sig.read_type != "filtered" && sig.read_type != "skipped") {
                         sig.to_fastqa_append(thread_buffers[tid]);
                         passed_count.fetch_add(1, std::memory_order_relaxed);
@@ -3035,7 +3280,7 @@ public:
             thread_times[tid] = std::chrono::duration_cast<std::chrono::milliseconds>(
                 thread_end - thread_start).count();
 
-            // Merge debug data if needed
+            // merge debug data
             if (write_debug) {
                 #pragma omp critical
                 {
@@ -3054,27 +3299,10 @@ public:
             actual_process_ms = std::max(actual_process_ms, t);
         }
 
-        // === CONSOLIDATE AND WRITE ===
+        // === consolidate and write ===
         if (passed_count > 0) {
             if (write_debug) {
-                /*size_t total_size = 0;
-
-                for (auto& buf : thread_buffers) {
-                    total_size += buf.size();
-                }
-
-                std::string consolidated;
-                consolidated.reserve(total_size);
-                for (auto& buf : thread_buffers) {
-                    consolidated.append(buf);
-                    std::string().swap(buf);
-                }*/
-
-                // Now serialize sigstrings / csv
-                //std::vector<std::string> slabs;
-                //slabs.emplace_back(std::move(consolidated));
                 writer.write_debug(debug_sig_writer.get(), debug_csv_writer.get(), debug_fastqa_writer.get(), debug_sigs);
-
             } else {
                 size_t total_size = 0;
                 for (const auto& buf : thread_buffers) {
@@ -3190,7 +3418,10 @@ public:
     }
 }
 
-    // sigstring format
+/**
+ * @brief convert SigString to a sigstring text representation
+ * @return `std::string` sigstring representation
+ */
     std::string to_sigstring() const {
         std::stringstream ss;
         std::string overall = read_type; // e.g., "forward", "reverse", "concatenate", "filtered"
@@ -3255,11 +3486,23 @@ public:
         // Return empty string if nothing was added
         return ss.str().empty() ? "" : ss.str();
     }
-   
-    // zero-copy serializer
+
+/**
+ * @brief append fastqa representation of SigString to a buffer
+ * @param buffer `std::string&` buffer to be appended to
+ * 
+ * @brief this function generates and writes the fastqa version of a sigstring. 
+ * It handles different read types including "forward", "reverse", "concatenate", and "skipped".
+ * For "concatenate", it processes both forward and reverse directions.
+ * It collects barcode, UMI, and read sequences from the sig_elements, constructs the appropriate tags,
+ * and appends the formatted output directly to the provided buffer. It's "to_fastqa_append" because
+ * it appends directly to an existing string buffer rather than returning a new string, which I don't have to
+ * go through the overhead of creating intermediate strings.
+ */
     void to_fastqa_append(std::string& buffer) const {
-        if (read_type == "skipped") return;
-        
+        if (read_type == "skipped") {
+            return;
+        }
         std::vector<std::string> dirs;
         if (read_type == "concatenate") {
             dirs = {"forward", "reverse"};
@@ -3373,7 +3616,14 @@ public:
         }
     }
 
-    // FASTQ format
+/** 
+ * @brief convert SigString to a fastqa text representation
+ * @return `std::string` fastqa representation
+ * 
+ * @brief This does all of the things that to_fastqa_append does, but instead of appending to a buffer,
+ * it constructs and returns a new string containing the fastqa representation of the SigString. This is
+ * an older, less efficient version of the writing process that's used in other contexts where we needed the string.
+*/
     std::string to_fastqa() const {
         std::vector<std::string> dirs;
         if(read_type == "skipped"){
@@ -3487,7 +3737,14 @@ public:
         return all_records;
     }
 
-    // CSV conversion
+/**
+ * @brief convert SigString to a CSV text representation
+ * @param write_header `bool` whether to include the CSV header
+ * @return `std::string` CSV representation
+ * 
+ * @brief This function converts the SigString object into a CSV. Great for debugging and per-element processing.
+ * It includes an optional header row. It processes only variable elements with non-empty sequences.
+ */
     std::string to_csv(bool write_header = false) const {
         std::stringstream ss;
         if (write_header) {

@@ -184,6 +184,7 @@ struct ReadElement {
 
 /**
  * @brief Multi-index container for read layout elements
+ * @param ReadElement Core element structure
  */
 typedef boost::multi_index::multi_index_container<
     ReadElement,
@@ -1365,8 +1366,8 @@ public:
                 // hardcoded whitelist size limit for entry so that we don't generate too many mismatches
                 memory_utils::get_rss();
                 // hardcoded this to essentially cover all scenarios where the whitelist becomes
-                // detrimental to size, so basically b/w 10K-30K barcodes we pregenerate it
-                if(entry.true_bcs.size() >= 10000 && entry.true_bcs.size() <= 30000){
+                // detrimental to size, so basically b/w 15K-30K barcodes we pre-generate it
+                if(entry.true_bcs.size() >= 15000 && entry.true_bcs.size() <= 30000){
                     entry.generate_mismatch_barcodes(
                             mut.value_or(2),
                             verbose, nthreads);
