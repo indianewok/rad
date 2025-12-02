@@ -9,7 +9,7 @@ private:
     // Helper function to check if sequence contains only ACGT
     bool is_valid_sequence(const std::string& seq) {
         for (char c : seq) {
-            if (c != 'A' && c != 'C' && c != 'G' && c != 'T') {
+            if (c != 'A' && c != 'C' && c != 'G' && c != 'T' && c != 'N') {
                 return false;
             }
         }
