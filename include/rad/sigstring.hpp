@@ -1365,21 +1365,37 @@ class SigString {
     std::string additional_info;
 
 public:
-    SigString(std::string id = "", int length = 0, std::string type = "undefined", std::string info = "")
-        : sequence_id(std::move(id)),
+    SigString(
+        std::string id = "", 
+        int length = 0, 
+        std::string type = "undefined", 
+        std::string info = ""
+    ) : sequence_id(std::move(id)),
           sequence_length(length),
           read_type(std::move(type)),
           additional_info(std::move(info)) {}
 
     // Metadata accessors
-    const std::string& id() const { return sequence_id; }
-    int length() const { return sequence_length; }
-    const std::string& type() const { return read_type; }
-    const std::string& info() const { return additional_info; }
+    const std::string& id() const { 
+        return sequence_id; 
+    }
+    int length() const { 
+        return sequence_length; 
+    }
+    const std::string& type() const { 
+        return read_type; 
+    }
+    const std::string& info() const { 
+        return additional_info; 
+    }
 
     // Container access methods
-    const SigElement& elements() const { return sig_elements; }
-    SigElement& elements() { return sig_elements; }
+    const SigElement& elements() const { 
+        return sig_elements; 
+    }
+    SigElement& elements() { 
+        return sig_elements; 
+    }
 
     // Index accessors
     auto& by_id() { return sig_elements.get<sig_id_tag>(); }
@@ -1446,8 +1462,10 @@ private:
  * @param sig_elements sig_elements to look at
  * @return true if variable elements were successfully generated and embedded into the order, false otherwise
  */
-    bool generate_variable_elements(const ReadElement* layout_elem,  const std::multimap<std::string, const seq_element*>& static_refs,
-                                  const std::string& read_seq, SigElement& sig_elements, bool verbose) {
+    bool generate_variable_elements(
+        const ReadElement* layout_elem, const std::multimap<std::string, const seq_element*>& static_refs,
+                                  const std::string& read_seq, SigElement& sig_elements, bool verbose
+                                ) {
         auto& id_index = sig_elements.get<sig_id_tag>();
         auto it = id_index.find(layout_elem->class_id);
         if (it == id_index.end() || !layout_elem->ref_pos){
@@ -2132,6 +2150,83 @@ private:
     }
 
 /**
+ * @brief Check for presence of forward direction static elements
+ * @param elems vector of references to `seq_element` objects
+ * @param layout `ReadLayout` object containing layout elements
+ * @return false if at least one forward static element is present, true otherwise
+ */
+    bool filter_forward_direction_statics(
+        const std::vector<std::reference_wrapper<const seq_element>>& elems, const ReadLayout& layout) const {
+        bool forward_fail = false;
+        int static_elements = 0;
+        for (auto& e_ref : elems) {
+            auto const& e = e_ref.get();
+            if (
+                e.direction == "forward" && 
+                e.type == "static" && 
+                e.global_class != "start" && 
+                e.global_class != "stop" && 
+                e.global_class != "poly_tail"
+                ) {
+                    static_elements++;
+                } 
+        }
+        if(static_elements == 0){
+            forward_fail = true;
+        }
+        return forward_fail;
+    }
+
+/**
+ * @brief Check for presence of reverse direction static elements
+ * @param elems vector of references to `seq_element` objects
+ * @param layout `ReadLayout` object containing layout elements
+ * @return true if at least one reverse static element is present, false otherwise
+ */
+    bool filter_reverse_direction_statics(
+        const std::vector<std::reference_wrapper<const seq_element>>& elems, const ReadLayout& layout) const {
+        bool reverse_fail = false;
+        int static_elements = 0;
+        for (auto& e_ref : elems) {
+            auto const& e = e_ref.get();
+            if (
+                e.direction == "reverse" && 
+                e.type == "static" && 
+                e.global_class != "start" && 
+                e.global_class != "stop" && 
+                e.global_class != "poly_tail"
+                ) {
+                    static_elements++;
+                } 
+        }
+        if(static_elements == 0){
+            reverse_fail = true;
+        }
+        return reverse_fail;
+    }
+
+/**
+ * @brief Filter static elements based on specified direction
+ * @param elems vector of references to `seq_element` objects
+ * @param layout `ReadLayout` object containing layout elements
+ * @param direction direction string ("forward", "reverse", or other)
+ * @return false if static elements are present, true if needs to be filtered
+ * 
+ * @note built one direction, built the other, built a wrapper, hit tab a lot, here we are
+ */
+    bool filter_direction_statics(
+        const std::vector<std::reference_wrapper<const seq_element>>& elems, const ReadLayout& layout, 
+        const std::string& direction) const {
+        if(direction == "forward"){
+            return filter_forward_direction_statics(elems, layout);
+        } else if(direction == "reverse"){
+            return filter_reverse_direction_statics(elems, layout);
+        } else {
+            return true;
+        }
+    }
+
+/**
  * @brief Validate positions of a sequence element
  * @param e reference to `seq_element` object
  * @param direction direction string
@@ -2213,13 +2308,24 @@ private:
  * @param verbose print verbose output
  * @return true if processing is successful, false if read is filtered
  */   
-    bool process_direction_basic(const std::string& direction, std::vector<std::reference_wrapper<const seq_element>>& elements,
-            const read_streaming::sequence& read, const ReadLayout& layout, std::string& filtered_because, bool verbose
+    bool process_direction_basic(
+        const std::string& direction, 
+        std::vector<std::reference_wrapper<const seq_element>>& elements,
+        const read_streaming::sequence& read, 
+        const ReadLayout& layout, 
+        std::string& filtered_because, 
+        bool verbose
     ) {
         
+        if(filter_direction_statics(elements, layout, direction)){
+            filtered_because += direction + "_FILTERED_NO_STATIC_ELEMENTS";
+            set_info(filtered_because);
+            return false;
+        }
+
         // Length filtering
         if (!filter_short_reads(elements, layout)) {
-            filtered_because += direction + ":FILTERED_READ_LENGTH";
+            filtered_because += direction + "_FILTERED_READ_LENGTH";
             set_info(filtered_because);
             return false;
         }
@@ -2466,8 +2572,14 @@ private:
  * @return true if all barcodes pass, false if any barcode fails
  * @note If multiple barcodes are present, the direction passes if at least one barcode passes.
  */
-    bool process_barcodes_for_direction(const std::string& direction, std::vector<std::reference_wrapper<const seq_element>>& elements,
-        const read_streaming::sequence& read, const ReadLayout& layout, int gen_mut,  const std::string& mode, bool verbose
+    bool process_barcodes_for_direction(
+        const std::string& direction, 
+        std::vector<std::reference_wrapper<const seq_element>>& elements,
+        const read_streaming::sequence& read, 
+        const ReadLayout& layout, 
+        int gen_mut,  
+        const std::string& mode, 
+        bool verbose
     ) {
         
         bool has_multiple_barcodes = count_barcodes_in_direction(elements) > 1;
@@ -2568,7 +2680,11 @@ private:
  * @return `std::pair<std::string, std::string>` containing preliminary read type and final read type
  */
     std::pair<std::string, std::string> determine_read_direction(
-        const std::map<std::string, bool>& direction_valid, const std::map<std::string, int>& pass_counts, bool verbose
+        const std::map<std::string, 
+        bool>& direction_valid, 
+        const std::map<std::string, 
+        int>& pass_counts, 
+        bool verbose
     ) {
         
         int forward_count = (direction_valid.count("forward") && direction_valid.at("forward")) 
@@ -3158,9 +3274,16 @@ public:
  * @param mode `std::string` correction mode for barcode correction (offensive or defensive, which whitelist to check first)
  */
     static void sigalign(
-        const std::string& fastq_path, const ReadLayout& layout, const std::string& output_prefix, 
-        std::optional<int> gen_mut, bool verbose, int num_threads, size_t chunk_size, size_t max_reads, 
-        bool write_debug, std::string mode
+        const std::string& fastq_path, 
+        const ReadLayout& layout, 
+        const std::string& output_prefix, 
+        std::optional<int> gen_mut, 
+        bool verbose, 
+        int num_threads, 
+        size_t chunk_size, 
+        size_t max_reads, 
+        bool write_debug, 
+        std::string mode
     ) {
     std::string file_out = path_utils::get_fastqa_type(fastq_path);
     std::string fastq_output_path = output_prefix + file_out;
@@ -3169,6 +3292,7 @@ public:
     std::unique_ptr<std::ofstream> metrics_file_ptr;
     std::unique_ptr<sigstring_writing> debug_sig_writer, debug_csv_writer, debug_fastqa_writer;
 
+    // Primary FASTQA writer
     sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, compress_fastq, false, num_threads);
 
     if (write_debug) {
@@ -3243,8 +3367,10 @@ public:
             auto thread_start = std::chrono::high_resolution_clock::now();
             
             // Pre-allocate thread-local buffer
+
             //character = byte in c++, so really guesstimating how big the chunk is in bytes
             //attempting to hardcode it--200 mb total (one chunk) divided by number of threads
+            
             size_t est_per_thread = (chunk.size() / num_threads + 1) * 1600;
             thread_buffers[tid].reserve(est_per_thread);
             
@@ -3259,7 +3385,7 @@ public:
                 
                 // process the read
                 {
-                    SigString sig(read.id, read.seq.length());
+                    SigString sig(read.id, read.seq.length(),"undefined", layout.sequencing_type);
                     sig.sigalign_static(read, layout, verbose);
                     sig.sigalign_variable(read, layout, verbose);
                     sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode);
@@ -3268,7 +3394,7 @@ public:
                     if (write_debug) {
                         thread_debug.push_back(sig);
                     }
-                    // Serialize directly to thread buffer--mod this to pigz_write later
+                    // Serialize directly to thread buffer--mod this to pigz_write?
                     if (sig.read_type != "filtered" && sig.read_type != "skipped") {
                         sig.to_fastqa_append(thread_buffers[tid]);
                         passed_count.fetch_add(1, std::memory_order_relaxed);
@@ -3505,9 +3631,14 @@ public:
         }
         std::vector<std::string> dirs;
         if (read_type == "concatenate") {
-            dirs = {"forward", "reverse"};
+            dirs = {
+                "forward", 
+                "reverse"
+            };
         } else {
-            dirs = {read_type};
+            dirs = {
+                read_type
+            };
         }
         
         for (const auto& dir : dirs) {
@@ -3519,9 +3650,13 @@ public:
             
             // Collect elements
             for (const auto& elem : sig_elements) {
-                if (!elem.seq.has_value()) continue;
-                if (elem.direction != dir) continue;
-                
+                if (!elem.seq.has_value()) {
+                    continue;
+                }
+                if (elem.direction != dir) {
+                    continue;
+                }
+
                 if (elem.global_class == "barcode") {
                     auto key = seq_utils::remove_rc(elem.class_id);
                     bool is_fwd = (dir == "forward");
@@ -3558,8 +3693,7 @@ public:
                 }
             }
             
-            // Skip if missing essential components
-            if (bc_map.empty() || read_seq.empty()) {
+            if ((bc_map.empty() && additional_info != "bulk") || read_seq.empty()) {
                 continue;
             }
             
@@ -3689,7 +3823,7 @@ public:
             }
             
             // Check if we have essential components - skip this direction if not
-            if (bc_map.empty() || read_seq.empty()) {
+            if ((bc_map.empty() && additional_info != "bulk") || read_seq.empty()) {
                 continue; // Skip this direction if either barcode or read are empty
             }
             

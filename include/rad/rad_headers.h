@@ -23,6 +23,7 @@
 #include <optional>
 #include <queue>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <unordered_map>

@@ -299,6 +299,48 @@ namespace seq_utils {
 
 };
 
+namespace term_print_utils {
+    inline const std::vector<std::string>& palette() {
+        static const std::vector<std::string> colors = {
+            "\033[38;5;31m",  // teal
+            "\033[38;5;27m",  // blue
+            "\033[38;5;35m",  // purple
+            "\033[38;5;166m", // orange
+            "\033[38;5;100m", // slate
+            "\033[38;5;64m",  // green
+            "\033[38;5;160m", // red
+            "\033[38;5;214m", // amber
+            "\033[38;5;45m",  // cyan
+            "\033[38;5;94m"   // brownish
+        };
+        return colors;
+    }
+
+    inline std::string colorize(const std::string& text, const std::string& color_code) {
+        static const char* reset = "\033[0m";
+        return color_code + text + reset;
+    }
+
+    inline const std::string& direction_label_color() {
+        static const std::string color_dir = "\033[38;5;247m"; // muted gray
+        return color_dir;
+    }
+
+    inline const std::string& class_color(const std::string& class_id, const std::string& seq = "") {
+        static std::unordered_map<std::string, std::string> cache;
+        std::string key = seq.empty() ? class_id : seq;
+        if (!seq.empty()) {
+            std::string rc = seq_utils::revcomp(seq);
+            if (rc < key) key = rc; // canonicalize to group fwd/rc together
+        }
+        auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+        size_t idx = std::hash<std::string>{}(key) % palette().size();
+        cache[key] = palette()[idx];
+        return cache[key];
+    }
+}
+
 namespace streaming_utils { 
     std::vector<std::string> import_text(const std::string &path, size_t max_lines = SIZE_MAX) {
         // 1) open the right kind of stream

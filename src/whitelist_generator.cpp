@@ -7,6 +7,17 @@ struct extracted_bc {
     bool is_reverse_complement;
 };
 
+static const EdlibEqualityPair kWildcardEqualities[8] = {
+                {'N', 'A'}, 
+                {'N', 'C'}, 
+                {'N', 'G'}, 
+                {'N', 'T'},
+                {'A', 'N'}, 
+                {'C', 'N'}, 
+                {'G', 'N'}, 
+                {'T', 'N'}
+};
+
 // Extract barcode sequence given primer position
 std::string extract_barcode(
     const std::string& sequence, int primer_pos, int primer_len, int n_bases, int m_left, int m_right, bool is_rc) {
@@ -62,7 +73,7 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
             EdlibAlignResult result = edlibAlign(primer.c_str(), primer.length(),
                                                read.sequence.c_str(), read.sequence.length(),
                                                edlibNewAlignConfig((int)(primer.length() * max_edit_distance_ratio), 
-                                                                 EDLIB_MODE_HW, EDLIB_TASK_LOC, NULL, 0));
+                                                                 EDLIB_MODE_HW, EDLIB_TASK_LOC, kWildcardEqualities, 8));
             
             if (result.status == EDLIB_STATUS_OK && result.numLocations > 0) {
                 // Found primer - extract barcode
@@ -82,7 +93,7 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
             result = edlibAlign(primer_rc.c_str(), primer_rc.length(),
                               read.sequence.c_str(), read.sequence.length(),
                               edlibNewAlignConfig((int)(primer_rc.length() * max_edit_distance_ratio), 
-                                                 EDLIB_MODE_HW, EDLIB_TASK_LOC, NULL, 0));
+                                                 EDLIB_MODE_HW, EDLIB_TASK_LOC, kWildcardEqualities, 8));
             
             if (result.status == EDLIB_STATUS_OK && result.numLocations > 0) {
                 // Found reverse complement primer - extract barcode

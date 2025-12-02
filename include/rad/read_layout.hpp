@@ -225,15 +225,17 @@ typedef boost::multi_index::multi_index_container<
 > Layout_Struct;
 
 /**
- * @brief Class for managing ReadLayout operations
+ * @brief Full read layout representation, containing whitelist map, layout elements, and position map
  * @param wl_map Whitelist map for barcode correction
  * @param layout Multi-index container for read layout elements
+ * @param sequencing_type Sequencing type information (bulk, single-cell)
  * @param position_map Map of reference positions
  */
 class ReadLayout {
 public:
     whitelist wl_map;
     Layout_Struct layout;
+    std::string sequencing_type;
     std::unordered_map<std::string, ReferencePositions> position_map;
 
     //A bunch of access-based methods for the multi-index container
@@ -282,6 +284,7 @@ public:
 
     // Import data from CSV
     void prep_new_layout(const std::string& input_file, bool verbose) {
+
         std::unordered_map<std::string, int> class_id_counts;
         std::unordered_map<std::string, int> class_id_total_counts;
         bool build_forward_only, build_reverse_only = false;
@@ -300,9 +303,14 @@ public:
         };
        
         std::string mode = get_rl_mode(input_file);
+        std::string sequencing_type;
+
+        std::regex_search(mode, std::regex("bulk")) ? sequencing_type = "bulk" : "";
+
         // set flags
-        build_forward_only = (mode == "R1");
-        build_reverse_only = (mode == "R2");
+        build_forward_only = std::regex_search(mode, std::regex("R1"));
+        build_reverse_only = std::regex_search(mode, std::regex("R2"));
+
         if(verbose){
             std::cout << "[prep_new_layout] Mode: '" << mode << "'\n";
             std::cout << "[prep_new_layout] Build mode: " << (build_forward_only ? "forward"  : build_reverse_only  ? "reverse" : "both")<< "\n";    
@@ -397,7 +405,18 @@ public:
             }
             std::string masked_seq = (type == "static" && global_class != "poly_tail") ? "MASKED" : "";
 
-           ReadElement elem(class_id, seq, masked_seq, expected_length, type, order_counter, normalized_direction, global_class, whitelist_path, unidirectional);
+           ReadElement elem(
+                            class_id, 
+                            seq, 
+                            masked_seq, 
+                            expected_length, 
+                            type, 
+                            order_counter, 
+                            normalized_direction, 
+                            global_class, 
+                            whitelist_path, 
+                            unidirectional
+                        );
 
             if (is_forward_only) {
                 single_sided_ids.insert(elem.class_id);
@@ -422,7 +441,16 @@ public:
         }
 
         // Insert seq_stop
-        ReadElement seq_stop("seq_stop", "", "", 0, "static", order_counter++, "forward", "stop");
+        ReadElement seq_stop(
+            "seq_stop", 
+            "", 
+            "", 
+            0, 
+            "static", 
+            order_counter++, 
+            "forward", 
+            "stop"
+        );
         layout.insert(seq_stop);
         if(build_forward_only){
             std::cout << "[prep_new_layout] Forward-only (R1) layout generated.\n";
@@ -462,9 +490,14 @@ public:
         }
         // Organize reverse complement rows
         auto start_it = std::stable_partition(reverse_elements.begin(), reverse_elements.end(),
-            [](const ReadElement& elem) { return elem.global_class == "start"; });
+            [](const ReadElement& elem) { 
+                return elem.global_class == "start"; 
+            });
+
         auto stop_it = std::stable_partition(start_it, reverse_elements.end(),
-            [](const ReadElement& elem) { return elem.global_class != "stop"; });
+            [](const ReadElement& elem) { 
+                return elem.global_class != "stop"; 
+            });
 
         // Reverse the middle portion
         std::reverse(start_it, stop_it);
@@ -497,7 +530,7 @@ public:
             // Find the sub-range where direction == "forward"
             auto range = dir_index.equal_range("forward");
             // Erase them
-            //dir_index.erase(range.first, range.second);
+            dir_index.erase(range.first, range.second);
             std::cout << "[prep_new_layout] Removed all forward elements; reverse-only layout ready. New layout :\n";
             for(auto& elem : layout) {
                 log_elem(elem);
@@ -511,7 +544,7 @@ public:
         layout.clear();
         position_map.clear();
 
-        struct PartStats {
+        struct adapter_stats {
             std::string id;
             std::string seq;
             std::string rc_seq;
@@ -521,8 +554,18 @@ public:
             std::vector<double> reverse_stops;
         };
 
+         struct ordered_element {
+            std::string id;
+            std::string class_id;
+            std::string seq;
+            std::string direction;
+            double mean_start;
+            size_t dominant_hits;
+            size_t alternate_hits;
+        };
+
         auto parts = [&]() {
-            std::vector<PartStats> parsed;
+            std::vector<adapter_stats> parsed;
             csv::CSVFormat fmt;
             fmt.delimiter(',').quote('"').header_row(0);
             csv::CSVReader reader(parts_csv, fmt);
@@ -570,7 +613,7 @@ public:
                                     kWildcardEqualities,
                                     8)
             );
-            int max_allowed_edits = static_cast<int>(query.length() * 0.1);
+            int max_allowed_edits = static_cast<int>(query.length() * 0.1); // 10% error tolerance hardcoded
 
             if (result.status == EDLIB_STATUS_OK &&
                 result.editDistance <= max_allowed_edits &&
@@ -598,15 +641,6 @@ public:
         };
         streamer.process_chunks(fastq_path, chunk_func, num_threads, max_reads);
 
-        struct OrderedPart {
-            std::string id;
-            std::string class_id;
-            std::string seq;
-            std::string direction;
-            double mean_start;
-            size_t dominant_hits;
-            size_t alternate_hits;
-        };
 
         auto mean_or_zero = [](const std::vector<double>& vals) {
             if (vals.empty()) return 0.0;
@@ -627,7 +661,7 @@ public:
             return (rev_hits > fwd_hits) ? std::string("reverse") : std::string("forward");
         };
 
-        std::vector<OrderedPart> ordered_parts;
+        std::vector<ordered_element> ordered_parts;
 
         for (const auto& part : parts) {
             size_t fwd_hits = part.forward_starts.size();
@@ -672,7 +706,7 @@ public:
             }
         }
 
-        auto share_same_site = [](const OrderedPart& a, const OrderedPart& b) {
+        auto share_same_site = [](const ordered_element& a, const ordered_element& b) {
             double pos_diff = std::abs(a.mean_start - b.mean_start);
             if (pos_diff > 1.0) return false;  // within ~1% of the read length
 
@@ -680,7 +714,7 @@ public:
             return a.seq.compare(0, min_len, b.seq, 0, min_len) == 0;
         };
 
-        auto prefer_part = [](const OrderedPart& a, const OrderedPart& b) {
+        auto prefer_part = [](const ordered_element& a, const ordered_element& b) {
             if ((a.dominant_hits + a.alternate_hits) != (b.dominant_hits + b.alternate_hits)) {
                 return (a.dominant_hits + a.alternate_hits) > (b.dominant_hits + b.alternate_hits);
             }
@@ -693,7 +727,7 @@ public:
             return a.id < b.id;
         };
 
-        std::vector<OrderedPart> deduped_parts;
+        std::vector<ordered_element> deduped_parts;
         for (const auto& part : ordered_parts) {
             bool merged = false;
             for (auto& kept : deduped_parts) {
@@ -737,7 +771,7 @@ public:
             }
         }
         {
-            std::vector<OrderedPart> kept;
+            std::vector<ordered_element> kept;
             for (size_t i = 0; i < deduped_parts.size(); ++i) {
                 if (!drop[i]) kept.push_back(deduped_parts[i]);
             }
@@ -750,7 +784,7 @@ public:
 
         const double min_hit_fraction = 0.5;      // At least 50% of sampled reads
         const size_t min_absolute_hits = 3;         // And at least 3 total hits
-        std::vector<OrderedPart> filtered_parts;
+        std::vector<ordered_element> filtered_parts;
         for (const auto& part : deduped_parts) {
             size_t total_hits = part.dominant_hits + part.alternate_hits;
             bool keep = total_hits >= min_absolute_hits;
@@ -782,9 +816,9 @@ public:
 
         deduped_parts.swap(filtered_parts);
 
-        std::unordered_map<std::string, OrderedPart> base_parts_by_id;
-        std::unordered_map<std::string, OrderedPart> forward_only_by_id;
-        std::unordered_map<std::string, OrderedPart> reverse_only_by_id;
+        std::unordered_map<std::string, ordered_element> base_parts_by_id;
+        std::unordered_map<std::string, ordered_element> forward_only_by_id;
+        std::unordered_map<std::string, ordered_element> reverse_only_by_id;
 
         for (const auto& part : deduped_parts) {
             if (part.direction == "forward_only") {
@@ -811,7 +845,7 @@ public:
             }
         }
 
-        std::vector<OrderedPart> base_parts;
+        std::vector<ordered_element> base_parts;
         base_parts.reserve(base_parts_by_id.size());
         for (const auto& kv : base_parts_by_id) {
             base_parts.push_back(kv.second);
@@ -821,7 +855,7 @@ public:
             throw std::runtime_error("No forward-oriented parts available to seed layout");
         }
 
-        std::sort(base_parts.begin(), base_parts.end(), [](const OrderedPart& a, const OrderedPart& b) {
+        std::sort(base_parts.begin(), base_parts.end(), [](const ordered_element& a, const ordered_element& b) {
             return a.mean_start < b.mean_start;
         });
 
@@ -851,20 +885,20 @@ public:
         prep_new_layout(tmp_layout.string(), verbose);
 
         auto forward_only_parts = [&]() {
-            std::vector<OrderedPart> parts;
+            std::vector<ordered_element> parts;
             parts.reserve(forward_only_by_id.size());
             for (const auto& kv : forward_only_by_id) parts.push_back(kv.second);
-            std::sort(parts.begin(), parts.end(), [](const OrderedPart& a, const OrderedPart& b) {
+            std::sort(parts.begin(), parts.end(), [](const ordered_element& a, const ordered_element& b) {
                 return a.mean_start < b.mean_start;
             });
             return parts;
         }();
 
         auto reverse_only_parts = [&]() {
-            std::vector<OrderedPart> parts;
+            std::vector<ordered_element> parts;
             parts.reserve(reverse_only_by_id.size());
             for (const auto& kv : reverse_only_by_id) parts.push_back(kv.second);
-            std::sort(parts.begin(), parts.end(), [](const OrderedPart& a, const OrderedPart& b) {
+            std::sort(parts.begin(), parts.end(), [](const ordered_element& a, const ordered_element& b) {
                 return a.mean_start > b.mean_start;
             });
             return parts;
@@ -1548,54 +1582,88 @@ public:
     }
 
     // print full layout
-    void display_read_layout() {
-        std::cout << "[read_layout] COMPLETE_READ_LAYOUT:\n";
-        for (const auto& elem : layout) {
-            // Base fields
-            std::cout
-                << "ID: "             << elem.class_id
-                << ", Seq: "          << elem.seq
-                << ", Type: "         << elem.type
-                << ", Order: "        << elem.order
-                << ", Direction: "    << elem.direction
-                << ", Global Class: " << elem.global_class;
-    
-            // Optional: misalignment_threshold (tuple<int,int,int>)
+void display_read_layout() {
+    std::cout << "[read_layout] Complete read layout:\n";
+
+    auto colorize = [](const std::string& text, const std::string& color_code) {
+        return term_print_utils::colorize(text, color_code);
+    };
+    auto class_color = [&](const ReadElement& elem) -> const std::string& {
+        return term_print_utils::class_color(elem.class_id, elem.seq);
+    };
+    auto class_color_by_id = [&](const std::string& class_id) -> const std::string& {
+        return term_print_utils::class_color(class_id);
+    };
+    const std::string color_dir = term_print_utils::direction_label_color();
+
+    auto fmt_double = [](double v) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2) << v;
+        return oss.str();
+    };
+    auto pos_to_string_clean = [](const ParsedPosition& pos) {
+        ParsedPosition clean{pos.ref_id, pos.is_start, pos.offset, ""};
+        return clean.to_string();
+    };
+    auto fmt_ref = [&](const ParsedPosition& pos) {
+        std::ostringstream oss;
+        oss << term_print_utils::colorize(pos.ref_id, class_color_by_id(pos.ref_id))
+            << "|" << (pos.is_start ? "start" : "stop");
+        if (pos.offset != 0) {
+            oss << (pos.offset > 0 ? "+" : "") << pos.offset;
+        }
+        return oss.str();
+    };
+
+        auto static_segment = [&](const ReadElement& elem) {
+            std::string thresh = "NA";
             if (elem.misalignment_threshold) {
-                auto [min_v, max_v, thr] = *elem.misalignment_threshold;
-                std::cout << ", Misalign Thresh: (min=" << min_v
-                          << ", max=" << max_v
-                          << ", thr=" << thr << ")";
-            }
-    
-            // Optional: aligned_positions
-            if (elem.aligned_positions) {
-                const auto& ap = *elem.aligned_positions;
-                std::cout << ", Aligned Pos: (start: mean="   << ap.start_stats.first
-                          << ", var="     << ap.start_stats.second
-                          << "; stop: mean=" << ap.stop_stats.first
-                          << ", var="     << ap.stop_stats.second << ")";
-            }
-    
-            // Optional: misaligned_positions
-            if (elem.misaligned_positions) {
-                const auto& mp = *elem.misaligned_positions;
-                std::cout << ", Misaligned Pos: (start: mean="   << mp.start_stats.first
-                          << ", var="     << mp.start_stats.second
-                          << "; stop: mean=" << mp.stop_stats.first
-                          << ", var="     << mp.stop_stats.second << ")";
+                auto [min_v, mean_v, max_v] = *elem.misalignment_threshold;
+                thresh = fmt_double(static_cast<double>(mean_v));
             }
 
-            if(elem.ref_pos) {
-                const auto& rp = *elem.ref_pos;
-                std::cout << ", Ref Pos: (primary_start: " << rp.primary_start.to_string()
-                          << ", primary_stop: " << rp.primary_stop.to_string()
-                          << ", secondary_start: " << rp.secondary_start.to_string()
-                          << ", secondary_stop: " << rp.secondary_stop.to_string() << ")";
+            std::string start = "NA";
+            std::string stop = "NA";
+            if (elem.aligned_positions) {
+                const auto& ap = *elem.aligned_positions;
+                start = fmt_double(ap.start_stats.first);
+                stop = fmt_double(ap.stop_stats.first);
             }
-    
-            std::cout << "\n";
+
+            std::ostringstream oss;
+            if(elem.global_class == "start" || elem.global_class == "stop" || elem.global_class == "poly_tail"){
+                oss << "[" << term_print_utils::colorize(elem.class_id, class_color(elem)) << "]";
+            } else {
+                oss << "["  << term_print_utils::colorize(elem.class_id, class_color(elem))
+                    << ":" << thresh << ":" << start << "->" << stop << "]";
+            }
+            return oss.str();
+        };
+
+        auto variable_segment = [&](const ReadElement& elem) {
+            std::string start = "start?";
+            std::string stop = "stop?";
+            if (elem.ref_pos) {
+                const auto& rp = *elem.ref_pos;
+                start = fmt_ref(rp.primary_start);
+                stop = fmt_ref(rp.primary_stop);
+            }
+            std::ostringstream oss;
+            oss << "[" << term_print_utils::colorize(elem.class_id, class_color(elem))
+                << ":" << start << "->" << stop << "]";
+            return oss.str();
+        };
+
+        std::map<std::string, std::string> dir_lines;
+        for (const auto& elem : by_dir_order()) {
+            std::string segment = (elem.type == "static") ? static_segment(elem) : variable_segment(elem);
+            dir_lines[elem.direction] += segment;
         }
+
+        for (const auto& [dir, line] : dir_lines) {
+            std::cout << colorize(dir, color_dir) << ": " << line << "\n";
+        }
+        std::cout << "\n";
     }
 
     // Other utility methods for managing layout
@@ -1809,6 +1877,10 @@ private:
  */
 class Misalignment_Setup {
 public:
+    inline static const std::array<EdlibEqualityPair, 8> kWildcardEqualities{{
+        {'N', 'A'}, {'N', 'C'}, {'N', 'G'}, {'N', 'T'},
+        {'A', 'N'}, {'C', 'N'}, {'G', 'N'}, {'T', 'N'}
+    }};
     /**
      * @brief information on perfect matches
      * @param read read sequence
@@ -1820,15 +1892,15 @@ public:
     };
 
     /**
-     * @brief structure for containing alignment and misalignments statistics--the name is kinda a legacy holdover
-     * @param mean mean edit distance
-     * @param sum_squares sum of squares for standard deviation calculation
-     * @param count number of reads considered
-     * @param total_reads_seen total number of reads processed
-     * @param is_stable whether the statistics have stabilized
-     * @param dir_counts pair of counts for forward and reverse directions
+     * @brief structure for containing statistics of alignment per adapter
+     * @param mean `double` mean edit distance
+     * @param sum_squares  `double` sum of squares for standard deviation calculation
+     * @param count  `size_t` number of reads considered
+     * @param total_reads_seen `size_t` total number of reads processed
+     * @param is_stable `bool` whether the statistics have stabilized
+     * @param dir_counts `pair<size_t, size_t>` of counts for forward and reverse directions
      */
-    struct misalignment_stats {
+    struct static_alignment_stats {
         double mean;
         double sum_squares;
         size_t count;
@@ -1877,13 +1949,16 @@ public:
         }
     } position_stats;
 
-    misalignment_stats() : mean(0), sum_squares(0), count(0), total_reads_seen(0), is_stable(false), dir_counts({0, 0}) {}
+    static_alignment_stats() : mean(0), sum_squares(0), count(0), total_reads_seen(0), is_stable(false), dir_counts({0, 0}) {}
 
     //contains defaults for the misalignment stats
     /**
      * @brief update statistics with a new edit distance
      * @param new_edit_distance the new edit distance to incorporate
      * @param total_reads total number of reads processed
+     * @param forward_count count of forward reads
+     * @param reverse_count count of reverse reads
+     * @param direction direction of the read ("forward" or "reverse")
      */
     void update_stats(int new_edit_distance, size_t total_reads, size_t forward_count, size_t reverse_count) {
             double old_mean = mean;
@@ -1912,7 +1987,6 @@ public:
     double confidence() const {
             return 1.0 - std::exp(-static_cast<double>(count) / 100.0);
         }
-    
     };
 
     /**
@@ -1934,7 +2008,7 @@ public:
     };
 
 /**
- * @brief Constructor that initializes the Misalignment_Setup with a given ReadLayout.
+ * @brief Constructor that initializes the Misalignment_Setup with a given ReadLayout
  * @param layout ReadLayout object
  */
     Misalignment_Setup(const ReadLayout& layout) {
@@ -1961,6 +2035,7 @@ public:
     void generate_misalignment_data(
         const std::string& fastq_path, ReadLayout& layout, int num_threads = 1, size_t max_reads = 50000
     ) {
+        prune_similar_reverse_adapters(layout);
 
         using ChunkFunc = std::function<bool(const std::vector<read_streaming::sequence>&, const std::string&)>;
         chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(max_reads);
@@ -1968,10 +2043,11 @@ public:
         size_t forward_count = 0;
         size_t reverse_count = 0;
         size_t total_reads_processed = 0;
+        constexpr size_t kMinPerfectMatches = 10;
         
         //collecting statistics of both adapter stats and misalignment stats
-        std::unordered_map<std::string, misalignment_stats> adapter_stats;
-        std::unordered_map<std::string, misalignment_stats> misalignment_stats;
+        std::unordered_map<std::string, static_alignment_stats> adapter_stats;
+        std::unordered_map<std::string, static_alignment_stats> misalignment_stats;
         ChunkFunc process_func = [&](const std::vector<read_streaming::sequence>& chunk, const std::string& file) -> bool {
             #pragma omp atomic
             total_reads_processed += chunk.size();
@@ -1986,28 +2062,47 @@ public:
             // Print progress and current misalignment thresholds.
             #pragma omp critical
             {
-                std::cout << "\r[misalignment_stats] Processed reads - Forward perfect: " << forward_count  << ", Reverse perfect: " << reverse_count << "\n";
+                std::cout << 
+                "\r[misalignment_stats] Processed " << total_reads_processed << 
+                " total reads - Forward perfect: " <<  forward_count  << 
+                ", Reverse perfect: " << reverse_count << "\n";
+
                 for (const auto& [adapter_id, stats] : adapter_stats) {
-                    std::cout << "[misalignment_stats] " << adapter_id << " misalignment mean: " << stats.mean  << " (n = " << stats.count << ")"
-                            << (stats.is_stable ? " [STABLE]" : "") << "\n";
+                    std::cout << 
+                    "[misalignment_stats] " << adapter_id << 
+                    " misalignment mean: " <<  misalignment_stats[adapter_id].mean  << 
+                    " (total times detected properly = " << stats.count << "," << 
+                    " misaligned forward: " << misalignment_stats[adapter_id].dir_counts.first << 
+                    ", misaligned reverse: " << misalignment_stats[adapter_id].dir_counts.second << 
+                    ")" << 
+                    (stats.is_stable ? " [STABLE]" : "") << 
+                    "\n";
                 }
             }
             // Determine if processing should stop.
-            bool all_stable;
-                #pragma omp critical(adapter_stats_read)
-                {
+            bool has_min_perfect = (forward_count >= kMinPerfectMatches) || (reverse_count >= kMinPerfectMatches);
+            bool reached_read_limit = total_reads_processed >= max_reads;
+
+            bool all_stable = false;
+            #pragma omp critical(adapter_stats_read)
+            {
+                if (!misalignment_stats.empty()) {
                     all_stable = std::all_of(
-                        adapter_stats.begin(),
-                        adapter_stats.end(),
+                        misalignment_stats.begin(),
+                        misalignment_stats.end(),
                         [](const auto& pair) { 
                             return pair.second.is_stable; 
                         }
                     );
                 }
-                if (all_stable || forward_count + reverse_count >= max_reads) {
-                    return false;  // Signal to stop processing
-                }
-                return true;  // Continue processing
+            }
+            if (!has_min_perfect && !reached_read_limit) {
+                return true;  // Need more data before considering stopping conditions.
+            }
+            if (all_stable || reached_read_limit) {
+                return false;  // Signal to stop processing
+            }
+            return true;  // Continue processing
         };
 
         streamer.process_chunks(fastq_path, process_func, num_threads, max_reads);
@@ -2024,29 +2119,97 @@ private:
     std::vector<std::pair<std::string, std::string>> reverse_adapters; /// vector of reverse adapters, stored as `pair:[class_id, seq]`
     std::vector<perfect_match> perfect_matches; /// vector of perfect matches
 
+    double alignment_distance_fraction(const std::string& lhs, const std::string& rhs) const {
+        if (lhs.empty() && rhs.empty()) return 0.0;
+        if (lhs.empty() || rhs.empty()) return 1.0;
+
+        EdlibAlignResult result = edlibAlign(
+            lhs.c_str(), lhs.length(),
+            rhs.c_str(), rhs.length(),
+            edlibNewAlignConfig(
+                -1,
+                EDLIB_MODE_HW,
+                EDLIB_TASK_DISTANCE,
+                kWildcardEqualities.data(),
+                kWildcardEqualities.size()
+            )
+        );
+
+        double distance = (result.status == EDLIB_STATUS_OK && result.editDistance >= 0)
+            ? static_cast<double>(result.editDistance)
+            : static_cast<double>(std::max(lhs.size(), rhs.size()));
+        edlibFreeAlignResult(result);
+
+        double denom = static_cast<double>(std::max(lhs.size(), rhs.size()));
+        return denom == 0.0 ? 0.0 : distance / denom;
+    }
+
+    void prune_similar_reverse_adapters(ReadLayout& layout) {
+        auto& by_id_index = layout.by_id();
+        const double similarity_threshold = 0.1;
+        std::vector<std::string> reverse_to_remove;
+
+        for (const auto& [rev_id, rev_seq] : reverse_adapters) {
+            double best_fraction = 1.0;
+            for (const auto& [fwd_id, fwd_seq] : forward_adapters) {
+                double fraction = alignment_distance_fraction(rev_seq, fwd_seq);
+                best_fraction = std::min({best_fraction, fraction});
+                if (best_fraction <= similarity_threshold) break;
+            }
+            if (best_fraction <= similarity_threshold) {
+                reverse_to_remove.push_back(rev_id);
+            }
+        }
+
+        for (const auto& adapter_id : reverse_to_remove) {
+            if (auto it = by_id_index.find(adapter_id); it != by_id_index.end()) {
+                std::cout << "[prune_similar_reverse_adapters] Removing reverse adapter " << adapter_id
+                          << " due to similarity with forward adapters.\n";
+                by_id_index.erase(it);
+            }
+            consensus_matrices.erase(adapter_id);
+        }
+
+        if (!reverse_to_remove.empty()) {
+            reverse_adapters.erase(
+                std::remove_if(
+                    reverse_adapters.begin(),
+                    reverse_adapters.end(),
+                    [&](const auto& entry) {
+                        return std::find(reverse_to_remove.begin(), reverse_to_remove.end(), entry.first) != reverse_to_remove.end();
+                    }),
+                reverse_adapters.end()
+            );
+        }
+    }
+
     /**
      * @brief process a chunk of reads to find perfect matches and update misalignment statistics
      * @param chunk vector of read sequences
      * @param forward_count count of perfect forward matches
      * @param reverse_count count of perfect reverse matches
-     * @param adapter_stats map of adapter IDs to their misalignment statistics
-     * @param misalignment_stats map of adapter IDs to their misalignment position statistics
+     * @param adapter_stats map of adapter IDs to their alignment statistics
+     * @param misalignment_stats map of adapter IDs to their misalignment statistics
      * @param total_reads total number of reads processed
      */
-    void process_misalignment_chunk(const std::vector<read_streaming::sequence>& chunk, 
-        size_t& forward_count, 
+    void process_misalignment_chunk(
+        const std::vector<read_streaming::sequence>& chunk, 
+        size_t& forward_count,
         size_t& reverse_count,
-        std::unordered_map<std::string, misalignment_stats>& adapter_stats,
-        std::unordered_map<std::string, misalignment_stats>& misalignment_stats,
-                      size_t total_reads) {
+        std::unordered_map<std::string, static_alignment_stats>& adapter_stats,
+        std::unordered_map<std::string, static_alignment_stats>& misalignment_stats,
+        size_t total_reads
+    ) {
         for (const auto& read : chunk) {
 
-                bool perfect_forward = find_perfect_match(read.seq, forward_adapters, adapter_stats);
-                bool perfect_reverse = find_perfect_match(read.seq, reverse_adapters, adapter_stats);
+            bool perfect_forward = find_perfect_match(read.seq, forward_adapters, adapter_stats, total_reads, "forward");
+            bool perfect_reverse = find_perfect_match(read.seq, reverse_adapters, adapter_stats, total_reads, "reverse");
             
             if (perfect_forward) {
-                // Update misalignment stats for reverse adapters
-                update_misalignment_stats(read.seq, reverse_adapters, adapter_stats, misalignment_stats, total_reads, forward_count, reverse_count);
+                // Update misalignment stats for REVERSE adapters
+                update_misalignment_stats(
+                    read.seq, reverse_adapters, adapter_stats, misalignment_stats, total_reads, forward_count, reverse_count
+                );
                 #pragma omp critical
                 {
                     perfect_matches.push_back({read, "forward"});
@@ -2055,8 +2218,10 @@ private:
                 }
             }
             if (perfect_reverse) {
-                // Update misalignment stats for forward adapters
-                update_misalignment_stats(read.seq, forward_adapters, adapter_stats, misalignment_stats, total_reads, forward_count, reverse_count);
+                // Update misalignment stats for REVERSE adapters
+                update_misalignment_stats(
+                    read.seq, forward_adapters, adapter_stats, misalignment_stats, total_reads, forward_count, reverse_count
+                );
                 #pragma omp critical
                 {
                     perfect_matches.push_back({read, "reverse"});
@@ -2079,26 +2244,36 @@ private:
      */
     void update_misalignment_stats(const std::string& read_seq, 
                        const std::vector<std::pair<std::string, std::string>>& adapters,
-                       std::unordered_map<std::string, misalignment_stats>& adapter_stats,
-                       std::unordered_map<std::string, misalignment_stats>& misalignment_stats,
-                       size_t total_reads, size_t forward_counts, size_t reverse_counts
+                       std::unordered_map<std::string, static_alignment_stats>& adapter_stats,
+                       std::unordered_map<std::string, static_alignment_stats>& misalignment_stats,
+                       size_t total_reads, 
+                       size_t forward_counts, 
+                       size_t reverse_counts
                     ) {
+
         for (const auto& [id, seq] : adapters) {
+
             EdlibAlignResult result = edlibAlign(
                 seq.c_str(), seq.length(),
                 read_seq.c_str(), read_seq.length(),
-                edlibNewAlignConfig(-1, EDLIB_MODE_HW, EDLIB_TASK_LOC, nullptr, 0)
+                edlibNewAlignConfig(
+                    -1, 
+                    EDLIB_MODE_HW, 
+                    EDLIB_TASK_LOC, 
+                    kWildcardEqualities.data(), 
+                    kWildcardEqualities.size()
+                )
             );
-            std::string aligned_seq = collect_aligned_seq(read_seq, seq, result);
+                      
+            std::string aligned_seq = collect_aligned_seq(read_seq, result);
             #pragma omp critical
             {
-                adapter_stats[id].update_stats(result.editDistance, total_reads, forward_counts, reverse_counts);
                 //this calculates the misalignment positions for the reverse primers in forward locations, and vice versa
+                misalignment_stats[id].update_stats(result.editDistance, total_reads, forward_counts, reverse_counts);  
                     double norm_misal_start = (static_cast<double>(result.startLocations[0]) / read_seq.length()) * 100.0;
                     double norm_misal_stop = (static_cast<double>(result.endLocations[0]) / read_seq.length()) * 100.0;
                     misalignment_stats[id].position_stats.start_positions.push_back(norm_misal_start);
                     misalignment_stats[id].position_stats.stop_positions.push_back(norm_misal_stop);
-
                 update_consensus_matrices(id, aligned_seq, result.editDistance);
             }
             edlibFreeAlignResult(result);
@@ -2141,31 +2316,71 @@ private:
     }
 
     /**
-     * @brief find perfect matches of adapters in a read sequence and update position statistics
+     * @brief finds matches of adapters in a read sequence and update position statistics
      * @param read_seq the read sequence to check
      * @param adapters vector of adapter ID and sequence pairs
      * @param adapter_stats map of adapter IDs to their misalignment statistics
-     * @return true if a perfect match is found for all adapters, false otherwise
+     * @return true if a match is found for adapters, false otherwise
      */
-    bool find_perfect_match(const std::string& read_seq,const std::vector<std::pair<std::string, std::string>>& adapters,
-                            std::unordered_map<std::string, misalignment_stats>& adapter_stats) {
+    bool find_perfect_match(
+        const std::string& read_seq, 
+        const std::vector<std::pair<std::string, std::string>>& adapters,
+        std::unordered_map<std::string, static_alignment_stats>& adapter_stats,
+        size_t total_reads,
+        std::string direction
+    ) {
+        // loop over adapters
         for (const auto& [id, seq] : adapters) {
+            int max_adapter_error_permissible = static_cast<int>(seq.length()*0.25); 
+            // 25% error permissible, easy way to gauge w/truncants
+            //there are cases like in bulk where even though the adapter hasn't been found perfectly, we should still say
+            //that we can find some of this adapter within reason in the direction that we're considering it.
+            //that way even if we filter the direction based on misalignment threshold, we can still have some 
+            //recoverable adapters
+
             EdlibAlignResult result = edlibAlign(
                 seq.c_str(), seq.length(),
                 read_seq.c_str(), read_seq.length(),
-                edlibNewAlignConfig(0, EDLIB_MODE_HW, EDLIB_TASK_LOC, nullptr, 0)
+                edlibNewAlignConfig(
+                    max_adapter_error_permissible,
+                    EDLIB_MODE_HW, 
+                    EDLIB_TASK_LOC, 
+                    kWildcardEqualities.data(), 
+                    kWildcardEqualities.size())
             );
-            //modified when i was playing, this is just sloppy redundant code
-            bool is_perfect = (result.editDistance == 0 && result.status == EDLIB_STATUS_OK);
-            if(is_perfect){
+            //check status of edlib
+            // this block is meant as a guard to the following
+            // especially in cases where the adapters are super long, and might be truncated, or we might have gotten it wrong
+            // we realy want to see if we can establish bounds for a proper adapter. this comes at the cost of
+            // honestly concatenate resolution, where our boundaries for adapter presence might become a bit fuzzy. but
+            // we set the perfect detected margin to be 10% or less, which means that we will only use edit distances 
+            // greater than 0 when of the total reads that we've seen, 
+            // the number of perfect adapter matches in total is less than 10% 
+
+            bool edlib_status = (result.status == EDLIB_STATUS_OK);
+            bool is_perfect = (result.editDistance == 0 && edlib_status);
+            bool is_good_enough = (result.editDistance > 0 && edlib_status);
+            if(is_good_enough){
+                double perfect_detected = static_cast<double>(adapter_stats[id].count) / static_cast<double>(total_reads);
+                if(perfect_detected < 0.1){
+                    is_good_enough = true;
+                } else {
+                    is_good_enough = false;
+                }
+            }
+
+            if(is_good_enough || is_perfect) {
                 double normalized_start = (static_cast<double>(result.startLocations[0]) / read_seq.length()) * 100.0;
                 double normalized_stop = (static_cast<double>(result.endLocations[0]) / read_seq.length()) * 100.0;
                 #pragma omp critical
                 {
+                    adapter_stats[id].count++;
+                    direction == "forward" ? adapter_stats[id].dir_counts.first++ : adapter_stats[id].dir_counts.second++;
                     adapter_stats[id].position_stats.start_positions.push_back(normalized_start);
                     adapter_stats[id].position_stats.stop_positions.push_back(normalized_stop);    
                 }
             }
+
             edlibFreeAlignResult(result);
             if(!is_perfect) return false;
         }
@@ -2205,24 +2420,14 @@ private:
 /**
  * @brief collect the aligned portion of a read sequence based on alignment result
  * @param read_seq the read sequence
- * @param adapter_seq the adapter sequence
  * @param result the Edlib alignment result
  * @return the aligned portion of the read sequence
  */
-    std::string collect_aligned_seq(const std::string& read_seq, const std::string& adapter_seq, EdlibAlignResult& result) {
-        // Get CIGAR string
-        char* cigar = edlibAlignmentToCigar(
-            result.alignment,
-            result.alignmentLength,
-            EDLIB_CIGAR_EXTENDED
-        );
-        
+    std::string collect_aligned_seq(const std::string& read_seq, EdlibAlignResult& result) {
         // Extract aligned portion
         int start_pos = result.startLocations[0];
         int end_pos = result.endLocations[0] + 1;
         std::string aligned = read_seq.substr(start_pos, end_pos - start_pos);
-        
-        free(cigar);
         return aligned;
     }
 /**
@@ -2232,7 +2437,7 @@ private:
  * @param stats the misalignment statistics for the adapter
  * @return the masked adapter sequence
  */
-    std::string generate_masked_adapter(const std::string& adapter_id, const std::string adapter_seq, const misalignment_stats& stats) {
+    std::string generate_masked_adapter(const std::string& adapter_id, const std::string adapter_seq, const static_alignment_stats& stats) {
     int threshold = static_cast<int>(std::floor(stats.mean - stats.get_sd()));
     // Define max consecutive N's allowed as (threshold - 1), with a minimum of 1.
     int max_consecutive_N = (threshold > 1 ? threshold - 1 : 1);
@@ -2313,40 +2518,43 @@ private:
  */
     void update_read_layout(
         ReadLayout& layout,
-         std::unordered_map<std::string, misalignment_stats>& adapter_stats,
-         std::unordered_map<std::string, misalignment_stats>& misalignment_stats) {
+         std::unordered_map<std::string, static_alignment_stats>& adapter_stats,
+         std::unordered_map<std::string, static_alignment_stats>& misalignment_stats) {
+        
         auto& by_id_index = layout.by_id();
-        bool remove_forward_direction = false;
-        bool remove_reverse_direction = false;
+        auto& by_dir_index = layout.by_direction();
+        auto color_id = [](const ReadElement& elem) {
+            return term_print_utils::colorize(elem.class_id, term_print_utils::class_color(elem.class_id, elem.seq));
+        };
+        auto color_text = [](const std::string& text, const ReadElement& elem) {
+            return term_print_utils::colorize(text, term_print_utils::class_color(elem.class_id, elem.seq));
+        };
 
-        //find the first occurrence of a a direction in which perfect matches could not be found
-        for(auto& [adapter_id, stats] : adapter_stats) {
-            if(stats.dir_counts.first == 0 && stats.dir_counts.second != 0){
-                remove_forward_direction = true;
-                break;
-            }
-            if(stats.dir_counts.second == 0 && stats.dir_counts.first != 0){
-                remove_reverse_direction = true;
-                break;
-            }
-        }
-
-        if(remove_forward_direction || remove_reverse_direction){
-            for(auto it = by_id_index.begin(); it != by_id_index.end(); ) {
-                if((remove_forward_direction && it->direction == "forward") ||
-                   (remove_reverse_direction && it->direction == "reverse")) {
-                    std::string dir = it->direction;
-                    std::cout << "[update_read_layout] Removing element " << it->class_id << " due to lack of perfect matches in the " << dir << " direction.\n";
-                    it = by_id_index.erase(it);
-                } else {
-                    ++it;
+        auto has_core_static = [&](const std::string& dir) {
+            auto range = by_dir_index.equal_range(dir);
+            for (auto it = range.first; it != range.second; ++it) {
+                if (it->type == "static" &&
+                    it->global_class != "start" &&
+                    it->global_class != "stop" &&
+                    it->global_class != "poly_tail") {
+                    return true;
                 }
             }
-        }
+            return false;
+        };
 
         for(auto& [adapter_id, stats] : adapter_stats) {
             auto it = by_id_index.find(adapter_id);
             if(it != by_id_index.end()) {
+                if(stats.dir_counts.first == 0 && stats.dir_counts.second == 0) {
+                    std::cout << "[update_read_layout] Removing adapter "
+                              << color_id(*it)
+                              << " due to lack of perfect matches in either direction.\n";
+                    by_id_index.erase(it);
+                    consensus_matrices.erase(adapter_id);
+                    continue;
+                }
+
                 std::string seq = it->seq;
                 std::string masked = generate_masked_adapter(adapter_id, seq, stats);
                 double sd = stats.get_sd();
@@ -2355,12 +2563,13 @@ private:
                 AlignmentPositions misalign_pos = misalignment_stats[adapter_id].position_stats.calculate();
 
                 if(align_pos.start_stats.first == 0 && align_pos.stop_stats.first == 0){
-                    std::cout << "[update_read_layout] Removing element " << adapter_id << " due to insufficient alignment data.\n";
+                    std::cout << "[update_read_layout] Removing element " << adapter_id << 
+                    " due to insufficient alignment data.\n";
                     by_id_index.erase(it);
                     continue;
                 }
 
-                double mean = stats.mean;
+                double mean = misalignment_stats[adapter_id].mean;
                 if(mean < 1.0){
                     mean = seq.length() * 0.25;
                 }
@@ -2375,15 +2584,16 @@ private:
                 }
 
                 std::cout
-                << "\n[update_read_layout] Adapter: " << adapter_id << "\n"
+                << "\n[update_read_layout] Adapter: " << color_text(adapter_id, *it) << "\n"
                 << "+------------------------------+----------------------+\n"
                 << "| Metric                       | Value                |\n"
                 << "+------------------------------+----------------------+\n"
                 << "| original seq                 | " << seq << "\n"
                 << "| misalignment mean            | " << mean << "\n"
                 << "| misalignment sd              | " << sd << "\n"
-                << "| forward_count                | " << adapter_stats[adapter_id].dir_counts.first << "\n"
-                << "| reverse_count                | " << adapter_stats[adapter_id].dir_counts.second << "\n"
+                << "| perfect adapter count        | " << adapter_stats[adapter_id].count << "\n"
+                << "| forward count                | " << adapter_stats[adapter_id].dir_counts.first << "\n"
+                << "| reverse count                | " << adapter_stats[adapter_id].dir_counts.second << "\n"
                 << "| aligned start pos (mean)     | " << align_pos.start_stats.first << "\n"
                 << "| aligned stop pos (mean)      | " << align_pos.stop_stats.first << "\n"
                 << "| misaligned start pos (mean)  | " << misalign_pos.start_stats.first << "\n"
@@ -2403,6 +2613,23 @@ private:
                     elem.aligned_positions = align_pos;
                     elem.misaligned_positions= misalign_pos;
                 });
+            }
+        }
+
+        // Remove directions that no longer contain core static adapters (excluding start/stop/poly_tail).
+        std::unordered_set<std::string> present_dirs;
+        for (auto it = by_dir_index.begin(); it != by_dir_index.end(); ++it) {
+            present_dirs.insert(it->direction);
+        }
+
+        for (const auto& dir : present_dirs) {
+            if (has_core_static(dir)) continue;
+            auto range = by_dir_index.equal_range(dir);
+            if (range.first == range.second) continue;
+            std::cout << "[update_read_layout] Removing direction " << dir
+                      << " due to absence of static adapters.\n";
+            while (range.first != range.second) {
+                range.first = by_dir_index.erase(range.first);
             }
         }
     }
