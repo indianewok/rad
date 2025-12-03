@@ -4,7 +4,7 @@ struct extracted_bc {
     std::string read_id;
     std::string sequence;
     int position;
-    bool is_reverse_complement;
+    bool is_rc;
 };
 
 static const EdlibEqualityPair kWildcardEqualities[8] = {
@@ -18,19 +18,33 @@ static const EdlibEqualityPair kWildcardEqualities[8] = {
                 {'T', 'N'}
 };
 
-// Extract barcode sequence given primer position
+// Compute allowed edit distance for adapter search given a ratio.
+// - Ratio <= 0 -> exact match only (0 edits).
+// - Positive ratios are rounded up so small adapters still allow >=1 edit.
+// - Clamp to int range for safety.
+static int compute_max_edit_distance(size_t adapter_len, double max_edit_distance_ratio) {
+    if (adapter_len == 0 || !std::isfinite(max_edit_distance_ratio) || max_edit_distance_ratio <= 0.0) {
+        return 0;
+    }
+    double raw = std::floor(static_cast<double>(adapter_len) * max_edit_distance_ratio);
+    raw = std::min(raw, static_cast<double>(std::numeric_limits<int>::max()));
+    int max_edits = static_cast<int>(raw);
+    return std::max(1, max_edits);
+}
+
+// Extract barcode sequence given adapter_seq position
 std::string extract_barcode(
-    const std::string& sequence, int primer_pos, int primer_len, int n_bases, int m_left, int m_right, bool is_rc) {
+    const std::string& sequence, int adapter_seq_pos, int adapter_seq_len, int bc_length, int m_left, int m_right, bool is_rc) {
     int start_pos, end_pos; 
     std::string final_bc;
     if (is_rc) {
-        // For reverse complement, extract before the primer
-        start_pos = std::max(0, primer_pos - m_right - n_bases);
-        end_pos = std::min((int)sequence.length(), primer_pos - m_right);
+        // For reverse complement, extract before the adapter_seq
+        start_pos = std::max(0, adapter_seq_pos - m_right - bc_length);
+        end_pos = std::min((int)sequence.length(), adapter_seq_pos - m_right);
     } else {
-        // For forward, extract after the primer
-        start_pos = std::max(0, primer_pos + primer_len + m_left);
-        end_pos = std::min((int)sequence.length(), start_pos + n_bases + m_right);
+        // For forward, extract after the adapter_seq
+        start_pos = std::max(0, adapter_seq_pos + adapter_seq_len + m_left);
+        end_pos = std::min((int)sequence.length(), start_pos + bc_length + m_right);
     }
     if (start_pos >= end_pos || start_pos < 0 || end_pos > (int)sequence.length()) {
         return "";
@@ -52,12 +66,33 @@ struct read_chunk {
 
 // Process a chunk of reads in parallel
 std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chunk,
-                                               const std::string& primer,
-                                               const std::string& primer_rc,
-                                               int n_bases, int m_left, int m_right,
+                                               const std::string& adapter_seq,
+                                               const std::string& adapter_seq_rc,
+                                               int bc_length, int m_left, int m_right,
                                                double max_edit_distance_ratio) {
     std::vector<extracted_bc> chunk_results;
-    
+
+    const int max_edits_forward = compute_max_edit_distance(adapter_seq.length(), max_edit_distance_ratio);
+    const int max_edits_rc = compute_max_edit_distance(adapter_seq_rc.length(), max_edit_distance_ratio);
+    const bool exact_match_only = (max_edits_forward == 0 && max_edits_rc == 0);
+
+    EdlibAlignConfig forward_config{};
+    EdlibAlignConfig rc_config{};
+    if (!exact_match_only) {
+        forward_config = edlibNewAlignConfig(
+            max_edits_forward,
+            EDLIB_MODE_HW,
+            EDLIB_TASK_LOC,
+            kWildcardEqualities,
+            8);
+        rc_config = edlibNewAlignConfig(
+            max_edits_rc,
+            EDLIB_MODE_HW,
+            EDLIB_TASK_LOC,
+            kWildcardEqualities,
+            8);
+    }
+
     // Reserve space to avoid reallocations
     chunk_results.reserve(chunk.size() / 5);
     #pragma omp parallel
@@ -68,41 +103,83 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
         #pragma omp for schedule(dynamic, 100)
         for (size_t i = 0; i < chunk.size(); ++i) {
             const auto& read = chunk[i];
-            
-            // Search for primer (forward)
-            EdlibAlignResult result = edlibAlign(primer.c_str(), primer.length(),
-                                               read.sequence.c_str(), read.sequence.length(),
-                                               edlibNewAlignConfig((int)(primer.length() * max_edit_distance_ratio), 
-                                                                 EDLIB_MODE_HW, EDLIB_TASK_LOC, kWildcardEqualities, 8));
-            
-            if (result.status == EDLIB_STATUS_OK && result.numLocations > 0) {
-                // Found primer - extract barcode
-                int primer_pos = result.startLocations[0];
-                std::string barcode = extract_barcode(read.sequence, primer_pos, primer.length(), 
-                                                    n_bases, m_left, m_right, false);
-                
-                if (!barcode.empty()) {
-                    thread_results.push_back({read.read_id, barcode, primer_pos, false});
+
+            if (exact_match_only) {
+                bool forward_found = false;
+                auto pos = read.sequence.find(adapter_seq);
+                if (pos != std::string::npos && pos <= static_cast<size_t>(std::numeric_limits<int>::max())) {
+                    forward_found = true;
+                    int adapter_seq_pos = static_cast<int>(pos);
+                    std::string barcode = extract_barcode(
+                        read.sequence,
+                        adapter_seq_pos,
+                        adapter_seq.length(),
+                        bc_length,
+                        m_left,
+                        m_right,
+                        false);
+
+                    if (!barcode.empty()) {
+                        thread_results.push_back({read.read_id, barcode, adapter_seq_pos, false});
+                    }
                 }
-                edlibFreeAlignResult(result);
+
+                if (!forward_found) {
+                    auto rc_pos = read.sequence.find(adapter_seq_rc);
+                    if (rc_pos != std::string::npos && rc_pos <= static_cast<size_t>(std::numeric_limits<int>::max())) {
+                        int adapter_seq_pos = static_cast<int>(rc_pos);
+                        std::string barcode = extract_barcode(
+                            read.sequence,
+                        adapter_seq_pos,
+                        adapter_seq_rc.length(),
+                        bc_length,
+                        m_left,
+                        m_right,
+                            true);
+                        if (!barcode.empty()) {
+                            thread_results.push_back({read.read_id, barcode, adapter_seq_pos, true});
+                        }
+                    }
+                }
                 continue;
             }
-            edlibFreeAlignResult(result);
-            
-            // Search for primer (reverse complement)
-            result = edlibAlign(primer_rc.c_str(), primer_rc.length(),
-                              read.sequence.c_str(), read.sequence.length(),
-                              edlibNewAlignConfig((int)(primer_rc.length() * max_edit_distance_ratio), 
-                                                 EDLIB_MODE_HW, EDLIB_TASK_LOC, kWildcardEqualities, 8));
+
+            // Search for adapter_seq (forward)
+            bool forward_found = false;
+            EdlibAlignResult result = edlibAlign(
+                adapter_seq.c_str(), adapter_seq.length(),
+                read.sequence.c_str(), read.sequence.length(),
+                forward_config);
             
             if (result.status == EDLIB_STATUS_OK && result.numLocations > 0) {
-                // Found reverse complement primer - extract barcode
-                int primer_pos = result.startLocations[0];
-                std::string barcode = extract_barcode(read.sequence, primer_pos, primer_rc.length(), 
-                                                    n_bases, m_left, m_right, true);
+                forward_found = true;
+                // Found adapter_seq - extract barcode
+                int adapter_seq_pos = result.startLocations[0];
+                std::string barcode = extract_barcode(read.sequence, adapter_seq_pos, adapter_seq.length(), 
+                                                    bc_length, m_left, m_right, false);
                 
                 if (!barcode.empty()) {
-                    thread_results.push_back({read.read_id, barcode, primer_pos, true});
+                    thread_results.push_back({read.read_id, barcode, adapter_seq_pos, false});
+                }
+            }
+            edlibFreeAlignResult(result);
+
+            if (forward_found) {
+                continue;
+            }
+            
+            // Search for adapter_seq (reverse complement)
+            result = edlibAlign(adapter_seq_rc.c_str(), adapter_seq_rc.length(),
+                              read.sequence.c_str(), read.sequence.length(),
+                              rc_config);
+            
+            if (result.status == EDLIB_STATUS_OK && result.numLocations > 0) {
+                // Found reverse complement adapter_seq - extract barcode
+                int adapter_seq_pos = result.startLocations[0];
+                std::string barcode = extract_barcode(read.sequence, adapter_seq_pos, adapter_seq_rc.length(), 
+                                                    bc_length, m_left, m_right, true);
+                if (!barcode.empty()) {
+                    thread_results.push_back({read.read_id, barcode, adapter_seq_pos, true});
                 }
             }
             edlibFreeAlignResult(result);
@@ -119,11 +196,23 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
 
 // Parse FASTQ file (regular or gzipped) and extract barcodes
 std::vector<extracted_bc> process_fastq(const std::string& input_path, 
-                                          const std::string& primer,
-                                          int n_bases, int m_left, int m_right,
-                                          int max_reads, double max_edit_distance_ratio = 0.2,
-                                          int chunk_size = 10000, int num_threads = 0) {
+                                          const std::string& adapter_seq,
+                                          int bc_length, 
+                                          int m_left, 
+                                          int m_right,
+                                          int max_reads, 
+                                          double max_edit_distance_ratio = 0.1,
+                                          int chunk_size = 10000, 
+                                          int num_threads = 0) {
     std::vector<extracted_bc> results;
+
+    if (!std::isfinite(max_edit_distance_ratio) || max_edit_distance_ratio < 0.0) {
+        std::cerr << "Warning: invalid max_edit_distance_ratio (" << max_edit_distance_ratio
+                  << "); clamping to 0 (exact matches only)\n";
+        max_edit_distance_ratio = 0.0;
+    } else if (max_edit_distance_ratio == 0.0) {
+        std::cout << "Max edit distance ratio set to 0 - requiring exact adapter matches\n";
+    }
     
     // Set number of OpenMP threads
     if (num_threads > 0) {
@@ -143,7 +232,7 @@ std::vector<extracted_bc> process_fastq(const std::string& input_path,
         return results;
     }
     
-    std::string primer_rc = seq_utils::revcomp(primer);
+    std::string adapter_seq_rc = seq_utils::revcomp(adapter_seq);
     int reads_processed = 0;
     int chunks_processed = 0;
     
@@ -174,9 +263,14 @@ std::vector<extracted_bc> process_fastq(const std::string& input_path,
         }
         
         // Process chunk in parallel
-        auto chunk_results = process_read_chunk(chunk, primer, primer_rc, 
-                                               n_bases, m_left, m_right, 
-                                               max_edit_distance_ratio);
+        auto chunk_results = process_read_chunk(
+            chunk, 
+            adapter_seq, 
+            adapter_seq_rc, 
+            bc_length, 
+            m_left, 
+            m_right, 
+            max_edit_distance_ratio);
         
         // Merge results
         results.insert(results.end(), chunk_results.begin(), chunk_results.end());
@@ -594,7 +688,8 @@ compute_saddle_cut_af(const std::vector<double>& af_x,
 
 void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted_barcodes,
                                       const std::vector<std::string>& whitelist,
-                                      const std::string& output_csv, const std::string text_out)
+                                      const std::string& output_csv, const std::string text_out,
+                                      bool verbose = false)
 {
     std::cout << "Building hash map of extracted sequences...\n";
 
@@ -660,7 +755,8 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
     }
 
     // 5) Above-floor population (log1p scale)
-    const double FLOOR = 1.0;
+    const double FLOOR = 2.0; // this number used to be 1,
+    // and then i modified the code to handle reverse complements and now 2 works great. why? same reason as 1.
     const double ZTPOIS_RULE = 95.0; // fallback percentile if saddle/50% fail
 
     std::vector<double> af_x; // log1p_ncpm for AF
@@ -679,7 +775,7 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
 
     if (af_x.size() >= 10) {
         auto sd = compute_saddle_cut_af(af_x, /*bw=*/-1.0, /*n_points=*/512,
-                                        /*min_height_ratio=*/0.10, /*debug=*/false);
+                                        /*min_height_ratio=*/0.10, /*debug=*/verbose);
         if (sd.ok) {
             t_saddle = sd.final_cut;
             threshold = std::max(sd.final_cut, FLOOR);
@@ -721,7 +817,7 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
     lr_x.reserve(af_x.size());
     bg_x.reserve(af_x.size());
     for (const auto& s : barcode_stats) {
-        if (s.log1p_ncpm < FLOOR) {
+        if (s.log1p_ncpm <= FLOOR) {
             continue;
         }
         if (s.log1p_ncpm_ztpois >= ZTPOIS_RULE) {
@@ -937,29 +1033,31 @@ void print_usage(const char* program_name) {
               << "Options:\n"
               << "  -i, --input FILE       Input FASTQ file\n"
               << "  -o, --output FILE      Output barcode text file\n"
-              << "  -p, --primer SEQ       Primer sequence to search for\n"
-              << "  -n, --n-bases INT      Number of bases to extract (barcode length)\n"
+              << "  -p, --adapter_seq SEQ       Adapter sequence to search for\n"
+              << "  -n, --barcode-length INT      Number of bases to extract (barcode length)\n"
               << "  -l, --left-margin INT  Bases to include on left side [default: 0]\n"
               << "  -r, --right-margin INT Bases to include on right side [default: 0]\n"
               << "  -m, --max-reads INT    Maximum number of reads to process [default: all]\n"
-              << "  -e, --max-error FLOAT  Maximum edit distance ratio [default: 0.2]\n"
+              << "  -e, --max-error FLOAT  Maximum edit distance ratio [default: 0.1]\n"
               << "  -w, --whitelist FILE   Barcode whitelist for perfect match analysis (optional)\n"
               << "  -c, --csv FILE         Output CSV file for perfect matches (requires --whitelist)\n"
               << "  -t, --threads INT      Number of threads for parallel processing [default: auto]\n"
               << "  -k, --chunk-size INT   Chunk size for parallel processing [default: 10000]\n"
+              << "  -v, --verbose          Enable verbose/debug output\n"
               << "  -h, --help             Show this help message\n";
 }
 
 int main(int argc, char* argv[]) {
-    std::string input_file, output_file, primer, whitelist_file, csv_file;
-    int n_bases = 16, m_left = 0, m_right = 0, max_reads = 0, num_threads = 0, chunk_size = 10000;
-    double max_error = 0.2;
+    std::string input_file, output_file, adapter_seq, whitelist_file, csv_file;
+    int bc_length = 16, m_left = 0, m_right = 0, max_reads = 0, num_threads = 0, chunk_size = 10000;
+    double max_error = 0.1;
+    bool verbose = false;
     
     static struct option long_options[] = {
         {"input", required_argument, 0, 'i'},
         {"output", required_argument, 0, 'o'},
-        {"primer", required_argument, 0, 'p'},
-        {"n-bases", required_argument, 0, 'n'},
+        {"adapter_seq", required_argument, 0, 'p'},
+        {"barcode-length", required_argument, 0, 'n'},
         {"left-margin", required_argument, 0, 'l'},
         {"right-margin", required_argument, 0, 'r'},
         {"max-reads", required_argument, 0, 'm'},
@@ -968,17 +1066,18 @@ int main(int argc, char* argv[]) {
         {"csv", required_argument, 0, 'c'},
         {"threads", required_argument, 0, 't'},
         {"chunk-size", required_argument, 0, 'k'},
+        {"verbose", no_argument, 0, 'v'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
     
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:o:p:n:l:r:m:e:w:c:t:k:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:o:p:n:l:r:m:e:w:c:t:k:hv", long_options, NULL)) != -1) {
         switch (opt) {
             case 'i': input_file = optarg; break;
             case 'o': output_file = optarg; break;
-            case 'p': primer = optarg; break;
-            case 'n': n_bases = std::atoi(optarg); break;
+            case 'p': adapter_seq = optarg; break;
+            case 'n': bc_length = std::atoi(optarg); break;
             case 'l': m_left = std::atoi(optarg); break;
             case 'r': m_right = std::atoi(optarg); break;
             case 'm': max_reads = std::atoi(optarg); break;
@@ -987,12 +1086,13 @@ int main(int argc, char* argv[]) {
             case 'c': csv_file = optarg; break;
             case 't': num_threads = std::atoi(optarg); break;
             case 'k': chunk_size = std::atoi(optarg); break;
+            case 'v': verbose = true; break;
             case 'h': print_usage(argv[0]); return 0;
             default: print_usage(argv[0]); return 1;
         }
     }
     
-    if (input_file.empty() || primer.empty()) {
+    if (input_file.empty() || adapter_seq.empty()) {
         std::cerr << "Error: Missing required arguments\n";
         print_usage(argv[0]);
         return 1;
@@ -1006,11 +1106,21 @@ int main(int argc, char* argv[]) {
     }*/
     
     std::cout << "Processing " << input_file << "...\n";
-    std::cout << "Primer: " << primer << "\n";
-    std::cout << "Extracting " << n_bases << " bases with margins: left=" << m_left << ", right=" << m_right << "\n";
+    std::cout << "Adapter: " << adapter_seq << "\n";
+    std::cout << "Extracting " << bc_length << " bases with margins: left=" << m_left << ", right=" << m_right << "\n";
     std::cout << "Chunk size: " << chunk_size << " reads per chunk\n";
     
-    auto barcodes = process_fastq(input_file, primer, n_bases, m_left, m_right, max_reads, max_error, chunk_size, num_threads);
+    auto barcodes = process_fastq(
+        input_file, 
+        adapter_seq, 
+        bc_length, 
+        m_left, 
+        m_right, 
+        max_reads, 
+        max_error, 
+        chunk_size, 
+        num_threads
+    );
     
     std::cout << "Found " << barcodes.size() << " barcodes\n";
         
@@ -1020,13 +1130,13 @@ int main(int argc, char* argv[]) {
         std::cout << "Loaded " << whitelist.size() << " whitelist barcodes\n";
         std::string csv_output = csv_file.empty() ? "perfect_matches.csv" : csv_file;
         std::string text_output = output_file.empty() ? "barcodes.txt" : output_file;
-        count_perfect_matches_with_stats(barcodes, whitelist, csv_output, output_file);
+        count_perfect_matches_with_stats(barcodes, whitelist, csv_output, output_file, verbose);
     } else {
         std::vector<std::string> empty_whitelist; // empty
         std::cout << " No whitelist provided; generating whitelist de novo.\n";
         std::string csv_output = csv_file.empty() ? "perfect_matches.csv" : csv_file;
         std::string text_output = output_file.empty() ? "barcodes.txt" : output_file;
-        count_perfect_matches_with_stats(barcodes, empty_whitelist, csv_output, output_file);
+        count_perfect_matches_with_stats(barcodes, empty_whitelist, csv_output, output_file, verbose);
     }
     return 0;
 }

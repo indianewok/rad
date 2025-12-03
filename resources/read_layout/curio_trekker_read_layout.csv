@@ -1,10 +1,10 @@
 Read Layout,,,,,
 id,seq,expected_length,type,class,whitelist
 forw_primer,CTACACGACGCTCTTCCGATCT,,static,,
-barcode,,16,variable,barcode,10x_3v4:/Users/cmv/Desktop/spatial_bcs.txt
+barcode,,16,variable,barcode,10x_3v4
 umi,,10,variable,umi,
 read,,,variable,read,
-barcode_1,,14,variable,barcode,/Users/cmv/Desktop/U0066_005_BeadBarcodes.csv
+barcode_1,,14,variable,barcode,
 linker,TCTCGGGAACGCTGAAGA,,static,linker,
-barcode_2,,14,variable,barcode,/Users/cmv/Desktop/U0066_006_BeadBarcodes.csv
+barcode_2,,14,variable,barcode,
 rev_primer,AAGCAGTGGTATCAACGCAGAGTACATGGG,,static,,
