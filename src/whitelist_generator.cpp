@@ -439,7 +439,7 @@ std::vector<double> find_peaks(const std::vector<std::pair<double, double>>& den
     double min_height_threshold = max_density * min_height; 
     if (debug) {
         std::cerr << "[find_peaks] max_density=" << std::setprecision(6) << max_density
-                  << "  min_height_threshold=" << min_height_threshold << " (10%)\n";
+                  << "  min_height_threshold=" << min_height_threshold << " (20%)\n";
     }
 
     // 2) Collect local maxima; print all local max w/ PASS/FAIL
@@ -515,13 +515,17 @@ kde_on_grid(
 
 static inline double
 tau_intersection_on_grid(const std::vector<double>& xs, const std::vector<double>& LRw,
-                         const std::vector<double>& BGw, double tau /* e.g. 0.5 */)
+                         const std::vector<double>& BGw, double tau)
 {
     const size_t n = xs.size();
-    if (n == 0) return 0.0;
+    if (n == 0){
+        return 0.0;
+    } 
     const double c = (tau == 0.5) ? 1.0 : (1.0 - tau) / tau;
 
-    auto diff_at = [&](size_t i){ return LRw[i] - c * BGw[i]; };
+    auto diff_at = [&](size_t i){ 
+        return LRw[i] - c * BGw[i]; 
+    };
 
     // find first sign change
     for (size_t i = 0; i + 1 < n; ++i) {
@@ -537,7 +541,9 @@ tau_intersection_on_grid(const std::vector<double>& xs, const std::vector<double
     double best = std::fabs(diff_at(0));
     for (size_t i = 1; i < n; ++i) {
         const double v = std::fabs(diff_at(i));
-        if (v < best) { best = v; k = i; }
+        if (v < best) { 
+            best = v; k = i; 
+        }
     }
     return xs[k];
 }
@@ -579,18 +585,14 @@ struct saddle_cut_result {
     double plateau_right   = 0.0;
 };
 
-static inline saddle_cut_result
-compute_saddle_cut_af(const std::vector<double>& af_x,
-                      double bw = -1.0,
-                      int n_points = 512,
-                      double min_height_ratio = 0.10,   // peaks must be >=10% of max
-                      bool debug = false,
+static inline saddle_cut_result compute_saddle_cut_af(const std::vector<double>& af_x, double bw = -1.0, int n_points = 512,
+                      double min_height_ratio = 0.20, bool debug = false,
                       double left_bound = -std::numeric_limits<double>::infinity()
-                      )
-{
+                      ) {
     saddle_cut_result res;
-    if (af_x.size() < 10) return res;
-
+    if (af_x.size() < 10) {
+        return res;
+    }
     // 1) Bandwidth (Silverman fallback)
     double use_bw = (bw > 0.0) ? bw : calculate_silverman_bandwidth(af_x);
     if (!(use_bw > 0.0)) use_bw = 0.1;
@@ -641,7 +643,9 @@ compute_saddle_cut_af(const std::vector<double>& af_x,
     size_t i_valley = i_left;
     double y_min = d[i_left].second;
     for (size_t i = i_left + 1; i < i_right; ++i) {
-        if (d[i].second < y_min) { y_min = d[i].second; i_valley = i; }
+        if (d[i].second < y_min) { 
+            y_min = d[i].second; i_valley = i; 
+        }
     }
 
     res.ok            = (i_right > i_left + 1);
@@ -655,32 +659,48 @@ compute_saddle_cut_af(const std::vector<double>& af_x,
     // 5) “Keep walking” across flat valley -> widen both directions,
     //    but: do not move left of left_bound; do not cross the right peak.
     const double valley_h = res.valley_height;
-    const double tol      = p2.h*0.5;
 
-    // left expansion (stay > left_bound)
+    // addressing peak switchoff--we expect p1 to be greater than p2 due to background
+    // but in cases with spatial data, or whether a peak needs to be pruned more than it needs to be preserved,
+    // the tolerance needs to be adjusted to shift left or right to whatever peak size is dominant.
+    // Get heights of spatially left and right peaks
+    double left_peak_height = d[i_left].second;
+    double right_peak_height = d[i_right].second;
+
+    double climb_left = left_peak_height - valley_h;
+    double climb_right = right_peak_height - valley_h;
+
+    // Stop threshold: the density level at which we stop walking
+    // Whichever is lower: half peak height, or halfway up from valley
+    double stop_at_left = std::min(0.5 * left_peak_height, valley_h + 0.5 * climb_left);
+    double stop_at_right = std::min(0.5 * right_peak_height, valley_h + 0.5 * climb_right);
+
+    // Left expansion - stop when density exceeds threshold
+    const double left_peak_bound = std::max(left_bound, d[i_left].first);
     size_t L = i_valley;
-    while (L > 0 && std::fabs(d[L-1].second - valley_h) <= tol && d[L-1].first > left_bound) {
+    while (L > i_left + 1 && d[L-1].second <= stop_at_left && d[L-1].first > left_peak_bound) {
         --L;
     }
-    // right expansion (stay strictly before the right peak)
+
+    // Right expansion - stop when density exceeds threshold
     size_t R = i_valley;
-    while (R + 1 < d.size() && (R + 1) < i_right &&
-           std::fabs(d[R+1].second - valley_h) <= tol) {
+    while (R + 1 < d.size() && (R + 1) < i_right && d[R+1].second <= stop_at_right) {
         ++R;
     }
 
-    res.plateau_left  = std::max(left_bound, d[L].first);
+
+    res.plateau_left  = std::max(left_peak_bound, d[L].first);
     res.plateau_right = d[R].first;
 
     // Choose the leftmost point in the flat valley (“keep walking” left)
-    res.final_cut = std::max(left_bound, res.plateau_left);
+    res.final_cut = std::max(left_peak_bound, res.plateau_left);
     res.used_flat_widen = (res.final_cut != res.cut);
 
     if (debug) {
         std::cerr << "[saddle] peaks @ " << p1.x << ", " << p2.x
                   << "  raw valley = " << res.cut << " (h=" << valley_h << ")"
                   << "  plateau=[" << res.plateau_left << ", " << res.plateau_right << "]"
-                  << "  final_cut = " << res.final_cut << "  (left_bound=" << left_bound
+                  << "  final_cut = " << res.final_cut << "  (left_bound=" << left_peak_bound
                   << ", bw = " << res.bw << ")\n";
     }
     return res;
@@ -727,8 +747,9 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
         int cnt = kv.second;
         
         // Skip if whitelist provided and sequence not in whitelist
-        if (use_whitelist && whitelist_set.find(seq) == whitelist_set.end()) continue;
-
+        if (use_whitelist && whitelist_set.find(seq) == whitelist_set.end()) {
+            continue;
+        }
         bc_wl_stats s;
         s.sequence = seq;
         s.count    = cnt;
@@ -762,7 +783,9 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
     std::vector<double> af_x; // log1p_ncpm for AF
     af_x.reserve(barcode_stats.size());
     for (const auto& s : barcode_stats){
-        if (s.log1p_ncpm >= FLOOR) af_x.push_back(s.log1p_ncpm);
+        if (s.log1p_ncpm >= FLOOR) {
+            af_x.push_back(s.log1p_ncpm);
+        }
     }
 
     // 6) PRIMARY THRESHOLD: AF-KDE saddle point on AF distribution
@@ -772,17 +795,16 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
 
     double t_saddle = std::numeric_limits<double>::quiet_NaN();
     bool   have_saddle = false;
+    saddle_cut_result sd;
 
     if (af_x.size() >= 10) {
-        auto sd = compute_saddle_cut_af(af_x, /*bw=*/-1.0, /*n_points=*/512,
-                                        /*min_height_ratio=*/0.10, /*debug=*/verbose);
+        sd = compute_saddle_cut_af(af_x, /*bw=*/-1.0, /*n_points=*/512, /*min_height_ratio=*/0.20, /*debug=*/verbose);
         if (sd.ok) {
             t_saddle = sd.final_cut;
             threshold = std::max(sd.final_cut, FLOOR);
             have_threshold = true;
             have_saddle = true;
-            std::cout << "\n[AF-KDE saddle] peaks @ " << sd.left_peak << " & " << sd.right_peak
-                      << "  → saddle cut=" << sd.final_cut << " (bw = " << sd.bw << ")\n";
+            std::cout << "\n[AF-KDE saddle] peaks @ " << sd.left_peak << " & " << sd.right_peak << "  → saddle cut=" << sd.final_cut << " (bw = " << sd.bw << ")";
         } else {
             std::cout << "\n[AF-KDE saddle] No stable valley; will try fallback.\n";
         }
@@ -830,9 +852,13 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
     double t_purity50 = std::numeric_limits<double>::quiet_NaN();
     bool   have_tpurity50 = false;
 
-    if (af_x.size() >= 10 && lr_x.size() >= 10 && bg_x.size() >= 10) {
+    if(af_x.size() >= 10 && lr_x.size() >= 10 && bg_x.size() >= 10) {
         double bw = calculate_silverman_bandwidth(lr_x);
-        if (!(bw > 0.0)) bw = 0.1;
+
+        if (!(bw > 0.0)){
+            bw = 0.1;
+        }
+
         const int KDE_N = 512;
         const double xmin = *std::min_element(af_x.begin(), af_x.end());
         const double xmax = *std::max_element(af_x.begin(), af_x.end());
@@ -859,19 +885,24 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
             AFw[i] = LRw[i] + BGw[i];
         }
 
-        std::cout << "\n[AF mixture diagnostics] bw=" << bw
+        std::cout << "\n[AF mixture diagnostics] bw = " << bw
                   << "  |AF|=" << af_x.size()
                   << "  |LR_in_AF|=" << lr_x.size()
                   << "  |BG_in_AF|=" << bg_x.size()
                   << "  piR=" << std::setprecision(6) << piR << "\n";
 
-        // 50% posterior intersection ("t_purity50")
+        // 50% posterior intersection
         t_purity50 = tau_intersection_on_grid(xs, LRw, BGw, /*tau=*/0.5);
         have_tpurity50 = std::isfinite(t_purity50);
         if (have_tpurity50) {
             std::cout << "[t_purity50] 50% boundary at x = " << t_purity50 << "\n";
         } else {
             std::cout << "[t_purity50] could not compute.\n";
+        }
+        if (t_purity50 > sd.right_peak) {
+            std::cout << "[t_purity50] " << t_purity50 << " exceeds right peak " 
+                  << sd.right_peak << " — invalid, using saddle only\n";
+            have_tpurity50 = false;
         }
 
         // If we have t_purity50 (and maybe a saddle), choose the greater of the two.
@@ -883,11 +914,12 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
                       << ", " << t_purity50 << ") = " << threshold << "\n";
         } else if (have_tpurity50 && !have_saddle) {
             double prev = threshold;
-            threshold = std::max(t_purity50, FLOOR);
-            rule = "t_purity50_only";
-            std::cout << "[gate] prev=" << prev << "  -> chosen=t_purity50=" << threshold << "\n";
+            threshold = std::max({t_purity50, FLOOR, prev});
+            std::cout << "[gate] prev=" << prev << "  -> chosen=" << threshold << "\n";
         }
     } else {
+        std::cout << "\n[AF mixture diagnostics] " << "  |AF|=" << af_x.size()
+                  << "  |LR_in_AF|=" << lr_x.size() << "  |BG_in_AF|=" << bg_x.size() <<   "\n";
         std::cout << "\n[AF mixture diagnostics] Skipped (need ≥10 in AF/LR/BG).\n";
     }
 
@@ -987,6 +1019,7 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
         } else {
             if (over_threshold && above_floor) {
                 ann = "high_confidence";
+                high_conf_barcodes.push_back(s.sequence);
             } else if (have_band && above_floor && s.log1p_ncpm >= band_lo && s.log1p_ncpm < band_hi) {
                 ann = "high_sensitivity";
             } else {
