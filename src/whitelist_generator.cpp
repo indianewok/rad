@@ -1,4 +1,5 @@
 #include "include/rad/rad_headers.h"
+#include <filesystem>
 
 struct extracted_bc {
     std::string read_id;
@@ -314,6 +315,71 @@ std::vector<std::string> read_whitelist(const std::string& filename) {
     return whitelist;
 }
 
+struct batch_entry {
+    std::string input_fastq;
+    std::string output_prefix;
+};
+
+static bool ensure_output_directory(const std::string& prefix) {
+    std::filesystem::path p(prefix);
+    std::filesystem::path dir = p.parent_path();
+    if (dir.empty()) {
+        return true; // current directory
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        std::cerr << "Error: Could not create output directory " << dir << ": " << ec.message() << "\n";
+        return false;
+    }
+    return true;
+}
+
+static std::string trim_whitespace(const std::string& s) {
+    const auto start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    const auto end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+std::vector<batch_entry> read_batch_csv(const std::string& filename) {
+    std::vector<batch_entry> entries;
+    std::ifstream in(filename);
+    if (!in) {
+        std::cerr << "Error: Could not open batch CSV file " << filename << "\n";
+        return entries;
+    }
+
+    std::string line;
+    size_t line_no = 0;
+    while (std::getline(in, line)) {
+        line_no++;
+        if (line.empty()) continue;
+
+        std::stringstream ss(line);
+        std::string fastq_path, prefix;
+        std::getline(ss, fastq_path, ',');
+        std::getline(ss, prefix);
+
+        fastq_path = trim_whitespace(fastq_path);
+        prefix = trim_whitespace(prefix);
+
+        if (fastq_path.empty() || prefix.empty()) {
+            std::cerr << "Warning: Skipping line " << line_no << " in " << filename
+                      << " (need two non-empty columns)\n";
+            continue;
+        }
+
+        entries.push_back({fastq_path, prefix});
+    }
+
+    if (entries.empty()) {
+        std::cerr << "Warning: No valid entries found in batch CSV " << filename << "\n";
+    }
+    return entries;
+}
+
 // Barcode statistics structure
 struct bc_wl_stats {
     std::string sequence;
@@ -495,8 +561,9 @@ kde_on_grid(
     int n_points = 512)
 {
     std::vector<std::pair<double,double>> density;
-    if (data.empty() || bandwidth <= 0.0 || n_points < 2) return density;
-
+    if (data.empty() || bandwidth <= 0.0 || n_points < 2) {
+        return density;
+    }
     density.reserve(n_points);
     const double step = (max_val - min_val) / (n_points - 1);
     const double inv_norm = 1.0 / (data.size() * bandwidth * std::sqrt(2.0 * M_PI));
@@ -1064,8 +1131,9 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
 void print_usage(const char* program_name) {
     std::cout << "Usage: " << program_name << " [options]\n"
               << "Options:\n"
-              << "  -i, --input FILE       Input FASTQ file\n"
-              << "  -o, --output FILE      Output barcode text file\n"
+              << "  -i, --input FILE       Input FASTQ file (use this for single runs)\n"
+              << "  -b, --batch-csv FILE   CSV with FASTQ path and output prefix (two columns, optional)\n"
+              << "  -o, --output-prefix PREFIX  Output prefix for generated files (.txt and .csv)\n"
               << "  -p, --adapter_seq SEQ       Adapter sequence to search for\n"
               << "  -n, --barcode-length INT      Number of bases to extract (barcode length)\n"
               << "  -l, --left-margin INT  Bases to include on left side [default: 0]\n"
@@ -1073,7 +1141,6 @@ void print_usage(const char* program_name) {
               << "  -m, --max-reads INT    Maximum number of reads to process [default: all]\n"
               << "  -e, --max-error FLOAT  Maximum edit distance ratio [default: 0.1]\n"
               << "  -w, --whitelist FILE   Barcode whitelist for perfect match analysis (optional)\n"
-              << "  -c, --csv FILE         Output CSV file for perfect matches (requires --whitelist)\n"
               << "  -t, --threads INT      Number of threads for parallel processing [default: auto]\n"
               << "  -k, --chunk-size INT   Chunk size for parallel processing [default: 10000]\n"
               << "  -v, --verbose          Enable verbose/debug output\n"
@@ -1081,14 +1148,15 @@ void print_usage(const char* program_name) {
 }
 
 int main(int argc, char* argv[]) {
-    std::string input_file, output_file, adapter_seq, whitelist_file, csv_file;
+    std::string input_file, output_prefix, adapter_seq, whitelist_file, batch_csv_file;
     int bc_length = 16, m_left = 0, m_right = 0, max_reads = 0, num_threads = 0, chunk_size = 10000;
     double max_error = 0.1;
     bool verbose = false;
     
     static struct option long_options[] = {
         {"input", required_argument, 0, 'i'},
-        {"output", required_argument, 0, 'o'},
+        {"batch-csv", required_argument, 0, 'b'},
+        {"output-prefix", required_argument, 0, 'o'},
         {"adapter_seq", required_argument, 0, 'p'},
         {"barcode-length", required_argument, 0, 'n'},
         {"left-margin", required_argument, 0, 'l'},
@@ -1096,7 +1164,6 @@ int main(int argc, char* argv[]) {
         {"max-reads", required_argument, 0, 'm'},
         {"max-error", required_argument, 0, 'e'},
         {"whitelist", optional_argument, 0, 'w'},
-        {"csv", required_argument, 0, 'c'},
         {"threads", required_argument, 0, 't'},
         {"chunk-size", required_argument, 0, 'k'},
         {"verbose", no_argument, 0, 'v'},
@@ -1105,10 +1172,11 @@ int main(int argc, char* argv[]) {
     };
     
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:o:p:n:l:r:m:e:w:c:t:k:hv", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:b:o:p:n:l:r:m:e:w:t:k:hv", long_options, NULL)) != -1) {
         switch (opt) {
             case 'i': input_file = optarg; break;
-            case 'o': output_file = optarg; break;
+            case 'b': batch_csv_file = optarg; break;
+            case 'o': output_prefix = optarg; break;
             case 'p': adapter_seq = optarg; break;
             case 'n': bc_length = std::atoi(optarg); break;
             case 'l': m_left = std::atoi(optarg); break;
@@ -1116,7 +1184,6 @@ int main(int argc, char* argv[]) {
             case 'm': max_reads = std::atoi(optarg); break;
             case 'e': max_error = std::atof(optarg); break;
             case 'w': whitelist_file = optarg; break;
-            case 'c': csv_file = optarg; break;
             case 't': num_threads = std::atoi(optarg); break;
             case 'k': chunk_size = std::atoi(optarg); break;
             case 'v': verbose = true; break;
@@ -1125,51 +1192,79 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    if (input_file.empty() || adapter_seq.empty()) {
-        std::cerr << "Error: Missing required arguments\n";
+    if (adapter_seq.empty()) {
+        std::cerr << "Error: Missing required adapter sequence\n";
         print_usage(argv[0]);
         return 1;
     }
-    
-    /*
-    if (!csv_file.empty() && whitelist_file.empty()) {
-        std::cerr << "Error: --csv requires --whitelist\n";
+
+    const bool using_single = !input_file.empty();
+    const bool using_batch  = !batch_csv_file.empty();
+
+    if (!using_single && !using_batch) {
+        std::cerr << "Error: Provide either --input (single run) or --batch-csv (batch mode)\n";
         print_usage(argv[0]);
         return 1;
-    }*/
-    
-    std::cout << "Processing " << input_file << "...\n";
-    std::cout << "Adapter: " << adapter_seq << "\n";
-    std::cout << "Extracting " << bc_length << " bases with margins: left=" << m_left << ", right=" << m_right << "\n";
-    std::cout << "Chunk size: " << chunk_size << " reads per chunk\n";
-    
-    auto barcodes = process_fastq(
-        input_file, 
-        adapter_seq, 
-        bc_length, 
-        m_left, 
-        m_right, 
-        max_reads, 
-        max_error, 
-        chunk_size, 
-        num_threads
-    );
-    
-    std::cout << "Found " << barcodes.size() << " barcodes\n";
+    }
+
+    if (using_batch && using_single) {
+        std::cout << "Batch CSV provided - ignoring single --input value\n";
+    }
+
+    auto run_single = [&](const std::string& fastq_path, const std::string& output_prefix) {
+        std::string resolved_prefix = output_prefix.empty() ? "barcodes" : output_prefix;
+        if (!ensure_output_directory(resolved_prefix)) {
+            return;
+        }
+
+        std::cout << "Processing " << fastq_path << "...\n";
+        std::cout << "Adapter: " << adapter_seq << "\n";
+        std::cout << "Extracting " << bc_length << " bases with margins: left=" << m_left << ", right=" << m_right << "\n";
+        std::cout << "Chunk size: " << chunk_size << " reads per chunk\n";
+
+        auto barcodes = process_fastq(
+            fastq_path, 
+            adapter_seq, 
+            bc_length, 
+            m_left, 
+            m_right, 
+            max_reads, 
+            max_error, 
+            chunk_size, 
+            num_threads
+        );
         
-    if (!whitelist_file.empty()) {
-        std::cout << "\nLoading whitelist and performing perfect match analysis...\n";
-        auto whitelist = read_whitelist(whitelist_file);
-        std::cout << "Loaded " << whitelist.size() << " whitelist barcodes\n";
-        std::string csv_output = csv_file.empty() ? "perfect_matches.csv" : csv_file;
-        std::string text_output = output_file.empty() ? "barcodes.txt" : output_file;
-        count_perfect_matches_with_stats(barcodes, whitelist, csv_output, output_file, verbose);
+        std::cout << "Found " << barcodes.size() << " barcodes\n";
+
+        std::string csv_output = resolved_prefix + ".csv";
+        std::string text_output = resolved_prefix + ".txt";
+            
+        if (!whitelist_file.empty()) {
+            std::cout << "\nLoading whitelist and performing perfect match analysis...\n";
+            auto whitelist = read_whitelist(whitelist_file);
+            std::cout << "Loaded " << whitelist.size() << " whitelist barcodes\n";
+            count_perfect_matches_with_stats(barcodes, whitelist, csv_output, text_output, verbose);
+        } else {
+            std::vector<std::string> empty_whitelist; // empty
+            std::cout << " No whitelist provided; generating whitelist de novo.\n";
+            count_perfect_matches_with_stats(barcodes, empty_whitelist, csv_output, text_output, verbose);
+        }
+    };
+
+    if (using_batch) {
+        auto batch_entries = read_batch_csv(batch_csv_file);
+        if (batch_entries.empty()) {
+            return 1;
+        }
+        std::cout << "Running batch of " << batch_entries.size() << " FASTQ files from " << batch_csv_file << "\n";
+        for (size_t idx = 0; idx < batch_entries.size(); ++idx) {
+            const auto& entry = batch_entries[idx];
+            std::cout << "\n[Batch " << (idx + 1) << "/" << batch_entries.size() << "] Prefix: "
+                      << entry.output_prefix << "\n";
+            run_single(entry.input_fastq, entry.output_prefix);
+        }
     } else {
-        std::vector<std::string> empty_whitelist; // empty
-        std::cout << " No whitelist provided; generating whitelist de novo.\n";
-        std::string csv_output = csv_file.empty() ? "perfect_matches.csv" : csv_file;
-        std::string text_output = output_file.empty() ? "barcodes.txt" : output_file;
-        count_perfect_matches_with_stats(barcodes, empty_whitelist, csv_output, output_file, verbose);
+        run_single(input_file, output_prefix);
     }
     return 0;
 }

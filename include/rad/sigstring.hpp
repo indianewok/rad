@@ -11,6 +11,7 @@
  * @param order ``int`` Position in layout
  * @param direction ``std::string`` Orientation (forward or reverse)
  * @param element_pass ``std::optional<bool>`` Whether element passed validation--optional for variable elements
+ * @param write ``std::optional<bool>`` Explicit control over whether to emit this element
  * @param seq ``std::optional<std::string>`` sequence for this element
  * @param qual ``std::optional<std::string>`` quality scores for sequencing data (if fastq)
  * @param original_seq ``std::optional<std::string>`` original (pre-corrected) sequence if available
@@ -24,6 +25,7 @@ struct seq_element {
     int order;                          // Position in layout
     std::string direction;              // Orientation
     std::optional<bool> element_pass;  // Whether element passed validation
+    std::optional<bool> write;         // Explicit control over whether to emit this element
     std::optional<std::string> seq;    // sequence for this element
     std::optional<std::string> qual;   // quality scores for sequencing data (if fastq)
     std::optional<std::string> original_seq;  // original (pre-corrected) sequence if available
@@ -37,6 +39,7 @@ struct seq_element {
         int order,
         std::string direction,
         std::optional<bool> element_pass = std::nullopt,
+        std::optional<bool> write = std::nullopt,
         std::optional<std::string> seq = std::nullopt,
         std::optional<std::string> qual = std::nullopt,
         std::optional<std::string> original_seq = std::nullopt
@@ -48,6 +51,7 @@ struct seq_element {
         order(order),
         direction(std::move(direction)),
         element_pass(element_pass),
+        write(write),
         seq(std::move(seq)),
         qual(std::move(qual)),
         original_seq(std::move(original_seq)) {}
@@ -986,7 +990,7 @@ namespace barcode_correction {
         }
     } else { // offensive mode
         // Check true first, then global
-        auto true_result = check_against_wl(original_barcode, all_candidates, "true", max_dist, verbose, mode, &wl);
+        auto true_result = check_against_wl(original_barcode, all_candidates, "true", 2, verbose, mode, &wl);
         if (true_result.has_value()) {
             if (verbose) {
                 #pragma omp critical
@@ -1272,7 +1276,7 @@ namespace barcode_correction {
         // generate mutations
         // === k-mer fuzzy search ===
 
-      auto kmer_fuzzy_result = kmer_fuzzy_search(bc, expanded_seq, bc_len, mode, wl, verbose, max_dist);
+      auto kmer_fuzzy_result = kmer_fuzzy_search(bc, expanded_seq, bc_len, mode, wl, verbose, 3);
       if (verbose) {
             #pragma omp critical
             {
@@ -2657,7 +2661,8 @@ private:
         bool found_in_true = wl.true_bcs.check_wl_for(corrected_barcode);
         bool found_in_global = wl.global_bcs.check_wl_for(corrected_barcode);
         
-        std::string final_wl = (found_in_true && !found_in_global) ? "true" : "global";
+        // Prefer true whitelist if present in both
+        std::string final_wl = found_in_true ? "true" : "global";
         
         // Update the element
         auto& id_index = sig_elements.get<sig_id_tag>();
@@ -2665,6 +2670,8 @@ private:
             e.original_seq = e.seq;
             e.seq = final_bc;
             e.element_pass = true;
+            // Default behavior: emit only barcodes that resolved to the true whitelist
+            e.write = found_in_true;
         });
         
         if (verbose) {
@@ -2919,6 +2926,7 @@ public:
                 it->order,
                 it->direction,
                 std::nullopt,
+                std::nullopt,
                 std::nullopt
             ));
             continue;
@@ -2947,6 +2955,7 @@ public:
                         it->order,
                         it->direction,
                         true,
+                        std::nullopt,
                         mutable_seq.substr(positions.first - 1,
                                              positions.second - positions.first + 1)
                     ));
@@ -3019,6 +3028,7 @@ public:
                         it->order,
                         it->direction,
                         true,
+                        std::nullopt,
                         mutable_seq.substr(adj_start - 1,
                                              adj_end - adj_start + 1)
                     ));
@@ -3075,6 +3085,7 @@ public:
                 "variable",
                 it->order,
                 it->direction,
+                std::nullopt,
                 std::nullopt,
                 std::nullopt
             ));
@@ -3658,6 +3669,9 @@ public:
                 }
 
                 if (elem.global_class == "barcode") {
+                    if (elem.write.has_value() && !elem.write.value()) {
+                        continue; // Skip barcodes explicitly marked not to write
+                    }
                     auto key = seq_utils::remove_rc(elem.class_id);
                     bool is_fwd = (dir == "forward");
                     if (bc_map.find(key) == bc_map.end()) {
@@ -3786,6 +3800,9 @@ public:
                 if (!elem.seq.has_value()) continue;
                 if (elem.direction != dir) continue;
                 if (elem.global_class == "barcode") {
+                    if (elem.write.has_value() && !elem.write.value()) {
+                        continue; // Skip barcodes explicitly marked not to write
+                    }
                     auto key = seq_utils::remove_rc(elem.class_id);
                     bool is_fwd = (dir == "forward");
                     if (bc_map.find(key) == bc_map.end()) {

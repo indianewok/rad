@@ -1,9 +1,0 @@
-﻿Read Layout,,,,,
-id,seq,expected_length,type,class,whitelist
-linker_1,AATGTACTTCGTTCAGTTACGTATTGCTAAGGTTAA,,static,,
-barcode_1,,24,variable,barcode,
-linker_2,CAGCACCT,,static,,
-read,,,variable,read,
-linker_3,AGGTGCTG,,static,,
-barcode_2,,24,variable,barcode,
-linker_4,TTAACCTTAGCAATACGTAACTGAACGAAGT,,static,,

@@ -418,7 +418,7 @@ namespace whitelist_utils {
         resolved.reserve(specs.size());
     
         for (auto &spec : specs) {
-            // 2a) if it’s a known kit key, map into resources/wl/…
+            // if it’s a known kit key, map into resources/wl/…
             if (auto it = kit_wl_paths.find(spec); it != kit_wl_paths.end()) {
                 bfs::path rel(it->second); // e.g. "resources/wl/foo.csv.gz"
     
@@ -594,7 +594,7 @@ namespace config_utils {
         {"splitseq", "resources/read_layout/splitseq_read_layout.csv" },
         {"curio_sc", "resources/read_layout/curio_sc_read_layout.csv" },
         {"curio_trekker", "resources/read_layout/curio_trekker_read_layout.csv"},
-        {"nb_nanopore_bulk", "resources/read_layout/np_bulk_read_layout.csv" }
+        {"nanopore_rapid_bc", "resources/read_layout/nanopore_bulk_rapid_bc_read_layout.csv" }
     };
 
     // check if the layout is a custom one

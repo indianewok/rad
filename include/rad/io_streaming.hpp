@@ -1,7 +1,6 @@
 #pragma once
 #include "rad_headers.h"
 
-
 // needed a way for IO to work on .gz and non .gz files, and needed a PIGZ/non-PIGZ solution for files.
 // finangled a way to deal with this by just opening two kseq instantiations because you can't trade them off once opened.
 // so just open two, kseq_fd and kseq_gz, and use the appropriate one based on whether pigz is being used or not/filetype.
@@ -459,6 +458,17 @@ namespace readmem_utils {
     };
 
     static inline double rss_gib() {
+    #if defined(__APPLE__)
+        // macOS: use Mach task info
+        mach_task_basic_info info;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+            return -1.0;
+        }
+        const double rss_bytes = static_cast<double>(info.resident_size);
+        return rss_bytes / (1024.0 * 1024.0 * 1024.0);
+    #else
+        // Linux: read statm
         FILE* f = std::fopen("/proc/self/statm", "r");
         if (!f) return -1.0;
         long long size_pages=0, res_pages=0;
@@ -467,6 +477,7 @@ namespace readmem_utils {
         const double page_kb = double(::sysconf(_SC_PAGESIZE)) / 1024.0;
         const double rss_kb = res_pages * page_kb;
         return rss_kb / (1024.0 * 1024.0);
+    #endif
     }
 
     // --- tiny logger ---
@@ -552,8 +563,9 @@ public:
                     }
 
                     const size_t __chunk_bytes = readmem_utils::bytes_of_vec(chunk);
+                    const size_t __chunk_id = next_chunk_id_.fetch_add(1, std::memory_order_relaxed);
                     readmem_utils::scoped_in_flight __guard(__chunk_bytes);
-                    readmem_utils::log_chunk(__chunk_bytes /*, optional_chunk_id */);
+                    readmem_utils::log_chunk(__chunk_bytes, __chunk_id);
                     chunk_func(chunk, input_path);
                 }
             }
@@ -566,6 +578,7 @@ public:
     int max_in_flight_;  // -1 = unlimited, >0 = limited
     std::atomic<size_t> seqs_processed_;
     std::atomic<int> peak_in_flight_;
+    std::atomic<size_t> next_chunk_id_{1};
 };
 
 /**
@@ -972,8 +985,9 @@ private:
                 
                 jobs_processed.fetch_add(1, std::memory_order_relaxed);
                 
+                const double size_mib = double(job->size) / (1024.0 * 1024.0);
                 std::cout << "\n[io_writer] chunk=" << job->chunk_id
-                          << " bytes=" << job->size
+                          << " size_mib=" << std::fixed << std::setprecision(2) << size_mib
                           << " queued_ms=" << queue_time_ms
                           << " wrote_ms=" << write_time_ms
                           << std::endl;

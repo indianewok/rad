@@ -363,6 +363,7 @@ int cmd_demux(int argc, char* argv[]) {
     std::ofstream log_stream;
     std::unique_ptr<tee_buff> tee_buf;
     std::streambuf* cout_backup = nullptr;
+    std::streambuf* cerr_backup = nullptr;
 
     if (!log_file.empty()) {
         boost::filesystem::path log_path(log_file);
@@ -377,10 +378,17 @@ int cmd_demux(int argc, char* argv[]) {
         }
         
         cout_backup = std::cout.rdbuf();
-        tee_buf = std::make_unique<tee_buff>(std::cout.rdbuf(), log_stream.rdbuf());
-        std::cout.rdbuf(tee_buf.get());
-        
-        std::cerr << "[main] Logging output to: " << log_file << "\n";
+        cerr_backup = std::cerr.rdbuf();
+        if (max_verbose) {
+            // In max verbose mode, send all stdout/stderr to the log file to avoid flooding the terminal.
+            std::cout.rdbuf(log_stream.rdbuf());
+            std::cerr.rdbuf(log_stream.rdbuf());
+            std::cerr << "[main] Max verbose output redirected to log file: " << log_file << "\n";
+        } else {
+            tee_buf = std::make_unique<tee_buff>(std::cout.rdbuf(), log_stream.rdbuf());
+            std::cout.rdbuf(tee_buf.get());
+            std::cerr << "[main] Logging output to: " << log_file << "\n";
+        }
     }
 
     // Output paths
@@ -541,6 +549,9 @@ int cmd_demux(int argc, char* argv[]) {
         if (cout_backup) {
             std::cout.rdbuf(cout_backup);
         }
+        if (cerr_backup) {
+            std::cerr.rdbuf(cerr_backup);
+        }
         if (log_stream.is_open()) {
             log_stream.close();
         }
@@ -552,6 +563,9 @@ int cmd_demux(int argc, char* argv[]) {
         // Restore cout on error too
         if (cout_backup) {
             std::cout.rdbuf(cout_backup);
+        }
+        if (cerr_backup) {
+            std::cerr.rdbuf(cerr_backup);
         }
         if (log_stream.is_open()) {
             log_stream.close();
