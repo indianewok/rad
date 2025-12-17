@@ -17,7 +17,7 @@ static void print_main_usage(const char* prog) {
 
 static void usage_demux(const char* prog) {
     std::cerr
-      << "Usage: " << prog << " demux -l LAYOUT -q FASTQ [options]\n\n"
+      << "Usage: rad " << prog << " -l LAYOUT -q FASTQ [options]\n\n"
       << "Required:\n"
       << "  -l, --layout                      layout key (five_prime, three_prime, splitseq) or path\n"
       << "  -q, --fastq                       input FASTQ file\n\n"
@@ -43,7 +43,7 @@ static void usage_demux(const char* prog) {
 
 static void usage_reformat(const char* prog) {
     std::cerr
-      << "Usage: " << prog << " reformat -q INPUT [options]\n\n"
+      << "Usage: rad " << prog << " -q INPUT [options]\n\n"
       << "Options:\n"
       << "  -q, --fastq           input FASTQ/FASTA (.fq/.fa/.gz)\n"
       << "  -o, --outdir          output directory for per-barcode fastqs (required if --split-bc)\n"
@@ -58,7 +58,7 @@ static void usage_reformat(const char* prog) {
 
 static void usage_prep(const char* prog) {
     std::cerr
-      << "Usage: " << prog << " prep -l LAYOUT [options]\n\n"
+      << "Usage: rad " << prog << " -l LAYOUT [options]\n\n"
       << "Generate read layout structure and/or position map with misalignment statistics.\n\n"
       << "Required:\n"
       << "  -l, --layout                      layout key or path to layout CSV\n\n"
