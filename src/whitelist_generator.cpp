@@ -1,5 +1,4 @@
 #include "include/rad/rad_headers.h"
-#include <filesystem>
 
 struct extracted_bc {
     std::string read_id;
@@ -246,11 +245,11 @@ std::vector<extracted_bc> process_fastq(const std::string& input_path,
             if (max_reads > 0 && reads_processed >= max_reads) {
                 break;
             }
-            reads_processed++;
             auto rec = reader_ptr->next_sequence();
             if (!rec) {
                 break;
             }
+            reads_processed++;
             chunk.push_back({rec->id, rec->seq});
 
         }
@@ -527,7 +526,7 @@ std::vector<double> find_peaks(const std::vector<std::pair<double, double>>& den
 
     // 3) Non-maximum suppression by separation
     std::vector<double> final_peaks;
-    const double log_dist = 0.25;
+    const double log_dist = 0.5; // doubled because floor doubled as well
     const double eps = 1e-9; // for x-comparison
 
     for (const auto& peak : potential_peaks) {

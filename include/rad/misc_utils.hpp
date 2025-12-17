@@ -455,61 +455,6 @@ namespace whitelist_utils {
             return resolved[0];
         }
     }
-    /*
-    inline std::string kit_to_path(const std::string &field) {
-        namespace bfs = boost::filesystem;
-        // 1) Peel off any "prefix:" to isolate the kit key
-        std::string kit = field;
-        if (auto pos = field.find(':'); pos!=std::string::npos) {
-          kit = field.substr(pos+1);
-        }
-    
-        // 2) If it's one of our known kits, build resources/wl/... from the relative map entry
-        auto it = kit_wl_paths.find(kit);
-        if (it != kit_wl_paths.end()) {
-          bfs::path orig_rel(it->second); // e.g. "resources/wl/foo.csv.gz" or "wl/foo.csv.gz"
-    
-          // strip leading "resources/" if present
-          auto iter = orig_rel.begin();
-          if (iter!=orig_rel.end() && *iter=="resources") {
-            ++iter;
-          }
-
-          // recombine what remains
-          bfs::path rel;
-          for (; iter!=orig_rel.end(); ++iter) {
-            rel /= *iter;
-          }
-    
-          // now join against the real resources folder
-          bfs::path root = path_utils::find_resource_root();
-          bfs::path full = root / rel;
-    
-          if (!bfs::exists(full))
-            throw std::runtime_error("Whitelist resource not found: " + full.string());
-          return bfs::canonical(full).string();
-        }
-    
-        // 3) Otherwise treat the field as a filesystem path and canonicalize it
-        bfs::path p(field);
-        if (p.is_relative()) {
-          p = bfs::absolute(p);
-        }
-        if (!bfs::exists(p))
-          throw std::runtime_error("Whitelist file not found: " + p.string());
-        return bfs::canonical(p).string();
-      }
-    std::string kit_to_path(const std::string &field) {
-        auto kit = field;
-        if (auto p = field.find(':'); p != std::string::npos){
-            kit = field.substr(p+1);
-        }
-        if (auto it = kit_wl_paths.find(kit); it != kit_wl_paths.end()){
-            return it->second;
-        }
-        return field; 
-    }
-    */
 
     // Check if it's a kit
     bool is_kit(const std::string &name){
@@ -602,15 +547,6 @@ namespace config_utils {
         return layout_files.find(type) == layout_files.end();
     }
     
-    // get read layout path from pre-existing elements
-    /*
-    inline const std::string& get_read_layout(const std::string &type) {
-        auto it = layout_files.find(type);
-        if (it == layout_files.end())
-            throw std::invalid_argument("Unknown layout type: " + type);
-        return it->second;
-    }
-    */
    inline std::string get_read_layout(const std::string &type) {
     namespace bfs = boost::filesystem;
     // 1) If `type` looks like an absolute or contains a path‐sep, treat it as a real file:
@@ -632,6 +568,7 @@ namespace config_utils {
     //    e.g. it->second == "splitseq_read_layout.csv"   OR
     //         it->second == "read_layout/splitseq_read_layout.csv" OR
     //         it->second == "resources/read_layout/splitseq_read_layout.csv"
+    
     bfs::path orig_rel(it->second);
 
     // strip any leading "resources/" component:

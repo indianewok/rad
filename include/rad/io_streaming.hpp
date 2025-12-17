@@ -36,6 +36,58 @@ namespace kseq_gz {
  */
 class pigz_reading {
 public:
+    static std::string shell_quote_posix(const std::string& s) {
+        // POSIX /bin/sh-safe single-quote escaping:
+        // abc'd -> 'abc'"'"'d'
+        std::string out;
+        out.reserve(s.size() + 2);
+        out.push_back('\'');
+        for (char c : s) {
+            if (c == '\'') {
+                out.append("'\"'\"'");
+            } else {
+                out.push_back(c);
+            }
+        }
+        out.push_back('\'');
+        return out;
+    }
+
+    static std::string sanitize_user_path(std::string p) {
+        // Trim ASCII whitespace (incl. CR/LF) commonly introduced by CSV/TSV parsing.
+        const auto start = p.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) return "";
+        const auto end = p.find_last_not_of(" \t\r\n");
+        p = p.substr(start, end - start + 1);
+
+        // Strip UTF-8 BOM if present.
+        if (p.size() >= 3) {
+            const unsigned char b0 = static_cast<unsigned char>(p[0]);
+            const unsigned char b1 = static_cast<unsigned char>(p[1]);
+            const unsigned char b2 = static_cast<unsigned char>(p[2]);
+            if (b0 == 0xEF && b1 == 0xBB && b2 == 0xBF) {
+                p.erase(0, 3);
+            }
+        }
+
+        // Strip surrounding quotes if the whole field is quoted.
+        if (p.size() >= 2) {
+            const char f = p.front();
+            const char l = p.back();
+            if ((f == '"' && l == '"') || (f == '\'' && l == '\'')) {
+                p = p.substr(1, p.size() - 2);
+            }
+        }
+
+        // Expand leading "~/" to $HOME (shell would normally do this).
+        if (!p.empty() && p[0] == '~' && (p.size() == 1 || p[1] == '/')) {
+            if (const char* home = std::getenv("HOME"); home && *home) {
+                p = std::string(home) + p.substr(1);
+            }
+        }
+        return p;
+    }
+
     /**
      * @brief Open a pigz decompression pipe for reading
      * @param input_path Path to compressed file (.gz, .fq.gz, .fastq.gz, etc.)
@@ -57,10 +109,22 @@ public:
             pigz = env;
         }
 
+        const std::string path = sanitize_user_path(input_path);
+        if (path.empty()) {
+            return nullptr;
+        }
+
+        // Avoid invoking pigz on a path that doesn't exist; this also makes it
+        // much easier to diagnose hidden characters (e.g. CR, BOM) in the path.
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path, ec)) {
+            return nullptr;
+        }
+
         // Use pigz -dc for decompression to stdout
         // -d = decompress, -c = write to stdout, -p = threads
-        std::string cmd = "'" + pigz + "' -dc -p " + std::to_string(threads) + 
-                         " '" + input_path + "'";
+        std::string cmd = shell_quote_posix(pigz) + " -dc -p " + std::to_string(threads) +
+                          " " + shell_quote_posix(path);
         
         FILE* fp = popen(cmd.c_str(), "r");
         if (!fp) {
@@ -103,7 +167,7 @@ public:
             pigz = env;
         }
         
-        std::string cmd = "which '" + pigz + "' > /dev/null 2>&1";
+        std::string cmd = "command -v " + shell_quote_posix(pigz) + " > /dev/null 2>&1";
         return system(cmd.c_str()) == 0;
     }
 };
@@ -182,14 +246,18 @@ public:
         file_pointer(const std::string& file_path, int pigz_threads = 4) 
             : fp_pigz(nullptr), fp_gzip(nullptr), seq_fd(nullptr), seq_gz(nullptr),
               fd(-1), path(file_path), using_pigz(false) {
+            path = pigz_reading::sanitize_user_path(path);
+            if (path.empty()) {
+                return;
+            }
             
             // Check if file is compressed
-            bool is_compressed = has_gz_extension(file_path);
+            bool is_compressed = has_gz_extension(path);
             
             if (is_compressed) {
                 // Try pigz first for parallel decompression
                 if (pigz_reading::is_pigz_available()) {
-                    fp_pigz = pigz_reader.open_pigz_read_pipe(file_path, pigz_threads);
+                    fp_pigz = pigz_reader.open_pigz_read_pipe(path, pigz_threads);
                     if (fp_pigz) {
                         fd = fileno(fp_pigz);
                         seq_fd = kseq_fd::kseq_init(fd);
@@ -199,7 +267,7 @@ public:
                 }
 
                 // Fallback to single-threaded gzip
-                fp_gzip = gzopen(file_path.c_str(), "r");
+                fp_gzip = gzopen(path.c_str(), "r");
                 if (fp_gzip) {
                     gzbuffer(fp_gzip, 1 << 22);  // 4 MiB buffer
                     seq_gz = kseq_gz::kseq_init(fp_gzip);
@@ -207,7 +275,7 @@ public:
                 }
             } else {
                 // Uncompressed file - use regular file descriptor
-                fp_pigz = fopen(file_path.c_str(), "r");
+                fp_pigz = fopen(path.c_str(), "r");
                 if (fp_pigz) {
                     fd = fileno(fp_pigz);
                     seq_fd =  kseq_fd::kseq_init(fd);
@@ -254,7 +322,8 @@ public:
      * @throws std::runtime_error if file cannot be opened or path is invalid
      */
     explicit file_streaming(const std::string& input_path, int threads = 4) 
-        : path(input_path), pigz_threads(threads) {
+        : pigz_threads(threads) {
+        path = pigz_reading::sanitize_user_path(input_path);
         dir_status = is_directory(path);
         if (dir_status) {
             dir_iter = std::filesystem::directory_iterator(path);
@@ -521,13 +590,16 @@ public:
     void process_chunks(const std::string& input_path, 
                     Function chunk_func, 
                     int num_threads, 
-                    int64_t max_seqs = -1) {
+                    int64_t max_seqs = -1,
+                    bool verbose = false,
+                    size_t log_every_chunks = 0) {
             file_streaming files(input_path, pigz_threads_);
             read_streaming reader(files);
 
             std::mutex reader_mutex;
             std::atomic<bool>   more_data{true};
             std::atomic<size_t> seqs_processed{0};
+            std::atomic<size_t> chunks_seen{0};
 
             #pragma omp parallel num_threads(num_threads)
             {
@@ -567,6 +639,14 @@ public:
                     readmem_utils::scoped_in_flight __guard(__chunk_bytes);
                     readmem_utils::log_chunk(__chunk_bytes, __chunk_id);
                     chunk_func(chunk, input_path);
+
+                    if (verbose) {
+                        size_t cseen = chunks_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (log_every_chunks == 0 || (cseen % log_every_chunks == 0)) {
+                            std::fprintf(stderr, "[chunk_streaming] chunk=%zu size=%zu seqs=%zu\n",
+                                         __chunk_id, __chunk_bytes, chunk.size());
+                        }
+                    }
                 }
             }
         }

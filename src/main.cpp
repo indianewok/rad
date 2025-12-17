@@ -8,10 +8,10 @@
 static void print_main_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " <command> [options]\n\n"
               << "Commands:\n"
-              << "  demux       Run full demultiplexing pipeline\n"
-              << "  prep_layout      Generate and display read layout structure\n"
-              << "  position_map      Generate position map with misalignment statistics\n"
-              << "  help        Show help for a specific command\n\n"
+              << "  prep              Prepare read layout and/or position map\n"
+              << "  demux             Run full demultiplexing pipeline\n"
+              << "  reformat          Reformat fastx.gz outputs for downstream applications\n"
+              << "  help              Show help for a specific command\n\n"
               << "Use '" << prog << " <command> --help' for command-specific options\n";
 }
 
@@ -41,34 +41,43 @@ static void usage_demux(const char* prog) {
       << "  -h, --help                        show this help\n";
 }
 
-static void usage_layout(const char* prog) {
+static void usage_reformat(const char* prog) {
     std::cerr
-      << "Usage: " << prog << " layout -l LAYOUT [options]\n\n"
-      << "Generate and display read layout structure from CSV\n\n"
-      << "Required:\n"
-      << "  -l, --layout                      layout key or path to layout CSV\n\n"
-      << "Optional:\n"
-      << "  -o, --output                      output base path (saves to _layout.csv)\n"
-      << "  -v, --verbose                     verbose mode\n"
-      << "  -h, --help                        show this help\n";
+      << "Usage: " << prog << " reformat -q INPUT [options]\n\n"
+      << "Options:\n"
+      << "  -q, --fastq           input FASTQ/FASTA (.fq/.fa/.gz)\n"
+      << "  -o, --outdir          output directory for per-barcode fastqs (required if --split-bc)\n"
+      << "      --split-bc        split reads into per-barcode .fq.gz files (CB:Z tag)\n"
+      << "      --reformat-header collapse headers to QNAME_CB_UB (default underscore)\n"
+      << "  -t, --threads         worker threads (default: 2)\n"
+      << "  -v, --verbose         verbose logging\n"
+      << "  -h, --help            show this help\n\n"
+      << "If both --split-bc and --reformat-header are set, headers are collapsed before splitting.\n"
+      << "If only --reformat-header is set, the input file is streamed and rewritten in place.\n";
 }
 
-static void usage_position_map(const char* prog) {
+static void usage_prep(const char* prog) {
     std::cerr
-      << "Usage: " << prog << " position_map -l LAYOUT -q FASTQ -o OUTPUT [options]\n\n"
-      << "Generate position map with misalignment statistics\n"
-      << "This command runs misalignment analysis and generates both\n"
-      << "layout and position_map CSV files.\n\n"
+      << "Usage: " << prog << " prep -l LAYOUT [options]\n\n"
+      << "Generate read layout structure and/or position map with misalignment statistics.\n\n"
       << "Required:\n"
-      << "  -l, --layout                      layout key or path to layout CSV\n"
-      << "  -q, --fastq                       input FASTQ file for misalignment stats\n"
-      << "  -o, --output                      output base path\n\n"
+      << "  -l, --layout                      layout key or path to layout CSV\n\n"
+      << "Mode flags (at least one required):\n"
+      << "      --read-layout                 generate and display read layout structure\n"
+      << "      --position-map                generate position map with misalignment stats\n"
+      << "                                    (requires -q/--fastq)\n\n"
       << "Optional:\n"
-      << "  -n, --max_reads                   max reads for sampling (default: 50000)\n"
+      << "  -q, --fastq                       input FASTQ file (required for --position-map)\n"
+      << "  -o, --output                      output base path (saves _layout.csv, _position_map.csv)\n"
+      << "  -n, --max_reads                   max reads for misalignment sampling (default: 50000)\n"
       << "  -t, --threads                     number of threads (default: 1)\n"
       << "  -v, --verbose                     verbose mode\n"
       << "  -D, --max_verbose                 maximum verbosity (debug)\n"
-      << "  -h, --help                        show this help\n";
+      << "  -h, --help                        show this help\n\n"
+      << "Examples:\n"
+      << "  rad " << prog << " -l five_prime --read-layout\n"
+      << "  rad " << prog << " -l my_layout.csv --position-map -q reads.fq.gz -o output\n"
+      << "  rad " << prog << " -l five_prime --read-layout --position-map -q reads.fq.gz -o output\n";
 }
 
 // =============================================================================
@@ -103,103 +112,28 @@ protected:
 };
 
 // ============================================================================
-// COMMAND: layout
+// COMMAND: prep (combined layout + position_map)
 // ============================================================================
 
-int cmd_layout(int argc, char* argv[]) {
-    std::string layout_key;
-    std::string output_base;
-    bool verbose = false;
-    
-    const char* optstring = "l:o:vh";
-    struct option longopts[] = {
-        {"layout",  required_argument, nullptr, 'l'},
-        {"output",  required_argument, nullptr, 'o'},
-        {"verbose", no_argument,       nullptr, 'v'},
-        {"help",    no_argument,       nullptr, 'h'},
-        {nullptr, 0, nullptr, 0}
-    };
-    
-    int c;
-    while ((c = getopt_long(argc, argv, optstring, longopts, nullptr)) != -1) {
-        switch (c) {
-            case 'l': layout_key = optarg; break;
-            case 'o': output_base = optarg; break;
-            case 'v': verbose = true; break;
-            case 'h': usage_layout(argv[0]); return 0;
-            default: usage_layout(argv[0]); return 1;
-        }
-    }
-    
-    if (layout_key.empty()) {
-        std::cerr << "[ERROR] --layout is required\n\n";
-        usage_layout(argv[0]);
-        return 1;
-    }
-    
-    try {
-        std::cout << "[layout] Generating layout structure...\n\n";
-        
-        ReadLayout read_layout;
-        std::string layout_csv;
-        
-        // Determine if it's a built-in layout or custom path
-        if (!config_utils::check_if_custom_rl(layout_key)) {
-            layout_csv = config_utils::get_read_layout(layout_key);
-            std::cout << "[layout] Using built-in layout: " << layout_key << "\n";
-        } else {
-            layout_csv = layout_key;
-            std::cout << "[layout] Using custom layout: " << layout_key << "\n";
-        }
-        
-        // Prep layout with verbosity
-        read_layout.prep_new_layout(layout_csv, verbose);
-        
-        std::cout << "\n========================================\n";
-        std::cout << "         LAYOUT STRUCTURE               \n";
-        std::cout << "========================================\n\n";
-        
-        // Display the layout
-        read_layout.display_read_layout();
-        
-        std::cout << "\n========================================\n";
-        std::cout << "Layout contains " << read_layout.size() << " elements\n";
-        std::cout << "========================================\n";
-        
-        // Optionally save to file
-        if (!output_base.empty()) {
-            read_layout.write_to_csv(output_base, "layout");
-            std::cout << "\n[layout] Saved to: " << output_base << "_layout.csv\n";
-        }
-        
-        return 0;
-    }
-    catch (const std::exception &ex) {
-        std::cerr << "[ERROR] " << ex.what() << "\n";
-        return 1;
-    }
-}
-
-// ============================================================================
-// COMMAND: position_map
-// ============================================================================
-
-int cmd_position_map(int argc, char* argv[]) {
+int cmd_prep(int argc, char* argv[]) {
     std::string layout_key, fastq_path, output_base;
     bool verbose = false, max_verbose = false;
+    bool do_read_layout = false, do_position_map = false;
     int nthreads = 1;
     size_t max_reads = 50000;
     
     const char* optstring = "l:q:o:n:t:vDh";
     struct option longopts[] = {
-        {"layout",      required_argument, nullptr, 'l'},
-        {"fastq",       required_argument, nullptr, 'q'},
-        {"output",      required_argument, nullptr, 'o'},
-        {"max_reads",   required_argument, nullptr, 'n'},
-        {"threads",     required_argument, nullptr, 't'},
-        {"verbose",     no_argument,       nullptr, 'v'},
-        {"max_verbose", no_argument,       nullptr, 'D'},
-        {"help",        no_argument,       nullptr, 'h'},
+        {"layout",       required_argument, nullptr, 'l'},
+        {"fastq",        required_argument, nullptr, 'q'},
+        {"output",       required_argument, nullptr, 'o'},
+        {"max_reads",    required_argument, nullptr, 'n'},
+        {"threads",      required_argument, nullptr, 't'},
+        {"verbose",      no_argument,       nullptr, 'v'},
+        {"max_verbose",  no_argument,       nullptr, 'D'},
+        {"help",         no_argument,       nullptr, 'h'},
+        {"read-layout",  no_argument,       nullptr,  1 },
+        {"position-map", no_argument,       nullptr,  2 },
         {nullptr, 0, nullptr, 0}
     };
     
@@ -213,72 +147,379 @@ int cmd_position_map(int argc, char* argv[]) {
             case 't': nthreads = std::stoi(optarg); break;
             case 'v': verbose = true; break;
             case 'D': max_verbose = true; verbose = true; break;
-            case 'h': usage_position_map(argv[0]); return 0;
-            default: usage_position_map(argv[0]); return 1;
+            case 'h': usage_prep(argv[0]); return 0;
+            case 1:   do_read_layout = true; break;
+            case 2:   do_position_map = true; break;
+            default:  usage_prep(argv[0]); return 1;
         }
     }
     
-    if (layout_key.empty() || fastq_path.empty() || output_base.empty()) {
-        std::cerr << "[ERROR] --layout, --fastq, and --output are required\n\n";
-        usage_position_map(argv[0]);
+    // Validate required args
+    if (layout_key.empty()) {
+        std::cerr << "[ERROR] --layout is required\n\n";
+        usage_prep(argv[0]);
+        return 1;
+    }
+    
+    if (!do_read_layout && !do_position_map) {
+        std::cerr << "[ERROR] must specify --read-layout and/or --position-map\n\n";
+        usage_prep(argv[0]);
+        return 1;
+    }
+    
+    if (do_position_map && fastq_path.empty()) {
+        std::cerr << "[ERROR] --fastq is required when using --position-map\n\n";
+        usage_prep(argv[0]);
+        return 1;
+    }
+    
+    if (do_position_map && output_base.empty()) {
+        std::cerr << "[ERROR] --output is required when using --position-map\n\n";
+        usage_prep(argv[0]);
         return 1;
     }
     
     try {
-        std::cout << "[position_map] Generating position map with misalignment statistics...\n";
         auto start = std::chrono::steady_clock::now();
         
         ReadLayout read_layout;
         std::string layout_csv;
         
-        // Load layout
+        // Determine if it's a built-in layout or custom path
         if (!config_utils::check_if_custom_rl(layout_key)) {
             layout_csv = config_utils::get_read_layout(layout_key);
-            if (verbose) std::cout << "[position_map] Using built-in layout: " << layout_key << "\n";
+            if (verbose) std::cout << "[prep] Using built-in layout: " << layout_key << "\n";
         } else {
             layout_csv = layout_key;
-            if (verbose) std::cout << "[position_map] Using custom layout: " << layout_key << "\n";
+            if (verbose) std::cout << "[prep] Using custom layout: " << layout_key << "\n";
         }
         
         // Prep layout
-        if (verbose) std::cout << "[position_map] Preparing layout...\n";
+        if (verbose) std::cout << "[prep] Preparing layout...\n";
         read_layout.prep_new_layout(layout_csv, max_verbose);
         
-        // Save initial layout
-        read_layout.write_to_csv(output_base, "layout");
-        
-        // Run misalignment analysis
-        if (verbose) std::cout << "[position_map] Computing misalignment statistics from FASTQ...\n";
-        Misalignment_Setup mis(read_layout);
-        mis.generate_misalignment_data(fastq_path, read_layout, nthreads, max_reads);
-        
-        // Generate position mapping
-        if (verbose) std::cout << "[position_map] Generating position mapping...\n";
-        read_layout.generate_position_mapping();
-        
-        // Display if max verbose
-        if (max_verbose) {
-            std::cout << "\n";
+        // Display layout if requested
+        if (do_read_layout) {
+            std::cout << "\n========================================\n";
+            std::cout << "         LAYOUT STRUCTURE               \n";
+            std::cout << "========================================\n\n";
+            
             read_layout.display_read_layout();
+            
+            std::cout << "\n========================================\n";
+            std::cout << "Layout contains " << read_layout.size() << " elements\n";
+            std::cout << "========================================\n";
         }
         
-        // Write updated files
-        if (verbose) std::cout << "[position_map] Writing output files...\n";
-        read_layout.write_to_csv(output_base, "both");
-        
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        std::cout << "\n[position_map] Complete! Time: "
-                  << std::chrono::duration_cast<std::chrono::seconds>(elapsed).count()
-                  << " seconds\n";
-        
-        std::cout << "\n[position_map] Output files:\n"
-                  << "  " << output_base << "_layout.csv\n"
-                  << "  " << output_base << "_position_map.csv\n";
+        // Generate position map if requested
+        if (do_position_map) {
+            // Save initial layout
+            read_layout.write_to_csv(output_base, "layout");
+            
+            // Run misalignment analysis
+            if (verbose) std::cout << "\n[prep] Computing misalignment statistics from FASTQ...\n";
+            Misalignment_Setup mis(read_layout);
+            mis.generate_misalignment_data(fastq_path, read_layout, nthreads, max_reads);
+            
+            // Generate position mapping
+            if (verbose) std::cout << "[prep] Generating position mapping...\n";
+            read_layout.generate_position_mapping();
+            
+            // Display if max verbose
+            if (max_verbose) {
+                std::cout << "\n";
+                read_layout.display_read_layout();
+            }
+            
+            // Write updated files
+            if (verbose) std::cout << "[prep] Writing output files...\n";
+            read_layout.write_to_csv(output_base, "both");
+            
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            std::cout << "\n[prep] Complete! Time: "
+                      << std::chrono::duration_cast<std::chrono::seconds>(elapsed).count()
+                      << " seconds\n";
+            
+            std::cout << "\n[prep] Output files:\n"
+                      << "  " << output_base << "_layout.csv\n"
+                      << "  " << output_base << "_position_map.csv\n";
+        } else if (!output_base.empty()) {
+            // Just save layout if output specified but no position map
+            read_layout.write_to_csv(output_base, "layout");
+            std::cout << "\n[prep] Saved to: " << output_base << "_layout.csv\n";
+        }
         
         return 0;
     }
     catch (const std::exception &ex) {
         std::cerr << "[ERROR] " << ex.what() << "\n";
+        return 1;
+    }
+}
+
+// ============================================================================
+// COMMAND: reformat
+// ============================================================================
+
+static std::optional<std::string> extract_cb(const std::string& id, const std::string& comment) {
+    const std::string tag = "CB:Z:";
+    const std::string* src = &comment;
+    auto pos = comment.find(tag);
+    if (pos == std::string::npos) {
+        pos = id.find(tag);
+        if (pos == std::string::npos) return std::nullopt;
+        src = &id;
+    }
+    pos += tag.size();
+    auto end = src->find_first_of(" \t", pos);
+    if (end == std::string::npos) {
+        return src->substr(pos);
+    }
+    return src->substr(pos, end - pos);
+}
+
+static std::optional<std::string> extract_ub(const std::string& comment) {
+    const std::string tag = "UB:Z:";
+    auto pos = comment.find(tag);
+    if (pos == std::string::npos) return std::nullopt;
+    pos += tag.size();
+    auto end = comment.find_first_of(" \t", pos);
+    if (end == std::string::npos) {
+        return comment.substr(pos);
+    }
+    return comment.substr(pos, end - pos);
+}
+
+static std::string collapse_id(const std::string& qname,
+                               const std::optional<std::string>& cb, const std::optional<std::string>& ub,
+                               char sep = '_') {
+    std::string out = qname;
+    if (cb && !cb->empty()) {
+        out.push_back(sep);
+        out.append(*cb);
+    }
+    if (ub && !ub->empty()) {
+        out.push_back(sep);
+        out.append(*ub);
+    }
+    return out;
+}
+
+int cmd_reformat(int argc, char* argv[]) {
+    std::string fastq_path, outdir;
+    int nthreads = 2;
+    bool verbose = false;
+    bool do_split = false;
+    bool do_reformat = false;
+
+    const char* optstring = "q:o:t:vh";
+    struct option longopts[] = {
+        {"fastq",            required_argument, nullptr, 'q'},
+        {"outdir",           required_argument, nullptr, 'o'},
+        {"threads",          required_argument, nullptr, 't'},
+        {"verbose",          no_argument,       nullptr, 'v'},
+        {"help",             no_argument,       nullptr, 'h'},
+        {"split-bc",         no_argument,       nullptr,  1 },
+        {"reformat-header",  no_argument,       nullptr,  2 },
+        {nullptr, 0, nullptr, 0}
+    };
+
+    int c;
+    while ((c = getopt_long(argc, argv, optstring, longopts, nullptr)) != -1) {
+        switch (c) {
+            case 'q': fastq_path = optarg; break;
+            case 'o': outdir = optarg; break;
+            case 't': nthreads = std::max(1, std::stoi(optarg)); break;
+            case 'v': verbose = true; break;
+            case 1: do_split = true; break;
+            case 2: do_reformat = true; break;
+            case 'h': usage_reformat(argv[0]); return 0;
+            default:  usage_reformat(argv[0]); return 1;
+        }
+    }
+
+    if (!do_split && !do_reformat) {
+        std::cerr << "[ERROR] must specify --split-bc and/or --reformat-header\n\n";
+        usage_reformat(argv[0]);
+        return 1;
+    }
+    if (fastq_path.empty()) {
+        std::cerr << "[ERROR] --fastq is required\n\n";
+        usage_reformat(argv[0]);
+        return 1;
+    }
+    if (do_split && outdir.empty()) {
+        std::cerr << "[ERROR] --outdir is required when --split-bc is set\n\n";
+        usage_reformat(argv[0]);
+        return 1;
+    }
+
+    boost::filesystem::path outdir_path(outdir);
+    if (do_split && !boost::filesystem::exists(outdir_path)) {
+        boost::filesystem::create_directories(outdir_path);
+    }
+
+    struct ref_writer {
+        std::mutex mtx;
+        FILE* pigz_fp = nullptr;
+        gzFile gz = nullptr;
+        std::ofstream out;
+        bool using_pigz = false;
+        bool use_gz = false;
+    };
+    std::unordered_map<std::string, std::shared_ptr<ref_writer>> writers;
+    std::mutex writers_mtx;
+    pigz_writing pigz_out;
+
+    auto get_writer = [&](const std::string& bc) -> ref_writer& {
+        std::lock_guard<std::mutex> lock(writers_mtx);
+        auto it = writers.find(bc);
+        if (it != writers.end()) return *(it->second);
+
+        boost::filesystem::path p = outdir_path / (bc + ".fq.gz");
+        auto w = std::make_shared<ref_writer>();
+        w->pigz_fp = pigz_out.open_pigz_pipe(p.string(), nthreads);
+        if (w->pigz_fp) {
+            w->using_pigz = true;
+        } else {
+            w->gz = gzopen(p.string().c_str(), "wb");
+            if (!w->gz) throw std::runtime_error("Failed to open output " + p.string());
+            gzbuffer(w->gz, 1 << 20); // 1 MiB buffer
+            w->use_gz = true;
+        }
+        auto [ins_it, _] = writers.emplace(bc, std::move(w));
+        return *(ins_it->second);
+    };
+    auto open_single_writer = [&](const std::string& path) -> std::unique_ptr<ref_writer> {
+        auto w = std::make_unique<ref_writer>();
+        bool is_gz = path.size() >= 3 && path.substr(path.size() - 3) == ".gz";
+        w->use_gz = is_gz;
+        w->pigz_fp = pigz_out.open_pigz_pipe(path, nthreads);
+        if (w->pigz_fp) {
+            w->using_pigz = true;
+            return w;
+        }
+        if (is_gz) {
+            w->gz = gzopen(path.c_str(), "wb");
+            if (!w->gz) throw std::runtime_error("Failed to open gzip output: " + path);
+            gzbuffer(w->gz, 1 << 20);
+        } else {
+            w->out.open(path, std::ios::out | std::ios::binary);
+            if (!w->out) throw std::runtime_error("Failed to open output: " + path);
+        }
+        return w;
+    };
+
+    auto close_writer = [&](ref_writer& w) {
+        if (w.using_pigz && w.pigz_fp) {
+            pigz_out.close_pigz_pipe(w.pigz_fp);
+        } else if (w.gz) {
+            gzclose(w.gz);
+        } else if (w.out.is_open()) {
+            w.out.close();
+        }
+    };
+
+    auto write_record = [&](ref_writer& w, const read_streaming::sequence& r, bool use_lock) {
+        std::string rec;
+        if (r.is_fastq) {
+            rec.reserve(r.id.size() + r.comment.size() + r.seq.size() + r.qual.size() + 16);
+            rec += '@'; rec += r.id;
+            if (!r.comment.empty()) { rec += '\t'; rec += r.comment; }
+            rec += '\n'; rec += r.seq; rec += "\n+\n"; rec += r.qual; rec += '\n';
+        } else {
+            rec.reserve(r.id.size() + r.comment.size() + r.seq.size() + 8);
+            rec += '>'; rec += r.id;
+            if (!r.comment.empty()) { rec += '\t'; rec += r.comment; }
+            rec += '\n'; rec += r.seq; rec += '\n';
+        }
+        auto do_write = [&]() {
+            if (w.using_pigz) {
+                pigz_out.pigz_write(w.pigz_fp, rec.data(), rec.size());
+            } else if (w.gz) {
+                gzwrite(w.gz, rec.data(), static_cast<unsigned int>(rec.size()));
+            } else {
+                w.out.write(rec.data(), rec.size());
+            }
+        };
+        if (use_lock) {
+            std::lock_guard<std::mutex> lock(w.mtx);
+            do_write();
+        } else {
+            do_write();
+        }
+    };
+
+    try {
+        const size_t progress_interval = 500000;
+        std::atomic<size_t> total{0};
+
+        chunk_streaming<read_streaming::sequence, 
+        std::function<void(std::vector<read_streaming::sequence>&, const std::string&)>> cs(5000);
+
+        // set up single-writer if reformat only
+        std::unique_ptr<ref_writer> single_writer;
+        std::string single_tmp;
+        if (do_reformat && !do_split) {
+            boost::filesystem::path in(fastq_path);
+            single_tmp = (in.parent_path() / (in.filename().string() + ".tmp")).string();
+            single_writer = open_single_writer(single_tmp);
+        }
+
+        auto chunk_func = [&](std::vector<read_streaming::sequence>& chunk, const std::string&) {
+            for (auto& r : chunk) {
+                auto cb = extract_cb(r.id, r.comment);
+                std::optional<std::string> ub = extract_ub(r.comment);
+
+                if (do_reformat) {
+                    r.id = collapse_id(r.id, cb, ub, '_');
+                    r.comment.clear(); // drop tags after collapsing
+                }
+
+                if (do_split) {
+                    if (!cb || cb->empty()) continue;
+                    ref_writer& w = get_writer(*cb);
+                    write_record(w, r, true);
+                } else {
+                    write_record(*single_writer, r, false);
+                }
+
+                size_t now = total.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (verbose && now % progress_interval == 0) {
+                    std::cout << "[reformat] processed " << now << " reads\n";
+                }
+            }
+        };
+
+        cs.process_chunks(fastq_path, chunk_func, nthreads, -1);
+
+        if (do_split) {
+            for (auto& kv : writers) {
+                auto& w = *(kv.second);
+                close_writer(w);
+            }
+        } else if (single_writer) {
+            close_writer(*single_writer);
+            // replace original
+            boost::filesystem::path orig(fastq_path);
+            boost::filesystem::path tmp(single_tmp);
+            boost::filesystem::remove(orig);
+            boost::filesystem::rename(tmp, orig);
+        }
+
+        if (verbose) {
+            std::cout << "[reformat] wrote " << total.load() << " reads\n";
+            if (do_split) {
+                std::cout << "[reformat] barcodes: " << writers.size() << "\n";
+            }
+        }
+        return 0;
+    } catch (const std::exception& ex) {
+        std::cerr << "[reformat][ERROR] " << ex.what() << "\n";
+        for (auto& kv : writers) {
+            auto& w = *(kv.second);
+            close_writer(w);
+        }
         return 1;
     }
 }
@@ -577,7 +818,7 @@ int cmd_demux(int argc, char* argv[]) {
 }
 
 // ============================================================================
-//  help (i need somebody (help (not just anybody)))
+//  COMMAND: help (i need somebody (help (not just anybody)))
 // ============================================================================
 
 int cmd_help(int argc, char* argv[]) {
@@ -589,10 +830,10 @@ int cmd_help(int argc, char* argv[]) {
     std::string topic = argv[1];
     if (topic == "demux") {
         usage_demux("rad");
-    } else if (topic == "layout") {
-        usage_layout("rad");
-    } else if (topic == "position_map") {
-        usage_position_map("rad");
+    } else if (topic == "prep") {
+        usage_prep("rad");
+    } else if (topic == "reformat") {
+        usage_reformat("rad");
     } else {
         std::cerr << "Unknown command: " << topic << "\n\n";
         print_main_usage("rad");
@@ -616,10 +857,10 @@ int main(int argc, char* argv[]) {
     // Dispatch to subcommands
     if (command == "demux") {
         return cmd_demux(argc - 1, argv + 1);
-    } else if (command == "prep_layout") {
-        return cmd_layout(argc - 1, argv + 1);
-    } else if (command == "position_map") {
-        return cmd_position_map(argc - 1, argv + 1);
+    } else if (command == "prep") {
+        return cmd_prep(argc - 1, argv + 1);
+    } else if (command == "reformat") {
+        return cmd_reformat(argc - 1, argv + 1);
     } else if (command == "help") {
         return cmd_help(argc - 1, argv + 1);
     } else if (command == "--help" || command == "-h") {
