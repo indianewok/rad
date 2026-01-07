@@ -31,10 +31,12 @@
 *.out
 *.app
 
-# VSCode, IDE, and system
+# VSCode, IDE, system, AI
 *.vscode
 **/.DS_Store
 .DS_Store
+.claude
+CLAUDE.*
 
 # build artifacts
 /build/

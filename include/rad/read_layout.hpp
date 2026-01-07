@@ -303,7 +303,7 @@ public:
         };
        
         std::string mode = get_rl_mode(input_file);
-        std::string sequencing_type;
+        //std::string sequencing_type;
 
         std::regex_search(mode, std::regex("bulk")) ? sequencing_type = "bulk" : "";
 

@@ -243,7 +243,110 @@ private:
         return edit_distance;
     }
 
+
 public:
+
+/**
+ * @brief Extract N-masked regions from an aligned sequence using CIGAR-based position mapping
+ * @param result The static_alignments struct containing alignment info (seq, cigar)
+ * @param query The original query/template sequence containing N's
+ * @return String containing extracted N-masked region(s) joined by "_", or empty if no N's
+ */
+    std::string extract_n_masked_regions(const static_alignments& result, const std::string& query) {
+        if (query.empty() || result.seq.empty()) {
+            return "";
+        }
+
+        // Find N-region boundaries in the query
+        std::vector<std::pair<size_t, size_t>> n_regions;  // start, end (exclusive)
+        size_t n_start = std::string::npos;
+        for (size_t i = 0; i < query.size(); i++) {
+            if (query[i] == 'N' || query[i] == 'n') {
+                if (n_start == std::string::npos) {
+                    n_start = i;
+                }
+            } else {
+                if (n_start != std::string::npos) {
+                    n_regions.push_back({n_start, i});
+                    n_start = std::string::npos;
+                }
+            }
+        }
+        // Handle trailing N's
+        if (n_start != std::string::npos) {
+            n_regions.push_back({n_start, query.size()});
+        }
+
+        if (n_regions.empty()) {
+            return "";
+        }
+
+        // Build query-to-target position mapping using CIGAR if available
+        std::vector<int> query_to_target(query.size(), -1);  // -1 = no mapping (deletion)
+
+        if (!result.cigar.empty()) {
+            // Parse CIGAR and map positions
+            size_t q_pos = 0;  // position in query
+            size_t t_pos = 0;  // position in target (result.seq)
+            const char* cig = result.cigar.c_str();
+
+            while (*cig) {
+                int count = 0;
+                while (std::isdigit(*cig)) {
+                    count = count * 10 + (*cig - '0');
+                    ++cig;
+                }
+                char op = *cig;
+                ++cig;
+
+                for (int i = 0; i < count; i++) {
+                    if (op == '=' || op == 'X' || op == 'M') {
+                        // Match/mismatch: both query and target advance
+                        if (q_pos < query.size() && t_pos < result.seq.size()) {
+                            query_to_target[q_pos] = t_pos;
+                        }
+                        q_pos++;
+                        t_pos++;
+                    } else if (op == 'I') {
+                        // Insertion in query: query advances, target doesn't
+                        q_pos++;
+                    } else if (op == 'D') {
+                        // Deletion in query: target advances, query doesn't
+                        t_pos++;
+                    }
+                }
+            }
+        } else {
+            // No CIGAR, assume 1:1 positional mapping
+            for (size_t i = 0; i < query.size() && i < result.seq.size(); i++) {
+                query_to_target[i] = i;
+            }
+        }
+
+        // Extract N-masked regions using the position mapping
+        std::vector<std::string> extracted;
+        for (const auto& region : n_regions) {
+            std::string segment;
+            for (size_t q = region.first; q < region.second; q++) {
+                if (q < query_to_target.size() && query_to_target[q] >= 0
+                    && static_cast<size_t>(query_to_target[q]) < result.seq.size()) {
+                    segment += result.seq[query_to_target[q]];
+                }
+            }
+            if (!segment.empty()) {
+                extracted.push_back(segment);
+            }
+        }
+
+        // Join with "-"
+        std::string output;
+        for (size_t i = 0; i < extracted.size(); i++) {
+            if (i > 0) output += "-";
+            output += extracted[i];
+        }
+        return output;
+    }
+
 /**
  * @brief This is the master alignment function for static elements, using Edlib and SSW.
  * @param query ``std::string`` Query sequence
@@ -285,7 +388,6 @@ public:
         // Custom equality rules:
         // Uppercase A, C, T, G match their lowercase forms and also the pad character 'x'.
         // The masked letter N matches uppercase A, C, T, G and 'x', but not lowercase.
-        //this isn't used here, but will be useful (N-masking for barcodes, etc.)
         const int numEq = 13;
         EdlibEqualityPair customEqualities[numEq] = {
             {'A','a'}, {'C','c'}, {'T','t'}, {'G','g'},
@@ -3018,6 +3120,11 @@ public:
                         adj_end = read_length;
                     }
                     std::pair<int, int> adjusted_positions = {adj_start, adj_end};
+                    std::string full_aligned_seq = mutable_seq.substr(adj_start - 1,
+                                                                       adj_end - adj_start + 1);
+
+                    // Extract N-masked regions if query contains N's
+                    std::string n_extracted = aligner.extract_n_masked_regions(result, it->seq);
 
                     add_element(seq_element(
                         it->class_id,
@@ -3029,8 +3136,9 @@ public:
                         it->direction,
                         true,
                         std::nullopt,
-                        mutable_seq.substr(adj_start - 1,
-                                             adj_end - adj_start + 1)
+                        n_extracted.empty() ? full_aligned_seq : n_extracted,
+                        std::nullopt,
+                        n_extracted.empty() ? std::nullopt : std::optional<std::string>(full_aligned_seq)
                     ));
 
                     // Mask the aligned region so that it is not re-aligned
@@ -3706,7 +3814,26 @@ public:
                     continue;
                 }
             }
-            
+
+            // In bulk mode with no barcodes, use N-masked regions from static elements as barcodes
+            if (bc_map.empty() && additional_info == "bulk") {
+                for (const auto& elem : sig_elements) {
+                    if (elem.type != "static" || elem.direction != dir) {
+                        continue;
+                    }
+                    // Static elements with original_seq have N-masked regions extracted
+                    if (elem.original_seq.has_value() && elem.seq.has_value()) {
+                        auto key = seq_utils::remove_rc(elem.class_id);
+                        if (bc_map.find(key) == bc_map.end()) {
+                            bc_keys.push_back(key);
+                            bc_map[key] = elem.seq.value();  // N-masked region(s)
+                            bc_dir[key] = dir;
+                            cr_map[key] = elem.original_seq.value();  // Full aligned sequence
+                        }
+                    }
+                }
+            }
+
             if ((bc_map.empty() && additional_info != "bulk") || read_seq.empty()) {
                 continue;
             }
@@ -3838,12 +3965,31 @@ public:
                     continue;
                 }
             }
-            
+
+            // In bulk mode with no barcodes, use N-masked regions from static elements as barcodes
+            if (bc_map.empty() && additional_info == "bulk") {
+                for (const auto& elem : sig_elements) {
+                    if (elem.type != "static" || elem.direction != dir) {
+                        continue;
+                    }
+                    // Static elements with original_seq have N-masked regions extracted
+                    if (elem.original_seq.has_value() && elem.seq.has_value()) {
+                        auto key = seq_utils::remove_rc(elem.class_id);
+                        if (bc_map.find(key) == bc_map.end()) {
+                            bc_keys.push_back(key);
+                            bc_map[key] = elem.seq.value();  // N-masked region(s)
+                            bc_dir[key] = dir;
+                            cr_map[key] = elem.original_seq.value();  // Full aligned sequence
+                        }
+                    }
+                }
+            }
+
             // Check if we have essential components - skip this direction if not
             if ((bc_map.empty() && additional_info != "bulk") || read_seq.empty()) {
                 continue; // Skip this direction if either barcode or read are empty
             }
-            
+
             std::string cb_tag, cr_tag;
             for (size_t i = 0; i < bc_keys.size(); ++i) {
                 const auto& key = bc_keys[i];

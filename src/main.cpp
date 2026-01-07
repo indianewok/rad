@@ -226,7 +226,7 @@ int cmd_prep(int argc, char* argv[]) {
             read_layout.generate_position_mapping();
             
             // Display if max verbose
-            if (max_verbose) {
+            if (verbose) {
                 std::cout << "\n";
                 read_layout.display_read_layout();
             }
@@ -690,8 +690,8 @@ int cmd_demux(int argc, char* argv[]) {
             if (verbose) std::cout << "[import_read_layout] from " << outbase.string() + "_layout.csv\n";
             read_layout.import_read_layout(outbase.string() + "_layout.csv", max_verbose);
         } else {
-            if (verbose) std::cout << "[prep_read_layout] Generating read layout...\n";
-            read_layout.prep_new_layout(layout_csv, max_verbose);
+            if (verbose) std::cout << "[prep_new_layout] Generating read layout...\n";
+            read_layout.prep_new_layout(layout_csv, verbose);
         }
         auto rl_gen_elapsed = std::chrono::steady_clock::now() - main_start;
         std::cout << "[main] Read layout generation time: "

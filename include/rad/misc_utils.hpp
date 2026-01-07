@@ -537,8 +537,7 @@ namespace config_utils {
         {"sctagger", "resources/read_layout/sctagger_sim_read_layout.csv" },
         {"three_prime", "resources/read_layout/three_prime_read_layout.csv" },
         {"splitseq", "resources/read_layout/splitseq_read_layout.csv" },
-        {"curio_sc", "resources/read_layout/curio_sc_read_layout.csv" },
-        {"curio_trekker", "resources/read_layout/curio_trekker_read_layout.csv"},
+        {"visium", "resources/read_layout/visium_three_prime_read_layout.csv" },
         {"nanopore_rapid_bc", "resources/read_layout/nanopore_bulk_rapid_bc_read_layout.csv" }
     };
 
