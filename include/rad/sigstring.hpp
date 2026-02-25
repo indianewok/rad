@@ -2893,6 +2893,7 @@ private:
         const ReadLayout& layout, 
         int gen_mut,  
         const std::string& mode, 
+        const std::string& joint_bc_mode,
         bool verbose
     ) {
         
@@ -2906,7 +2907,9 @@ private:
         }
 
         bool has_multiple_barcodes = barcode_ids.size() > 1;
+        bool strict_joint_mode = (joint_bc_mode == "strict");
         bool all_barcodes_passed = true;
+        bool any_barcode_passed = false;
 
         auto& id_index = sig_elements.get<sig_id_tag>();
         for (size_t i = 0; i < barcode_ids.size();) {
@@ -2922,6 +2925,7 @@ private:
                 if (next_it != id_index.end()) {
                     seq_element next_elem = *next_it;
                     if (try_process_joint_barcode_pair(elem, next_elem, layout, read, verbose)) {
+                        any_barcode_passed = true;
                         i += 2;
                         continue;
                     }
@@ -2930,17 +2934,21 @@ private:
 
             bool barcode_passed = process_single_barcode(elem, layout, read, gen_mut, mode, verbose);
             if (!barcode_passed) {
+                all_barcodes_passed = false;
                 mark_element_failed(elem.class_id);
-                //add_failed_barcode_to_filter(elem, layout, verbose);
-                // If single barcode fails, direction fails
-                if (!has_multiple_barcodes) {
-                    all_barcodes_passed = false;
-                    break;
-                }
+            } else {
+                any_barcode_passed = true;
             }
             ++i;
         }
-        return all_barcodes_passed;
+
+        if (!has_multiple_barcodes) {
+            return all_barcodes_passed;
+        }
+        if (strict_joint_mode) {
+            return all_barcodes_passed;
+        }
+        return any_barcode_passed;
     }
 
 /**
@@ -3095,7 +3103,12 @@ private:
         auto& id_index = sig_elements.get<sig_id_tag>();
         auto it = id_index.find(class_id);
         if (it != id_index.end()) {
-            id_index.modify(it, [](seq_element& e) noexcept { e.element_pass = false; });
+            id_index.modify(it, [](seq_element& e) noexcept {
+                e.element_pass = false;
+                if (e.global_class == "barcode") {
+                    e.write = false;
+                }
+            });
         }
     }
     
@@ -3546,7 +3559,7 @@ public:
  * This function also includes concatenate resolution logic.
  */
     void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, int gen_mut, bool verbose, 
-        std::string mode
+        std::string mode, const std::string& joint_bc_mode
     ) {
         
         constexpr char qual_mask = '\x7F';
@@ -3586,7 +3599,7 @@ public:
                 continue;
             }
             bool barcode_success = process_barcodes_for_direction(
-                direction, elements, read, layout, gen_mut, mode, verbose
+                direction, elements, read, layout, gen_mut, mode, joint_bc_mode, verbose
             );
             
             if (!barcode_success) {
@@ -3634,7 +3647,8 @@ public:
         size_t chunk_size, 
         size_t max_reads, 
         bool write_debug, 
-        std::string mode
+        std::string mode,
+        std::string joint_bc_mode = "default"
     ) {
     const auto sigalign_wall_t0 = std::chrono::steady_clock::now();
 
@@ -3741,7 +3755,7 @@ public:
                     SigString sig(read.id, read.seq.length(),"undefined", layout.sequencing_type);
                     sig.sigalign_static(read, layout, verbose);
                     sig.sigalign_variable(read, layout, verbose);
-                    sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode);
+                    sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode, joint_bc_mode);
 
                     // Keep for debug if needed
                     if (write_debug) {

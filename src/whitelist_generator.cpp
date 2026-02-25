@@ -5,6 +5,8 @@ struct extracted_bc {
     std::string sequence;
     int position;
     bool is_rc;
+    std::string barcode_1;
+    std::string barcode_2;
 };
 
 static const EdlibEqualityPair kWildcardEqualities[8] = {
@@ -120,7 +122,7 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
                         false);
 
                     if (!barcode.empty()) {
-                        thread_results.push_back({read.read_id, barcode, adapter_seq_pos, false});
+                        thread_results.push_back({read.read_id, barcode, adapter_seq_pos, false, "", ""});
                     }
                 }
 
@@ -137,7 +139,7 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
                         m_right,
                             true);
                         if (!barcode.empty()) {
-                            thread_results.push_back({read.read_id, barcode, adapter_seq_pos, true});
+                            thread_results.push_back({read.read_id, barcode, adapter_seq_pos, true, "", ""});
                         }
                     }
                 }
@@ -159,7 +161,7 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
                                                     bc_length, m_left, m_right, false);
                 
                 if (!barcode.empty()) {
-                    thread_results.push_back({read.read_id, barcode, adapter_seq_pos, false});
+                    thread_results.push_back({read.read_id, barcode, adapter_seq_pos, false, "", ""});
                 }
             }
             edlibFreeAlignResult(result);
@@ -179,7 +181,7 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
                 std::string barcode = extract_barcode(read.sequence, adapter_seq_pos, adapter_seq_rc.length(), 
                                                     bc_length, m_left, m_right, true);
                 if (!barcode.empty()) {
-                    thread_results.push_back({read.read_id, barcode, adapter_seq_pos, true});
+                    thread_results.push_back({read.read_id, barcode, adapter_seq_pos, true, "", ""});
                 }
             }
             edlibFreeAlignResult(result);
@@ -326,18 +328,28 @@ load_split_whitelist_csv(const std::string& path) {
     std::unordered_set<std::string> seqs;
     std::vector<int> all_lengths;
 
-    std::ifstream in(path);
-    if (!in) {
-        std::cerr << "Error: Could not open split-barcode whitelist: " << path << "\n";
+    std::vector<std::string> lines;
+    try {
+        lines = streaming_utils::import_text(path);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: Could not open split-barcode whitelist: " << path
+                  << " (" << e.what() << ")\n";
         return {seqs, {}};
     }
 
-    std::string line;
     bool first_line = true;
-    while (std::getline(in, line)) {
+    for (auto line : lines) {
         line = seq_utils::trim(line);
         if (line.empty()) continue;
-        if (first_line) { first_line = false; continue; }  // skip header
+        if (first_line) {
+            first_line = false;
+            if (seq_utils::trim(line) == "whitelist_bcs") continue; // header
+        }
+        auto comma = line.find(',');
+        if (comma != std::string::npos) {
+            line = seq_utils::trim(line.substr(0, comma));
+        }
+        if (line.empty()) continue;
         seqs.insert(line);
         all_lengths.push_back((int)line.size());
     }
@@ -351,8 +363,14 @@ load_split_whitelist_csv(const std::string& path) {
 // adapter_end + umi_length.  The extra search offset range
 // [search_extra_min, search_extra_max] handles the small positional
 // jitter expected in two-part barcode protocols.
-// Returns the concatenated BC1+BC2 string, or "" if no pair is found.
-std::string extract_split_barcode(
+// Returns split barcode fields when a valid pair is found.
+struct split_barcode_hit {
+    std::string bc1;
+    std::string bc2;
+    std::string combined() const { return bc1 + bc2; }
+};
+
+std::optional<split_barcode_hit> extract_split_barcode(
     const std::string& seq,
     int adapter_end,
     int umi_length,
@@ -377,14 +395,18 @@ std::string extract_split_barcode(
             if (bc1_set.count(seq.substr(bc1_start, len1))) {
                 for (int len2 : bc2_lengths) {
                     if (bc1_end + len2 > seq_len) continue;
-                    if (bc2_set.count(seq.substr(bc1_end, len2))) {
-                        return seq.substr(bc1_start, len1 + len2);
+                    std::string bc2 = seq.substr(bc1_end, len2);
+                    if (bc2_set.count(bc2)) {
+                        split_barcode_hit hit;
+                        hit.bc1 = seq.substr(bc1_start, len1);
+                        hit.bc2 = std::move(bc2);
+                        return hit;
                     }
                 }
             }
         }
     }
-    return "";
+    return std::nullopt;
 }
 
 std::vector<extracted_bc> process_read_chunk_split_barcode(
@@ -423,12 +445,19 @@ std::vector<extracted_bc> process_read_chunk_split_barcode(
             const auto& read = chunk[i];
 
             auto try_pair = [&](const std::string& seq, int adapter_end, bool is_rc) -> bool {
-                std::string bc = extract_split_barcode(
+                auto hit = extract_split_barcode(
                     seq, adapter_end, umi_length,
                     bc1_set, bc1_lengths, bc2_set, bc2_lengths,
                     search_extra_min, search_extra_max);
-                if (!bc.empty()) {
-                    thread_results.push_back({read.read_id, bc, adapter_end, is_rc});
+                if (hit.has_value()) {
+                    thread_results.push_back({
+                        read.read_id,
+                        hit->combined(),
+                        adapter_end,
+                        is_rc,
+                        hit->bc1,
+                        hit->bc2
+                    });
                     return true;
                 }
                 return false;
@@ -563,6 +592,52 @@ static bool ensure_output_directory(const std::string& prefix) {
         return false;
     }
     return true;
+}
+
+void write_split_pair_counts(const std::vector<extracted_bc>& extracted_barcodes,
+                             const std::string& output_csv) {
+    std::unordered_map<std::string, uint64_t> counts;
+    counts.reserve(extracted_barcodes.size());
+
+    for (const auto& x : extracted_barcodes) {
+        if (x.barcode_1.empty() || x.barcode_2.empty()) continue;
+        std::string key = x.barcode_1;
+        key.push_back('\t');
+        key += x.barcode_2;
+        ++counts[key];
+    }
+
+    std::vector<std::tuple<std::string, std::string, uint64_t>> rows;
+    rows.reserve(counts.size());
+    for (const auto& kv : counts) {
+        auto tab = kv.first.find('\t');
+        if (tab == std::string::npos) continue;
+        rows.emplace_back(
+            kv.first.substr(0, tab),
+            kv.first.substr(tab + 1),
+            kv.second
+        );
+    }
+
+    std::sort(rows.begin(), rows.end(),
+              [](const auto& a, const auto& b) {
+                  if (std::get<2>(a) != std::get<2>(b)) return std::get<2>(a) > std::get<2>(b);
+                  if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) < std::get<0>(b);
+                  return std::get<1>(a) < std::get<1>(b);
+              });
+
+    std::ofstream out(output_csv);
+    if (!out.is_open()) {
+        std::cerr << "Warning: could not write split pair counts to " << output_csv << "\n";
+        return;
+    }
+    out << "bc1,bc2,pair,count\n";
+    for (const auto& row : rows) {
+        const auto& bc1 = std::get<0>(row);
+        const auto& bc2 = std::get<1>(row);
+        const auto cnt = std::get<2>(row);
+        out << bc1 << "," << bc2 << "," << bc1 << bc2 << "," << cnt << "\n";
+    }
 }
 
 std::vector<batch_entry> read_batch_csv(const std::string& filename) {
@@ -1496,6 +1571,10 @@ int main(int argc, char* argv[]) {
                 umi_length, bc1_set, bc1_lengths, bc2_set, bc2_lengths,
                 offset_min, offset_max,
                 max_reads, max_error, chunk_size, num_threads);
+
+            std::string pair_counts_output = resolved_prefix + "_valid_pairs.csv";
+            write_split_pair_counts(barcodes, pair_counts_output);
+            std::cout << "Raw valid BC1+BC2 pair counts written to: " << pair_counts_output << "\n";
 
             std::vector<std::string> empty_wl;
             count_perfect_matches_with_stats(barcodes, empty_wl, csv_output, text_output, verbose);

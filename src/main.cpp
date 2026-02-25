@@ -28,6 +28,7 @@ static void usage_demux(const char* prog) {
       << "  -g, --global_whitelist            path to custom global whitelist CSV\n"
       << "  -c, --custom_whitelist            path to custom whitelist CSV\n"
       << "  -R, --bc_correction_mode          'offensive' (default) or 'defensive'\n"
+      << "      --joint-bc-mode               'default' (permissive) or 'strict' (all barcodes must pass)\n"
       << "  -M, --whitelist_mutation          mutation space for whitelist (default: 2)\n"
       << "  -m, --generated_mutation          mutation space for generated barcodes (default: 2)\n"
       << "  -n, --max_reads                   maximum number of reads (default: all)\n"
@@ -908,6 +909,7 @@ int cmd_demux(int argc, char* argv[]) {
     size_t max_reads = -1;
     size_t chunk_size = 5000;
     std::string bc_corr_mode = "offensive";
+    std::string joint_bc_mode = "default";
 
     const char* optstring = "l:q:k:g:c:R:M:m:n:z:o:d:F:wbt:vDh";
     struct option longopts[] = {
@@ -926,6 +928,7 @@ int cmd_demux(int argc, char* argv[]) {
         {"log-file",                    required_argument, nullptr, 'F'},
         {"write_dbg",                   no_argument,       nullptr, 'w'},
         {"bc_split",                    no_argument,       nullptr, 'b'},
+        {"joint-bc-mode",               required_argument, nullptr,  1 },
         {"threads",                     required_argument, nullptr, 't'},
         {"verbose",                     no_argument,       nullptr, 'v'},
         {"max_verbose",                 no_argument,       nullptr, 'D'},
@@ -951,6 +954,17 @@ int cmd_demux(int argc, char* argv[]) {
           case 'F': log_file               = optarg;            break;
           case 'w': write_debug            = true;              break;
           case 'b': split_bc               = true;              break;
+          case 1: {
+              joint_bc_mode = optarg ? optarg : "default";
+              std::transform(joint_bc_mode.begin(), joint_bc_mode.end(), joint_bc_mode.begin(),
+                             [](unsigned char ch){ return static_cast<char>(std::tolower(ch)); });
+              if (joint_bc_mode == "auto") joint_bc_mode = "default";
+              if (joint_bc_mode != "default" && joint_bc_mode != "strict") {
+                  std::cerr << "[ERROR] --joint-bc-mode must be one of: default, strict\n";
+                  return 1;
+              }
+              break;
+          }
           case 't': nthreads               = std::stoi(optarg); break;
           case 'v': verbose                = true;              break;
           case 'D': max_verbose            = true;              break;
@@ -1052,6 +1066,7 @@ int cmd_demux(int argc, char* argv[]) {
                   << "  global whitelist             : " << (global_whitelist_path.empty()? "[none]" : global_whitelist_path) << "\n"
                   << "  custom whitelist             : " << (custom_whitelist_path.empty()? "[none]" : custom_whitelist_path) << "\n"
                   << "  barcode correction mode      : " << bc_corr_mode             << "\n"
+                  << "  joint barcode mode           : " << joint_bc_mode            << "\n"
                   << "  whitelist-generated mutations: " << (wl_mut ? std::to_string(*wl_mut) : "default(2)") << "\n"
                   << "  read-generated mutations     : " << (gen_mut ? std::to_string(*gen_mut) : "default(2)") << "\n"
                   << "  max reads                    : " << (max_reads == -1 ? "all" : std::to_string(max_reads)) << "\n"
@@ -1151,7 +1166,7 @@ int cmd_demux(int argc, char* argv[]) {
         memory_utils::get_rss();
         
         size_t max_reads_param = (max_reads == -1) ? -1 : max_reads;
-        SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut, max_verbose, nthreads, chunk_size, max_reads_param, write_debug, bc_corr_mode);
+        SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut, max_verbose, nthreads, chunk_size, max_reads_param, write_debug, bc_corr_mode, joint_bc_mode);
         
         auto sig_time = std::chrono::steady_clock::now() - sigalign_start;
         std::cout << "[sigalign] End-to-end wall time: "
@@ -1256,7 +1271,8 @@ int cmd_list(int argc, char* argv[]) {
 
         for (const auto& kv : rows) {
             try {
-                std::cout << kv.first << "\t" << config_utils::get_read_layout(kv.first) << "\n";
+                std::string resolved = config_utils::get_read_layout(kv.first);
+                std::cout << kv.first << "\t" << resolved << "\n";
             } catch (const std::exception& e) {
                 std::cout << kv.first << "\t[unresolved] " << kv.second
                           << " (" << e.what() << ")\n";
@@ -1276,7 +1292,8 @@ int cmd_list(int argc, char* argv[]) {
 
         for (const auto& kv : rows) {
             try {
-                std::cout << kv.first << "\t" << whitelist_utils::kit_to_path(kv.first) << "\n";
+                std::string resolved = whitelist_utils::kit_to_path(kv.first);
+                std::cout << kv.first << "\t" << resolved << "\n";
             } catch (const std::exception& e) {
                 std::cout << kv.first << "\t[unresolved] " << kv.second
                           << " (" << e.what() << ")\n";
@@ -1339,7 +1356,8 @@ int cmd_modify(int argc, char* argv[]) {
             config_utils::save_read_layout(layout_key, add_path);
             std::cout << "[modify] layout[" << layout_key << "] = " << add_path << "\n";
             try {
-                std::cout << "[modify] resolved path: " << config_utils::get_read_layout(layout_key) << "\n";
+                std::string resolved = config_utils::get_read_layout(layout_key);
+                std::cout << "[modify] resolved path: " << resolved << "\n";
             } catch (const std::exception& e) {
                 std::cout << "[modify] warning: layout is currently unresolved (" << e.what() << ")\n";
             }
@@ -1356,7 +1374,8 @@ int cmd_modify(int argc, char* argv[]) {
             whitelist_utils::set_whitelist_path(whitelist_key, add_path);
             std::cout << "[modify] whitelist[" << whitelist_key << "] = " << add_path << "\n";
             try {
-                std::cout << "[modify] resolved path: " << whitelist_utils::kit_to_path(whitelist_key) << "\n";
+                std::string resolved = whitelist_utils::kit_to_path(whitelist_key);
+                std::cout << "[modify] resolved path: " << resolved << "\n";
             } catch (const std::exception& e) {
                 std::cout << "[modify] warning: whitelist is currently unresolved (" << e.what() << ")\n";
             }

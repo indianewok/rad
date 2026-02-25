@@ -398,8 +398,8 @@ namespace streaming_utils {
 };
 
 namespace whitelist_utils {
-    // Map of kit names to their respective whitelist paths
-    static std::unordered_map<std::string,std::string> kit_wl_paths = {
+    inline const std::unordered_map<std::string, std::string>& default_kit_wl_paths() {
+        static const std::unordered_map<std::string, std::string> defaults = {
         //splitseq barcodes
         {"splitseq_bc1", "resources/wl/splitseq_bc1_bitlist.csv.gz"},
         {"splitseq_bc2", "resources/wl/splitseq_bc2_bitlist.csv.gz"},
@@ -430,13 +430,23 @@ namespace whitelist_utils {
         { "visium_hd_v1", "resources/wl/visium_hd_v1_whitelist.csv.gz" },
         { "visium_hd_bc1", "resources/wl/visium_hd_bc1.csv.gz" },
         { "visium_hd_bc2", "resources/wl/visium_hd_bc2.csv.gz" }
-    };
+        };
+        return defaults;
+    }
+
+    // Effective map (defaults + runtime overrides - tombstoned removals)
+    static std::unordered_map<std::string, std::string> kit_wl_paths = default_kit_wl_paths();
 
     inline std::filesystem::path whitelist_override_path() {
         if (const char* home = std::getenv("HOME"); home && *home) {
             return std::filesystem::path(home) / ".rad" / "whitelist_overrides.tsv";
         }
         return std::filesystem::current_path() / ".rad_whitelist_overrides.tsv";
+    }
+
+    inline std::unordered_set<std::string>& removed_whitelist_keys() {
+        static std::unordered_set<std::string> removed;
+        return removed;
     }
 
     inline bool& whitelist_overrides_loaded() {
@@ -453,8 +463,9 @@ namespace whitelist_utils {
 
         std::string line;
         while (std::getline(in, line)) {
-            line = seq_utils::trim(line);
-            if (line.empty() || line[0] == '#') continue;
+            std::string trimmed_line = seq_utils::trim(line);
+            if (trimmed_line.empty() || trimmed_line[0] == '#') continue;
+
             auto tab = line.find('\t');
             if (tab == std::string::npos) continue;
 
@@ -464,8 +475,10 @@ namespace whitelist_utils {
 
             if (value.empty()) {
                 kit_wl_paths.erase(key);
+                removed_whitelist_keys().insert(key);
             } else {
                 kit_wl_paths[key] = value;
+                removed_whitelist_keys().erase(key);
             }
         }
     }
@@ -479,16 +492,40 @@ namespace whitelist_utils {
         std::ofstream out(out_path);
         if (!out.is_open()) return false;
 
+        const auto& defaults = default_kit_wl_paths();
         std::vector<std::pair<std::string, std::string>> rows;
         rows.reserve(kit_wl_paths.size());
         for (const auto& kv : kit_wl_paths) {
+            auto dit = defaults.find(kv.first);
+            if (dit != defaults.end() && dit->second == kv.second) {
+                continue; // not an override; omit
+            }
             rows.emplace_back(kv.first, kv.second);
         }
         std::sort(rows.begin(), rows.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
 
+        std::vector<std::string> tombstones;
+        tombstones.reserve(removed_whitelist_keys().size());
+        for (const auto& key : removed_whitelist_keys()) {
+            if (defaults.find(key) != defaults.end()) {
+                tombstones.push_back(key);
+            }
+        }
+        std::sort(tombstones.begin(), tombstones.end());
+
+        if (rows.empty() && tombstones.empty()) {
+            out.close();
+            std::error_code rm_ec;
+            std::filesystem::remove(out_path, rm_ec);
+            return true;
+        }
+
         for (const auto& kv : rows) {
             out << kv.first << '\t' << kv.second << '\n';
+        }
+        for (const auto& key : tombstones) {
+            out << key << '\t' << '\n'; // tombstone removal marker
         }
         return true;
     }
@@ -635,6 +672,7 @@ namespace whitelist_utils {
 
     inline void set_whitelist_path(const std::string &kit, const std::string &path) {
         load_whitelist_overrides_once();
+        removed_whitelist_keys().erase(kit);
         kit_wl_paths[kit] = path;
         if (!persist_whitelist_overrides()) {
             std::cerr << "[WARNING] Failed to persist whitelist overrides to "
@@ -644,7 +682,14 @@ namespace whitelist_utils {
 
     inline bool remove_whitelist_path(const std::string &kit) {
         load_whitelist_overrides_once();
-        bool removed = kit_wl_paths.erase(kit) > 0;
+        bool removed = false;
+        if (kit_wl_paths.erase(kit) > 0) {
+            removed = true;
+        }
+        if (default_kit_wl_paths().find(kit) != default_kit_wl_paths().end()) {
+            removed_whitelist_keys().insert(kit);
+            removed = true;
+        }
         if (removed && !persist_whitelist_overrides()) {
             std::cerr << "[WARNING] Failed to persist whitelist overrides to "
                       << whitelist_override_path().string() << "\n";
@@ -657,7 +702,8 @@ namespace whitelist_utils {
 namespace config_utils {
 
     //config for read layout
-    static std::unordered_map<std::string, std::string> layout_files = {
+    inline const std::unordered_map<std::string, std::string>& default_layout_files() {
+        static const std::unordered_map<std::string, std::string> defaults = {
         {"five_prime", "resources/read_layout/five_prime_read_layout.csv" },
         {"sctagger", "resources/read_layout/sctagger_sim_read_layout.csv" },
         {"three_prime", "resources/read_layout/three_prime_read_layout.csv" },
@@ -666,13 +712,22 @@ namespace config_utils {
         {"visium_hd", "resources/read_layout/visium_hd_read_layout.csv" },
         {"visium_hd_full_bc", "resources/read_layout/visium_hd_read_layout_full_bc.csv" },
         {"nanopore_rapid_bc", "resources/read_layout/nanopore_bulk_rapid_bc_read_layout.csv" }
-    };
+        };
+        return defaults;
+    }
+
+    static std::unordered_map<std::string, std::string> layout_files = default_layout_files();
 
     inline std::filesystem::path layout_override_path() {
         if (const char* home = std::getenv("HOME"); home && *home) {
             return std::filesystem::path(home) / ".rad" / "layout_overrides.tsv";
         }
         return std::filesystem::current_path() / ".rad_layout_overrides.tsv";
+    }
+
+    inline std::unordered_set<std::string>& removed_layout_keys() {
+        static std::unordered_set<std::string> removed;
+        return removed;
     }
 
     inline bool& layout_overrides_loaded() {
@@ -689,8 +744,9 @@ namespace config_utils {
 
         std::string line;
         while (std::getline(in, line)) {
-            line = seq_utils::trim(line);
-            if (line.empty() || line[0] == '#') continue;
+            std::string trimmed_line = seq_utils::trim(line);
+            if (trimmed_line.empty() || trimmed_line[0] == '#') continue;
+
             auto tab = line.find('\t');
             if (tab == std::string::npos) continue;
 
@@ -700,8 +756,10 @@ namespace config_utils {
 
             if (value.empty()) {
                 layout_files.erase(key);
+                removed_layout_keys().insert(key);
             } else {
                 layout_files[key] = value;
+                removed_layout_keys().erase(key);
             }
         }
     }
@@ -715,16 +773,40 @@ namespace config_utils {
         std::ofstream out(out_path);
         if (!out.is_open()) return false;
 
+        const auto& defaults = default_layout_files();
         std::vector<std::pair<std::string, std::string>> rows;
         rows.reserve(layout_files.size());
         for (const auto& kv : layout_files) {
+            auto dit = defaults.find(kv.first);
+            if (dit != defaults.end() && dit->second == kv.second) {
+                continue; // not an override; omit
+            }
             rows.emplace_back(kv.first, kv.second);
         }
         std::sort(rows.begin(), rows.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
 
+        std::vector<std::string> tombstones;
+        tombstones.reserve(removed_layout_keys().size());
+        for (const auto& key : removed_layout_keys()) {
+            if (defaults.find(key) != defaults.end()) {
+                tombstones.push_back(key);
+            }
+        }
+        std::sort(tombstones.begin(), tombstones.end());
+
+        if (rows.empty() && tombstones.empty()) {
+            out.close();
+            std::error_code rm_ec;
+            std::filesystem::remove(out_path, rm_ec);
+            return true;
+        }
+
         for (const auto& kv : rows) {
             out << kv.first << '\t' << kv.second << '\n';
+        }
+        for (const auto& key : tombstones) {
+            out << key << '\t' << '\n'; // tombstone removal marker
         }
         return true;
     }
@@ -796,6 +878,7 @@ namespace config_utils {
 
     inline void save_read_layout(const std::string &type, const std::string &path) {
         load_layout_overrides_once();
+        removed_layout_keys().erase(type);
         layout_files[type] = path;
         if (!persist_layout_overrides()) {
             std::cerr << "[WARNING] Failed to persist layout overrides to "
@@ -805,7 +888,14 @@ namespace config_utils {
     
     inline bool remove_read_layout(const std::string &type) {
         load_layout_overrides_once();
-        bool removed = layout_files.erase(type) > 0;
+        bool removed = false;
+        if (layout_files.erase(type) > 0) {
+            removed = true;
+        }
+        if (default_layout_files().find(type) != default_layout_files().end()) {
+            removed_layout_keys().insert(type);
+            removed = true;
+        }
         if (removed && !persist_layout_overrides()) {
             std::cerr << "[WARNING] Failed to persist layout overrides to "
                       << layout_override_path().string() << "\n";
