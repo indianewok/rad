@@ -41,3 +41,6 @@ CLAUDE.*
 
 # build artifacts
 /build/
+
+# files that are too large
+resources/wl/visium_hd_coordinates.csv.gz
