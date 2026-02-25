@@ -314,6 +314,236 @@ std::vector<std::string> read_whitelist(const std::string& filename) {
     return whitelist;
 }
 
+// -----------------------------------------------------------------------
+// Two-part barcode (BC1 + BC2) support
+// -----------------------------------------------------------------------
+
+// Load a two-part barcode whitelist CSV. The first row is a header; subsequent
+// rows are bare barcode sequences.  Returns {sequence set, sorted vector
+// of unique lengths found in the whitelist}.
+std::pair<std::unordered_set<std::string>, std::vector<int>>
+load_split_whitelist_csv(const std::string& path) {
+    std::unordered_set<std::string> seqs;
+    std::vector<int> all_lengths;
+
+    std::ifstream in(path);
+    if (!in) {
+        std::cerr << "Error: Could not open split-barcode whitelist: " << path << "\n";
+        return {seqs, {}};
+    }
+
+    std::string line;
+    bool first_line = true;
+    while (std::getline(in, line)) {
+        line = seq_utils::trim(line);
+        if (line.empty()) continue;
+        if (first_line) { first_line = false; continue; }  // skip header
+        seqs.insert(line);
+        all_lengths.push_back((int)line.size());
+    }
+
+    std::sort(all_lengths.begin(), all_lengths.end());
+    all_lengths.erase(std::unique(all_lengths.begin(), all_lengths.end()), all_lengths.end());
+    return {seqs, all_lengths};
+}
+
+// Search for a valid BC1+BC2 pair in a read window that begins at
+// adapter_end + umi_length.  The extra search offset range
+// [search_extra_min, search_extra_max] handles the small positional
+// jitter expected in two-part barcode protocols.
+// Returns the concatenated BC1+BC2 string, or "" if no pair is found.
+std::string extract_split_barcode(
+    const std::string& seq,
+    int adapter_end,
+    int umi_length,
+    const std::unordered_set<std::string>& bc1_set,
+    const std::vector<int>& bc1_lengths,
+    const std::unordered_set<std::string>& bc2_set,
+    const std::vector<int>& bc2_lengths,
+    int search_extra_min,
+    int search_extra_max)
+{
+    const int seq_len = (int)seq.size();
+    const int window_base = adapter_end + umi_length;
+
+    for (int extra = search_extra_min; extra <= search_extra_max; ++extra) {
+        const int bc1_start = window_base + extra;
+        if (bc1_start < 0 || bc1_start >= seq_len) continue;
+
+        for (int len1 : bc1_lengths) {
+            const int bc1_end = bc1_start + len1;
+            if (bc1_end > seq_len) continue;
+
+            if (bc1_set.count(seq.substr(bc1_start, len1))) {
+                for (int len2 : bc2_lengths) {
+                    if (bc1_end + len2 > seq_len) continue;
+                    if (bc2_set.count(seq.substr(bc1_end, len2))) {
+                        return seq.substr(bc1_start, len1 + len2);
+                    }
+                }
+            }
+        }
+    }
+    return "";
+}
+
+std::vector<extracted_bc> process_read_chunk_split_barcode(
+    const std::vector<read_chunk>& chunk,
+    const std::string& adapter_seq,
+    const std::string& adapter_seq_rc,
+    int umi_length,
+    const std::unordered_set<std::string>& bc1_set,
+    const std::vector<int>& bc1_lengths,
+    const std::unordered_set<std::string>& bc2_set,
+    const std::vector<int>& bc2_lengths,
+    int search_extra_min,
+    int search_extra_max,
+    double max_edit_distance_ratio)
+{
+    std::vector<extracted_bc> chunk_results;
+    chunk_results.reserve(chunk.size() / 5);
+
+    const int max_edits_fwd = compute_max_edit_distance(adapter_seq.size(), max_edit_distance_ratio);
+    const int max_edits_rc  = compute_max_edit_distance(adapter_seq_rc.size(), max_edit_distance_ratio);
+    const bool exact_only   = (max_edits_fwd == 0 && max_edits_rc == 0);
+
+    EdlibAlignConfig fwd_cfg{}, rc_cfg{};
+    if (!exact_only) {
+        fwd_cfg = edlibNewAlignConfig(max_edits_fwd, EDLIB_MODE_HW, EDLIB_TASK_LOC, kWildcardEqualities, 8);
+        rc_cfg  = edlibNewAlignConfig(max_edits_rc,  EDLIB_MODE_HW, EDLIB_TASK_LOC, kWildcardEqualities, 8);
+    }
+
+    #pragma omp parallel
+    {
+        std::vector<extracted_bc> thread_results;
+        thread_results.reserve(chunk.size() / (10 * omp_get_num_threads()));
+
+        #pragma omp for schedule(dynamic, 100)
+        for (size_t i = 0; i < chunk.size(); ++i) {
+            const auto& read = chunk[i];
+
+            auto try_pair = [&](const std::string& seq, int adapter_end, bool is_rc) -> bool {
+                std::string bc = extract_split_barcode(
+                    seq, adapter_end, umi_length,
+                    bc1_set, bc1_lengths, bc2_set, bc2_lengths,
+                    search_extra_min, search_extra_max);
+                if (!bc.empty()) {
+                    thread_results.push_back({read.read_id, bc, adapter_end, is_rc});
+                    return true;
+                }
+                return false;
+            };
+
+            if (exact_only) {
+                auto pos = read.sequence.find(adapter_seq);
+                if (pos != std::string::npos) {
+                    try_pair(read.sequence, (int)(pos + adapter_seq.size()), false);
+                } else {
+                    pos = read.sequence.find(adapter_seq_rc);
+                    if (pos != std::string::npos) {
+                        std::string rc_seq = seq_utils::revcomp(read.sequence);
+                        try_pair(rc_seq, (int)(rc_seq.size() - pos), true);
+                    }
+                }
+                continue;
+            }
+
+            // Fuzzy forward
+            bool found = false;
+            EdlibAlignResult res = edlibAlign(
+                adapter_seq.c_str(), adapter_seq.size(),
+                read.sequence.c_str(), read.sequence.size(), fwd_cfg);
+            if (res.status == EDLIB_STATUS_OK && res.numLocations > 0) {
+                found = try_pair(read.sequence, res.endLocations[0] + 1, false);
+            }
+            edlibFreeAlignResult(res);
+
+            if (!found) {
+                res = edlibAlign(
+                    adapter_seq_rc.c_str(), adapter_seq_rc.size(),
+                    read.sequence.c_str(), read.sequence.size(), rc_cfg);
+                if (res.status == EDLIB_STATUS_OK && res.numLocations > 0) {
+                    std::string rc_seq = seq_utils::revcomp(read.sequence);
+                    // In the RC'd read the adapter ends at (read_len - start_loc)
+                    try_pair(rc_seq, (int)(rc_seq.size() - res.startLocations[0]), true);
+                }
+                edlibFreeAlignResult(res);
+            }
+        }
+
+        #pragma omp critical
+        {
+            chunk_results.insert(chunk_results.end(), thread_results.begin(), thread_results.end());
+        }
+    }
+    return chunk_results;
+}
+
+std::vector<extracted_bc> process_fastq_split_barcode(
+    const std::string& input_path,
+    const std::string& adapter_seq,
+    int umi_length,
+    const std::unordered_set<std::string>& bc1_set,
+    const std::vector<int>& bc1_lengths,
+    const std::unordered_set<std::string>& bc2_set,
+    const std::vector<int>& bc2_lengths,
+    int search_extra_min,
+    int search_extra_max,
+    int max_reads,
+    double max_edit_distance_ratio = 0.1,
+    int chunk_size = 10000,
+    int num_threads = 0)
+{
+    std::vector<extracted_bc> results;
+
+    if (num_threads > 0) omp_set_num_threads(num_threads);
+    std::cout << "Using " << omp_get_max_threads() << " threads\n";
+
+    std::unique_ptr<file_streaming> files_ptr;
+    std::unique_ptr<read_streaming> reader_ptr;
+    try {
+        files_ptr  = std::make_unique<file_streaming>(input_path, std::max(1, num_threads));
+        reader_ptr = std::make_unique<read_streaming>(*files_ptr);
+    } catch (const std::exception& e) {
+        std::cerr << "Error opening " << input_path << ": " << e.what() << "\n";
+        return results;
+    }
+
+    std::string adapter_seq_rc = seq_utils::revcomp(adapter_seq);
+    int reads_processed = 0, chunks_processed = 0;
+
+    while (max_reads <= 0 || reads_processed < max_reads) {
+        std::vector<read_chunk> chunk;
+        chunk.reserve(chunk_size);
+        for (int i = 0; i < chunk_size; ++i) {
+            if (max_reads > 0 && reads_processed >= max_reads) break;
+            auto rec = reader_ptr->next_sequence();
+            if (!rec) break;
+            reads_processed++;
+            chunk.push_back({rec->id, rec->seq});
+        }
+        if (chunk.empty()) break;
+
+        ++chunks_processed;
+        if (chunks_processed % 100 == 0) {
+            std::cout << "Processed " << reads_processed << " reads, "
+                      << results.size() << " BC pairs found\n";
+        }
+
+        auto chunk_res = process_read_chunk_split_barcode(
+            chunk, adapter_seq, adapter_seq_rc,
+            umi_length, bc1_set, bc1_lengths, bc2_set, bc2_lengths,
+            search_extra_min, search_extra_max, max_edit_distance_ratio);
+        results.insert(results.end(), chunk_res.begin(), chunk_res.end());
+    }
+
+    std::cout << "Done: " << reads_processed << " reads, "
+              << results.size() << " BC pairs extracted\n";
+    return results;
+}
+
+// -----------------------------------------------------------------------
+
 struct batch_entry {
     std::string input_fastq;
     std::string output_prefix;
@@ -335,13 +565,6 @@ static bool ensure_output_directory(const std::string& prefix) {
     return true;
 }
 
-static std::string trim_whitespace(const std::string& s) {
-    const auto start = s.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) return "";
-    const auto end = s.find_last_not_of(" \t\r\n");
-    return s.substr(start, end - start + 1);
-}
-
 std::vector<batch_entry> read_batch_csv(const std::string& filename) {
     std::vector<batch_entry> entries;
     std::ifstream in(filename);
@@ -361,8 +584,8 @@ std::vector<batch_entry> read_batch_csv(const std::string& filename) {
         std::getline(ss, fastq_path, ',');
         std::getline(ss, prefix);
 
-        fastq_path = trim_whitespace(fastq_path);
-        prefix = trim_whitespace(prefix);
+        fastq_path = seq_utils::trim(fastq_path);
+        prefix = seq_utils::trim(prefix);
 
         if (fastq_path.empty() || prefix.empty()) {
             std::cerr << "Warning: Skipping line " << line_no << " in " << filename
@@ -1130,48 +1353,64 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
 void print_usage(const char* program_name) {
     std::cout << "Usage: " << program_name << " [options]\n"
               << "Options:\n"
-              << "  -i, --input FILE       Input FASTQ file (use this for single runs)\n"
-              << "  -b, --batch-csv FILE   CSV with FASTQ path and output prefix (two columns, optional)\n"
+              << "  -i, --input FILE            Input FASTQ file (use this for single runs)\n"
+              << "  -b, --batch-csv FILE        CSV with FASTQ path and output prefix (two columns, optional)\n"
               << "  -o, --output-prefix PREFIX  Output prefix for generated files (.txt and .csv)\n"
-              << "  -p, --adapter_seq SEQ       Adapter sequence to search for\n"
-              << "  -n, --barcode-length INT      Number of bases to extract (barcode length)\n"
-              << "  -l, --left-margin INT  Bases to include on left side [default: 0]\n"
-              << "  -r, --right-margin INT Bases to include on right side [default: 0]\n"
-              << "  -m, --max-reads INT    Maximum number of reads to process [default: all]\n"
-              << "  -e, --max-error FLOAT  Maximum edit distance ratio [default: 0.1]\n"
-              << "  -w, --whitelist FILE   Barcode whitelist for perfect match analysis (optional)\n"
-              << "  -t, --threads INT      Number of threads for parallel processing [default: auto]\n"
-              << "  -k, --chunk-size INT   Chunk size for parallel processing [default: 10000]\n"
-              << "  -v, --verbose          Enable verbose/debug output\n"
-              << "  -h, --help             Show this help message\n";
+              << "  -p, --adapter_seq SEQ       Adapter/primer sequence to search for\n"
+              << "  -n, --barcode-length INT    Number of bases to extract (barcode length)\n"
+              << "  -l, --left-margin INT       Bases to include on left side [default: 0]\n"
+              << "  -r, --right-margin INT      Bases to include on right side [default: 0]\n"
+              << "  -m, --max-reads INT         Maximum number of reads to process [default: all]\n"
+              << "  -e, --max-error FLOAT       Maximum edit distance ratio [default: 0.1]\n"
+              << "  -w, --whitelist FILE        Barcode whitelist kit key or path (optional)\n"
+              << "  -t, --threads INT           Number of threads for parallel processing [default: auto]\n"
+              << "  -k, --chunk-size INT        Chunk size for parallel processing [default: 10000]\n"
+              << "  -v, --verbose               Enable verbose/debug output\n"
+              << "  -h, --help                  Show this help message\n"
+              << "\nTwo-part barcode options (BC1+BC2 mode):\n"
+              << "  -1, --bc1-whitelist FILE    BC1 whitelist kit key or path (activates two-part mode)\n"
+              << "  -2, --bc2-whitelist FILE    BC2 whitelist kit key or path\n"
+              << "  -u, --umi-length INT        UMI length between primer and BC1 [default: 9]\n"
+              << "      --offset-min INT        Min extra bases after UMI to start BC1 search [default: 0]\n"
+              << "      --offset-max INT        Max extra bases after UMI to start BC1 search [default: 3]\n";
 }
 
 int main(int argc, char* argv[]) {
     std::string input_file, output_prefix, adapter_seq, whitelist_file, batch_csv_file;
+    std::string bc1_whitelist_file, bc2_whitelist_file;
     int bc_length = 16, m_left = 0, m_right = 0, max_reads = 0, num_threads = 0, chunk_size = 10000;
+    int umi_length = 9, offset_min = 0, offset_max = 3;
     double max_error = 0.1;
     bool verbose = false;
-    
+
     static struct option long_options[] = {
-        {"input", required_argument, 0, 'i'},
-        {"batch-csv", required_argument, 0, 'b'},
-        {"output-prefix", required_argument, 0, 'o'},
-        {"adapter_seq", required_argument, 0, 'p'},
+        {"input",          required_argument, 0, 'i'},
+        {"batch-csv",      required_argument, 0, 'b'},
+        {"output-prefix",  required_argument, 0, 'o'},
+        {"adapter_seq",    required_argument, 0, 'p'},
         {"barcode-length", required_argument, 0, 'n'},
-        {"left-margin", required_argument, 0, 'l'},
-        {"right-margin", required_argument, 0, 'r'},
-        {"max-reads", required_argument, 0, 'm'},
-        {"max-error", required_argument, 0, 'e'},
-        {"whitelist", optional_argument, 0, 'w'},
-        {"threads", required_argument, 0, 't'},
-        {"chunk-size", required_argument, 0, 'k'},
-        {"verbose", no_argument, 0, 'v'},
-        {"help", no_argument, 0, 'h'},
+        {"left-margin",    required_argument, 0, 'l'},
+        {"right-margin",   required_argument, 0, 'r'},
+        {"max-reads",      required_argument, 0, 'm'},
+        {"max-error",      required_argument, 0, 'e'},
+        {"whitelist",      optional_argument, 0, 'w'},
+        {"threads",        required_argument, 0, 't'},
+        {"chunk-size",     required_argument, 0, 'k'},
+        {"bc1-whitelist",  required_argument, 0, '1'},
+        {"bc2-whitelist",  required_argument, 0, '2'},
+        {"umi-length",     required_argument, 0, 'u'},
+        {"offset-min",     required_argument, 0,  3 },
+        {"offset-max",     required_argument, 0,  4 },
+        // Backward-compatible aliases
+        {"hd-offset-min",  required_argument, 0,  3 },
+        {"hd-offset-max",  required_argument, 0,  4 },
+        {"verbose",        no_argument,       0, 'v'},
+        {"help",           no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
-    
+
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:b:o:p:n:l:r:m:e:w:t:k:hv", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:b:o:p:n:l:r:m:e:w:t:k:1:2:u:hv", long_options, NULL)) != -1) {
         switch (opt) {
             case 'i': input_file = optarg; break;
             case 'b': batch_csv_file = optarg; break;
@@ -1185,6 +1424,11 @@ int main(int argc, char* argv[]) {
             case 'w': whitelist_file = optarg; break;
             case 't': num_threads = std::atoi(optarg); break;
             case 'k': chunk_size = std::atoi(optarg); break;
+            case '1': bc1_whitelist_file = optarg; break;
+            case '2': bc2_whitelist_file = optarg; break;
+            case 'u': umi_length = std::atoi(optarg); break;
+            case  3 : offset_min = std::atoi(optarg); break;
+            case  4 : offset_max = std::atoi(optarg); break;
             case 'v': verbose = true; break;
             case 'h': print_usage(argv[0]); return 0;
             default: print_usage(argv[0]); return 1;
@@ -1210,43 +1454,84 @@ int main(int argc, char* argv[]) {
         std::cout << "Batch CSV provided - ignoring single --input value\n";
     }
 
+    const bool split_barcode_mode = !bc1_whitelist_file.empty() && !bc2_whitelist_file.empty();
+
     auto run_single = [&](const std::string& fastq_path, const std::string& output_prefix) {
         std::string resolved_prefix = output_prefix.empty() ? "barcodes" : output_prefix;
         if (!ensure_output_directory(resolved_prefix)) {
             return;
         }
 
-        std::cout << "Processing " << fastq_path << "...\n";
-        std::cout << "Adapter: " << adapter_seq << "\n";
-        std::cout << "Extracting " << bc_length << " bases with margins: left=" << m_left << ", right=" << m_right << "\n";
-        std::cout << "Chunk size: " << chunk_size << " reads per chunk\n";
-
-        auto barcodes = process_fastq(
-            fastq_path, 
-            adapter_seq, 
-            bc_length, 
-            m_left, 
-            m_right, 
-            max_reads, 
-            max_error, 
-            chunk_size, 
-            num_threads
-        );
-        
-        std::cout << "Found " << barcodes.size() << " barcodes\n";
-
-        std::string csv_output = resolved_prefix + ".csv";
+        std::string csv_output  = resolved_prefix + ".csv";
         std::string text_output = resolved_prefix + ".txt";
-            
-        if (!whitelist_file.empty()) {
-            std::cout << "\nLoading whitelist and performing perfect match analysis...\n";
-            auto whitelist = read_whitelist(whitelist_file);
-            std::cout << "Loaded " << whitelist.size() << " whitelist barcodes\n";
-            count_perfect_matches_with_stats(barcodes, whitelist, csv_output, text_output, verbose);
+
+        if (split_barcode_mode) {
+            std::string bc1_path, bc2_path;
+            try {
+                bc1_path = whitelist_utils::kit_to_path(bc1_whitelist_file);
+                bc2_path = whitelist_utils::kit_to_path(bc2_whitelist_file);
+            } catch (const std::exception& e) {
+                std::cerr << "Error: could not resolve split whitelist path(s): " << e.what() << "\n";
+                return;
+            }
+
+            std::cout << "Two-part barcode mode: " << fastq_path << "\n"
+                      << "  Adapter: " << adapter_seq << "  UMI length: " << umi_length
+                      << "  BC1 search offset: [" << offset_min << ", " << offset_max << "]\n";
+            if (verbose) {
+                std::cout << "  BC1 whitelist: " << bc1_path << "\n"
+                          << "  BC2 whitelist: " << bc2_path << "\n";
+            }
+
+            auto [bc1_set, bc1_lengths] = load_split_whitelist_csv(bc1_path);
+            auto [bc2_set, bc2_lengths] = load_split_whitelist_csv(bc2_path);
+            if (bc1_set.empty() || bc2_set.empty()) {
+                std::cerr << "Error: failed to load two-part barcode whitelists\n";
+                return;
+            }
+            std::cout << "Loaded " << bc1_set.size() << " BC1 / " << bc2_set.size() << " BC2 sequences\n";
+
+            auto barcodes = process_fastq_split_barcode(
+                fastq_path, adapter_seq,
+                umi_length, bc1_set, bc1_lengths, bc2_set, bc2_lengths,
+                offset_min, offset_max,
+                max_reads, max_error, chunk_size, num_threads);
+
+            std::vector<std::string> empty_wl;
+            count_perfect_matches_with_stats(barcodes, empty_wl, csv_output, text_output, verbose);
         } else {
-            std::vector<std::string> empty_whitelist; // empty
-            std::cout << " No whitelist provided; generating whitelist de novo.\n";
-            count_perfect_matches_with_stats(barcodes, empty_whitelist, csv_output, text_output, verbose);
+            std::cout << "Processing " << fastq_path << "...\n";
+            std::cout << "Adapter: " << adapter_seq << "\n";
+            std::cout << "Extracting " << bc_length << " bases with margins: left=" << m_left << ", right=" << m_right << "\n";
+            std::cout << "Chunk size: " << chunk_size << " reads per chunk\n";
+
+            auto barcodes = process_fastq(
+                fastq_path, adapter_seq, bc_length, m_left, m_right,
+                max_reads, max_error, chunk_size, num_threads);
+
+            std::cout << "Found " << barcodes.size() << " barcodes\n";
+
+            if (!whitelist_file.empty()) {
+                std::string resolved_wl;
+                try {
+                    resolved_wl = whitelist_utils::kit_to_path(whitelist_file);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error: could not resolve whitelist path: " << e.what() << "\n";
+                    return;
+                }
+                std::cout << "\nLoading whitelist and performing perfect match analysis...\n";
+                if (verbose) {
+                    std::cout << "Whitelist source: " << whitelist_file << "\n"
+                              << "Resolved path: " << resolved_wl << "\n";
+                }
+                auto whitelist = read_whitelist(resolved_wl);
+                std::cout << "Loaded " << whitelist.size() << " whitelist barcodes\n";
+                count_perfect_matches_with_stats(barcodes, whitelist, csv_output, text_output, verbose);
+            } else {
+                std::vector<std::string> empty_whitelist;
+                std::cout << " No whitelist provided; generating whitelist de novo.\n";
+                count_perfect_matches_with_stats(barcodes, empty_whitelist, csv_output, text_output, verbose);
+            }
         }
     };
 

@@ -11,6 +11,8 @@ static void print_main_usage(const char* prog) {
               << "  prep              Prepare read layout and/or position map\n"
               << "  demux             Run full demultiplexing pipeline\n"
               << "  reformat          Reformat fastx.gz outputs for downstream applications\n"
+              << "  list              List available read layouts and/or whitelist kits\n"
+              << "  modify            Add/remove read layout or whitelist-kit mappings\n"
               << "  help              Show help for a specific command\n\n"
               << "Use '" << prog << " <command> --help' for command-specific options\n";
 }
@@ -49,6 +51,9 @@ static void usage_reformat(const char* prog) {
       << "  -o, --outdir          output directory for per-barcode fastqs (required if --split-bc)\n"
       << "      --split-bc        split reads into per-barcode .fq.gz files (CB:Z tag)\n"
       << "      --reformat-header collapse headers to QNAME_CB_UB (default underscore)\n"
+      << "      --reformat-delim  delimiter for collapsed headers (single char; use \" \" for space)\n"
+      << "      --coordinate[=MODE] rewrite headers using coordinate mode (default MODE: vizHD-v1)\n"
+      << "      --bin-size INT    target bin size in microns for coordinate mode (default: 2)\n"
       << "  -t, --threads         worker threads (default: 2)\n"
       << "  -v, --verbose         verbose logging\n"
       << "  -h, --help            show this help\n\n"
@@ -78,6 +83,30 @@ static void usage_prep(const char* prog) {
       << "  rad " << prog << " -l five_prime --read-layout\n"
       << "  rad " << prog << " -l my_layout.csv --position-map -q reads.fq.gz -o output\n"
       << "  rad " << prog << " -l five_prime --read-layout --position-map -q reads.fq.gz -o output\n";
+}
+
+static void usage_list(const char* prog) {
+    std::cerr
+      << "Usage: rad " << prog << " [--layouts] [--whitelists]\n\n"
+      << "List registered layout keys and whitelist kit keys with resolved paths.\n\n"
+      << "Options:\n"
+      << "      --layouts                    list read layout keys and paths\n"
+      << "      --whitelists                 list whitelist kit keys and paths\n"
+      << "  -h, --help                       show this help\n\n"
+      << "If neither --layouts nor --whitelists is provided, both are listed.\n";
+}
+
+static void usage_modify(const char* prog) {
+    std::cerr
+      << "Usage: rad " << prog
+      << " (--layout KEY | --whitelist KIT) (--add PATH | --remove)\n\n"
+      << "Modify registered mappings for layout keys or whitelist kits.\n\n"
+      << "Options:\n"
+      << "      --layout KEY                 target read layout key\n"
+      << "      --whitelist KIT              target whitelist kit key\n"
+      << "      --add PATH                   add or update mapping to PATH\n"
+      << "      --remove                     remove mapping\n"
+      << "  -h, --help                       show this help\n";
 }
 
 // =============================================================================
@@ -305,12 +334,229 @@ static std::string collapse_id(const std::string& qname,
     return out;
 }
 
+static std::optional<std::tuple<std::string, std::string, std::string>>
+parse_collapsed_id(const std::string& id, char sep) {
+    // Parse from the right so QNAME can safely contain the delimiter.
+    auto p2 = id.rfind(sep);
+    if (p2 == std::string::npos) return std::nullopt;
+    auto p1 = id.rfind(sep, p2 == 0 ? std::string::npos : p2 - 1);
+    if (p1 == std::string::npos) return std::nullopt;
+
+    std::string qname = id.substr(0, p1);
+    std::string cb = id.substr(p1 + 1, p2 - p1 - 1);
+    std::string ub = id.substr(p2 + 1);
+    if (qname.empty() || cb.empty() || ub.empty()) return std::nullopt;
+    return std::make_tuple(std::move(qname), std::move(cb), std::move(ub));
+}
+
+static std::string make_visium_hd_comment(const std::string& bc, const std::string& cb,
+                                          const std::string& ub, const std::string& sample_tag) {
+    std::string comment;
+    comment.reserve(bc.size() + cb.size() + ub.size() + sample_tag.size() + 40);
+    comment += "BC:Z:";
+    comment += bc;
+    comment += "\t";
+    comment += "CB:Z:";
+    comment += cb;
+    comment += "\tUB:Z:";
+    comment += ub;
+    comment += "\tRG:Z:";
+    comment += sample_tag;
+    return comment;
+}
+
+static std::string to_lower_copy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+static std::string zpad(int v, int width) {
+    if (v < 0) v = 0;
+    std::ostringstream oss;
+    oss << std::setw(width) << std::setfill('0') << v;
+    return oss.str();
+}
+
+static bool parse_positive_int(const std::string& s, int& out) {
+    if (s.empty()) return false;
+    try {
+        size_t consumed = 0;
+        int value = std::stoi(s, &consumed);
+        if (consumed != s.size() || value <= 0) return false;
+        out = value;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool parse_legacy_bin_token(const std::string& token, int& out_bin_size_um) {
+    // Accept either integer microns (e.g. "8") or legacy token "s008um".
+    if (parse_positive_int(token, out_bin_size_um)) return true;
+    if (token.size() >= 4 && (token[0] == 's' || token[0] == 'S')) {
+        auto lower = to_lower_copy(token);
+        if (lower.size() > 3 && lower.substr(lower.size() - 2) == "um") {
+            std::string num = lower.substr(1, lower.size() - 3);
+            return parse_positive_int(num, out_bin_size_um);
+        }
+    }
+    return false;
+}
+
+static std::vector<std::string> split_string(const std::string& s, char sep) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= s.size()) {
+        size_t pos = s.find(sep, start);
+        if (pos == std::string::npos) pos = s.size();
+        out.push_back(s.substr(start, pos - start));
+        start = pos + 1;
+        if (pos == s.size()) break;
+    }
+    return out;
+}
+
+struct vizhd_axis_reference {
+    std::unordered_map<std::string, int> x_index_by_bc;
+    std::unordered_map<std::string, int> y_index_by_bc;
+    std::vector<int> x_lengths;
+    std::vector<int> y_lengths;
+};
+
+static std::vector<std::string> load_barcode_csv_first_column(const std::string& path) {
+    auto lines = streaming_utils::import_text(path);
+    std::vector<std::string> out;
+    out.reserve(lines.size());
+    bool first = true;
+    for (auto& line : lines) {
+        auto trimmed = seq_utils::trim(line);
+        if (trimmed.empty()) continue;
+        if (first) {
+            first = false;
+            if (to_lower_copy(trimmed) == "whitelist_bcs") continue;
+        }
+        auto comma = trimmed.find(',');
+        if (comma != std::string::npos) trimmed = trimmed.substr(0, comma);
+        trimmed = seq_utils::trim(trimmed);
+        if (!trimmed.empty()) out.push_back(trimmed);
+    }
+    return out;
+}
+
+static vizhd_axis_reference load_vizhd_v1_axis_reference() {
+    vizhd_axis_reference ref;
+
+    const std::string x_path = whitelist_utils::kit_to_path("visium_hd_bc1");
+    const std::string y_path = whitelist_utils::kit_to_path("visium_hd_bc2");
+    auto x_bcs = load_barcode_csv_first_column(x_path);
+    auto y_bcs = load_barcode_csv_first_column(y_path);
+
+    ref.x_index_by_bc.reserve(x_bcs.size());
+    ref.y_index_by_bc.reserve(y_bcs.size());
+
+    for (size_t i = 0; i < x_bcs.size(); ++i) {
+        ref.x_index_by_bc.emplace(x_bcs[i], static_cast<int>(i));
+        ref.x_lengths.push_back(static_cast<int>(x_bcs[i].size()));
+    }
+    for (size_t i = 0; i < y_bcs.size(); ++i) {
+        ref.y_index_by_bc.emplace(y_bcs[i], static_cast<int>(i));
+        ref.y_lengths.push_back(static_cast<int>(y_bcs[i].size()));
+    }
+
+    std::sort(ref.x_lengths.begin(), ref.x_lengths.end());
+    ref.x_lengths.erase(std::unique(ref.x_lengths.begin(), ref.x_lengths.end()), ref.x_lengths.end());
+    std::sort(ref.y_lengths.begin(), ref.y_lengths.end());
+    ref.y_lengths.erase(std::unique(ref.y_lengths.begin(), ref.y_lengths.end()), ref.y_lengths.end());
+    return ref;
+}
+
+static std::optional<std::pair<std::string, std::string>>
+resolve_xy_barcodes_from_cb(const std::string& cb_tag, const vizhd_axis_reference& ref) {
+    if (cb_tag.empty()) return std::nullopt;
+
+    auto direct = split_string(cb_tag, '-');
+    if (direct.size() >= 2) {
+        const std::string& a = direct[0];
+        const std::string& b = direct[1];
+        bool a_is_x = ref.x_index_by_bc.find(a) != ref.x_index_by_bc.end();
+        bool b_is_y = ref.y_index_by_bc.find(b) != ref.y_index_by_bc.end();
+        if (a_is_x && b_is_y) return std::make_pair(a, b);
+
+        bool b_is_x = ref.x_index_by_bc.find(b) != ref.x_index_by_bc.end();
+        bool a_is_y = ref.y_index_by_bc.find(a) != ref.y_index_by_bc.end();
+        if (b_is_x && a_is_y) return std::make_pair(b, a);
+    }
+
+    // Fallback for concatenated CB tags with no delimiter.
+    std::vector<std::pair<std::string, std::string>> candidates;
+    for (int lx : ref.x_lengths) {
+        for (int ly : ref.y_lengths) {
+            if (static_cast<int>(cb_tag.size()) != lx + ly) continue;
+
+            std::string xs = cb_tag.substr(0, static_cast<size_t>(lx));
+            std::string ys = cb_tag.substr(static_cast<size_t>(lx), static_cast<size_t>(ly));
+            if (ref.x_index_by_bc.find(xs) != ref.x_index_by_bc.end() &&
+                ref.y_index_by_bc.find(ys) != ref.y_index_by_bc.end()) {
+                candidates.emplace_back(xs, ys);
+            }
+
+            ys = cb_tag.substr(0, static_cast<size_t>(ly));
+            xs = cb_tag.substr(static_cast<size_t>(ly), static_cast<size_t>(lx));
+            if (ref.x_index_by_bc.find(xs) != ref.x_index_by_bc.end() &&
+                ref.y_index_by_bc.find(ys) != ref.y_index_by_bc.end()) {
+                candidates.emplace_back(xs, ys);
+            }
+        }
+    }
+
+    if (candidates.size() == 1) return candidates.front();
+    return std::nullopt;
+}
+
+static int project_axis_for_bin_size(int coord_2um, int bin_size_um) {
+    if (bin_size_um <= 0) return coord_2um;
+    long long scaled = static_cast<long long>(coord_2um) * 2LL;
+    return static_cast<int>(scaled / static_cast<long long>(bin_size_um));
+}
+
+static std::string make_bin_rg_tag(int bin_size_um) {
+    std::ostringstream oss;
+    oss << "s" << std::setw(3) << std::setfill('0') << bin_size_um << "um";
+    return oss.str();
+}
+
+static std::string make_spatial_mapping_id(int bin_size_um, int x_bin, int y_bin) {
+    std::ostringstream oss;
+    oss << "s_"
+        << std::setw(3) << std::setfill('0') << bin_size_um
+        << "um_"
+        << zpad(x_bin, 5)
+        << "_"
+        << zpad(y_bin, 5)
+        << "-1";
+    return oss.str();
+}
+
+static std::string make_coordinate_read_id(const std::string& base_id, int x_bin, int y_bin) {
+    std::string id = base_id;
+    id += "_";
+    id += zpad(x_bin, 5);
+    id += "_";
+    id += zpad(y_bin, 5);
+    return id;
+}
+
 int cmd_reformat(int argc, char* argv[]) {
     std::string fastq_path, outdir;
     int nthreads = 2;
     bool verbose = false;
     bool do_split = false;
     bool do_reformat = false;
+    bool do_coordinate = false;
+    std::string coordinate_mode = "vizHD-v1";
+    int bin_size_um = 2;
+    char reformat_sep = '_';
 
     const char* optstring = "q:o:t:vh";
     struct option longopts[] = {
@@ -321,6 +567,12 @@ int cmd_reformat(int argc, char* argv[]) {
         {"help",             no_argument,       nullptr, 'h'},
         {"split-bc",         no_argument,       nullptr,  1 },
         {"reformat-header",  no_argument,       nullptr,  2 },
+        {"reformat-delim",   required_argument, nullptr,  3 },
+        {"coordinate",       optional_argument, nullptr,  4 },
+        {"bin-size",         required_argument, nullptr,  5 },
+        // Backward-compatible aliases:
+        {"visium-hd-header", no_argument,       nullptr,  6 },
+        {"visium-hd-sample", required_argument, nullptr,  7 },
         {nullptr, 0, nullptr, 0}
     };
 
@@ -333,6 +585,66 @@ int cmd_reformat(int argc, char* argv[]) {
             case 'v': verbose = true; break;
             case 1: do_split = true; break;
             case 2: do_reformat = true; break;
+            case 3: {
+                std::string arg = optarg ? optarg : "";
+                if (arg == "\\t") {
+                    reformat_sep = '\t';
+                } else if (arg == "\\n") {
+                    reformat_sep = '\n';
+                } else if (arg == "\\r") {
+                    reformat_sep = '\r';
+                } else if (arg.size() == 1) {
+                    reformat_sep = arg[0];
+                } else {
+                    std::cerr << "[ERROR] --reformat-delim must be a single character (or \\t/\\n/\\r)\n\n";
+                    usage_reformat(argv[0]);
+                    return 1;
+                }
+                do_reformat = true;
+                break;
+            }
+            case 4: {
+                do_coordinate = true;
+                do_reformat = true;
+                if (optarg && *optarg) {
+                    coordinate_mode = optarg;
+                } else if (optind < argc && argv[optind] && argv[optind][0] != '-') {
+                    coordinate_mode = argv[optind];
+                    ++optind;
+                }
+                break;
+            }
+            case 5: {
+                int parsed = 0;
+                if (!parse_positive_int(optarg ? std::string(optarg) : "", parsed)) {
+                    std::cerr << "[ERROR] --bin-size must be a positive integer (microns)\n\n";
+                    usage_reformat(argv[0]);
+                    return 1;
+                }
+                bin_size_um = parsed;
+                do_coordinate = true;
+                do_reformat = true;
+                break;
+            }
+            case 6: {
+                do_coordinate = true;
+                do_reformat = true;
+                if (coordinate_mode.empty()) coordinate_mode = "vizHD-v1";
+                break;
+            }
+            case 7: {
+                int parsed = 0;
+                std::string arg = optarg ? optarg : "";
+                if (!parse_legacy_bin_token(arg, parsed)) {
+                    std::cerr << "[ERROR] --visium-hd-sample expects legacy sXXXum token or integer bin size\n\n";
+                    usage_reformat(argv[0]);
+                    return 1;
+                }
+                bin_size_um = parsed;
+                do_coordinate = true;
+                do_reformat = true;
+                break;
+            }
             case 'h': usage_reformat(argv[0]); return 0;
             default:  usage_reformat(argv[0]); return 1;
         }
@@ -357,6 +669,29 @@ int cmd_reformat(int argc, char* argv[]) {
     boost::filesystem::path outdir_path(outdir);
     if (do_split && !boost::filesystem::exists(outdir_path)) {
         boost::filesystem::create_directories(outdir_path);
+    }
+
+    std::optional<vizhd_axis_reference> spatial_ref;
+    if (do_coordinate) {
+        std::string mode_lc = to_lower_copy(coordinate_mode);
+        if (!(mode_lc == "vizhd-v1" || mode_lc == "visium-hd-v1" || mode_lc == "visium_hd_v1")) {
+            std::cerr << "[ERROR] Unsupported --coordinate mode: " << coordinate_mode
+                      << " (supported: vizHD-v1)\n";
+            return 1;
+        }
+        try {
+            spatial_ref = load_vizhd_v1_axis_reference();
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] Failed to load coordinate reference for mode " << coordinate_mode
+                      << ": " << e.what() << "\n";
+            return 1;
+        }
+        if (verbose) {
+            std::cout << "[reformat] coordinate mode: " << coordinate_mode
+                      << ", bin-size: " << bin_size_um << "um"
+                      << ", x barcodes: " << spatial_ref->x_index_by_bc.size()
+                      << ", y barcodes: " << spatial_ref->y_index_by_bc.size() << "\n";
+        }
     }
 
     struct ref_writer {
@@ -394,12 +729,12 @@ int cmd_reformat(int argc, char* argv[]) {
         auto w = std::make_unique<ref_writer>();
         bool is_gz = path.size() >= 3 && path.substr(path.size() - 3) == ".gz";
         w->use_gz = is_gz;
-        w->pigz_fp = pigz_out.open_pigz_pipe(path, nthreads);
-        if (w->pigz_fp) {
-            w->using_pigz = true;
-            return w;
-        }
         if (is_gz) {
+            w->pigz_fp = pigz_out.open_pigz_pipe(path, nthreads);
+            if (w->pigz_fp) {
+                w->using_pigz = true;
+                return w;
+            }
             w->gz = gzopen(path.c_str(), "wb");
             if (!w->gz) throw std::runtime_error("Failed to open gzip output: " + path);
             gzbuffer(w->gz, 1 << 20);
@@ -462,7 +797,11 @@ int cmd_reformat(int argc, char* argv[]) {
         std::string single_tmp;
         if (do_reformat && !do_split) {
             boost::filesystem::path in(fastq_path);
-            single_tmp = (in.parent_path() / (in.filename().string() + ".tmp")).string();
+            const std::string in_name = in.filename().string();
+            const bool in_is_gz = in_name.size() >= 3 &&
+                                  in_name.substr(in_name.size() - 3) == ".gz";
+            const std::string tmp_name = in_name + ".tmp" + (in_is_gz ? ".gz" : "");
+            single_tmp = (in.parent_path() / tmp_name).string();
             single_writer = open_single_writer(single_tmp);
         }
 
@@ -470,9 +809,42 @@ int cmd_reformat(int argc, char* argv[]) {
             for (auto& r : chunk) {
                 auto cb = extract_cb(r.id, r.comment);
                 std::optional<std::string> ub = extract_ub(r.comment);
+                std::string qname = r.id;
 
-                if (do_reformat) {
-                    r.id = collapse_id(r.id, cb, ub, '_');
+                // If ID was previously collapsed, restore qname and recover CB/UB from the ID.
+                if (auto parsed = parse_collapsed_id(r.id, reformat_sep); parsed.has_value()) {
+                    auto [parsed_qname, parsed_cb, parsed_ub] = *parsed;
+                    qname = parsed_qname;
+                    cb = parsed_cb;
+                    ub = parsed_ub;
+                    r.id = qname;
+                }
+
+                if (do_coordinate) {
+                    if (cb.has_value() && ub.has_value() && !cb->empty() && !ub->empty()) {
+                        auto xy = resolve_xy_barcodes_from_cb(*cb, *spatial_ref);
+                        if (xy.has_value()) {
+                            const auto& x_bc = xy->first;
+                            const auto& y_bc = xy->second;
+                            auto xit = spatial_ref->x_index_by_bc.find(x_bc);
+                            auto yit = spatial_ref->y_index_by_bc.find(y_bc);
+                            if (xit != spatial_ref->x_index_by_bc.end() && yit != spatial_ref->y_index_by_bc.end()) {
+                                int x_bin = project_axis_for_bin_size(xit->second, bin_size_um);
+                                int y_bin = project_axis_for_bin_size(yit->second, bin_size_um);
+                                r.id = make_coordinate_read_id(qname, x_bin, y_bin);
+                                std::string spatial_bc = make_spatial_mapping_id(bin_size_um, x_bin, y_bin);
+                                r.comment = make_visium_hd_comment(spatial_bc, *cb, *ub, make_bin_rg_tag(bin_size_um));
+                            }
+                        } else if (verbose) {
+                            std::cout << "[reformat] skipped coordinate mapping for read with unresolvable CB pair: "
+                                      << *cb << "\n";
+                        }
+                    } else if (verbose) {
+                        std::cout << "[reformat] skipped coordinate mapping for read without parsable CB/UB: "
+                                  << r.id << "\n";
+                    }
+                } else if (do_reformat) {
+                    r.id = collapse_id(r.id, cb, ub, reformat_sep);
                     r.comment.clear(); // drop tags after collapsing
                 }
 
@@ -637,15 +1009,40 @@ int cmd_demux(int argc, char* argv[]) {
         ? boost::filesystem::current_path()
         : boost::filesystem::path(output_dir);
 
-    if (!boost::filesystem::exists(outdir)) {
-        if (!boost::filesystem::create_directories(outdir)) {
+    auto ensure_dir = [](const boost::filesystem::path& dir_path) -> bool {
+        if (dir_path.empty()) return true;
+        if (boost::filesystem::exists(dir_path)) return true;
+        return boost::filesystem::create_directories(dir_path);
+    };
+
+    boost::filesystem::path outbase;
+    if (output_prefix.empty()) {
+        if (!ensure_dir(outdir)) {
             std::cerr << "[ERROR] Cannot create output directory: " << outdir.string() << "\n";
             return 1;
         }
+        outbase = outdir / "output";
+    } else {
+        boost::filesystem::path prefix_path(output_prefix);
+        if (prefix_path.is_absolute()) {
+            outbase = prefix_path;
+        } else {
+            if (!ensure_dir(outdir)) {
+                std::cerr << "[ERROR] Cannot create output directory: " << outdir.string() << "\n";
+                return 1;
+            }
+            outbase = outdir / prefix_path;
+        }
     }
 
-    std::string base = output_prefix.empty() ? "output" : output_prefix;
-    boost::filesystem::path outbase = outdir / base;
+    boost::filesystem::path outbase_parent = outbase.parent_path();
+    if (!outbase_parent.empty() && !ensure_dir(outbase_parent)) {
+        std::cerr << "[ERROR] Cannot create output directory: " << outbase_parent.string() << "\n";
+        return 1;
+    }
+
+    std::string base = outbase.filename().string();
+    std::string outdir_display = outbase_parent.empty() ? outdir.string() : outbase_parent.string();
 
     if (verbose) {
         std::cout << "============= Configuration =============\n"
@@ -659,7 +1056,7 @@ int cmd_demux(int argc, char* argv[]) {
                   << "  read-generated mutations     : " << (gen_mut ? std::to_string(*gen_mut) : "default(2)") << "\n"
                   << "  max reads                    : " << (max_reads == -1 ? "all" : std::to_string(max_reads)) << "\n"
                   << "  chunk size                   : " << chunk_size               << "\n"
-                  << "  output directory             : " << outdir.string()          << "\n"
+                  << "  output directory             : " << outdir_display           << "\n"
                   << "  write debug files            : " << std::boolalpha << write_debug << "\n"
                   << "  filename base                : " << base                     << "\n"
                   << "  log file                     : " << (log_file.empty() ? "[none]" : log_file) << "\n"
@@ -757,7 +1154,7 @@ int cmd_demux(int argc, char* argv[]) {
         SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut, max_verbose, nthreads, chunk_size, max_reads_param, write_debug, bc_corr_mode);
         
         auto sig_time = std::chrono::steady_clock::now() - sigalign_start;
-        std::cout << "[sigalign] Time: "
+        std::cout << "[sigalign] End-to-end wall time: "
                   << std::chrono::duration_cast<std::chrono::seconds>(sig_time).count()
                   << " s\n";
 
@@ -818,6 +1215,165 @@ int cmd_demux(int argc, char* argv[]) {
 }
 
 // ============================================================================
+// COMMAND: list
+// ============================================================================
+
+int cmd_list(int argc, char* argv[]) {
+    bool show_layouts = false;
+    bool show_whitelists = false;
+
+    const char* optstring = "h";
+    struct option longopts[] = {
+        {"layouts", no_argument, nullptr, 1},
+        {"whitelists", no_argument, nullptr, 2},
+        {"help", no_argument, nullptr, 'h'},
+        {nullptr, 0, nullptr, 0}
+    };
+
+    int c;
+    while ((c = getopt_long(argc, argv, optstring, longopts, nullptr)) != -1) {
+        switch (c) {
+            case 1: show_layouts = true; break;
+            case 2: show_whitelists = true; break;
+            case 'h': usage_list(argv[0]); return 0;
+            default: usage_list(argv[0]); return 1;
+        }
+    }
+
+    if (!show_layouts && !show_whitelists) {
+        show_layouts = true;
+        show_whitelists = true;
+    }
+
+    if (show_layouts) {
+        std::cout << "[layouts]\n";
+        std::vector<std::pair<std::string, std::string>> rows;
+        const auto& layouts = config_utils::list_read_layouts();
+        rows.reserve(layouts.size());
+        for (const auto& kv : layouts) rows.emplace_back(kv.first, kv.second);
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        for (const auto& kv : rows) {
+            try {
+                std::cout << kv.first << "\t" << config_utils::get_read_layout(kv.first) << "\n";
+            } catch (const std::exception& e) {
+                std::cout << kv.first << "\t[unresolved] " << kv.second
+                          << " (" << e.what() << ")\n";
+            }
+        }
+        if (show_whitelists) std::cout << "\n";
+    }
+
+    if (show_whitelists) {
+        std::cout << "[whitelists]\n";
+        std::vector<std::pair<std::string, std::string>> rows;
+        const auto& whitelists = whitelist_utils::list_whitelist_paths();
+        rows.reserve(whitelists.size());
+        for (const auto& kv : whitelists) rows.emplace_back(kv.first, kv.second);
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        for (const auto& kv : rows) {
+            try {
+                std::cout << kv.first << "\t" << whitelist_utils::kit_to_path(kv.first) << "\n";
+            } catch (const std::exception& e) {
+                std::cout << kv.first << "\t[unresolved] " << kv.second
+                          << " (" << e.what() << ")\n";
+            }
+        }
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// COMMAND: modify
+// ============================================================================
+
+int cmd_modify(int argc, char* argv[]) {
+    std::string layout_key;
+    std::string whitelist_key;
+    std::string add_path;
+    bool do_remove = false;
+
+    const char* optstring = "h";
+    struct option longopts[] = {
+        {"layout", required_argument, nullptr, 1},
+        {"whitelist", required_argument, nullptr, 2},
+        {"add", required_argument, nullptr, 3},
+        {"remove", no_argument, nullptr, 4},
+        {"help", no_argument, nullptr, 'h'},
+        {nullptr, 0, nullptr, 0}
+    };
+
+    int c;
+    while ((c = getopt_long(argc, argv, optstring, longopts, nullptr)) != -1) {
+        switch (c) {
+            case 1: layout_key = optarg; break;
+            case 2: whitelist_key = optarg; break;
+            case 3: add_path = optarg; break;
+            case 4: do_remove = true; break;
+            case 'h': usage_modify(argv[0]); return 0;
+            default: usage_modify(argv[0]); return 1;
+        }
+    }
+
+    const bool target_layout = !layout_key.empty();
+    const bool target_whitelist = !whitelist_key.empty();
+    if (target_layout == target_whitelist) {
+        std::cerr << "[ERROR] Specify exactly one of --layout or --whitelist\n\n";
+        usage_modify(argv[0]);
+        return 1;
+    }
+
+    const bool do_add = !add_path.empty();
+    if (do_add == do_remove) {
+        std::cerr << "[ERROR] Specify exactly one of --add or --remove\n\n";
+        usage_modify(argv[0]);
+        return 1;
+    }
+
+    if (target_layout) {
+        if (do_add) {
+            config_utils::save_read_layout(layout_key, add_path);
+            std::cout << "[modify] layout[" << layout_key << "] = " << add_path << "\n";
+            try {
+                std::cout << "[modify] resolved path: " << config_utils::get_read_layout(layout_key) << "\n";
+            } catch (const std::exception& e) {
+                std::cout << "[modify] warning: layout is currently unresolved (" << e.what() << ")\n";
+            }
+        } else {
+            bool ok = config_utils::remove_read_layout(layout_key);
+            if (!ok) {
+                std::cerr << "[modify] layout key not found: " << layout_key << "\n";
+                return 1;
+            }
+            std::cout << "[modify] removed layout key: " << layout_key << "\n";
+        }
+    } else {
+        if (do_add) {
+            whitelist_utils::set_whitelist_path(whitelist_key, add_path);
+            std::cout << "[modify] whitelist[" << whitelist_key << "] = " << add_path << "\n";
+            try {
+                std::cout << "[modify] resolved path: " << whitelist_utils::kit_to_path(whitelist_key) << "\n";
+            } catch (const std::exception& e) {
+                std::cout << "[modify] warning: whitelist is currently unresolved (" << e.what() << ")\n";
+            }
+        } else {
+            bool ok = whitelist_utils::remove_whitelist_path(whitelist_key);
+            if (!ok) {
+                std::cerr << "[modify] whitelist key not found: " << whitelist_key << "\n";
+                return 1;
+            }
+            std::cout << "[modify] removed whitelist key: " << whitelist_key << "\n";
+        }
+    }
+
+    return 0;
+}
+
+// ============================================================================
 //  COMMAND: help (i need somebody (help (not just anybody)))
 // ============================================================================
 
@@ -829,11 +1385,15 @@ int cmd_help(int argc, char* argv[]) {
     
     std::string topic = argv[1];
     if (topic == "demux") {
-        usage_demux("rad");
+        usage_demux("demux");
     } else if (topic == "prep") {
-        usage_prep("rad");
+        usage_prep("prep");
     } else if (topic == "reformat") {
-        usage_reformat("rad");
+        usage_reformat("reformat");
+    } else if (topic == "list") {
+        usage_list("list");
+    } else if (topic == "modify") {
+        usage_modify("modify");
     } else {
         std::cerr << "Unknown command: " << topic << "\n\n";
         print_main_usage("rad");
@@ -861,6 +1421,10 @@ int main(int argc, char* argv[]) {
         return cmd_prep(argc - 1, argv + 1);
     } else if (command == "reformat") {
         return cmd_reformat(argc - 1, argv + 1);
+    } else if (command == "list") {
+        return cmd_list(argc - 1, argv + 1);
+    } else if (command == "modify") {
+        return cmd_modify(argc - 1, argv + 1);
     } else if (command == "help") {
         return cmd_help(argc - 1, argv + 1);
     } else if (command == "--help" || command == "-h") {

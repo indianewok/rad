@@ -103,18 +103,49 @@ namespace path_utils {
     namespace bdl = boost::dll;
   
     inline bfs::path find_resource_root() {
-      // 1) Where the exe lives
-      bfs::path exe = bdl::program_location();
-      bfs::path dir = exe.parent_path();
-  
+      // 0) Explicit override.
+      if (const char* env_root = std::getenv("RAD_RESOURCES"); env_root && *env_root) {
+        boost::system::error_code ec;
+        bfs::path p(env_root);
+        if (p.is_relative()) p = bfs::absolute(p, ec);
+        if (!ec && bfs::exists(p) && bfs::is_directory(p)) {
+          // Accept either <root>/resources or direct resources path.
+          bfs::path cand = (p.filename() == "resources") ? p : (p / "resources");
+          if (bfs::exists(cand) && bfs::is_directory(cand)) {
+            return bfs::canonical(cand);
+          }
+        }
+      }
+
+      // 1) Where the executable truly lives (resolve symlinks first).
+      bfs::path exe;
+      try {
+        exe = bdl::program_location();
+      } catch (...) {
+        exe.clear();
+      }
+      if (!exe.empty()) {
+        boost::system::error_code ec;
+        bfs::path resolved = bfs::canonical(exe, ec);
+        if (!ec) {
+          exe = resolved;
+        } else {
+          ec.clear();
+          resolved = bfs::absolute(exe, ec);
+          if (!ec) exe = resolved;
+        }
+      }
+
       // 2) Climb upwards looking for a "resources" folder
-      while (true) {
+      bfs::path dir = exe.parent_path();
+      while (!dir.empty()) {
         bfs::path cand = dir / "resources";
         if (bfs::exists(cand) && bfs::is_directory(cand)) {
           return bfs::canonical(cand);
         }
-        if (!dir.has_parent_path()) break;
-        dir = dir.parent_path();
+        bfs::path parent = dir.parent_path();
+        if (parent == dir) break;
+        dir = parent;
       }
   
       // 3) Fallback: ./resources in your CWD
@@ -393,8 +424,79 @@ namespace whitelist_utils {
         { "10x_Vis_V2", "resources/wl/visium-v1_v2_bitlist.csv.gz" },
         { "10x_Vis_V3", "resources/wl/visium-v3_v4_bitlist.csv.gz" },
         { "10x_Vis_V4", "resources/wl/visium-v3_v4_bitlist.csv.gz" },
-        { "10x_Vis_V5", "resources/wl/visium-v5_bitlist.csv.gz" }
+        { "10x_Vis_V5", "resources/wl/visium-v5_bitlist.csv.gz" },
+
+        //10x Visium HD
+        { "visium_hd_v1", "resources/wl/visium_hd_v1_whitelist.csv.gz" },
+        { "visium_hd_bc1", "resources/wl/visium_hd_bc1.csv.gz" },
+        { "visium_hd_bc2", "resources/wl/visium_hd_bc2.csv.gz" }
     };
+
+    inline std::filesystem::path whitelist_override_path() {
+        if (const char* home = std::getenv("HOME"); home && *home) {
+            return std::filesystem::path(home) / ".rad" / "whitelist_overrides.tsv";
+        }
+        return std::filesystem::current_path() / ".rad_whitelist_overrides.tsv";
+    }
+
+    inline bool& whitelist_overrides_loaded() {
+        static bool loaded = false;
+        return loaded;
+    }
+
+    inline void load_whitelist_overrides_once() {
+        if (whitelist_overrides_loaded()) return;
+        whitelist_overrides_loaded() = true;
+
+        std::ifstream in(whitelist_override_path());
+        if (!in.is_open()) return;
+
+        std::string line;
+        while (std::getline(in, line)) {
+            line = seq_utils::trim(line);
+            if (line.empty() || line[0] == '#') continue;
+            auto tab = line.find('\t');
+            if (tab == std::string::npos) continue;
+
+            std::string key = seq_utils::trim(line.substr(0, tab));
+            std::string value = seq_utils::trim(line.substr(tab + 1));
+            if (key.empty()) continue;
+
+            if (value.empty()) {
+                kit_wl_paths.erase(key);
+            } else {
+                kit_wl_paths[key] = value;
+            }
+        }
+    }
+
+    inline bool persist_whitelist_overrides() {
+        auto out_path = whitelist_override_path();
+        std::error_code ec;
+        std::filesystem::create_directories(out_path.parent_path(), ec);
+        if (ec) return false;
+
+        std::ofstream out(out_path);
+        if (!out.is_open()) return false;
+
+        std::vector<std::pair<std::string, std::string>> rows;
+        rows.reserve(kit_wl_paths.size());
+        for (const auto& kv : kit_wl_paths) {
+            rows.emplace_back(kv.first, kv.second);
+        }
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        for (const auto& kv : rows) {
+            out << kv.first << '\t' << kv.second << '\n';
+        }
+        return true;
+    }
+
+    inline const std::unordered_map<std::string, std::string>& list_whitelist_paths() {
+        load_whitelist_overrides_once();
+        return kit_wl_paths;
+    }
 
     // split “kit:path” or “kit:kit” or “path” into 1–2 specs
     static std::vector<std::string> parse_whitelist_specs(std::string const &field) {
@@ -411,6 +513,7 @@ namespace whitelist_utils {
 
     inline std::string kit_to_path(const std::string &field) {
         namespace bfs = boost::filesystem;
+        load_whitelist_overrides_once();
     
         // 1) Split into up to two specs
         auto specs = whitelist_utils::parse_whitelist_specs(field);
@@ -420,15 +523,24 @@ namespace whitelist_utils {
         for (auto &spec : specs) {
             // if it’s a known kit key, map into resources/wl/…
             if (auto it = kit_wl_paths.find(spec); it != kit_wl_paths.end()) {
-                bfs::path rel(it->second); // e.g. "resources/wl/foo.csv.gz"
+                bfs::path mapped(it->second); // e.g. "resources/wl/foo.csv.gz" or absolute path
+
+                // explicit/custom filesystem path override
+                if (mapped.is_absolute() ||
+                    (it->second.find(bfs::path::preferred_separator) != std::string::npos && bfs::exists(mapped))) {
+                    if (!bfs::exists(mapped))
+                        throw std::runtime_error("Whitelist resource not found: " + mapped.string());
+                    resolved.push_back(bfs::canonical(mapped).string());
+                    continue;
+                }
     
                 // strip leading "resources/" if present
-                auto iter = rel.begin();
-                if (iter!=rel.end() && *iter=="resources") ++iter;
+                auto iter = mapped.begin();
+                if (iter!=mapped.end() && *iter=="resources") ++iter;
     
                 // recombine the remainder
                 bfs::path sub;
-                for (; iter!=rel.end(); ++iter) sub /= *iter;
+                for (; iter!=mapped.end(); ++iter) sub /= *iter;
     
                 // now prepend the true resources folder
                 bfs::path root = path_utils::find_resource_root();
@@ -458,6 +570,7 @@ namespace whitelist_utils {
 
     // Check if it's a kit
     bool is_kit(const std::string &name){
+        load_whitelist_overrides_once();
         if(kit_wl_paths.find(name) != kit_wl_paths.end()){
             return true;
         }
@@ -513,6 +626,7 @@ namespace whitelist_utils {
       }
 
     inline const std::string& get_whitelist_path(const std::string &kit) {
+        load_whitelist_overrides_once();
         auto it = kit_wl_paths.find(kit);
         if (it == kit_wl_paths.end())
             throw std::invalid_argument("Unknown kit name: " + kit);
@@ -520,11 +634,22 @@ namespace whitelist_utils {
     }
 
     inline void set_whitelist_path(const std::string &kit, const std::string &path) {
+        load_whitelist_overrides_once();
         kit_wl_paths[kit] = path;
+        if (!persist_whitelist_overrides()) {
+            std::cerr << "[WARNING] Failed to persist whitelist overrides to "
+                      << whitelist_override_path().string() << "\n";
+        }
     }
 
     inline bool remove_whitelist_path(const std::string &kit) {
-        return kit_wl_paths.erase(kit) > 0;
+        load_whitelist_overrides_once();
+        bool removed = kit_wl_paths.erase(kit) > 0;
+        if (removed && !persist_whitelist_overrides()) {
+            std::cerr << "[WARNING] Failed to persist whitelist overrides to "
+                      << whitelist_override_path().string() << "\n";
+        }
+        return removed;
     }
 
 };
@@ -538,16 +663,86 @@ namespace config_utils {
         {"three_prime", "resources/read_layout/three_prime_read_layout.csv" },
         {"splitseq", "resources/read_layout/splitseq_read_layout.csv" },
         {"visium", "resources/read_layout/visium_three_prime_read_layout.csv" },
+        {"visium_hd", "resources/read_layout/visium_hd_read_layout.csv" },
+        {"visium_hd_full_bc", "resources/read_layout/visium_hd_read_layout_full_bc.csv" },
         {"nanopore_rapid_bc", "resources/read_layout/nanopore_bulk_rapid_bc_read_layout.csv" }
     };
 
+    inline std::filesystem::path layout_override_path() {
+        if (const char* home = std::getenv("HOME"); home && *home) {
+            return std::filesystem::path(home) / ".rad" / "layout_overrides.tsv";
+        }
+        return std::filesystem::current_path() / ".rad_layout_overrides.tsv";
+    }
+
+    inline bool& layout_overrides_loaded() {
+        static bool loaded = false;
+        return loaded;
+    }
+
+    inline void load_layout_overrides_once() {
+        if (layout_overrides_loaded()) return;
+        layout_overrides_loaded() = true;
+
+        std::ifstream in(layout_override_path());
+        if (!in.is_open()) return;
+
+        std::string line;
+        while (std::getline(in, line)) {
+            line = seq_utils::trim(line);
+            if (line.empty() || line[0] == '#') continue;
+            auto tab = line.find('\t');
+            if (tab == std::string::npos) continue;
+
+            std::string key = seq_utils::trim(line.substr(0, tab));
+            std::string value = seq_utils::trim(line.substr(tab + 1));
+            if (key.empty()) continue;
+
+            if (value.empty()) {
+                layout_files.erase(key);
+            } else {
+                layout_files[key] = value;
+            }
+        }
+    }
+
+    inline bool persist_layout_overrides() {
+        auto out_path = layout_override_path();
+        std::error_code ec;
+        std::filesystem::create_directories(out_path.parent_path(), ec);
+        if (ec) return false;
+
+        std::ofstream out(out_path);
+        if (!out.is_open()) return false;
+
+        std::vector<std::pair<std::string, std::string>> rows;
+        rows.reserve(layout_files.size());
+        for (const auto& kv : layout_files) {
+            rows.emplace_back(kv.first, kv.second);
+        }
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        for (const auto& kv : rows) {
+            out << kv.first << '\t' << kv.second << '\n';
+        }
+        return true;
+    }
+
+    inline const std::unordered_map<std::string, std::string>& list_read_layouts() {
+        load_layout_overrides_once();
+        return layout_files;
+    }
+
     // check if the layout is a custom one
     inline bool check_if_custom_rl(const std::string &type) {
+        load_layout_overrides_once();
         return layout_files.find(type) == layout_files.end();
     }
     
    inline std::string get_read_layout(const std::string &type) {
     namespace bfs = boost::filesystem;
+    load_layout_overrides_once();
     // 1) If `type` looks like an absolute or contains a path‐sep, treat it as a real file:
     bfs::path p(type);
     if (p.is_absolute() ||
@@ -563,7 +758,16 @@ namespace config_utils {
     if (it == layout_files.end())
       throw std::invalid_argument("Unknown layout key: " + type);
 
-    // 3) Take the stored relative‐to‐resources path
+    // 3) If mapped value is a direct path and exists, use it directly.
+    bfs::path mapped(it->second);
+    if (mapped.is_absolute() ||
+        (it->second.find(bfs::path::preferred_separator) != std::string::npos && bfs::exists(mapped))) {
+        if (!bfs::exists(mapped))
+            throw std::runtime_error("Missing layout resource: " + mapped.string());
+        return bfs::canonical(mapped).string();
+    }
+
+    // 4) Take the stored relative‐to‐resources path
     //    e.g. it->second == "splitseq_read_layout.csv"   OR
     //         it->second == "read_layout/splitseq_read_layout.csv" OR
     //         it->second == "resources/read_layout/splitseq_read_layout.csv"
@@ -581,7 +785,7 @@ namespace config_utils {
       rel /= *iter;
     }
 
-    // 4) Join against the real resources folder
+    // 5) Join against the real resources folder
     bfs::path root = path_utils::find_resource_root();
     bfs::path full = root / rel;
 
@@ -591,11 +795,22 @@ namespace config_utils {
   }
 
     inline void save_read_layout(const std::string &type, const std::string &path) {
+        load_layout_overrides_once();
         layout_files[type] = path;
+        if (!persist_layout_overrides()) {
+            std::cerr << "[WARNING] Failed to persist layout overrides to "
+                      << layout_override_path().string() << "\n";
+        }
     }
     
     inline bool remove_read_layout(const std::string &type) {
-        return layout_files.erase(type) > 0;
+        load_layout_overrides_once();
+        bool removed = layout_files.erase(type) > 0;
+        if (removed && !persist_layout_overrides()) {
+            std::cerr << "[WARNING] Failed to persist layout overrides to "
+                      << layout_override_path().string() << "\n";
+        }
+        return removed;
     }
 
 };

@@ -140,12 +140,14 @@ struct ReadElement {
     std::string seq;             // Raw sequence data
     std::string masked_seq;      // Masked version of the sequence (if static)
     std::optional<int> expected_length;  // Expected sequence length if known
+    std::vector<int> length_candidates;  // Allowed lengths for variable elements (e.g. 15-16)
     std::string type;            // Element type (e.g., "static", "variable")
     int order;                   // Position in the layout
     std::string direction;       // Orientation ("forward" or "reverse")
     bool unidirectional;     // Whether the element is unidirectional
     std::string global_class;    // Global classification
     std::string whitelist_path;     //path to whitelist_file (if applicable)
+    std::string flags;           // Optional layout flags (e.g. joint_barcode)
     std::optional<std::tuple<int, int, int>> misalignment_threshold;  // Threshold for misalignment detection
     std::optional<AlignmentPositions> aligned_positions;  // Alignment position storage
     std::optional<AlignmentPositions> misaligned_positions;  // Alignment position storage
@@ -256,6 +258,56 @@ public:
     const auto& by_global_class() const { return layout.get<global_class_tag>(); }
     const auto& by_dir_order() const { return layout.get<dir_order_tag>(); }
 
+    static std::optional<std::string> get_optional_csv_string(const csv::CSVRow& row, const std::string& field) {
+        try {
+            auto f = row[field];
+            if (f.is_null()) return std::nullopt;
+            auto v = seq_utils::trim(f.get<std::string>());
+            if (v.empty()) return std::nullopt;
+            return v;
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+
+    static std::vector<int> parse_length_candidates(const std::optional<std::string>& spec_opt) {
+        std::vector<int> out;
+        if (!spec_opt.has_value()) return out;
+
+        std::string spec = seq_utils::trim(spec_opt.value());
+        if (spec.empty()) return out;
+
+        auto push_if_valid = [&](int v) {
+            if (v > 0) out.push_back(v);
+        };
+
+        try {
+            auto dash = spec.find('-');
+            if (dash != std::string::npos) {
+                std::string lhs = seq_utils::trim(spec.substr(0, dash));
+                std::string rhs = seq_utils::trim(spec.substr(dash + 1));
+                int a = std::stoi(lhs);
+                int b = std::stoi(rhs);
+                if (a > b) std::swap(a, b);
+                for (int v = a; v <= b; ++v) push_if_valid(v);
+            } else {
+                push_if_valid(std::stoi(spec));
+            }
+        } catch (...) {
+            return {};
+        }
+
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+
+    static std::string format_length_candidates(const std::vector<int>& lengths) {
+        if (lengths.empty()) return "";
+        if (lengths.size() == 1) return std::to_string(lengths.front());
+        return std::to_string(lengths.front()) + "-" + std::to_string(lengths.back());
+    }
+
     // get read layout mode
     std::string get_rl_mode(std::string input_file) const {
         std::string mode;
@@ -299,6 +351,8 @@ public:
                       << " class=" << e.global_class
                       << " seq=\"" << e.seq << "\""
                       << " exp_len=" << (e.expected_length? std::to_string(*e.expected_length) : "none")
+                      << " len_cands=" << (e.length_candidates.empty() ? "none" : format_length_candidates(e.length_candidates))
+                      << " flags=" << (e.flags.empty() ? "none" : e.flags)
                       << "\n";
         };
        
@@ -351,6 +405,7 @@ public:
             std::transform(direction.begin(), direction.end(), direction.begin(), ::tolower);
             std::string class_id = row["class"].is_null() ? id : row["class"].get<std::string>();
             std::string whitelist_path = row["whitelist"].is_null() ? "" : row["whitelist"].get<std::string>();
+            std::string flags = get_optional_csv_string(row, "flags").value_or("");
 
             bool is_forward_only = (direction == "forward_only");
             bool is_reverse_only = (direction == "reverse_only");
@@ -367,10 +422,11 @@ public:
 
 
             // Fill empty class, class_id, or expected length
-            std::optional<int> expected_length;
-            if (!row["expected_length"].is_null()) {
-                expected_length = row["expected_length"].get<int>();
-            }
+            auto length_spec = get_optional_csv_string(row, "expected_length");
+            std::vector<int> length_candidates = parse_length_candidates(length_spec);
+            std::optional<int> expected_length = length_candidates.empty()
+                ? std::nullopt
+                : std::optional<int>(length_candidates.back());
             if (global_class.empty()) {
                 global_class = class_id;
             }
@@ -383,10 +439,12 @@ public:
                 expected_length = expected_length.value_or(12);
                 seq = "T{" + std::to_string(*expected_length) + ",}+";
                 global_class = "poly_tail";
+                if (length_candidates.empty()) length_candidates.push_back(*expected_length);
             } else if (class_id == "poly_a") {
                 expected_length = expected_length.value_or(12);
                 seq = "A{" + std::to_string(*expected_length) + ",}+";
                 global_class = "poly_tail";
+                if (length_candidates.empty()) length_candidates.push_back(*expected_length);
             }
 
             if (class_id_total_counts[class_id] > 1) {
@@ -402,6 +460,7 @@ public:
 
             if (!seq.empty() && !expected_length.has_value()) {
                 expected_length = static_cast<int>(seq.length());
+                if (length_candidates.empty()) length_candidates.push_back(*expected_length);
             }
             std::string masked_seq = (type == "static" && global_class != "poly_tail") ? "MASKED" : "";
 
@@ -417,6 +476,8 @@ public:
                             whitelist_path, 
                             unidirectional
                         );
+            elem.length_candidates = std::move(length_candidates);
+            elem.flags = std::move(flags);
 
             if (is_forward_only) {
                 single_sided_ids.insert(elem.class_id);
@@ -990,12 +1051,14 @@ public:
         if(which_file == "layout" || which_file == "both") {
             // Basic layout information
             std::ofstream layout_file(path_prefix + "_layout.csv");
-            layout_file << "id,seq,masked_seq,expected_length,type,class,direction,class_id,whitelist,order\n";
+            layout_file << "id,seq,masked_seq,expected_length,length_candidates,flags,type,class,direction,class_id,whitelist,order\n";
             for (const auto& element : by_order()) {
                 layout_file << "\"" << element.class_id << "\","
                     << "\"" << element.seq << "\","
                     << (element.masked_seq.empty() ? "" : element.masked_seq) << ","
                     << (element.expected_length.has_value() ? std::to_string(*element.expected_length) : "") << ","
+                    << "\"" << format_length_candidates(element.length_candidates) << "\","
+                    << "\"" << element.flags << "\","
                     << element.type << ","
                     << element.global_class << ","
                     << element.direction << ","
@@ -1073,18 +1136,25 @@ public:
 
         //int order_counter = 1;
         for (auto& row : layout_reader) {
+            auto expected_spec = get_optional_csv_string(row, "expected_length");
+            auto length_spec = get_optional_csv_string(row, "length_candidates");
+            auto length_candidates = parse_length_candidates(length_spec.has_value() ? length_spec : expected_spec);
+            std::optional<int> expected_length = length_candidates.empty()
+                ? std::nullopt
+                : std::optional<int>(length_candidates.back());
             ReadElement elem(
                 row["id"].get<std::string>(),
                 row["seq"].get<std::string>(),
                 row["masked_seq"].get<std::string>(),
-                row["expected_length"].is_null() ? std::nullopt : 
-                    std::optional<int>(std::stoi(row["expected_length"].get<std::string>())),
+                expected_length,
                 row["type"].get<std::string>(),
                 std::stoi(row["order"].get<std::string>()),
                 row["direction"].get<std::string>(),
                 row["class"].get<std::string>(),
                 row["whitelist"].get<std::string>()
             );
+            elem.length_candidates = std::move(length_candidates);
+            elem.flags = get_optional_csv_string(row, "flags").value_or("");
             layout.insert(elem);
         }
 
@@ -1177,17 +1247,25 @@ public:
         .variable_columns(VariableColumnPolicy::THROW);
         CSVReader reader(layout_csv, fmt);
         for (auto &row : reader) {
+            auto expected_spec = get_optional_csv_string(row, "expected_length");
+            auto length_spec = get_optional_csv_string(row, "length_candidates");
+            auto length_candidates = parse_length_candidates(length_spec.has_value() ? length_spec : expected_spec);
+            std::optional<int> expected_length = length_candidates.empty()
+                ? std::nullopt
+                : std::optional<int>(length_candidates.back());
             ReadElement elem(
                 row["id"].get<std::string>(),
                 row["seq"].get<std::string>(),
                 row["masked_seq"].get<std::string>(),
-                row["expected_length"].is_null() ? std::nullopt : std::optional<int>(std::stoi(row["expected_length"].get<std::string>())),
+                expected_length,
                 row["type"].get<std::string>(),
                 std::stoi(row["order"].get<std::string>()),
                 row["direction"].get<std::string>(),
                 row["class"].get<std::string>(),
                 row["whitelist"].get<std::string>()
             );
+            elem.length_candidates = std::move(length_candidates);
+            elem.flags = get_optional_csv_string(row, "flags").value_or("");
             layout.insert(elem);
         }
         if (verbose) {
@@ -1545,12 +1623,25 @@ public:
     
     void save_wl(const std::string &path, bool verbose, bool full = true) const {
         if (!full) {
+            std::ostringstream payload;
+            save_wl(payload, verbose, false, "true");
+
+            const std::string data = payload.str();
+            if (data.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+                if (verbose) {
+                    std::cout << "[save_wl] No true whitelist entries with counts; skipping " << path << std::endl;
+                }
+                return;
+            }
+
             std::ofstream out(path);
             if (!out.is_open()) {
                 std::cerr << "[error] Error opening file for writing: " << path << "\n";
                 return;
             }
-            save_wl(out, verbose, full, "true");
+            out << data;
             out.close();
         } else {
             // Extract base and extension
@@ -1562,21 +1653,43 @@ public:
                 base = base.substr(0, dot_pos);
             }
             
-            // Write true barcodes
-            {
-                std::ofstream true_out(base + "_true" + extension);
-                save_wl(true_out, verbose, true, "true");
-            }
-            
-            // Write global barcodes  
-            {
-                std::ofstream global_out(base + "_global" + extension);
-                save_wl(global_out, verbose, true, "global");
-            }
-            
+            auto write_nonempty_payload = [&](const std::string& out_path, const std::string& wl_type) {
+                std::ostringstream payload;
+                save_wl(payload, verbose, true, wl_type);
+
+                const std::string data = payload.str();
+                if (data.empty()) {
+                    std::error_code ec;
+                    std::filesystem::remove(out_path, ec);
+                    if (verbose) {
+                        std::cout << "[save_wl] No " << wl_type
+                                  << " whitelist entries with counts; skipping " << out_path << std::endl;
+                    }
+                    return false;
+                }
+
+                std::ofstream out(out_path);
+                if (!out.is_open()) {
+                    std::cerr << "[error] Error opening file for writing: " << out_path << "\n";
+                    return false;
+                }
+                out << data;
+                return true;
+            };
+
+            const std::string true_path = base + "_true" + extension;
+            const std::string global_path = base + "_global" + extension;
+            bool wrote_true = write_nonempty_payload(true_path, "true");
+            bool wrote_global = write_nonempty_payload(global_path, "global");
+
             if (verbose) {
-                std::cout << "[save_wl] Written to " << base << "_true" << extension 
-                        << " and " << base << "_global" << extension << std::endl;
+                if (wrote_true || wrote_global) {
+                    std::cout << "[save_wl] Written "
+                              << (wrote_true ? true_path : "[no true file]")
+                              << " and "
+                              << (wrote_global ? global_path : "[no global file]")
+                              << std::endl;
+                }
             }
         }
     }

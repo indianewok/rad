@@ -37,6 +37,7 @@
 .DS_Store
 .claude
 CLAUDE.*
+.cache
 
 # build artifacts
 /build/

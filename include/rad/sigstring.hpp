@@ -2666,6 +2666,214 @@ private:
         return count;
     }
 
+    bool has_layout_flag_token(const std::string& flags, const std::string& token) const {
+        if (flags.empty() || token.empty()) return false;
+        std::string lowered_flags = flags;
+        std::string lowered_token = token;
+        std::transform(lowered_flags.begin(), lowered_flags.end(), lowered_flags.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(lowered_token.begin(), lowered_token.end(), lowered_token.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        std::string cur;
+        for (char c : lowered_flags) {
+            if (c == ',' || c == ';' || c == '|' || c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                if (cur == lowered_token) return true;
+                cur.clear();
+            } else {
+                cur.push_back(c);
+            }
+        }
+        return cur == lowered_token;
+    }
+
+    const ReadElement* find_layout_element(const ReadLayout& layout, const std::string& class_id) const {
+        const auto& idx = layout.by_id();
+        auto it = idx.find(class_id);
+        if (it == idx.end()) return nullptr;
+        return &(*it);
+    }
+
+    std::vector<int> effective_barcode_lengths(const ReadLayout& layout, const seq_element& elem) const {
+        std::vector<int> out;
+        if (const ReadElement* layout_elem = find_layout_element(layout, elem.class_id)) {
+            out = layout_elem->length_candidates;
+            if (out.empty() && layout_elem->expected_length.has_value()) {
+                out.push_back(*layout_elem->expected_length);
+            }
+        }
+        if (out.empty() && elem.seq.has_value() && !elem.seq->empty()) {
+            out.push_back(static_cast<int>(elem.seq->size()));
+        }
+        out.erase(std::remove_if(out.begin(), out.end(), [](int v) { return v <= 0; }), out.end());
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+
+    bool exact_whitelist_match(const whitelist::wl_entry& wl, const std::string& seq) const {
+        int64_seq bits;
+        bits.sequence_to_bits(seq);
+        if (!bits.is_valid()) return false;
+        return wl.true_bcs.check_wl_for(bits) || wl.global_bcs.check_wl_for(bits);
+    }
+
+    bool try_process_joint_barcode_pair(
+        const seq_element& first,
+        const seq_element& second,
+        const ReadLayout& layout,
+        const read_streaming::sequence& read,
+        bool verbose
+    ) {
+        if (first.global_class != "barcode" || second.global_class != "barcode") return false;
+        if (first.direction != second.direction) return false;
+
+        const ReadElement* l1 = find_layout_element(layout, first.class_id);
+        const ReadElement* l2 = find_layout_element(layout, second.class_id);
+        if (!l1 || !l2) return false;
+        if (std::abs(l1->order - l2->order) != 1) return false;
+        if (!has_layout_flag_token(l1->flags, "joint_barcode") ||
+            !has_layout_flag_token(l2->flags, "joint_barcode")) {
+            return false;
+        }
+
+        auto w1_it = layout.wl_map.maps.find(seq_utils::remove_rc(first.class_id));
+        auto w2_it = layout.wl_map.maps.find(seq_utils::remove_rc(second.class_id));
+        if (w1_it == layout.wl_map.maps.end() || w2_it == layout.wl_map.maps.end()) return false;
+        const auto& wl1 = w1_it->second.get();
+        const auto& wl2 = w2_it->second.get();
+
+        auto len1 = effective_barcode_lengths(layout, first);
+        auto len2 = effective_barcode_lengths(layout, second);
+        if (len1.empty() || len2.empty()) return false;
+
+        std::string oriented_read = read.seq;
+        auto p1 = first.position;
+        auto p2 = second.position;
+        const int read_len = static_cast<int>(read.seq.size());
+        if (read_len <= 0) return false;
+
+        const bool reverse = (first.direction == "reverse");
+        if (reverse) {
+            oriented_read = seq_utils::revcomp(oriented_read);
+            auto to_oriented = [read_len](std::pair<int, int> p) {
+                return std::make_pair(read_len - p.second + 1, read_len - p.first + 1);
+            };
+            p1 = to_oriented(p1);
+            p2 = to_oriented(p2);
+        }
+
+        if (p1.first <= 0 || p2.first <= 0) return false;
+
+        const seq_element* left_elem = &first;
+        const seq_element* right_elem = &second;
+        const whitelist::wl_entry* left_wl = &wl1;
+        const whitelist::wl_entry* right_wl = &wl2;
+        std::vector<int> left_lens = len1;
+        std::vector<int> right_lens = len2;
+        auto left_pos = p1;
+        auto right_pos = p2;
+
+        if (p2.first < p1.first) {
+            std::swap(left_elem, right_elem);
+            std::swap(left_wl, right_wl);
+            std::swap(left_lens, right_lens);
+            std::swap(left_pos, right_pos);
+        }
+
+        struct joint_hit {
+            std::string left_seq;
+            std::string right_seq;
+            int left_start = -1;
+            int left_end = -1;
+            int right_start = -1;
+            int right_end = -1;
+            int offset = 0;
+        };
+
+        std::optional<joint_hit> hit;
+        const int search_min = -3;
+        const int search_max = 3;
+        std::vector<int> offset_order{0, 1, -1, 2, -2, 3, -3};
+        const int anchor_start = left_pos.first;
+        const int oriented_len = static_cast<int>(oriented_read.size());
+
+        for (int off : offset_order) {
+            if (off < search_min || off > search_max) continue;
+            const int left_start = anchor_start + off;
+            if (left_start < 1) continue;
+
+            for (int l1_len : left_lens) {
+                const int left_end = left_start + l1_len - 1;
+                if (left_end > oriented_len) continue;
+
+                const std::string left_seq = oriented_read.substr(static_cast<size_t>(left_start - 1), static_cast<size_t>(l1_len));
+                if (!exact_whitelist_match(*left_wl, left_seq)) continue;
+
+                for (int l2_len : right_lens) {
+                    const int right_start = left_end + 1;
+                    const int right_end = right_start + l2_len - 1;
+                    if (right_end > oriented_len) continue;
+
+                    const std::string right_seq = oriented_read.substr(static_cast<size_t>(right_start - 1), static_cast<size_t>(l2_len));
+                    if (exact_whitelist_match(*right_wl, right_seq)) {
+                        hit = joint_hit{left_seq, right_seq, left_start, left_end, right_start, right_end, off};
+                        break;
+                    }
+                }
+                if (hit.has_value()) break;
+            }
+            if (hit.has_value()) break;
+        }
+
+        if (!hit.has_value()) return false;
+
+        auto to_original = [read_len, reverse](std::pair<int, int> p) {
+            if (!reverse) return p;
+            return std::make_pair(read_len - p.second + 1, read_len - p.first + 1);
+        };
+
+        std::pair<int, int> left_final = to_original({hit->left_start, hit->left_end});
+        std::pair<int, int> right_final = to_original({hit->right_start, hit->right_end});
+
+        std::string seq_for_first = (left_elem->class_id == first.class_id) ? hit->left_seq : hit->right_seq;
+        std::string seq_for_second = (left_elem->class_id == first.class_id) ? hit->right_seq : hit->left_seq;
+        std::pair<int, int> pos_for_first = (left_elem->class_id == first.class_id) ? left_final : right_final;
+        std::pair<int, int> pos_for_second = (left_elem->class_id == first.class_id) ? right_final : left_final;
+
+        int64_seq bits_first, bits_second;
+        bits_first.sequence_to_bits(seq_for_first);
+        bits_second.sequence_to_bits(seq_for_second);
+        if (!bits_first.is_valid() || !bits_second.is_valid()) return false;
+
+        apply_barcode_correction(first, bits_first, layout, verbose);
+        apply_barcode_correction(second, bits_second, layout, verbose);
+
+        auto& id_index = sig_elements.get<sig_id_tag>();
+        auto it_first = id_index.find(first.class_id);
+        if (it_first != id_index.end()) {
+            id_index.modify(it_first, [&](seq_element& e) {
+                e.position = pos_for_first;
+            });
+        }
+        auto it_second = id_index.find(second.class_id);
+        if (it_second != id_index.end()) {
+            id_index.modify(it_second, [&](seq_element& e) {
+                e.position = pos_for_second;
+            });
+        }
+
+        if (verbose) {
+            std::ostringstream oss;
+            oss << "JOINT_BARCODE_HIT " << first.class_id << "+" << second.class_id
+                << " offset=" << hit->offset
+                << " left=" << seq_for_first
+                << " right=" << seq_for_second;
+            log_verbose(oss.str());
+        }
+        return true;
+    }
+
 /**
  * @brief process barcodes in a given direction: apply corrections and validate
  * @param direction direction string
@@ -2688,18 +2896,39 @@ private:
         bool verbose
     ) {
         
-        bool has_multiple_barcodes = count_barcodes_in_direction(elements) > 1;
-        bool all_barcodes_passed = true;
-        
+        std::vector<std::string> barcode_ids;
+        barcode_ids.reserve(elements.size());
         for (const auto& elem_ref : elements) {
             const auto& elem = elem_ref.get();
-            if (elem.global_class != "barcode"){
+            if (elem.global_class == "barcode") {
+                barcode_ids.push_back(elem.class_id);
+            }
+        }
+
+        bool has_multiple_barcodes = barcode_ids.size() > 1;
+        bool all_barcodes_passed = true;
+
+        auto& id_index = sig_elements.get<sig_id_tag>();
+        for (size_t i = 0; i < barcode_ids.size();) {
+            auto it = id_index.find(barcode_ids[i]);
+            if (it == id_index.end()) {
+                ++i;
                 continue;
             }
-            bool barcode_passed = process_single_barcode(
-                elem, layout, read, gen_mut, mode, verbose
-            );
-            
+            seq_element elem = *it;
+
+            if (i + 1 < barcode_ids.size()) {
+                auto next_it = id_index.find(barcode_ids[i + 1]);
+                if (next_it != id_index.end()) {
+                    seq_element next_elem = *next_it;
+                    if (try_process_joint_barcode_pair(elem, next_elem, layout, read, verbose)) {
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+
+            bool barcode_passed = process_single_barcode(elem, layout, read, gen_mut, mode, verbose);
             if (!barcode_passed) {
                 mark_element_failed(elem.class_id);
                 //add_failed_barcode_to_filter(elem, layout, verbose);
@@ -2709,6 +2938,7 @@ private:
                     break;
                 }
             }
+            ++i;
         }
         return all_barcodes_passed;
     }
@@ -2762,6 +2992,7 @@ private:
         // Determine which whitelist the correction came from
         bool found_in_true = wl.true_bcs.check_wl_for(corrected_barcode);
         bool found_in_global = wl.global_bcs.check_wl_for(corrected_barcode);
+        bool true_wl_empty = wl.true_bcs.empty();
         
         // Prefer true whitelist if present in both
         std::string final_wl = found_in_true ? "true" : "global";
@@ -2772,8 +3003,9 @@ private:
             e.original_seq = e.seq;
             e.seq = final_bc;
             e.element_pass = true;
-            // Default behavior: emit only barcodes that resolved to the true whitelist
-            e.write = found_in_true;
+            // Emit true-whitelist barcodes by default.
+            // If no true whitelist exists, allow global matches to be emitted.
+            e.write = found_in_true || (true_wl_empty && found_in_global);
         });
         
         if (verbose) {
@@ -3404,6 +3636,8 @@ public:
         bool write_debug, 
         std::string mode
     ) {
+    const auto sigalign_wall_t0 = std::chrono::steady_clock::now();
+
     std::string file_out = path_utils::get_fastqa_type(fastq_path);
     std::string fastq_output_path = output_prefix + file_out;
     bool compress_fastq = true;
@@ -3636,20 +3870,28 @@ public:
     }
 
     // Summary
+    const auto sigalign_wall_t1 = std::chrono::steady_clock::now();
+    const double wall_total_s = std::chrono::duration_cast<std::chrono::milliseconds>(
+        sigalign_wall_t1 - sigalign_wall_t0
+    ).count() / 1000.0;
+
     const double process_s = total_process_time_ms.load() / 1000.0;
     const double queue_s   = total_queue_time_ms.load()   / 1000.0;
-    const double total_s   = process_s + queue_s;
+    const double accounted_s = process_s + queue_s;
+    const double overhead_s = std::max(0.0, wall_total_s - accounted_s);
 
     std::cout << "\n[sigalign] Performance Summary:\n";
     std::cout << "────────────────────────────────────────────────────\n";
-    std::cout << "[sigalign] Total runtime: " << total_s << " seconds\n";
+    std::cout << "[sigalign] Wall-clock runtime: " << wall_total_s << " seconds\n";
     std::cout << "[sigalign] Total chunks processed: " << chunk_id_ctr.load() << "\n";
     std::cout << "[sigalign] Total reads processed: " << total_reads.load() << "\n";
     std::cout << "[sigalign] Reads passing filter: " << total_passed.load() << " ("
               << (total_reads > 0 ? (total_passed.load() * 100.0 / (double)total_reads.load()) : 0.0) << "%)\n";
     std::cout << "[sigalign] Timing breakdown:\n";
+    std::cout << "  - Accounted chunk runtime: " << accounted_s << " seconds\n";
     std::cout << "  - Process time: " << process_s << " seconds\n";
     std::cout << "  - Queue time: " << queue_s << " seconds\n";
+    std::cout << "  - Overhead (writer drain/setup): " << overhead_s << " seconds\n";
 
     if (write_debug) {
         std::cout << "\n[sigalign] Output written to:\n"
