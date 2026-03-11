@@ -1,5 +1,7 @@
 # Output files
 
+This page is the file-level contract: what each command writes and where it lands.
+
 ## `rad prep`
 
 Typical command:
@@ -9,11 +11,10 @@ build/rad prep -l <layout> --position-map -q <reads> -o <prefix>
 ```
 
 Writes:
-
 - `<prefix>_layout.csv`
 - `<prefix>_position_map.csv`
 
-If only `--read-layout` is used, output may stay console-only unless `-o` is provided.
+If you only run `--read-layout`, output can stay console-only unless you also pass `-o`.
 
 ## `rad demux`
 
@@ -24,24 +25,20 @@ build/rad demux -l <layout> -q <reads> -o <prefix> -d <outdir>
 ```
 
 Primary output:
-
 - `<outdir>/<prefix>.fq.gz` or `<outdir>/<prefix>.fa.gz` (extension follows input type logic)
 
 Whitelist summaries:
-
 - `<outdir>/<prefix>_whitelist_true.csv`
 - `<outdir>/<prefix>_whitelist_global.csv`
 
 With `-w` debug enabled:
-
 - `<outdir>/<prefix>_dbg.sig.gz`
 - `<outdir>/<prefix>_dbg.csv.gz`
 - `<outdir>/<prefix>_dbg.fq.gz`
 - `<outdir>/<prefix>.metrics.tsv`
 
-Note:
-
-- some console messages may print paths without `.gz`; actual files are gzip-compressed in those channels.
+Practical note:
+- some console path messages may omit `.gz`; those channels are still gzip-compressed on disk.
 
 ## `rad reformat`
 
@@ -52,8 +49,7 @@ build/rad reformat -q <file.fq.gz> --reformat-header
 ```
 
 Effect:
-
-- rewrites input in place.
+- rewrites the input file in place
 
 Barcode split mode:
 
@@ -62,27 +58,23 @@ build/rad reformat -q <file.fq.gz> --split-bc -o <outdir>
 ```
 
 Writes:
-
-- `<outdir>/<CB>.fq.gz` for each observed `CB:Z` tag.
+- `<outdir>/<CB>.fq.gz` for each observed `CB:Z` tag
 
 ## `discover_layout`
 
 Writes:
-
 - `<prefix>_layout.csv`
 
 ## `generate_whitelist`
 
 Writes:
-
 - `<output-prefix>.csv`
 - `<output-prefix>.txt`
 
 ## Run checklist
 
-Capture with every run:
-
-- command line used,
-- full output file list,
-- byte sizes,
-- read/line counts for major artifacts.
+Capture this with every run:
+- full command line
+- full output file list
+- byte size of each major artifact
+- read/line counts for the main outputs

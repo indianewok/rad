@@ -13,16 +13,16 @@ Commands:
 - `help`
 
 Exit codes:
-- `0` success
-- non-zero validation/runtime failure
+- `0` means success
+- non-zero means validation/runtime failure
 
 ---
 
 ## `rad prep`
 
 What it does:
-- parses/normalizes layout,
-- optionally estimates position map from reads.
+- parses and normalizes layout CSV
+- optionally estimates a position map from reads
 
 Usage:
 
@@ -33,7 +33,7 @@ build/rad prep -l LAYOUT [options]
 Required:
 - `-l, --layout`
 
-Mode flags (at least one required):
+Mode flags (set at least one):
 - `--read-layout`
 - `--position-map`
 
@@ -47,17 +47,18 @@ Options:
 - `-h, --help`
 
 Hard checks:
-- fails if neither mode flag is set.
-- fails if `--position-map` is set without `--fastq` and `--output`.
+- command fails if neither mode flag is set
+- command fails if `--position-map` is set without both `--fastq` and `--output`
 
 ---
 
 ## `rad demux`
 
 What it does:
-- loads layout + whitelist state,
-- runs `sigalign` pipeline,
-- writes filtered output plus optional debug artifacts.
+- loads layout + position map state
+- loads whitelist sets (`true` + `global` model)
+- runs chunked `sigalign` extraction/filtering
+- writes filtered output and optional debug artifacts
 
 Usage:
 
@@ -84,22 +85,21 @@ Runtime/output knobs:
 - `-d, --dir` (default current dir)
 - `-F, --log-file`
 - `-w, --write_dbg`
-- `-b, --bc_split` (see caveat)
+- `-b, --bc_split`
 - `-t, --threads` (default `1`)
 - `-v, --verbose`
 - `-D, --max_verbose`
 - `-h, --help`
 
-Current caveat:
-- `--bc_split` is exposed in help, but split execution inside `demux` is currently stubbed.
-- Use `rad reformat --split-bc` for actual split output.
+Practical note:
+- `--bc_split` is visible in help, but split output is done by `rad reformat --split-bc` in the current build.
 
 ---
 
 ## `rad reformat`
 
 What it does:
-- rewrites headers and/or splits reads by barcode tag.
+- rewrites headers and/or splits reads by barcode tag
 
 Usage:
 
@@ -117,11 +117,11 @@ Options:
 - `-h, --help`
 
 Hard checks:
-- fails if neither `--split-bc` nor `--reformat-header` is set.
-- fails if `--split-bc` is set without `--outdir`.
+- command fails if neither `--split-bc` nor `--reformat-header` is set
+- command fails if `--split-bc` is set without `--outdir`
 
 Behavior detail:
-- `--reformat-header` alone rewrites input in place.
+- `--reformat-header` alone rewrites input in place
 
 ---
 
@@ -141,8 +141,8 @@ build/rad_config whitelist set <kit> <path>
 build/rad_config whitelist rm <kit>
 ```
 
-Current caveat:
-- `set/rm` updates are process-local and not persistent across independent invocations.
+Practical note:
+- `set/rm` updates are process-local in the current build and won't persist across independent invocations.
 
 ---
 

@@ -1,29 +1,29 @@
 # Troubleshooting
 
-Format here is simple: symptom -> why -> what to do.
+Format is simple: symptom -> why it happens -> what to do next.
 
 ## OpenMP build failure
 
 Symptom:
-- OpenMP not found or linker OpenMP errors.
+- OpenMP isn't found, or linking fails with OpenMP errors
 
 Why:
-- compiler/runtime mismatch (especially macOS default clang setups).
+- compiler/runtime mismatch (especially default macOS clang setups)
 
 What to do:
-- install `llvm` + `libomp`.
-- configure CMake with LLVM compilers.
-- rebuild cleanly.
+- install `llvm` + `libomp`
+- configure CMake with LLVM compilers
+- rebuild cleanly
 
 See [`installation.md`](installation.md).
 
 ## `Unknown layout key`
 
 Symptom:
-- `prep`/`demux` fails on unknown layout.
+- `prep` or `demux` fails on an unknown layout
 
 Why:
-- key not present in runtime layout map.
+- the key isn't in the runtime layout map
 
 What to do:
 
@@ -36,22 +36,22 @@ Use one of those keys, or pass an absolute layout CSV path.
 ## `Cannot locate 'resources' folder`
 
 Symptom:
-- runtime exception for missing `resources`.
+- runtime exception says `resources` can't be found
 
 Why:
-- executable moved away from expected relative resource path.
+- binary moved away from the expected relative resource path
 
 What to do:
-- run from repository tree, or
-- deploy `resources/` with the binary path layout RAD expects.
+- run from the repository tree, or
+- deploy `resources/` with the binary path layout RAD expects
 
 ## `Whitelist file not found`
 
 Symptom:
-- whitelist load failure.
+- whitelist load fails
 
 Why:
-- alias/path resolution failed (bad key/path/whitespace).
+- alias/path resolution failed (bad key/path/whitespace)
 
 What to do:
 
@@ -64,51 +64,51 @@ Then use explicit absolute paths if needed.
 ## Slow `.gz` throughput
 
 Symptom:
-- compressed I/O is much slower than expected.
+- compressed I/O is much slower than expected
 
 Why:
-- fallback gzip path rather than `pigz` path.
+- RAD fell back to the non-`pigz` path
 
 What to do:
-- install `pigz`.
-- set `RAD_PIGZ` if needed.
-- tune `RAD_PIGZ_THREADS`.
+- install `pigz`
+- set `RAD_PIGZ` if needed
+- tune `RAD_PIGZ_THREADS`
 
 ## Empty or near-empty demux output
 
 Symptom:
-- output FASTQ exists but very few reads pass.
+- output FASTQ exists, but almost no reads pass
 
-Why (usual causes):
-- layout/chemistry mismatch,
-- whitelist mismatch,
-- overly strict correction assumptions.
+Why (common causes):
+- layout/chemistry mismatch
+- whitelist mismatch
+- correction settings are too strict
 
 What to do:
-- inspect layout with `prep --read-layout`.
-- rerun with `-v` and `-w`.
-- inspect `*_dbg.csv.gz` + `*.metrics.tsv`.
-- verify kit/whitelist pairing.
+- inspect layout with `prep --read-layout`
+- rerun with `-v` and `-w`
+- inspect `*_dbg.csv.gz` and `*.metrics.tsv`
+- verify kit/whitelist pairing
 
-## Output order changes b/w runs
+## Output order changes between runs
 
 Symptom:
-- same input, different record order across runs.
+- same input, different record order across runs
 
 Why:
-- multi-threaded chunk scheduling and async write behavior.
+- chunk scheduling and async writes in multithreaded mode
 
 What to do:
-- use `--threads 1` when stable ordering is required.
-- compare canonicalized content rather than raw line order for multi-thread runs.
+- use `--threads 1` if stable ordering matters
+- compare canonicalized content, not raw line order, for multithreaded runs
 
 ## Behavior looks stale after edits
 
 Symptom:
-- runtime/help output does not match recent code changes.
+- runtime/help output doesn't match recent code changes
 
 Why:
-- stale build artifacts.
+- stale build artifacts
 
 What to do:
 

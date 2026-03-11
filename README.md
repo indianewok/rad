@@ -1,8 +1,8 @@
 # RAD (Read-structure Agnostic Demultiplexer)
 
-RAD is a read-structure agnostic demultiplexer for layout-aware sequencing demultiplexing.
+RAD is a layout-aware demultiplexer for sequencing reads.
 
-Short version: define the read structure, map positions, run demux, then reformat/split as needed.
+Plain English version: you define read structure once, RAD finds barcode/UMI/read segments, applies whitelist-aware filtering/correction, then writes output for downstream analysis.
 
 ## Docs map
 
@@ -12,7 +12,7 @@ Short version: define the read structure, map positions, run demux, then reforma
 | First run (`prep -> demux -> reformat`) | [`docs/quickstart.md`](docs/quickstart.md) |
 | Exact command/flag behavior | [`docs/cli-reference.md`](docs/cli-reference.md) |
 | Layout + whitelist details (origins, sizes, pairings) | [`docs/layouts-and-whitelists.md`](docs/layouts-and-whitelists.md) |
-| What RAD is doing under the hood | [`docs/architecture.md`](docs/architecture.md) |
+| What RAD does under the hood | [`docs/architecture.md`](docs/architecture.md) |
 | Output file contract | [`docs/output-files.md`](docs/output-files.md) |
 | Failure diagnosis | [`docs/troubleshooting.md`](docs/troubleshooting.md) |
 
@@ -44,24 +44,21 @@ build/rad reformat -q run/demo.fq.gz --split-bc -o run/by_barcode -t 8
 ├── resources/
 │   ├── read_layout/      # bundled layout templates
 │   └── wl/               # bundled whitelist resources
-├── docs/                 # user/methods docs
+├── docs/                 # user + methods docs
 └── CMakeLists.txt
 ```
 
 ## Operational notes
 
-- RAD resolves `resources/` relative to executable location, then `./resources`.
-- `pigz` is optional, but usually worth it for gzip throughput.
+- RAD looks for `resources/` relative to the executable location, then `./resources`.
+- `pigz` is optional, but it usually improves gzip throughput a lot.
+- `rad demux --bc_split` is shown in help, but split output is handled by `rad reformat --split-bc` in the current build.
+- `rad_config set/rm` is process-local in the current build, so those updates won't persist across separate invocations.
 - After big source/header edits, do a clean rebuild:
 
 ```bash
 cmake --build build --clean-first
 ```
-
-## Current caveats
-
-- `rad demux --bc_split` is shown in help, but split execution there is stubbed; use `rad reformat --split-bc`.
-- `rad_config set/rm` is process-local right now (not persistent across independent invocations).
 
 ## License
 

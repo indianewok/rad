@@ -1,6 +1,6 @@
 # Quickstart
 
-This is the standard RAD run path!
+This is the standard RAD run path.
 
 ## 1) Setup
 
@@ -9,23 +9,22 @@ mkdir -p run
 ```
 
 Assumes:
+- `build/rad` exists
+- input reads are available (for example `reads.fq.gz`)
 
-- `build/rad` exists,
-- input reads are available (for example `reads.fq.gz`).
-
-## 2) Inspect layout
+## 2) Check the layout
 
 ```bash
 build/rad prep -l five_prime --read-layout
 ```
 
-Custom layout file works too:
+Custom layout files work the same way:
 
 ```bash
 build/rad prep -l /abs/path/layout.csv --read-layout
 ```
 
-## 3) Build position map
+## 3) Build a position map
 
 ```bash
 build/rad prep \
@@ -38,7 +37,6 @@ build/rad prep \
 ```
 
 Expected files:
-
 - `run/demo_layout.csv`
 - `run/demo_position_map.csv`
 
@@ -54,7 +52,6 @@ build/rad demux \
 ```
 
 Expected file:
-
 - `run/demo.fq.gz`
 
 ## 5) Optional debug run
@@ -70,7 +67,6 @@ build/rad demux \
 ```
 
 Debug outputs:
-
 - `run/debug/demo_dbg.sig.gz`
 - `run/debug/demo_dbg.csv.gz`
 - `run/debug/demo_dbg.fq.gz`
@@ -120,7 +116,7 @@ flowchart TD
     C --> E["reformat --split-bc"]
 ```
 
-## 9) Sanity check commands
+## 9) Quick sanity checks
 
 ```bash
 build/rad --help

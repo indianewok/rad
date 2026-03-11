@@ -1,8 +1,8 @@
 # Installation
 
-RAD is a CMake/C++ build. Once deps are installed, build steps are the same across platforms.
+RAD is a CMake/C++ build. Once dependencies are in place, the build commands are the same across platforms.
 
-## Required deps
+## Required dependencies
 
 - CMake `>= 3.18`
 - C++17 compiler
@@ -11,8 +11,7 @@ RAD is a CMake/C++ build. Once deps are installed, build steps are the same acro
 - zlib
 
 Optional:
-
-- `pigz` for faster `.gz` I/O
+- `pigz` for faster `.gz` read/write throughput
 
 ## Platform-agnostic build
 
@@ -37,7 +36,7 @@ build/rad_config --help
 brew install cmake boost libomp llvm pigz
 ```
 
-Use Homebrew LLVM for cleaner OpenMP linkage:
+Using Homebrew LLVM usually gives cleaner OpenMP linkage:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -79,10 +78,10 @@ cmake --build build -j
 
 ## Runtime path note
 
-RAD expects `resources/` to be reachable relative to executable/CWD search logic.
-If binaries are moved, move `resources/` with them (or run from repo tree).
+RAD expects `resources/` to be discoverable from executable/CWD search paths.
+If you move the binaries, move `resources/` with them (or run from the repo tree).
 
-## Runtime env knobs
+## Runtime environment knobs
 
 - `RAD_PIGZ=/path/to/pigz`
 - `RAD_NO_PIGZ=1`

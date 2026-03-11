@@ -1,6 +1,6 @@
 # Architecture
 
-This is the short methods view of what RAD is doing.
+This is the short methods-level view of what RAD does internally.
 
 ## Core pieces
 
@@ -40,31 +40,27 @@ flowchart TD
 
 What happens:
 
-1. parse CSV rows.
-2. normalize fields (`class`, `class_id`, lengths).
-3. inject sentinels (`seq_start`, `seq_stop`).
-4. auto-generate reverse-complement elements unless single-sided.
-5. build ordered indexes used later by demux.
+1. parse CSV rows
+2. normalize fields (`class`, `class_id`, lengths)
+3. inject sentinels (`seq_start`, `seq_stop`)
+4. auto-generate reverse-complement elements unless rows are single-sided
+5. build ordered indexes that `demux` uses later
 
-If `--position-map` is set:
-
-- RAD samples reads,
-- computes misalignment stats,
-- writes `_layout.csv` and `_position_map.csv`.
+If `--position-map` is set, RAD samples reads, computes misalignment stats, then writes `_layout.csv` and `_position_map.csv`.
 
 ## Demux pipeline (`sigalign`)
 
-At runtime:
+Runtime flow:
 
-1. load or build layout/map.
-2. resolve/load whitelist data (`true_bcs` + `global_bcs` strategy).
-3. stream reads in chunks.
+1. load or build layout/map
+2. resolve/load whitelist data (`true_bcs` + `global_bcs`)
+3. stream reads in chunks
 4. process each read with:
    - `sigalign_static`
    - `sigalign_variable`
    - `sigalign_filter`
-5. emit pass reads; optionally emit debug channels.
-6. write whitelist summaries.
+5. emit passing reads and optional debug channels
+6. write whitelist summaries
 
 Per-read logic:
 
@@ -78,29 +74,27 @@ flowchart LR
     E -->|no| G["filtered (debug only if enabled)"]
 ```
 
-## Whitelist model (internal)
+## Whitelist model
 
-- `true_bcs`: stricter accepted set.
-- `global_bcs`: broader correction candidate set.
+- `true_bcs`: stricter accepted set
+- `global_bcs`: broader correction candidate set
 
 Import behavior:
-
-- one source -> assigned based on set size policy.
-- two sources -> smaller tends to map to `true`, larger to `global`.
+- one source: RAD assigns based on set size policy
+- two sources: smaller usually maps to `true`, larger to `global`
 
 ## Parallelism and I/O
 
-- read path: chunked streaming, pigz if available.
-- compute path: OpenMP over chunks/reads.
-- write path: buffered/asynchronous writer path.
+- read path: chunked streaming, `pigz` if available
+- compute path: OpenMP across chunks/reads
+- write path: buffered/asynchronous writer path
 
-Main perf knobs:
-
+Main performance knobs:
 - `--threads`
 - `--chunk_size`
 - `pigz` availability/config
 
-## Current interface caveats
+## Practical implementation notes
 
-- `demux --bc_split` is listed, but split execution there is stubbed.
-- `rad_config set/rm` is not persistent across independent invocations--need to fix that.
+- `demux --bc_split` appears in help, but split execution is handled in `reformat --split-bc` in the current build.
+- `rad_config set/rm` is process-local in the current build, so updates won't persist across independent invocations.

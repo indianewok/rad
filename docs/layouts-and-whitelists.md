@@ -208,6 +208,6 @@ build/rad demux \
   -o demo -d run
 ```
 
-## `rad_config` caveat
+## `rad_config` behavior in the current build
 
 `rad_config set/rm` is process-local in the current implementation, so it doesn't persist across separate invocations.
