@@ -143,7 +143,7 @@ Important positional detail:
 
 Character constraints:
 - encoder accepts `A/C/T/G` only (uppercase in the direct `int64_seq` conversion path).
-- `N` is not encodable in this 2-bit schema.
+- `N` isn't encodable in this 2-bit schema.
 
 ### `barcode_entry` structure
 
@@ -157,34 +157,17 @@ Counter categories are:
 ### Translating bitlist values to DNA barcodes
 
 Bitlist whitelist files store integer-encoded barcodes.  
-To decode correctly, the barcode length is required (the integer alone is not enough).
+To decode correctly, the barcode length is required (the integer alone isn't enough).
 
-Python decode helper:
+Decode rule:
+- read 2 bits at a time from least-significant to most-significant (`value & 0b11`, then `value >>= 2`)
+- map codes with `0->A`, `1->C`, `2->T`, `3->G`
+- reverse the collected bases to recover the original left-to-right barcode string
 
-```python
-def decode_barcode(value: int, length: int) -> str:
-    # if negative values ever appear, reinterpret as unsigned 64-bit
-    if value < 0:
-        value &= (1 << 64) - 1
-
-    lut = "ACTG"  # 0->A, 1->C, 2->T, 3->G
-    out = []
-    for _ in range(length):
-        out.append(lut[value & 0b11])
-        value >>= 2
-    return "".join(reversed(out))
-```
-
-Python encode helper:
-
-```python
-def encode_barcode(seq: str) -> int:
-    code = {"A": 0, "C": 1, "T": 2, "G": 3}
-    v = 0
-    for b in seq.upper():
-        v = (v << 2) | code[b]
-    return v
-```
+Encode rule:
+- start at `0`
+- for each base from left to right, shift left by 2 and OR in the base code
+- same map: `A=0`, `C=1`, `T=2`, `G=3`
 
 Example:
 - `decode_barcode(23904338, 16)` -> `AAACCTGAGAAACCAT`
@@ -227,4 +210,4 @@ build/rad demux \
 
 ## `rad_config` caveat
 
-`rad_config set/rm` is process-local in the current implementation, so it does not persist across separate invocations.
+`rad_config set/rm` is process-local in the current implementation, so it doesn't persist across separate invocations.
