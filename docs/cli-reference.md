@@ -1,5 +1,7 @@
 # CLI reference
 
+This is a list of all of the commands and what they get you.
+
 ## `rad`
 
 ```bash
@@ -7,12 +9,14 @@ build/rad <command> [options]
 ```
 
 Commands:
+
 - `prep`
 - `demux`
 - `reformat`
 - `help`
 
 Exit codes:
+
 - `0` means success
 - non-zero means validation/runtime failure
 
@@ -21,6 +25,7 @@ Exit codes:
 ## `rad prep`
 
 What it does:
+
 - parses and normalizes layout CSV
 - optionally estimates a position map from reads
 
@@ -31,13 +36,16 @@ build/rad prep -l LAYOUT [options]
 ```
 
 Required:
+
 - `-l, --layout`
 
 Mode flags (set at least one):
+
 - `--read-layout`
 - `--position-map`
 
 Options:
+
 - `-q, --fastq` (required with `--position-map`)
 - `-o, --output` (required with `--position-map`)
 - `-n, --max_reads` (default `50000`)
@@ -47,14 +55,21 @@ Options:
 - `-h, --help`
 
 Hard checks:
+
 - command fails if neither mode flag is set
 - command fails if `--position-map` is set without both `--fastq` and `--output`
+
+Files written:
+
+- with `--position-map`: `<prefix>_layout.csv`, `<prefix>_position_map.csv`
+- with `--read-layout` only: output can stay console-only unless `-o` is also set
 
 ---
 
 ## `rad demux`
 
 What it does:
+
 - loads layout + position map state
 - loads whitelist sets (`true` + `global` model)
 - runs chunked `sigalign` extraction/filtering
@@ -67,10 +82,12 @@ build/rad demux -l LAYOUT -q FASTQ [options]
 ```
 
 Required:
+
 - `-l, --layout`
 - `-q, --fastq`
 
 Whitelist/correction knobs:
+
 - `-k, --kit`
 - `-g, --global_whitelist`
 - `-c, --custom_whitelist`
@@ -79,6 +96,7 @@ Whitelist/correction knobs:
 - `-m, --generated_mutation` (default `2`)
 
 Runtime/output knobs:
+
 - `-n, --max_reads` (default all)
 - `-z, --chunk_size` (default `5000`, must be `> 0`)
 - `-o, --output` (default `output`)
@@ -92,13 +110,25 @@ Runtime/output knobs:
 - `-h, --help`
 
 Practical note:
-- `--bc_split` is visible in help, but split output is done by `rad reformat --split-bc` in the current build.
+
+- `--bc_split` is visible, but split output should be handled by `rad reformat --split-bc` in the current build.
+
+Files written:
+
+- primary output: `<outdir>/<prefix>.fq.gz` or `<outdir>/<prefix>.fa.gz` (extension follows input-type logic)
+- whitelist summaries: `<outdir>/<prefix>_whitelist_true.csv`, `<outdir>/<prefix>_whitelist_global.csv`
+- with `-w`: `<outdir>/<prefix>_dbg.sig.gz`, `<outdir>/<prefix>_dbg.csv.gz`, `<outdir>/<prefix>_dbg.fq.gz`, `<outdir>/<prefix>.metrics.tsv`
+
+Practical note:
+
+- some console path messages may omit `.gz`; those channels are still gzip-compressed on disk.
 
 ---
 
 ## `rad reformat`
 
 What it does:
+
 - rewrites headers and/or splits reads by barcode tag
 
 Usage:
@@ -108,6 +138,7 @@ build/rad reformat -q INPUT [options]
 ```
 
 Options:
+
 - `-q, --fastq` (required)
 - `-o, --outdir` (required with `--split-bc`)
 - `--split-bc`
@@ -117,11 +148,18 @@ Options:
 - `-h, --help`
 
 Hard checks:
+
 - command fails if neither `--split-bc` nor `--reformat-header` is set
 - command fails if `--split-bc` is set without `--outdir`
 
 Behavior detail:
+
 - `--reformat-header` alone rewrites input in place
+
+Files written:
+
+- `--reformat-header`: input file is rewritten in place
+- `--split-bc`: `<outdir>/<CB>.fq.gz` for each observed `CB:Z` tag
 
 ---
 
@@ -142,6 +180,7 @@ build/rad_config whitelist rm <kit>
 ```
 
 Practical note:
+
 - `set/rm` updates are process-local in the current build and won't persist across independent invocations.
 
 ---
@@ -154,8 +193,28 @@ Practical note:
 build/discover_layout --help
 ```
 
+Writes:
+
+- `<prefix>_layout.csv`
+
 ### `generate_whitelist`
 
 ```bash
 build/generate_whitelist --help
 ```
+
+Writes:
+
+- `<output-prefix>.csv`
+- `<output-prefix>.txt`
+
+---
+
+## Run checklist
+
+Capture this for every run:
+
+- full command line
+- full output file list
+- byte size of each major artifact
+- read/line counts for main outputs

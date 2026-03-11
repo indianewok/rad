@@ -1,15 +1,10 @@
 # RAD docs index
 
-Use this as a quick pointer map.
-
 ## Core usage
 
-- [`installation.md`](installation.md): what RAD depends on, and how to build it on macOS/Linux/Conda.
-- [`quickstart.md`](quickstart.md): the standard `prep -> demux -> reformat` flow.
-- [`cli-reference.md`](cli-reference.md): command and flag behavior, including hard validation checks.
+- [`installation.md`](installation.md): dependency setup, build, and first run (`prep -> demux -> reformat`).
+- [`cli-reference.md`](cli-reference.md): command behavior, flag contract, and exact output files.
 - [`layouts-and-whitelists.md`](layouts-and-whitelists.md): layout CSV format, bundled layouts, whitelist sizes/sources, and common kit pairings.
-- [`output-files.md`](output-files.md): what each command writes, with exact filename patterns.
-- [`troubleshooting.md`](troubleshooting.md): symptom -> likely cause -> fix.
 
 ## Internals
 
