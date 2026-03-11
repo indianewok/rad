@@ -21,6 +21,10 @@ Where these come from:
 - all are local templates shipped in `resources/read_layout/`.
 - nothing is downloaded at runtime.
 
+Visium HD status note:
+- Visium HD support is being developed on `dev`.
+- In the current `main` build/docs format, treat Visium HD as not fully integrated into the stable layout/whitelist flow yet.
+
 ## Quick layout pick guide
 
 - 10x 3' style library -> start with `three_prime`
@@ -42,19 +46,49 @@ Columns RAD expects:
 
 Minimal example:
 
-```csv
-Read Layout,,,,,
-id,seq,expected_length,type,class,whitelist
-forw_primer,CTACACGACGCTCTTCCGATCT,,static,,
-barcode,,16,variable,barcode,10x_5v1
-umi,,10,variable,umi,
-read,,,variable,read,
-rev_primer,GTACTCTGCGTTGATACCACTGCTT,,static,,
-```
+| id | seq | expected_length | type | class | whitelist |
+| --- | --- | --- | --- | --- | --- |
+| `forw_primer` | `CTACACGACGCTCTTCCGATCT` |  | `static` |  |  |
+| `barcode` |  | `16` | `variable` | `barcode` | `10x_5v1` |
+| `umi` |  | `10` | `variable` | `umi` |  |
+| `read` |  |  | `variable` | `read` |  |
+| `rev_primer` | `GTACTCTGCGTTGATACCACTGCTT` |  | `static` |  |  |
 
 Direction notes:
 - if `direction` is omitted, RAD treats rows as forward and auto-generates reverse-complement counterparts.
 - `forward_only` / `reverse_only` can be used for one-sided elements.
+
+## Direction column examples (`both`, `forward_only`, `reverse_only`)
+
+### 1) Both orientations (auto forward + reverse-complement)
+
+Use the standard header and omit `direction`:
+
+```csv
+id,seq,expected_length,type,class,whitelist
+forw_primer,CTACACGACGCTCTTCCGATCT,,static,,
+barcode,,16,variable,barcode,10x_5v1
+```
+
+### 2) Forward-only element(s)
+
+Add a `direction` column and mark specific rows as `forward_only`:
+
+```csv
+id,seq,expected_length,type,class,whitelist,direction
+barcode,,16,variable,barcode,10x_5v1,forward_only
+read,,,variable,read,,forward_only
+```
+
+### 3) Reverse-only element(s)
+
+Use the same header and mark rows as `reverse_only`:
+
+```csv
+id,seq,expected_length,type,class,whitelist,direction
+adapter_rc,AGATCGGAAGAGCGTCGTGTAG,,static,adapter,,reverse_only
+barcode_rc,,16,variable,barcode,10x_5v1,reverse_only
+```
 
 ## Bundled whitelist resources (current files + sizes)
 
