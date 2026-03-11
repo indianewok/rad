@@ -20,8 +20,8 @@ Short version: define the read structure, map positions, run demux, then reforma
 
 ```mermaid
 flowchart LR
-    A["rad prep\n(layout + optional position map)"] --> B["rad demux\n(layout-aware extraction + filtering)"]
-    B --> C["rad reformat\n(header rewrite and/or CB split)"]
+    A["rad prep (layout + optional position map)"] --> B["rad demux (layout-aware extraction + filtering)"]
+    B --> C["rad reformat (header rewrite and/or CB split)"]
 ```
 
 ## Minimal run
