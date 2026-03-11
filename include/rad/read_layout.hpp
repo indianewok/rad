@@ -1477,12 +1477,17 @@ public:
                 whitelist::wl_entry entry = wl_map.import_whitelist(spec, verbose, default_length);
                 // hardcoded whitelist size limit for entry so that we don't generate too many mismatches
                 memory_utils::get_rss();
-                // hardcoded this to essentially cover all scenarios where the whitelist becomes
-                // detrimental to size, so basically b/w 15K-30K barcodes we pre-generate it
-                if(entry.true_bcs.size() >= 15000 && entry.true_bcs.size() <= 30000){
-                    entry.generate_mismatch_barcodes(
-                            mut.value_or(2),
-                            verbose, nthreads);
+                // For large true whitelists, pre-build a 3-part seed index and skip mismatch expansion.
+                const size_t true_unique_size = entry.true_bcs.unique_val_size();
+                if (true_unique_size > 10000) {
+                    entry.build_true_seed_index(verbose);
+                    if (verbose) {
+                        std::cout << "[load_wl] Skipping generate_mismatch_barcodes for "
+                                  << elem.class_id << " (deprecated path; true_unique_size="
+                                  << true_unique_size << ")\n";
+                    }
+                    // Deprecated for large true whitelists:
+                    // entry.generate_mismatch_barcodes(mut.value_or(2), verbose, nthreads);
                 }
                 memory_utils::get_rss();
                 // build filter_bcs from static_seqs

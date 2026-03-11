@@ -1123,23 +1123,62 @@ namespace barcode_correction {
             std::cout << "[kmer_fuzzy_wl_search] No direct k-mer hits, trying k-mer mutations..." << std::endl;
         }
     }
-    std::unordered_set<int64_seq> mutation_candidates;
+    if (wl.has_true_seed_index()) {
+        auto seed_candidates = wl.query_true_seed_candidates(original_barcode);
+        if (verbose) {
+            #pragma omp critical
+            {
+                std::cout << "[kmer_fuzzy_wl_search] Seed shortlist candidates (true): "
+                          << seed_candidates.size() << "\n";
+            }
+        }
+
+        if (!seed_candidates.empty()) {
+            auto seed_result = check_against_wl(
+                original_barcode,
+                seed_candidates,
+                "true",
+                2,
+                verbose,
+                mode,
+                &wl
+            );
+            if (seed_result.has_value()) {
+                if (verbose) {
+                    #pragma omp critical
+                    {
+                        std::cout << "[kmer_fuzzy_wl_search] SEED_SHORTLIST_HIT (true): "
+                                  << seed_result.value().bits_to_sequence() << "\n";
+                    }
+                }
+                return seed_result;
+            }
+        }
+    }
+
     int64_seq exp_bc;
     exp_bc.sequence_to_bits(expanded_seq);
-       //BEST VERSION WORKS HERE @ ED 2, check_against_wl_exhaustive regular
-       //totally arbitrary sizing of the whitelist to scan under, chosen bc i guesstimate that's the max of a sc expt
-       //case in point, nearly a 2x speedup going from ~5k barcodes to 12k barcodes in the wl
-    if(wl.true_bcs.size() <= 30000){
+    // Exhaustive true-whitelist scan is expensive; cap by unique true barcodes.
+    constexpr size_t true_exhaustive_cap = 10000;
+    const size_t true_unique_size = wl.true_bcs.unique_val_size();
+    if (true_unique_size <= true_exhaustive_cap) {
        auto true_result = exhaustive_check_against_wl(exp_bc, "true", 2, verbose, mode, &wl);
        if (true_result.has_value()) {
             if (verbose) {
                 #pragma omp critical
-                { 
-                    std::cout << "[kmer_fuzzy_wl_search] KMER_MUTATION_HIT (true): " 
+                {
+                    std::cout << "[kmer_fuzzy_wl_search] KMER_MUTATION_HIT (true): "
                               << true_result.value().bits_to_sequence() << std::endl;
                 }
             }
             return true_result;
+        }
+    } else if (verbose) {
+        #pragma omp critical
+        {
+            std::cout << "[kmer_fuzzy_wl_search] Skipping exhaustive true whitelist search "
+                      << "(unique_true_barcodes=" << true_unique_size
+                      << ", cap=" << true_exhaustive_cap << ")\n";
         }
     }
     if (verbose) {
@@ -2404,6 +2443,108 @@ private:
         return direction_elements;
     }
 
+    // Restore per-read whitelist count accounting used by barcode QC.
+    void update_bc_counts(
+        SigString &sig,
+        const ReadLayout &layout,
+        bool verbose
+    ) {
+        const std::string type = sig.read_type;
+
+        for (auto const &elem : sig.elements()) {
+            if (elem.global_class != "barcode" || !elem.seq.has_value()) {
+                continue;
+            }
+
+            const std::string bc_seq = elem.seq.value();
+            int64_seq bc(bc_seq);
+            const std::string key = seq_utils::remove_rc(elem.class_id);
+            auto wl_it = layout.wl_map.maps.find(key);
+            if (wl_it == layout.wl_map.maps.end()) {
+                if (verbose) {
+                    #pragma omp critical
+                    {
+                        std::cout << "[update_bc_counts] Missing whitelist map for " << key << "\n";
+                    }
+                }
+                continue;
+            }
+            auto &wl = wl_it->second.get();
+
+            bool is_corrected = false;
+            if (elem.original_seq.has_value() && !elem.original_seq.value().empty()) {
+                const std::string &original_seq = elem.original_seq.value();
+                const std::string original_revcomp = seq_utils::revcomp(original_seq);
+                is_corrected = (bc_seq != original_seq && bc_seq != original_revcomp);
+            }
+
+            const bool found_in_true = wl.true_bcs.check_wl_for(bc);
+            const bool found_in_global = wl.global_bcs.check_wl_for(bc);
+            const std::string whitelist_used = found_in_true ? "true" : (found_in_global ? "global" : "filter");
+
+            auto update_target = [&](auto &typed_wl) {
+                if (type == "filtered" || (type != elem.direction && type != "concatenate")) {
+                    typed_wl.update_bc_count(bc, barcode_counts::filtered);
+                }
+
+                if (type == "forward" && elem.direction == "forward") {
+                    typed_wl.update_bc_count(bc, barcode_counts::total);
+                    typed_wl.update_bc_count(bc, barcode_counts::forw);
+                    typed_wl.update_bc_count(
+                        bc,
+                        is_corrected ? barcode_counts::corrected : barcode_counts::raw
+                    );
+                }
+
+                if (type == "reverse" && elem.direction == "reverse") {
+                    typed_wl.update_bc_count(bc, barcode_counts::total);
+                    typed_wl.update_bc_count(bc, barcode_counts::rev);
+                    typed_wl.update_bc_count(
+                        bc,
+                        is_corrected ? barcode_counts::corrected : barcode_counts::raw
+                    );
+                }
+
+                if (type == "concatenate") {
+                    if (elem.direction == "forward") {
+                        typed_wl.update_bc_count(bc, barcode_counts::total);
+                        typed_wl.update_bc_count(bc, barcode_counts::forw_concat);
+                        typed_wl.update_bc_count(
+                            bc,
+                            is_corrected ? barcode_counts::corrected : barcode_counts::raw
+                        );
+                    }
+
+                    if (elem.direction == "reverse") {
+                        typed_wl.update_bc_count(bc, barcode_counts::total);
+                        typed_wl.update_bc_count(bc, barcode_counts::rev_concat);
+                        typed_wl.update_bc_count(
+                            bc,
+                            is_corrected ? barcode_counts::corrected : barcode_counts::raw
+                        );
+                    }
+                }
+            };
+
+            if (whitelist_used == "true") {
+                (void)wl.with_wl("true", [&](auto &typed_wl) { update_target(typed_wl); });
+            } else if (whitelist_used == "global") {
+                (void)wl.with_wl("global", [&](auto &typed_wl) { update_target(typed_wl); });
+            } else {
+                update_target(wl.filter_bcs);
+            }
+
+            if (verbose) {
+                #pragma omp critical
+                {
+                    std::cout << "[update_bc_counts] Updated " << bc.bits_to_sequence()
+                              << " in " << whitelist_used
+                              << " (" << (is_corrected ? "CORRECTED" : "RAW") << ")\n";
+                }
+            }
+        }
+    }
+
 /** 
  * @brief Process sequence elements in a given direction: filter by length, mask overlaps, trim reads, and validate positions
  * @param direction direction string
@@ -3617,7 +3758,7 @@ public:
         determine_final_read_type(direction_valid, pass_counts, verbose);
         
         // part 5: Update barcode counts
-        //update_bc_counts(*this, layout, verbose);
+        update_bc_counts(*this, layout, verbose);
         
         if (verbose) {
             log_final_results(direction_valid, pass_counts);

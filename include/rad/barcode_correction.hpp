@@ -1782,6 +1782,118 @@ class whitelist {
         bc_multimap<int64_seq, barcode_entry> true_bcs, filter_bcs;
         bc_flat_set global_bcs;
 
+        struct seed_key {
+            uint8_t partition = 0;
+            std::string seed;
+
+            bool operator==(const seed_key& other) const noexcept {
+                return partition == other.partition && seed == other.seed;
+            }
+        };
+
+        struct seed_key_hash {
+            size_t operator()(const seed_key& key) const noexcept {
+                const size_t h_part = std::hash<uint8_t>{}(key.partition);
+                const size_t h_seed = std::hash<std::string>{}(key.seed);
+                return h_part ^ (h_seed + 0x9e3779b97f4a7c15ULL + (h_part << 6) + (h_part >> 2));
+            }
+        };
+
+        std::unordered_map<seed_key, std::vector<int64_seq>, seed_key_hash> true_seed_index;
+        size_t true_seed_barcode_length = 0;
+        bool true_seed_index_ready = false;
+
+        static std::array<std::pair<size_t, size_t>, 3> seed_partitions(size_t len) {
+            std::array<std::pair<size_t, size_t>, 3> windows{};
+            size_t start = 0;
+            const size_t base = len / 3;
+            const size_t rem = len % 3;
+            for (size_t i = 0; i < 3; ++i) {
+                const size_t seg_len = base + (i < rem ? 1 : 0);
+                const size_t end = start + seg_len;
+                windows[i] = {start, end};
+                start = end;
+            }
+            return windows;
+        }
+
+        void build_true_seed_index(bool verbose) {
+            true_seed_index.clear();
+            true_seed_barcode_length = 0;
+            true_seed_index_ready = false;
+
+            std::vector<const barcode_entry*> originals = true_bcs.get_unique_entries();
+            if (originals.empty()) {
+                return;
+            }
+
+            const size_t barcode_len = originals.front()->barcode.length;
+            if (barcode_len < 3) {
+                if (verbose) {
+                    std::cout << "[seed_index] Skipping seed index build: barcode length < 3\n";
+                }
+                return;
+            }
+
+            const auto windows = seed_partitions(barcode_len);
+            true_seed_index.reserve(originals.size() * 3);
+
+            for (const auto* entry : originals) {
+                if (!entry) continue;
+                const std::string seq = entry->barcode.bits_to_sequence();
+                if (seq.size() != barcode_len) continue;
+
+                for (size_t pid = 0; pid < 3; ++pid) {
+                    const auto [start, end] = windows[pid];
+                    if (end <= start || end > seq.size()) continue;
+                    seed_key key{};
+                    key.partition = static_cast<uint8_t>(pid);
+                    key.seed = seq.substr(start, end - start);
+                    true_seed_index[key].push_back(entry->barcode);
+                }
+            }
+
+            true_seed_barcode_length = barcode_len;
+            true_seed_index_ready = !true_seed_index.empty();
+
+            if (verbose) {
+                std::cout << "[seed_index] Built true barcode seed index: "
+                          << true_seed_index.size() << " keys from "
+                          << originals.size() << " barcodes (len=" << true_seed_barcode_length
+                          << ", partitions=3)\n";
+            }
+        }
+
+        bool has_true_seed_index() const noexcept {
+            return true_seed_index_ready;
+        }
+
+        std::unordered_set<int64_seq> query_true_seed_candidates(const int64_seq& query) const {
+            std::unordered_set<int64_seq> candidates;
+            if (!true_seed_index_ready) return candidates;
+
+            const std::string query_seq = query.bits_to_sequence();
+            if (query_seq.size() != true_seed_barcode_length) return candidates;
+
+            const auto windows = seed_partitions(true_seed_barcode_length);
+            for (size_t pid = 0; pid < 3; ++pid) {
+                const auto [start, end] = windows[pid];
+                if (end <= start || end > query_seq.size()) continue;
+
+                seed_key key{};
+                key.partition = static_cast<uint8_t>(pid);
+                key.seed = query_seq.substr(start, end - start);
+
+                auto it = true_seed_index.find(key);
+                if (it == true_seed_index.end()) continue;
+                for (const auto& bc : it->second) {
+                    candidates.insert(bc);
+                }
+            }
+
+            return candidates;
+        }
+
         template<class F> decltype(auto) with_wl(std::string_view src, F&& f) {
             if (src == "global") return f(global_bcs);
             return f(true_bcs);
