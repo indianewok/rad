@@ -44,3 +44,8 @@ CLAUDE.*
 
 # files that are too large
 resources/wl/visium_hd_coordinates.csv.gz
+
+# Legacy tools slated for removal
+src/synthetic_main.cpp
+include/rad/synthetic_generator.hpp
+src/badread_sim.cpp
