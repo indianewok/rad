@@ -111,6 +111,84 @@ Entry counts below are line counts from bundled `.gz` files.
 | `splitseq_bc2_bitlist.csv.gz` | 96 | SPLiT-seq barcode set |
 | `visium_hd_coordinates.csv.gz` | 11,222,501 | Visium HD coordinate table (auxiliary spatial resource) |
 
+## How RAD stores barcodes internally (`int64_seq` + `barcode_entry`)
+
+RAD stores barcodes in a compact 2-bit encoding (`int64_seq`), then wraps that in `barcode_entry` for counts/flags.
+
+### `int64_seq` structure
+
+- `length` (`uint16_t`): barcode length in bases.
+- `bits` (`vector<int64_t>`): packed 2-bit chunks (up to 32 bases per `int64_t` chunk).
+
+Base map used in encoding:
+
+| Base | 2-bit code |
+| --- | --- |
+| `A` | `00` |
+| `C` | `01` |
+| `T` | `10` |
+| `G` | `11` |
+
+Encoding rule per chunk:
+- initialize `result = 0`
+- for each base (left to right): `result = (result << 2) | code(base)`
+
+That means:
+- first base in a chunk is stored in the highest used bits of that chunk
+- last base in a chunk is stored in the least-significant 2 bits
+
+Important positional detail:
+- many low-level mutation/distance routines index from LSB upward (`(bits >> (2*pos)) & 3`),
+- so `pos = 0` corresponds to the **rightmost** base in the decoded sequence.
+
+Character constraints:
+- encoder accepts `A/C/T/G` only (uppercase in the direct `int64_seq` conversion path).
+- `N` is not encodable in this 2-bit schema.
+
+### `barcode_entry` structure
+
+- `barcode` (`int64_seq`)
+- `count` (`counter`, atomic count array)
+- `filtered` (`bool`)
+
+Counter categories are:
+- `raw`, `forw`, `forw_concat`, `rev`, `rev_concat`, `total`, `corrected`, `filtered`
+
+### Translating bitlist values to DNA barcodes
+
+Bitlist whitelist files store integer-encoded barcodes.  
+To decode correctly, the barcode length is required (the integer alone is not enough).
+
+Python decode helper:
+
+```python
+def decode_barcode(value: int, length: int) -> str:
+    # if negative values ever appear, reinterpret as unsigned 64-bit
+    if value < 0:
+        value &= (1 << 64) - 1
+
+    lut = "ACTG"  # 0->A, 1->C, 2->T, 3->G
+    out = []
+    for _ in range(length):
+        out.append(lut[value & 0b11])
+        value >>= 2
+    return "".join(reversed(out))
+```
+
+Python encode helper:
+
+```python
+def encode_barcode(seq: str) -> int:
+    code = {"A": 0, "C": 1, "T": 2, "G": 3}
+    v = 0
+    for b in seq.upper():
+        v = (v << 2) | code[b]
+    return v
+```
+
+Example:
+- `decode_barcode(23904338, 16)` -> `AAACCTGAGAAACCAT`
+
 ## Kit aliases -> whitelist files (current map)
 
 | Kit group | Aliases | Backing file |
