@@ -1934,116 +1934,147 @@ class whitelist {
         bc_flat_set global_bcs;
         std::optional<spat_mask> spat_wl;
 
-        struct seed_key {
-            uint8_t partition = 0;
-            std::string seed;
+/**
+ * @brief Seed-based barcode candidate index
+ *
+ * Splits barcodes into 3 equal partitions and indexes each partition's
+ * 2-bit packed value.  Any barcode within edit distance 1 of a query
+ * must share at least 2 of 3 seed partitions (pigeonhole), so the
+ * candidate set returned by query() is a superset of all ED-1 matches.
+ *
+ * Keys are packed uint32_t (supports seeds up to 16bp).  Values are
+ * const barcode_entry* pointers into the owning whitelist — no copies.
+ */
+        struct seed_idx {
+            struct key {
+                uint8_t  partition = 0;
+                uint32_t bits = 0;
+                bool operator==(const key& o) const noexcept {
+                    return partition == o.partition && bits == o.bits;
+                }
+            };
+            struct key_hash {
+                size_t operator()(const key& k) const noexcept {
+                    return std::hash<uint64_t>{}(
+                        (static_cast<uint64_t>(k.partition) << 32) | k.bits);
+                }
+            };
 
-            bool operator==(const seed_key& other) const noexcept {
-                return partition == other.partition && seed == other.seed;
+            std::unordered_map<key, std::vector<const barcode_entry*>, key_hash> index;
+            size_t barcode_length = 0;
+            bool ready = false;
+
+            static std::array<std::pair<size_t, size_t>, 3> partitions(size_t len) {
+                std::array<std::pair<size_t, size_t>, 3> windows{};
+                size_t start = 0;
+                const size_t base = len / 3;
+                const size_t rem = len % 3;
+                for (size_t i = 0; i < 3; ++i) {
+                    const size_t seg_len = base + (i < rem ? 1 : 0);
+                    const size_t end = start + seg_len;
+                    windows[i] = {start, end};
+                    start = end;
+                }
+                return windows;
             }
-        };
 
-        struct seed_key_hash {
-            size_t operator()(const seed_key& key) const noexcept {
-                const size_t h_part = std::hash<uint8_t>{}(key.partition);
-                const size_t h_seed = std::hash<std::string>{}(key.seed);
-                return h_part ^ (h_seed + 0x9e3779b97f4a7c15ULL + (h_part << 6) + (h_part >> 2));
-            }
-        };
-
-        std::unordered_map<seed_key, std::vector<int64_seq>, seed_key_hash> true_seed_index;
-        size_t true_seed_barcode_length = 0;
-        bool true_seed_index_ready = false;
-
-        static std::array<std::pair<size_t, size_t>, 3> seed_partitions(size_t len) {
-            std::array<std::pair<size_t, size_t>, 3> windows{};
-            size_t start = 0;
-            const size_t base = len / 3;
-            const size_t rem = len % 3;
-            for (size_t i = 0; i < 3; ++i) {
-                const size_t seg_len = base + (i < rem ? 1 : 0);
-                const size_t end = start + seg_len;
-                windows[i] = {start, end};
-                start = end;
-            }
-            return windows;
-        }
-
-        void build_true_seed_index(bool verbose) {
-            true_seed_index.clear();
-            true_seed_barcode_length = 0;
-            true_seed_index_ready = false;
-
-            std::vector<const barcode_entry*> originals = true_bcs.get_unique_entries();
-            if (originals.empty()) {
-                return;
+            /// Extract 2-bit packed seed from an int64_seq at [start, start+len).
+            /// Single-chunk only (barcode length <= 32bp).
+            static uint32_t extract_bits(const int64_seq& seq, size_t start, size_t len) {
+                const size_t shift = 2 * (seq.length - start - len);
+                const uint32_t mask = (1U << (2 * len)) - 1;
+                return static_cast<uint32_t>((seq.bits[0] >> shift) & mask);
             }
 
-            const size_t barcode_len = originals.front()->barcode.length;
-            if (barcode_len < 3) {
+            void build(const std::vector<const barcode_entry*>& entries, bool verbose) {
+                index.clear();
+                barcode_length = 0;
+                ready = false;
+
+                if (entries.empty()) return;
+
+                const size_t bc_len = entries.front()->barcode.length;
+                if (bc_len < 3) {
+                    if (verbose) {
+                        std::cout << "[seed_idx] Skipping build: barcode length < 3\n";
+                    }
+                    return;
+                }
+
+                const auto windows = partitions(bc_len);
+                index.reserve(entries.size() * 3);
+
+                for (const auto* entry : entries) {
+                    if (!entry || entry->barcode.length != bc_len) continue;
+                    for (size_t pid = 0; pid < 3; ++pid) {
+                        const auto [s, e] = windows[pid];
+                        if (e <= s) continue;
+                        key k{};
+                        k.partition = static_cast<uint8_t>(pid);
+                        k.bits = extract_bits(entry->barcode, s, e - s);
+                        index[k].push_back(entry);
+                    }
+                }
+
+                barcode_length = bc_len;
+                ready = !index.empty();
+
                 if (verbose) {
-                    std::cout << "[seed_index] Skipping seed index build: barcode length < 3\n";
+                    std::cout << "[seed_idx] Built index: "
+                              << index.size() << " keys from "
+                              << entries.size() << " barcodes (len=" << bc_len
+                              << ", partitions=3)\n";
                 }
-                return;
             }
 
-            const auto windows = seed_partitions(barcode_len);
-            true_seed_index.reserve(originals.size() * 3);
+            std::vector<const barcode_entry*> query(const int64_seq& barcode) const {
+                std::vector<const barcode_entry*> candidates;
+                if (!ready) return candidates;
+                if (barcode.length != barcode_length) return candidates;
 
-            for (const auto* entry : originals) {
-                if (!entry) continue;
-                const std::string seq = entry->barcode.bits_to_sequence();
-                if (seq.size() != barcode_len) continue;
-
+                const auto windows = partitions(barcode_length);
                 for (size_t pid = 0; pid < 3; ++pid) {
-                    const auto [start, end] = windows[pid];
-                    if (end <= start || end > seq.size()) continue;
-                    seed_key key{};
-                    key.partition = static_cast<uint8_t>(pid);
-                    key.seed = seq.substr(start, end - start);
-                    true_seed_index[key].push_back(entry->barcode);
+                    const auto [s, e] = windows[pid];
+                    if (e <= s) continue;
+                    key k{};
+                    k.partition = static_cast<uint8_t>(pid);
+                    k.bits = extract_bits(barcode, s, e - s);
+
+                    auto it = index.find(k);
+                    if (it == index.end()) continue;
+                    for (const auto* entry : it->second) {
+                        candidates.push_back(entry);
+                    }
                 }
+                return candidates;
             }
+        };
 
-            true_seed_barcode_length = barcode_len;
-            true_seed_index_ready = !true_seed_index.empty();
+        seed_idx true_seeds, global_seeds;
 
-            if (verbose) {
-                std::cout << "[seed_index] Built true barcode seed index: "
-                          << true_seed_index.size() << " keys from "
-                          << originals.size() << " barcodes (len=" << true_seed_barcode_length
-                          << ", partitions=3)\n";
+        void build_seed_idx(bool verbose) {
+            auto true_entries = true_bcs.get_unique_entries();
+            if (!true_entries.empty()) {
+                true_seeds.build(true_entries, verbose);
+            }
+            auto global_entries = global_bcs.get_unique_entries();
+            if (!global_entries.empty()) {
+                global_seeds.build(global_entries, verbose);
             }
         }
 
-        bool has_true_seed_index() const noexcept {
-            return true_seed_index_ready;
+        bool has_seed_idx() const noexcept {
+            return true_seeds.ready || global_seeds.ready;
         }
 
-        std::unordered_set<int64_seq> query_true_seed_candidates(const int64_seq& query) const {
-            std::unordered_set<int64_seq> candidates;
-            if (!true_seed_index_ready) return candidates;
-
-            const std::string query_seq = query.bits_to_sequence();
-            if (query_seq.size() != true_seed_barcode_length) return candidates;
-
-            const auto windows = seed_partitions(true_seed_barcode_length);
-            for (size_t pid = 0; pid < 3; ++pid) {
-                const auto [start, end] = windows[pid];
-                if (end <= start || end > query_seq.size()) continue;
-
-                seed_key key{};
-                key.partition = static_cast<uint8_t>(pid);
-                key.seed = query_seq.substr(start, end - start);
-
-                auto it = true_seed_index.find(key);
-                if (it == true_seed_index.end()) continue;
-                for (const auto& bc : it->second) {
-                    candidates.insert(bc);
-                }
-            }
-
-            return candidates;
+        std::vector<const barcode_entry*> query_bc_seeds(
+            const int64_seq& query, const std::string& src) const {
+            if (src == "true")  return true_seeds.query(query);
+            if (src == "global") return global_seeds.query(query);
+            auto r = true_seeds.query(query);
+            auto g = global_seeds.query(query);
+            r.insert(r.end(), g.begin(), g.end());
+            return r;
         }
 
         template<class F> decltype(auto) with_wl(std::string_view src, F&& f) {

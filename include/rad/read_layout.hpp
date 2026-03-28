@@ -1480,7 +1480,7 @@ public:
                 // For large true whitelists, pre-build a 3-part seed index and skip mismatch expansion.
                 const size_t true_unique_size = entry.true_bcs.unique_val_size();
                 if (true_unique_size > 10000) {
-                    entry.build_true_seed_index(verbose);
+                    entry.build_seed_idx(verbose);
                     if (verbose) {
                         std::cout << "[load_wl] Skipping generate_mismatch_barcodes for "
                                   << elem.class_id << " (deprecated path; true_unique_size="

@@ -1127,31 +1127,41 @@ namespace barcode_correction {
             std::cout << "[kmer_fuzzy_wl_search] No direct k-mer hits, trying k-mer mutations..." << std::endl;
         }
     }
-    if (wl.has_true_seed_index()) {
-        auto seed_candidates = wl.query_true_seed_candidates(original_barcode);
+    if (wl.has_seed_idx()) {
+        // Query both true and global seed indices
+        auto seed_entries = wl.query_bc_seeds(original_barcode, "both");
         if (verbose) {
             #pragma omp critical
             {
-                std::cout << "[kmer_fuzzy_wl_search] Seed shortlist candidates (true): "
-                          << seed_candidates.size() << "\n";
+                std::cout << "[kmer_fuzzy_wl_search] Seed shortlist candidates: "
+                          << seed_entries.size() << "\n";
             }
         }
 
-        if (!seed_candidates.empty()) {
+        if (!seed_entries.empty()) {
+            std::unordered_set<int64_seq> seed_candidates;
+            seed_candidates.reserve(seed_entries.size());
+            for (const auto* e : seed_entries) {
+                if (e) seed_candidates.insert(e->barcode);
+            }
+
+            // Check true seeds first, then global (offensive order)
+            const std::string first_src  = (mode == "defensive") ? "global" : "true";
+            const std::string second_src = (mode == "defensive") ? "true" : "global";
+
             auto seed_result = check_against_wl(
-                original_barcode,
-                seed_candidates,
-                "true",
-                2,
-                verbose,
-                mode,
-                &wl
+                original_barcode, seed_candidates, first_src, 2, verbose, mode, &wl
             );
+            if (!seed_result.has_value()) {
+                seed_result = check_against_wl(
+                    original_barcode, seed_candidates, second_src, 2, verbose, mode, &wl
+                );
+            }
             if (seed_result.has_value()) {
                 if (verbose) {
                     #pragma omp critical
                     {
-                        std::cout << "[kmer_fuzzy_wl_search] SEED_SHORTLIST_HIT (true): "
+                        std::cout << "[kmer_fuzzy_wl_search] SEED_SHORTLIST_HIT: "
                                   << seed_result.value().bits_to_sequence() << "\n";
                     }
                 }
