@@ -16,6 +16,7 @@ static void print_main_usage(const char *prog) {
                "whitelist kits\n"
             << "  modify            Add/remove read layout or whitelist-kit "
                "mappings\n"
+            << "  scan-wl           Scan FASTQ for barcodes and generate/validate whitelists\n"
             << "  help              Show help for a specific command\n\n"
             << "Use '" << prog
             << " <command> --help' for command-specific options\n";
@@ -1718,6 +1719,8 @@ int main(int argc, char *argv[]) {
     return cmd_list(argc - 1, argv + 1);
   } else if (command == "modify") {
     return cmd_modify(argc - 1, argv + 1);
+  } else if (command == "scan-wl") {
+    return cmd_scan_wl(argc - 1, argv + 1);
   } else if (command == "help") {
     return cmd_help(argc - 1, argv + 1);
   } else if (command == "--help" || command == "-h") {

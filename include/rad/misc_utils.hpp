@@ -148,12 +148,22 @@ namespace path_utils {
         dir = parent;
       }
   
-      // 3) Fallback: ./resources in your CWD
+      // 3) Compile-time source directory from CMake
+#ifdef RAD_SOURCE_DIR
+      {
+        bfs::path src_res = bfs::path(RAD_SOURCE_DIR) / "resources";
+        if (bfs::exists(src_res) && bfs::is_directory(src_res)) {
+          return bfs::canonical(src_res);
+        }
+      }
+#endif
+
+      // 4) Fallback: ./resources in your CWD
       bfs::path alt = bfs::current_path() / "resources";
       if (bfs::exists(alt) && bfs::is_directory(alt)) {
         return bfs::canonical(alt);
       }
-  
+
       throw std::runtime_error("Cannot locate 'resources' folder up the tree or in CWD");
     }
 

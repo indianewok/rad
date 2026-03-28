@@ -46,7 +46,7 @@ else()
   message(STATUS "pigz not found; will fall back to zlib at runtime")
 endif()
 
-find_package(Boost REQUIRED COMPONENTS filesystem system iostreams)
+find_package(Boost REQUIRED COMPONENTS filesystem iostreams)
 
 # --------------------------------------------------------------------------
 # third party libraries
@@ -72,7 +72,7 @@ file(GLOB_RECURSE RAD_HEADERS CONFIGURE_DEPENDS rad/*.hpp)
 
 add_library(rad_lib INTERFACE)
 target_sources(rad_lib INTERFACE ${RAD_HEADERS})
-target_compile_definitions(rad_lib INTERFACE HAVE_PIGZ=1 PIGZ_PATH="${PIGZ_EXE}")
+target_compile_definitions(rad_lib INTERFACE HAVE_PIGZ=1 PIGZ_PATH="${PIGZ_EXE}" RAD_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 target_include_directories(rad_lib INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -89,7 +89,6 @@ target_link_libraries(rad_lib INTERFACE
     OpenMP::OpenMP_CXX
     Boost::filesystem
     Boost::iostreams
-    Boost::system
     Boost::boost
     ZLIB::ZLIB
     edlib
