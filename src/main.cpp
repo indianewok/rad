@@ -1391,8 +1391,8 @@ int cmd_demux(int argc, char *argv[]) {
       read_layout.load_wl(whitelist_path.value(), wl_mut, verbose, nthreads);
     } else if (!custom_kit.empty()) {
       if (verbose)
-        std::cout << "[main] Loading kit whitelist...\n";
-      read_layout.load_wl(std::nullopt, wl_mut, verbose, nthreads);
+        std::cout << "[main] Loading kit whitelist (overriding layout default)...\n";
+      read_layout.load_wl(custom_kit, wl_mut, verbose, nthreads);
     } else {
       if (verbose)
         std::cout << "[main] Loading all whitelists...\n";
@@ -1416,20 +1416,11 @@ int cmd_demux(int argc, char *argv[]) {
         << std::chrono::duration_cast<std::chrono::seconds>(sig_time).count()
         << " s\n";
 
-    // Save whitelist summaries. Without an explicit true barcode list (-c),
-    // keep only the global output.
+    // Save whitelist summaries (true + global).
     if (verbose)
       std::cout << "[main] Saving whitelist summary...\n";
     const std::string wl_summary_base = outbase.string() + "_whitelist.csv";
-    read_layout.save_wl(wl_summary_base, false);
-    if (custom_whitelist_path.empty()) {
-      std::error_code ec;
-      const std::string true_summary_path = outbase.string() + "_whitelist_true.csv";
-      std::filesystem::remove(true_summary_path, ec);
-      if (verbose && !ec) {
-        std::cout << "[main] No custom true whitelist provided; keeping global summary only.\n";
-      }
-    }
+    read_layout.save_wl(wl_summary_base, true);
 
     auto final_elapsed = std::chrono::steady_clock::now() - main_start;
     std::cout << "[main] Total code duration: "

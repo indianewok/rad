@@ -323,10 +323,15 @@ std::vector<std::string> read_whitelist(const std::string& filename) {
 // Load a two-part barcode whitelist CSV. The first row is a header; subsequent
 // rows are bare barcode sequences.  Returns {sequence set, sorted vector
 // of unique lengths found in the whitelist}.
-std::pair<std::unordered_set<std::string>, std::vector<int>>
-load_split_whitelist_csv(const std::string& path) {
+struct split_whitelist {
     std::unordered_set<std::string> seqs;
-    std::vector<int> all_lengths;
+    std::vector<int> lengths;
+    std::vector<std::string> ordered;              // insertion-order list for index mapping
+    std::unordered_map<std::string, uint16_t> idx; // sequence -> index
+};
+
+split_whitelist load_split_whitelist_csv(const std::string& path) {
+    split_whitelist wl;
 
     std::vector<std::string> lines;
     try {
@@ -334,7 +339,7 @@ load_split_whitelist_csv(const std::string& path) {
     } catch (const std::exception& e) {
         std::cerr << "Error: Could not open split-barcode whitelist: " << path
                   << " (" << e.what() << ")\n";
-        return {seqs, {}};
+        return wl;
     }
 
     bool first_line = true;
@@ -350,13 +355,16 @@ load_split_whitelist_csv(const std::string& path) {
             line = seq_utils::trim(line.substr(0, comma));
         }
         if (line.empty()) continue;
-        seqs.insert(line);
-        all_lengths.push_back((int)line.size());
+        if (wl.seqs.insert(line).second) {
+            wl.idx[line] = static_cast<uint16_t>(wl.ordered.size());
+            wl.ordered.push_back(line);
+        }
+        wl.lengths.push_back((int)line.size());
     }
 
-    std::sort(all_lengths.begin(), all_lengths.end());
-    all_lengths.erase(std::unique(all_lengths.begin(), all_lengths.end()), all_lengths.end());
-    return {seqs, all_lengths};
+    std::sort(wl.lengths.begin(), wl.lengths.end());
+    wl.lengths.erase(std::unique(wl.lengths.begin(), wl.lengths.end()), wl.lengths.end());
+    return wl;
 }
 
 // Search for a valid BC1+BC2 pair in a read window that begins at
@@ -638,6 +646,47 @@ void write_split_pair_counts(const std::vector<extracted_bc>& extracted_barcodes
         const auto cnt = std::get<2>(row);
         out << bc1 << "," << bc2 << "," << bc1 << bc2 << "," << cnt << "\n";
     }
+}
+
+/// Write a dense NxM binary matrix CSV (0s and 1s) from the observed pairs.
+/// Row = BC1 index, Col = BC2 index.  The file has no header.
+void write_spat_mask_csv(
+    const std::vector<extracted_bc>& extracted_barcodes,
+    const split_whitelist& bc1_wl,
+    const split_whitelist& bc2_wl,
+    const std::string& output_path)
+{
+    const size_t nrows = bc1_wl.ordered.size();
+    const size_t ncols = bc2_wl.ordered.size();
+    if (nrows == 0 || ncols == 0) return;
+
+    // Build the bit grid
+    std::vector<bool> grid(nrows * ncols, false);
+    size_t pairs_set = 0;
+    for (const auto& x : extracted_barcodes) {
+        if (x.barcode_1.empty() || x.barcode_2.empty()) continue;
+        auto it1 = bc1_wl.idx.find(x.barcode_1);
+        auto it2 = bc2_wl.idx.find(x.barcode_2);
+        if (it1 == bc1_wl.idx.end() || it2 == bc2_wl.idx.end()) continue;
+        size_t pos = static_cast<size_t>(it1->second) * ncols + it2->second;
+        if (!grid[pos]) { grid[pos] = true; ++pairs_set; }
+    }
+
+    // Write row by row
+    std::ofstream out(output_path);
+    if (!out.is_open()) {
+        std::cerr << "Warning: could not write spat_mask to " << output_path << "\n";
+        return;
+    }
+    for (size_t r = 0; r < nrows; ++r) {
+        for (size_t c = 0; c < ncols; ++c) {
+            if (c > 0) out << ',';
+            out << (grid[r * ncols + c] ? '1' : '0');
+        }
+        out << '\n';
+    }
+    std::cout << "[spat_mask] Written " << nrows << "x" << ncols
+              << " matrix (" << pairs_set << " valid pairs) to " << output_path << "\n";
 }
 
 std::vector<batch_entry> read_batch_csv(const std::string& filename) {
@@ -1558,23 +1607,26 @@ int main(int argc, char* argv[]) {
                           << "  BC2 whitelist: " << bc2_path << "\n";
             }
 
-            auto [bc1_set, bc1_lengths] = load_split_whitelist_csv(bc1_path);
-            auto [bc2_set, bc2_lengths] = load_split_whitelist_csv(bc2_path);
-            if (bc1_set.empty() || bc2_set.empty()) {
+            auto bc1_wl = load_split_whitelist_csv(bc1_path);
+            auto bc2_wl = load_split_whitelist_csv(bc2_path);
+            if (bc1_wl.seqs.empty() || bc2_wl.seqs.empty()) {
                 std::cerr << "Error: failed to load two-part barcode whitelists\n";
                 return;
             }
-            std::cout << "Loaded " << bc1_set.size() << " BC1 / " << bc2_set.size() << " BC2 sequences\n";
+            std::cout << "Loaded " << bc1_wl.seqs.size() << " BC1 / " << bc2_wl.seqs.size() << " BC2 sequences\n";
 
             auto barcodes = process_fastq_split_barcode(
                 fastq_path, adapter_seq,
-                umi_length, bc1_set, bc1_lengths, bc2_set, bc2_lengths,
+                umi_length, bc1_wl.seqs, bc1_wl.lengths, bc2_wl.seqs, bc2_wl.lengths,
                 offset_min, offset_max,
                 max_reads, max_error, chunk_size, num_threads);
 
             std::string pair_counts_output = resolved_prefix + "_valid_pairs.csv";
             write_split_pair_counts(barcodes, pair_counts_output);
             std::cout << "Raw valid BC1+BC2 pair counts written to: " << pair_counts_output << "\n";
+
+            std::string spat_mask_output = resolved_prefix + "_spat_mask.csv";
+            write_spat_mask_csv(barcodes, bc1_wl, bc2_wl, spat_mask_output);
 
             std::vector<std::string> empty_wl;
             count_perfect_matches_with_stats(barcodes, empty_wl, csv_output, text_output, verbose);

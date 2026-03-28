@@ -1034,6 +1034,20 @@ namespace mutation_tools {
             auto it = s.find(probe);
             if (it != s.end()) const_cast<value&>(*it).count.increment(slot);
         }
+
+/**
+ * @brief Single-lookup entry accessor for direct counter manipulation
+ * @tparam T key, value, or int64_seq
+ * @param x the barcode to look up
+ * @return mutable pointer to the entry, or nullptr if not found
+ */
+        template<typename T> value* find_entry(const T& x) const {
+            value probe; probe.barcode = key_of(x);
+            if (!probe.is_valid()) return nullptr;
+            auto it = s.find(probe);
+            if (it == s.end()) return nullptr;
+            return const_cast<value*>(&(*it));
+        }
 /**
  * @brief Subtract from the barcode count for a given barcode
  * @tparam T Type which can be a key, value, or a range of either
@@ -1573,6 +1587,19 @@ public:
         }
     }
 
+    /// Single-lookup entry accessor for direct counter manipulation.
+    /// Returns a mutable pointer to the first associated entry, or nullptr.
+    template<typename T>
+    value* find_entry(T const &x) const {
+        const auto& k = key_of(x);
+        if (!k.is_valid()) return nullptr;
+        auto it = associations.find(k);
+        if (it != associations.end() && !it->second.empty()) {
+            return const_cast<value*>(*it->second.begin());
+        }
+        return nullptr;
+    }
+
     template<typename T>
     void subtract_bc_count(T const &x, barcode_counts slot = total) const {
         const auto& k = key_of(x);
@@ -1764,6 +1791,129 @@ public:
 };
 
 /**
+ * @brief Sparse bitmask for validating joint barcode pairs
+ *
+ * Stores a dense M x N bit matrix indexed by barcode whitelist position.
+ * For Visium HD: 3350 x 3350 = ~1.4 MB.  Bit (i, j) is set iff the
+ * (BC1_i, BC2_j) pair was observed in the valid-pairs whitelist.
+ *
+ * The sequence-to-index lookup maps are built once at load time from the
+ * ordered whitelist files.  Validation is a single array access.
+ */
+struct spat_mask {
+    std::vector<bool> bits;
+    size_t rows = 0;   // BC1 axis size
+    size_t cols = 0;   // BC2 axis size
+
+    // sequence -> axis index
+    phmap::flat_hash_map<int64_seq, uint16_t> bc1_to_idx;
+    phmap::flat_hash_map<int64_seq, uint16_t> bc2_to_idx;
+
+    bool empty() const { return bits.empty(); }
+
+    /// Check whether a (BC1, BC2) pair is valid.
+    bool check(const int64_seq& bc1, const int64_seq& bc2) const {
+        auto it1 = bc1_to_idx.find(bc1);
+        auto it2 = bc2_to_idx.find(bc2);
+        if (it1 == bc1_to_idx.end() || it2 == bc2_to_idx.end()) return false;
+        return bits[static_cast<size_t>(it1->second) * cols + it2->second];
+    }
+
+    /// Number of valid pairs (set bits).
+    size_t count_valid() const {
+        size_t n = 0;
+        for (bool b : bits) n += b;
+        return n;
+    }
+
+    /// Load a binary matrix CSV and the two axis whitelist files.
+    /// The matrix has no header; row = BC1 index, col = BC2 index, values are 0 or 1.
+    /// The whitelist files define the index ordering (one barcode per line, first line may be "whitelist_bcs").
+    bool load(const std::string& matrix_path,
+              const std::string& bc1_wl_path,
+              const std::string& bc2_wl_path,
+              bool verbose) {
+
+        auto read_ordered_wl = [](const std::string& path) -> std::vector<std::string> {
+            std::vector<std::string> out;
+            gzFile fp = gzopen(path.c_str(), "r");
+            if (!fp) return out;
+            char buf[1024];
+            bool first = true;
+            while (gzgets(fp, buf, sizeof(buf))) {
+                std::string line(buf);
+                // trim trailing whitespace/newline
+                while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
+                    line.pop_back();
+                if (line.empty()) continue;
+                // strip anything after a comma (some whitelists have extra columns)
+                auto comma = line.find(',');
+                if (comma != std::string::npos) line = line.substr(0, comma);
+                if (first) { first = false; if (line == "whitelist_bcs") continue; }
+                out.push_back(line);
+            }
+            gzclose(fp);
+            return out;
+        };
+
+        auto bc1_list = read_ordered_wl(bc1_wl_path);
+        auto bc2_list = read_ordered_wl(bc2_wl_path);
+        if (bc1_list.empty() || bc2_list.empty()) {
+            std::cerr << "[spat_mask] Failed to load axis whitelists\n";
+            return false;
+        }
+
+        rows = bc1_list.size();
+        cols = bc2_list.size();
+
+        bc1_to_idx.reserve(rows);
+        bc2_to_idx.reserve(cols);
+        for (size_t i = 0; i < rows; ++i) {
+            int64_seq bits_i(bc1_list[i]);
+            bc1_to_idx[bits_i] = static_cast<uint16_t>(i);
+        }
+        for (size_t j = 0; j < cols; ++j) {
+            int64_seq bits_j(bc2_list[j]);
+            bc2_to_idx[bits_j] = static_cast<uint16_t>(j);
+        }
+
+        // Read the matrix CSV
+        bits.assign(rows * cols, false);
+        std::ifstream in(matrix_path);
+        if (!in.is_open()) {
+            std::cerr << "[spat_mask] Failed to open matrix: " << matrix_path << "\n";
+            return false;
+        }
+
+        size_t valid_count = 0;
+        std::string line;
+        for (size_t r = 0; r < rows && std::getline(in, line); ++r) {
+            size_t c = 0;
+            size_t pos = 0;
+            while (pos < line.size() && c < cols) {
+                char ch = line[pos];
+                if (ch == '1') {
+                    bits[r * cols + c] = true;
+                    ++valid_count;
+                    ++c;
+                } else if (ch == '0') {
+                    ++c;
+                }
+                // skip commas and whitespace
+                ++pos;
+            }
+        }
+
+        if (verbose) {
+            std::cout << "[spat_mask] Loaded " << rows << "x" << cols
+                      << " matrix (" << valid_count << " valid pairs) from "
+                      << matrix_path << "\n";
+        }
+        return true;
+    }
+};
+
+/**
  * @brief Whitelist class managing true and filtered barcodes
  * @param wl_entry: Struct containing true barcodes, filtered barcodes, and global barcodes
  */
@@ -1777,10 +1927,12 @@ class whitelist {
  * @param true_bcs: `bc_multimap<int64_seq, barcode_entry>` for true barcodes
  * @param filter_bcs: `bc_multimap<int64_seq, barcode_entry>` for filtered barcodes
  * @param global_bcs: `bc_flat_set` for global barcodes
+ * @param spat_wl: optional `spat_mask` for validating joint barcode pairs
  */
     struct wl_entry {
         bc_multimap<int64_seq, barcode_entry> true_bcs, filter_bcs;
         bc_flat_set global_bcs;
+        std::optional<spat_mask> spat_wl;
 
         struct seed_key {
             uint8_t partition = 0;

@@ -30,6 +30,10 @@ struct seq_element {
     std::optional<std::string> qual;   // quality scores for sequencing data (if fastq)
     std::optional<std::string> original_seq;  // original (pre-corrected) sequence if available
 
+    // Resolved during barcode correction — avoids redundant lookups in update_bc_counts.
+    counter* resolved_counter = nullptr;       // pointer to the matched whitelist entry's counter
+    bool     resolved_corrected = false;       // true if barcode was error-corrected (not just RC)
+
     seq_element(
         std::string class_id,
         std::string global_class,
@@ -1203,7 +1207,9 @@ namespace barcode_correction {
         const read_streaming::sequence& full_read,  bool verbose, int mut_dist, std::string mode) {
         // pick the right whitelist
         auto key = seq_utils::remove_rc(elem.class_id);
-        auto &wl = layout.wl_map.maps.at(key).get();
+        auto wl_it = layout.wl_map.maps.find(key);
+        if (wl_it == layout.wl_map.maps.end()) return std::nullopt;
+        auto &wl = wl_it->second.get();
         int max_dist = 4;
         // extract and reverse‐complement the raw string
         // encoded barcode and reverse complement
@@ -2443,104 +2449,48 @@ private:
         return direction_elements;
     }
 
-    // Restore per-read whitelist count accounting used by barcode QC.
+/**
+ * @brief Update per-barcode whitelist counters after read classification
+ * @param sig  the SigString whose elements carry resolved counter pointers
+ * @param layout ReadLayout (unused — counters already resolved during correction)
+ * @param verbose enable verbose/debug output
+ * @note Called once per read inside sigalign_filter.  Uses the counter pointer
+ *       stashed on each seq_element during apply_barcode_correction — zero
+ *       hash lookups, zero string operations, just atomic increments.
+ */
     void update_bc_counts(
         SigString &sig,
         const ReadLayout &layout,
         bool verbose
     ) {
-        const std::string type = sig.read_type;
+        const std::string& type = sig.read_type;
 
         for (auto const &elem : sig.elements()) {
-            if (elem.global_class != "barcode" || !elem.seq.has_value()) {
+            if (elem.global_class != "barcode" || !elem.resolved_counter) {
                 continue;
             }
 
-            const std::string bc_seq = elem.seq.value();
-            int64_seq bc(bc_seq);
-            const std::string key = seq_utils::remove_rc(elem.class_id);
-            auto wl_it = layout.wl_map.maps.find(key);
-            if (wl_it == layout.wl_map.maps.end()) {
-                if (verbose) {
-                    #pragma omp critical
-                    {
-                        std::cout << "[update_bc_counts] Missing whitelist map for " << key << "\n";
-                    }
-                }
+            auto& cnt = *elem.resolved_counter;
+
+            if (type == "filtered" || (type != elem.direction && type != "concatenate")) {
+                cnt.increment(barcode_counts::filtered);
                 continue;
             }
-            auto &wl = wl_it->second.get();
 
-            bool is_corrected = false;
-            if (elem.original_seq.has_value() && !elem.original_seq.value().empty()) {
-                const std::string &original_seq = elem.original_seq.value();
-                const std::string original_revcomp = seq_utils::revcomp(original_seq);
-                is_corrected = (bc_seq != original_seq && bc_seq != original_revcomp);
-            }
+            // Passing read — increment total + raw/corrected
+            cnt.increment(barcode_counts::total);
+            cnt.increment(elem.resolved_corrected
+                ? barcode_counts::corrected
+                : barcode_counts::raw);
 
-            const bool found_in_true = wl.true_bcs.check_wl_for(bc);
-            const bool found_in_global = wl.global_bcs.check_wl_for(bc);
-            const std::string whitelist_used = found_in_true ? "true" : (found_in_global ? "global" : "filter");
-
-            auto update_target = [&](auto &typed_wl) {
-                if (type == "filtered" || (type != elem.direction && type != "concatenate")) {
-                    typed_wl.update_bc_count(bc, barcode_counts::filtered);
-                }
-
-                if (type == "forward" && elem.direction == "forward") {
-                    typed_wl.update_bc_count(bc, barcode_counts::total);
-                    typed_wl.update_bc_count(bc, barcode_counts::forw);
-                    typed_wl.update_bc_count(
-                        bc,
-                        is_corrected ? barcode_counts::corrected : barcode_counts::raw
-                    );
-                }
-
-                if (type == "reverse" && elem.direction == "reverse") {
-                    typed_wl.update_bc_count(bc, barcode_counts::total);
-                    typed_wl.update_bc_count(bc, barcode_counts::rev);
-                    typed_wl.update_bc_count(
-                        bc,
-                        is_corrected ? barcode_counts::corrected : barcode_counts::raw
-                    );
-                }
-
-                if (type == "concatenate") {
-                    if (elem.direction == "forward") {
-                        typed_wl.update_bc_count(bc, barcode_counts::total);
-                        typed_wl.update_bc_count(bc, barcode_counts::forw_concat);
-                        typed_wl.update_bc_count(
-                            bc,
-                            is_corrected ? barcode_counts::corrected : barcode_counts::raw
-                        );
-                    }
-
-                    if (elem.direction == "reverse") {
-                        typed_wl.update_bc_count(bc, barcode_counts::total);
-                        typed_wl.update_bc_count(bc, barcode_counts::rev_concat);
-                        typed_wl.update_bc_count(
-                            bc,
-                            is_corrected ? barcode_counts::corrected : barcode_counts::raw
-                        );
-                    }
-                }
-            };
-
-            if (whitelist_used == "true") {
-                (void)wl.with_wl("true", [&](auto &typed_wl) { update_target(typed_wl); });
-            } else if (whitelist_used == "global") {
-                (void)wl.with_wl("global", [&](auto &typed_wl) { update_target(typed_wl); });
-            } else {
-                update_target(wl.filter_bcs);
-            }
-
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::cout << "[update_bc_counts] Updated " << bc.bits_to_sequence()
-                              << " in " << whitelist_used
-                              << " (" << (is_corrected ? "CORRECTED" : "RAW") << ")\n";
-                }
+            if (type == "forward" && elem.direction == "forward") {
+                cnt.increment(barcode_counts::forw);
+            } else if (type == "reverse" && elem.direction == "reverse") {
+                cnt.increment(barcode_counts::rev);
+            } else if (type == "concatenate") {
+                cnt.increment(elem.direction == "forward"
+                    ? barcode_counts::forw_concat
+                    : barcode_counts::rev_concat);
             }
         }
     }
@@ -2807,6 +2757,70 @@ private:
         return count;
     }
 
+/**
+ * @brief Parsed joint_barcode flag: group id and positional search offset range
+ *
+ * Flag grammar (in the `flags` column of a read layout CSV):
+ *   joint_barcode          -> group 0, offset [-3, +3]  (backward compatible)
+ *   joint_barcode:G        -> group G, offset [-3, +3]
+ *   joint_barcode:G_O      -> group G, offset [0, O]
+ *
+ * Barcodes that share the same group id are validated jointly as a
+ * contiguous chain.  The offset range controls how many bases of
+ * positional jitter to search around the expected anchor position.
+ */
+    struct joint_barcode_info {
+        int group = 0;
+        int offset_min = -3;
+        int offset_max = 3;
+    };
+
+/**
+ * @brief Parse the joint_barcode flag from a layout element's flags string
+ * @param flags the raw flags string from the ReadElement
+ * @return parsed `joint_barcode_info` if the element carries a joint_barcode
+ *         flag, or `std::nullopt` otherwise
+ */
+    std::optional<joint_barcode_info> parse_joint_barcode_flag(const std::string& flags) const {
+        if (flags.empty()) return std::nullopt;
+        std::string lowered = flags;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        // Tokenize on the same delimiters as has_layout_flag_token
+        std::vector<std::string> tokens;
+        std::string cur;
+        for (char c : lowered) {
+            if (c == ',' || c == ';' || c == '|' || c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                if (!cur.empty()) { tokens.push_back(cur); cur.clear(); }
+            } else {
+                cur.push_back(c);
+            }
+        }
+        if (!cur.empty()) tokens.push_back(cur);
+
+        for (const auto& tok : tokens) {
+            if (tok.rfind("joint_barcode", 0) != 0) continue;
+            joint_barcode_info info;
+            if (tok == "joint_barcode") return info; // bare default
+            if (tok.size() > 14 && tok[13] == ':') {
+                std::string suffix = tok.substr(14);
+                auto underscore = suffix.find('_');
+                if (underscore == std::string::npos) {
+                    // joint_barcode:G
+                    info.group = std::atoi(suffix.c_str());
+                } else {
+                    // joint_barcode:G_O
+                    info.group = std::atoi(suffix.substr(0, underscore).c_str());
+                    info.offset_max = std::atoi(suffix.substr(underscore + 1).c_str());
+                    info.offset_min = 0;
+                }
+            }
+            return info;
+        }
+        return std::nullopt;
+    }
+
     bool has_layout_flag_token(const std::string& flags, const std::string& token) const {
         if (flags.empty() || token.empty()) return false;
         std::string lowered_flags = flags;
@@ -2859,157 +2873,185 @@ private:
         return wl.true_bcs.check_wl_for(bits) || wl.global_bcs.check_wl_for(bits);
     }
 
-    bool try_process_joint_barcode_pair(
-        const seq_element& first,
-        const seq_element& second,
+/**
+ * @brief Process a group of N joint barcodes that share the same joint_barcode group id
+ * @param group  vector of references to the `seq_element` objects in the group, in layout order
+ * @param layout `ReadLayout` containing element definitions and whitelist maps
+ * @param read   `read_streaming::sequence` containing the read sequence
+ * @param jb_info parsed `joint_barcode_info` (group id and search offset range)
+ * @param verbose enable verbose/debug output
+ * @return true if every member of the group matched its whitelist exactly, false otherwise
+ * @note Members are searched as a contiguous chain: BC2 must start immediately after BC1 ends,
+ *       BC3 after BC2, etc.  All length combinations are tried at each position.  The search
+ *       offset is applied only to the anchor (first member) position.
+ */
+    bool try_process_joint_barcode_group(
+        const std::vector<std::reference_wrapper<const seq_element>>& group,
         const ReadLayout& layout,
         const read_streaming::sequence& read,
+        const joint_barcode_info& jb_info,
         bool verbose
     ) {
-        if (first.global_class != "barcode" || second.global_class != "barcode") return false;
-        if (first.direction != second.direction) return false;
+        if (group.size() < 2) return false;
 
-        const ReadElement* l1 = find_layout_element(layout, first.class_id);
-        const ReadElement* l2 = find_layout_element(layout, second.class_id);
-        if (!l1 || !l2) return false;
-        if (std::abs(l1->order - l2->order) != 1) return false;
-        if (!has_layout_flag_token(l1->flags, "joint_barcode") ||
-            !has_layout_flag_token(l2->flags, "joint_barcode")) {
-            return false;
+        // Validate: all must be barcodes, same direction
+        const std::string& direction = group[0].get().direction;
+        for (const auto& ref : group) {
+            if (ref.get().global_class != "barcode") return false;
+            if (ref.get().direction != direction) return false;
         }
 
-        auto w1_it = layout.wl_map.maps.find(seq_utils::remove_rc(first.class_id));
-        auto w2_it = layout.wl_map.maps.find(seq_utils::remove_rc(second.class_id));
-        if (w1_it == layout.wl_map.maps.end() || w2_it == layout.wl_map.maps.end()) return false;
-        const auto& wl1 = w1_it->second.get();
-        const auto& wl2 = w2_it->second.get();
+        // Load whitelists and length candidates for each member
+        struct member_info {
+            const seq_element* elem;
+            const whitelist::wl_entry* wl;
+            std::vector<int> lengths;
+            std::pair<int, int> position;
+        };
+        std::vector<member_info> members;
+        members.reserve(group.size());
 
-        auto len1 = effective_barcode_lengths(layout, first);
-        auto len2 = effective_barcode_lengths(layout, second);
-        if (len1.empty() || len2.empty()) return false;
+        for (const auto& ref : group) {
+            const auto& elem = ref.get();
+            auto wl_it = layout.wl_map.maps.find(seq_utils::remove_rc(elem.class_id));
+            if (wl_it == layout.wl_map.maps.end()) return false;
+            auto lens = effective_barcode_lengths(layout, elem);
+            if (lens.empty()) return false;
+            members.push_back({&elem, &wl_it->second.get(), std::move(lens), elem.position});
+        }
 
-        std::string oriented_read = read.seq;
-        auto p1 = first.position;
-        auto p2 = second.position;
         const int read_len = static_cast<int>(read.seq.size());
         if (read_len <= 0) return false;
 
-        const bool reverse = (first.direction == "reverse");
+        // Orient read and positions
+        std::string oriented_read = read.seq;
+        const bool reverse = (direction == "reverse");
         if (reverse) {
             oriented_read = seq_utils::revcomp(oriented_read);
-            auto to_oriented = [read_len](std::pair<int, int> p) {
-                return std::make_pair(read_len - p.second + 1, read_len - p.first + 1);
-            };
-            p1 = to_oriented(p1);
-            p2 = to_oriented(p2);
+            for (auto& m : members) {
+                m.position = std::make_pair(
+                    read_len - m.position.second + 1,
+                    read_len - m.position.first + 1);
+            }
         }
 
-        if (p1.first <= 0 || p2.first <= 0) return false;
+        // Sort members by position (leftmost first in oriented read)
+        std::vector<size_t> order(members.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return members[a].position.first < members[b].position.first;
+        });
 
-        const seq_element* left_elem = &first;
-        const seq_element* right_elem = &second;
-        const whitelist::wl_entry* left_wl = &wl1;
-        const whitelist::wl_entry* right_wl = &wl2;
-        std::vector<int> left_lens = len1;
-        std::vector<int> right_lens = len2;
-        auto left_pos = p1;
-        auto right_pos = p2;
-
-        if (p2.first < p1.first) {
-            std::swap(left_elem, right_elem);
-            std::swap(left_wl, right_wl);
-            std::swap(left_lens, right_lens);
-            std::swap(left_pos, right_pos);
+        // Build offset search order centered on 0
+        const int off_min = jb_info.offset_min;
+        const int off_max = jb_info.offset_max;
+        std::vector<int> offset_order;
+        offset_order.reserve(static_cast<size_t>(off_max - off_min + 1));
+        for (int d = 0; d <= std::max(std::abs(off_min), std::abs(off_max)); ++d) {
+            if (d >= off_min && d <= off_max) offset_order.push_back(d);
+            if (-d >= off_min && -d <= off_max && d != 0) offset_order.push_back(-d);
         }
 
-        struct joint_hit {
-            std::string left_seq;
-            std::string right_seq;
-            int left_start = -1;
-            int left_end = -1;
-            int right_start = -1;
-            int right_end = -1;
-            int offset = 0;
-        };
-
-        std::optional<joint_hit> hit;
-        const int search_min = -3;
-        const int search_max = 3;
-        std::vector<int> offset_order{0, 1, -1, 2, -2, 3, -3};
-        const int anchor_start = left_pos.first;
+        const int anchor_start = members[order[0]].position.first;
         const int oriented_len = static_cast<int>(oriented_read.size());
 
+        // Per-member hit result
+        struct member_hit {
+            std::string seq;
+            int start = -1;
+            int end = -1;
+        };
+
+        // Recursive chain search: try all length combinations for members in order
+        // cursor = current position in the oriented read (1-based)
+        // depth  = which member in `order` we're trying to match
+        std::vector<member_hit> hits(members.size());
+
+        std::function<bool(int, size_t)> search_chain = [&](int cursor, size_t depth) -> bool {
+            if (depth == order.size()) return true; // all matched
+            size_t mi = order[depth];
+            const auto& m = members[mi];
+            for (int len : m.lengths) {
+                int start = cursor;
+                int end = start + len - 1;
+                if (end > oriented_len) continue;
+                std::string seq = oriented_read.substr(
+                    static_cast<size_t>(start - 1), static_cast<size_t>(len));
+                if (!exact_whitelist_match(*m.wl, seq)) continue;
+                hits[mi] = {seq, start, end};
+                if (search_chain(end + 1, depth + 1)) return true;
+            }
+            return false;
+        };
+
+        bool found = false;
         for (int off : offset_order) {
-            if (off < search_min || off > search_max) continue;
-            const int left_start = anchor_start + off;
-            if (left_start < 1) continue;
+            int start = anchor_start + off;
+            if (start < 1) continue;
+            if (search_chain(start, 0)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
 
-            for (int l1_len : left_lens) {
-                const int left_end = left_start + l1_len - 1;
-                if (left_end > oriented_len) continue;
-
-                const std::string left_seq = oriented_read.substr(static_cast<size_t>(left_start - 1), static_cast<size_t>(l1_len));
-                if (!exact_whitelist_match(*left_wl, left_seq)) continue;
-
-                for (int l2_len : right_lens) {
-                    const int right_start = left_end + 1;
-                    const int right_end = right_start + l2_len - 1;
-                    if (right_end > oriented_len) continue;
-
-                    const std::string right_seq = oriented_read.substr(static_cast<size_t>(right_start - 1), static_cast<size_t>(l2_len));
-                    if (exact_whitelist_match(*right_wl, right_seq)) {
-                        hit = joint_hit{left_seq, right_seq, left_start, left_end, right_start, right_end, off};
-                        break;
+        // Validate the pair against the joint_spat_wl if loaded.
+        // For a two-member group: check the (BC1, BC2) bit in the sparse mask.
+        if (group.size() == 2) {
+            size_t first_idx = order[0];
+            size_t second_idx = order[1];
+            auto wl_it = layout.wl_map.maps.find(
+                seq_utils::remove_rc(members[first_idx].elem->class_id));
+            if (wl_it != layout.wl_map.maps.end()) {
+                const auto& wl_entry = wl_it->second.get();
+                if (wl_entry.spat_wl.has_value() && !wl_entry.spat_wl->empty()) {
+                    int64_seq bc1_bits, bc2_bits;
+                    bc1_bits.sequence_to_bits(hits[first_idx].seq);
+                    bc2_bits.sequence_to_bits(hits[second_idx].seq);
+                    if (!wl_entry.spat_wl->check(bc1_bits, bc2_bits)) {
+                        if (verbose) {
+                            log_verbose("JOINT_BARCODE_PAIR_REJECTED: " +
+                                hits[first_idx].seq + "+" + hits[second_idx].seq +
+                                " not in valid pairs mask");
+                        }
+                        return false;
                     }
                 }
-                if (hit.has_value()) break;
             }
-            if (hit.has_value()) break;
         }
 
-        if (!hit.has_value()) return false;
-
-        auto to_original = [read_len, reverse](std::pair<int, int> p) {
+        // Convert hits back to original coordinates and apply corrections
+        auto to_original = [read_len, reverse](std::pair<int, int> p) -> std::pair<int, int> {
             if (!reverse) return p;
             return std::make_pair(read_len - p.second + 1, read_len - p.first + 1);
         };
 
-        std::pair<int, int> left_final = to_original({hit->left_start, hit->left_end});
-        std::pair<int, int> right_final = to_original({hit->right_start, hit->right_end});
-
-        std::string seq_for_first = (left_elem->class_id == first.class_id) ? hit->left_seq : hit->right_seq;
-        std::string seq_for_second = (left_elem->class_id == first.class_id) ? hit->right_seq : hit->left_seq;
-        std::pair<int, int> pos_for_first = (left_elem->class_id == first.class_id) ? left_final : right_final;
-        std::pair<int, int> pos_for_second = (left_elem->class_id == first.class_id) ? right_final : left_final;
-
-        int64_seq bits_first, bits_second;
-        bits_first.sequence_to_bits(seq_for_first);
-        bits_second.sequence_to_bits(seq_for_second);
-        if (!bits_first.is_valid() || !bits_second.is_valid()) return false;
-
-        apply_barcode_correction(first, bits_first, layout, verbose);
-        apply_barcode_correction(second, bits_second, layout, verbose);
-
         auto& id_index = sig_elements.get<sig_id_tag>();
-        auto it_first = id_index.find(first.class_id);
-        if (it_first != id_index.end()) {
-            id_index.modify(it_first, [&](seq_element& e) {
-                e.position = pos_for_first;
-            });
-        }
-        auto it_second = id_index.find(second.class_id);
-        if (it_second != id_index.end()) {
-            id_index.modify(it_second, [&](seq_element& e) {
-                e.position = pos_for_second;
-            });
+        for (size_t mi = 0; mi < members.size(); ++mi) {
+            const auto& m = members[mi];
+            const auto& h = hits[mi];
+            auto final_pos = to_original({h.start, h.end});
+
+            int64_seq bits;
+            bits.sequence_to_bits(h.seq);
+            if (!bits.is_valid()) return false;
+            apply_barcode_correction(*m.elem, bits, layout, verbose);
+
+            auto it = id_index.find(m.elem->class_id);
+            if (it != id_index.end()) {
+                id_index.modify(it, [&](seq_element& e) {
+                    e.position = final_pos;
+                });
+            }
         }
 
         if (verbose) {
             std::ostringstream oss;
-            oss << "JOINT_BARCODE_HIT " << first.class_id << "+" << second.class_id
-                << " offset=" << hit->offset
-                << " left=" << seq_for_first
-                << " right=" << seq_for_second;
+            oss << "JOINT_BARCODE_HIT group=" << jb_info.group;
+            for (size_t mi = 0; mi < members.size(); ++mi) {
+                size_t idx = order[mi];
+                oss << " " << members[idx].elem->class_id << "=" << hits[idx].seq;
+            }
             log_verbose(oss.str());
         }
         return true;
@@ -3038,41 +3080,62 @@ private:
         bool verbose
     ) {
         
-        std::vector<std::string> barcode_ids;
-        barcode_ids.reserve(elements.size());
+        // Collect barcode elements and detect joint groups from layout flags
+        struct bc_entry {
+            std::string class_id;
+            std::optional<joint_barcode_info> jb;
+        };
+        std::vector<bc_entry> barcode_entries;
+        barcode_entries.reserve(elements.size());
         for (const auto& elem_ref : elements) {
             const auto& elem = elem_ref.get();
-            if (elem.global_class == "barcode") {
-                barcode_ids.push_back(elem.class_id);
-            }
+            if (elem.global_class != "barcode") continue;
+            const ReadElement* le = find_layout_element(layout, elem.class_id);
+            std::optional<joint_barcode_info> jb;
+            if (le) jb = parse_joint_barcode_flag(le->flags);
+            barcode_entries.push_back({elem.class_id, jb});
         }
 
-        bool has_multiple_barcodes = barcode_ids.size() > 1;
+        bool has_multiple_barcodes = barcode_entries.size() > 1;
         bool strict_joint_mode = (joint_bc_mode == "strict");
         bool all_barcodes_passed = true;
         bool any_barcode_passed = false;
 
         auto& id_index = sig_elements.get<sig_id_tag>();
-        for (size_t i = 0; i < barcode_ids.size();) {
-            auto it = id_index.find(barcode_ids[i]);
+        for (size_t i = 0; i < barcode_entries.size();) {
+            const auto& entry = barcode_entries[i];
+
+            // If this barcode has a joint group flag, collect the full group
+            if (entry.jb.has_value()) {
+                int group_id = entry.jb->group;
+                std::vector<std::reference_wrapper<const seq_element>> group;
+                joint_barcode_info group_info = *entry.jb;
+                size_t j = i;
+                while (j < barcode_entries.size() &&
+                       barcode_entries[j].jb.has_value() &&
+                       barcode_entries[j].jb->group == group_id) {
+                    auto it = id_index.find(barcode_entries[j].class_id);
+                    if (it == id_index.end()) break;
+                    group.push_back(std::cref(*it));
+                    ++j;
+                }
+
+                if (group.size() >= 2 &&
+                    try_process_joint_barcode_group(group, layout, read, group_info, verbose)) {
+                    any_barcode_passed = true;
+                    i = j;
+                    continue;
+                }
+                // Joint group failed — fall through to process individually
+            }
+
+            // Process as a single barcode
+            auto it = id_index.find(entry.class_id);
             if (it == id_index.end()) {
                 ++i;
                 continue;
             }
             seq_element elem = *it;
-
-            if (i + 1 < barcode_ids.size()) {
-                auto next_it = id_index.find(barcode_ids[i + 1]);
-                if (next_it != id_index.end()) {
-                    seq_element next_elem = *next_it;
-                    if (try_process_joint_barcode_pair(elem, next_elem, layout, read, verbose)) {
-                        any_barcode_passed = true;
-                        i += 2;
-                        continue;
-                    }
-                }
-            }
-
             bool barcode_passed = process_single_barcode(elem, layout, read, gen_mut, mode, verbose);
             if (!barcode_passed) {
                 all_barcodes_passed = false;
@@ -3135,28 +3198,45 @@ private:
         bool verbose
     ) {
 
-        auto& wl = layout.wl_map.maps.at(seq_utils::remove_rc(elem.class_id)).get();
+        auto wl_it = layout.wl_map.maps.find(seq_utils::remove_rc(elem.class_id));
+        if (wl_it == layout.wl_map.maps.end()) return;
+        auto& wl = wl_it->second.get();
         std::string final_bc = corrected_barcode.bits_to_sequence();
-        
-        // Determine which whitelist the correction came from
-        bool found_in_true = wl.true_bcs.check_wl_for(corrected_barcode);
-        bool found_in_global = wl.global_bcs.check_wl_for(corrected_barcode);
+
+        // Single-lookup resolution: find the entry once in true, then global.
+        // Stash the counter pointer on the element so update_bc_counts avoids re-lookup.
+        barcode_entry* entry = nullptr;
+        bool found_in_true = false;
+        bool found_in_global = false;
+
+        entry = wl.true_bcs.find_entry(corrected_barcode);
+        if (entry) {
+            found_in_true = true;
+        } else {
+            entry = wl.global_bcs.find_entry(corrected_barcode);
+            if (entry) found_in_global = true;
+        }
+
         bool true_wl_empty = wl.true_bcs.empty();
-        
-        // Prefer true whitelist if present in both
         std::string final_wl = found_in_true ? "true" : "global";
-        
-        // Update the element
+
+        // Update the element — stash resolved counter and corrected flag
         auto& id_index = sig_elements.get<sig_id_tag>();
         id_index.modify(id_index.find(elem.class_id), [&](seq_element& e) {
             e.original_seq = e.seq;
             e.seq = final_bc;
             e.element_pass = true;
-            // Emit true-whitelist barcodes by default.
-            // If no true whitelist exists, allow global matches to be emitted.
             e.write = found_in_true || (true_wl_empty && found_in_global);
+            e.resolved_counter = entry ? &entry->count : nullptr;
+            // Check if corrected: different from original (and not just its RC)
+            if (e.original_seq.has_value() && !e.original_seq->empty()) {
+                const std::string& orig = e.original_seq.value();
+                if (final_bc != orig) {
+                    e.resolved_corrected = (final_bc != seq_utils::revcomp(orig));
+                }
+            }
         });
-        
+
         if (verbose) {
             log_verbose("Barcode corrected: " + elem.class_id + " -> " + final_bc + " (" + final_wl + ")");
         }
@@ -3257,7 +3337,9 @@ private:
     ) {
         if (!elem.seq.has_value()) return;
         
-        auto& wl = layout.wl_map.maps.at(seq_utils::remove_rc(elem.class_id)).get();
+        auto wl_it = layout.wl_map.maps.find(seq_utils::remove_rc(elem.class_id));
+        if (wl_it == layout.wl_map.maps.end()) return;
+        auto& wl = wl_it->second.get();
         int64_seq failed_bc, rc_failed_bc;
         failed_bc.sequence_to_bits(elem.seq.value());
         rc_failed_bc.sequence_to_bits(seq_utils::revcomp(elem.seq.value()));

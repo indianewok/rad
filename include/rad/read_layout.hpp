@@ -1539,6 +1539,67 @@ public:
             }
         }
 
+        // Load spat_mask for joint barcode elements whose whitelist field
+        // contains a colon separator (e.g. "visium_hd_bc1:spat_mask.csv").
+        // The mask CSV path is the same for both bc1 and bc2 — passed on either.
+        // We load it once onto the first joint barcode element's wl_entry.
+        {
+            std::string mask_csv_path;
+            std::string bc1_wl_path, bc2_wl_path;
+            std::string first_joint_key;
+
+            for (auto const& elem : layout) {
+                if (elem.global_class != "barcode" || elem.type != "variable") continue;
+                if (elem.flags.find("joint_barcode") == std::string::npos) continue;
+
+                // Check if whitelist field has a colon (individual_wl:spat_mask_path)
+                auto colon = elem.whitelist_path.find(':');
+                if (colon != std::string::npos) {
+                    std::string individual_spec = elem.whitelist_path.substr(0, colon);
+                    std::string mask_spec = elem.whitelist_path.substr(colon + 1);
+
+                    // Resolve the mask path
+                    std::string resolved_mask = mask_spec;
+                    try {
+                        // If it's not an absolute path, try resolving as kit key
+                        if (!std::filesystem::path(mask_spec).is_absolute() &&
+                            !std::filesystem::exists(mask_spec)) {
+                            resolved_mask = whitelist_utils::kit_to_path(mask_spec);
+                        }
+                    } catch (...) {}
+
+                    if (mask_csv_path.empty()) {
+                        mask_csv_path = resolved_mask;
+                    }
+
+                    // Resolve individual whitelist path for axis mapping
+                    std::string resolved_wl = whitelist_utils::kit_to_path(individual_spec);
+                    if (bc1_wl_path.empty()) {
+                        bc1_wl_path = resolved_wl;
+                        first_joint_key = seq_utils::remove_rc(elem.class_id);
+                    } else if (bc2_wl_path.empty()) {
+                        bc2_wl_path = resolved_wl;
+                    }
+                }
+            }
+
+            if (!mask_csv_path.empty() && !bc1_wl_path.empty() && !bc2_wl_path.empty()) {
+                auto mit = wl_map.maps.find(first_joint_key);
+                if (mit != wl_map.maps.end()) {
+                    auto& entry = mit->second.get();
+                    entry.spat_wl.emplace();
+                    bool ok = entry.spat_wl->load(mask_csv_path, bc1_wl_path, bc2_wl_path, verbose);
+                    if (!ok) {
+                        entry.spat_wl.reset();
+                        std::cerr << "[load_wl] Failed to load spat_mask from " << mask_csv_path << "\n";
+                    } else {
+                        std::cout << "[load_wl] Spatial mask loaded: "
+                                  << entry.spat_wl->count_valid() << " valid pairs\n";
+                    }
+                }
+            }
+        }
+
         for (auto & [key, entry_ref] : wl_map.maps) {
             auto &E = entry_ref.get();
             std::unordered_set<int64_seq> to_remove;

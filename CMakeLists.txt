@@ -15,11 +15,19 @@ endfunction()
 set_required_build_settings_for_GCC8()
 
 # --------------------------------------------------------------------------
-# OpenMP (Homebrew libomp on macOS)
+# OpenMP (auto-detect libomp on macOS via Homebrew or MacPorts)
 # --------------------------------------------------------------------------
 if(APPLE)
-# hardcoded--change it
-    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libomp")
+    # Check common Homebrew locations (Apple Silicon + Intel)
+    foreach(_omp_prefix
+        "/opt/homebrew/opt/libomp"
+        "/usr/local/opt/libomp"
+        "/opt/local"
+    )
+        if(EXISTS "${_omp_prefix}" AND NOT OpenMP_FOUND)
+            list(APPEND CMAKE_PREFIX_PATH "${_omp_prefix}")
+        endif()
+    endforeach()
 endif()
 find_package(OpenMP REQUIRED)
 

@@ -8,71 +8,66 @@ Follow these steps in your terminal to install dependencies and build **rad** in
 
 * **macOS** or **Linux**
 * A working **bash** (or similar) shell
-* **Homebrew** (Package manager for macOS/Linux)
+* **Homebrew** (macOS) or **conda** (Linux/HPC)
 
 ---
 
-## 2. Install Homebrew (if needed)
+## 2. Install Dependencies
+
+### macOS (Homebrew)
 
 ```bash
-which brew
+brew install llvm libomp boost cmake pigz zlib
 ```
 
-* If you see a path (e.g. `/usr/local/bin/brew`), you already have it.
-* Otherwise, install from [https://brew.sh/](https://brew.sh/) by following their instructions.
-
----
-
-## 3. Install Dependencies
+### Linux / HPC (conda)
 
 ```bash
-# Install LLVM (for up-to-date clang), OpenMP and Boost
-brew install llvm libomp boost cmake
+conda install -c conda-forge boost-cpp cmake pigz zlib libomp-dev
 ```
 
-For Mac users, 
-
-> **Tip:** If you already have these, `brew install` will skip or upgrade them.
+> **Note:** `pigz` is optional but recommended for parallel gzip decompression. Set `RAD_NO_PIGZ=1` to disable at runtime.
 
 ---
 
-## 4. Clone the Repository
+## 3. Clone the Repository
 
 ```bash
-git clone --recurse-submodules https://github.com/indianewok/rad.git
+git clone https://github.com/indianewok/rad.git
 ```
 
-Make a note of the clone path (e.g. `~/projects/rad`).
-
 ---
 
-## 5. Create and Enter the Build Directory
+## 4. Create and Enter the Build Directory
 
 ```bash
-cd path/to/rad          # e.g. cd ~/projects/rad
+cd rad
 mkdir build && cd build
 ```
 
 ---
 
-## 6. Configure & Build in Release Mode
+## 5. Configure & Build in Release Mode
 
 ```bash
-# 6A) Generate Makefiles for a Release build
+# Generate Makefiles for a Release build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 
-# 6B) Compile!
+# Compile
 cmake --build .
 ```
 
 ---
 
-## 7. Run
+## 6. Run
 
-Your `rad` executable will now be in `build/`. For example:
+Your executables will now be in `build/`:
 
 ```bash
 ./rad --help
+./rad prep --help
+./rad demux --help
+./rad reformat --help
 ```
 
-You’re all set!
+You're all set!

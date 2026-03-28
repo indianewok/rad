@@ -42,5 +42,8 @@ CLAUDE.*
 # build artifacts
 /build/
 
+# internal test files
+src/barcode_test.cpp
+
 # files that are too large
 resources/wl/visium_hd_coordinates.csv.gz
