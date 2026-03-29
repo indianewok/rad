@@ -32,33 +32,33 @@ static void usage_demux(const char *prog) {
       << "Optional:\n"
       << "  -k, --kit                         use this kit's default "
          "whitelist\n"
-      << "  -g, --global_whitelist            path to custom global whitelist "
+      << "  -g, --global-whitelist            path to custom global whitelist "
          "CSV\n"
-      << "  -c, --custom_whitelist            path to custom whitelist CSV\n"
-      << "  -R, --bc_correction_mode          'offensive' (default) or "
+      << "  -c, --custom-whitelist            path to custom whitelist CSV\n"
+      << "  -R, --bc-correction-mode          'offensive' (default) or "
          "'defensive'\n"
       << "      --joint-bc-mode               'default' (permissive) or "
          "'strict' (all barcodes must pass)\n"
-      << "  -M, --whitelist_mutation          mutation space for whitelist "
+      << "  -M, --whitelist-mutation          mutation space for whitelist "
          "(default: 2)\n"
-      << "  -m, --generated_mutation          mutation space for generated "
+      << "  -m, --generated-mutation          mutation space for generated "
          "barcodes (default: 2)\n"
-      << "  -n, --max_reads                   maximum number of reads "
+      << "  -n, --max-reads                   maximum number of reads "
          "(default: all)\n"
-      << "  -z, --chunk_size                  chunk size for processing "
+      << "  -z, --chunk-size                  chunk size for processing "
          "(default: 5000)\n"
       << "  -o, --output                      filename prefix (default: "
          "output)\n"
       << "  -d, --dir                         output directory (default: "
          "current)\n"
       << "  -F, --log-file                    save output to log file\n"
-      << "  -w, --write_dbg                   write debug files (.sig, .csv, "
+      << "  -w, --write-dbg                   write debug files (.sig, .csv, "
          "metrics)\n"
-      << "  -b, --bc_split                    split reads into per-barcode "
+      << "  -b, --bc-split                    split reads into per-barcode "
          "FASTQs\n"
       << "  -t, --threads                     number of threads (default: 1)\n"
       << "  -v, --verbose                     verbose mode\n"
-      << "  -D, --max_verbose                 maximum verbosity (debug)\n"
+      << "  -D, --max-verbose                 maximum verbosity (debug)\n"
       << "  -h, --help                        show this help\n";
 }
 
@@ -106,11 +106,11 @@ static void usage_prep(const char *prog) {
          "--position-map)\n"
       << "  -o, --output                      output base path (saves "
          "_layout.csv, _position_map.csv)\n"
-      << "  -n, --max_reads                   max reads for misalignment "
+      << "  -n, --max-reads                   max reads for misalignment "
          "sampling (default: 50000)\n"
       << "  -t, --threads                     number of threads (default: 1)\n"
       << "  -v, --verbose                     verbose mode\n"
-      << "  -D, --max_verbose                 maximum verbosity (debug)\n"
+      << "  -D, --max-verbose                 maximum verbosity (debug)\n"
       << "  -h, --help                        show this help\n\n"
       << "Examples:\n"
       << "  rad " << prog << " -l five_prime --read-layout\n"
@@ -193,10 +193,10 @@ int cmd_prep(int argc, char *argv[]) {
   struct option longopts[] = {{"layout", required_argument, nullptr, 'l'},
                               {"fastq", required_argument, nullptr, 'q'},
                               {"output", required_argument, nullptr, 'o'},
-                              {"max_reads", required_argument, nullptr, 'n'},
+                              {"max-reads", required_argument, nullptr, 'n'},
                               {"threads", required_argument, nullptr, 't'},
                               {"verbose", no_argument, nullptr, 'v'},
-                              {"max_verbose", no_argument, nullptr, 'D'},
+                              {"max-verbose", no_argument, nullptr, 'D'},
                               {"help", no_argument, nullptr, 'h'},
                               {"read-layout", no_argument, nullptr, 1},
                               {"position-map", no_argument, nullptr, 2},
@@ -1067,22 +1067,22 @@ int cmd_demux(int argc, char *argv[]) {
       {"layout", required_argument, nullptr, 'l'},
       {"fastq", required_argument, nullptr, 'q'},
       {"kit", required_argument, nullptr, 'k'},
-      {"global_whitelist", required_argument, nullptr, 'g'},
-      {"custom_whitelist", required_argument, nullptr, 'c'},
-      {"bc_correction_mode", required_argument, nullptr, 'R'},
-      {"whitelist_mutation", required_argument, nullptr, 'M'},
-      {"generated_mutation", required_argument, nullptr, 'm'},
-      {"max_reads", required_argument, nullptr, 'n'},
-      {"chunk_size", required_argument, nullptr, 'z'},
+      {"global-whitelist", required_argument, nullptr, 'g'},
+      {"custom-whitelist", required_argument, nullptr, 'c'},
+      {"bc-correction-mode", required_argument, nullptr, 'R'},
+      {"whitelist-mutation", required_argument, nullptr, 'M'},
+      {"generated-mutation", required_argument, nullptr, 'm'},
+      {"max-reads", required_argument, nullptr, 'n'},
+      {"chunk-size", required_argument, nullptr, 'z'},
       {"output", required_argument, nullptr, 'o'},
       {"dir", required_argument, nullptr, 'd'},
       {"log-file", required_argument, nullptr, 'F'},
-      {"write_dbg", no_argument, nullptr, 'w'},
-      {"bc_split", no_argument, nullptr, 'b'},
+      {"write-dbg", no_argument, nullptr, 'w'},
+      {"bc-split", no_argument, nullptr, 'b'},
       {"joint-bc-mode", required_argument, nullptr, 1},
       {"threads", required_argument, nullptr, 't'},
       {"verbose", no_argument, nullptr, 'v'},
-      {"max_verbose", no_argument, nullptr, 'D'},
+      {"max-verbose", no_argument, nullptr, 'D'},
       {"help", no_argument, nullptr, 'h'},
       {nullptr, 0, nullptr, 0}};
 

@@ -437,7 +437,6 @@ namespace whitelist_utils {
         { "10x_Vis_V5", "resources/wl/visium-v5_bitlist.csv.gz" },
 
         //10x Visium HD
-        { "visium_hd_v1", "resources/wl/visium_hd_v1_whitelist.csv.gz" },
         { "visium_hd_bc1", "resources/wl/visium_hd_bc1.csv.gz" },
         { "visium_hd_bc2", "resources/wl/visium_hd_bc2.csv.gz" }
         };
