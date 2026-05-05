@@ -870,7 +870,7 @@ public:
 /**
  * @brief Constructs a parallel_writer and starts the writer thread
  */
-    parallel_writer() : running(true), jobs_processed(0), total_write_time_ms(0), total_queue_time_ms(0) {
+    parallel_writer() : running(true), jobs_processed(0) {
         writer_thread = std::thread([this]() {
             this->process_jobs();
         });
@@ -1004,15 +1004,15 @@ public:
         
         std::cout << "\n[Writer Thread] Statistics:" << std::endl;
         std::cout << "  Total jobs processed: " << jobs_processed.load() << std::endl;
-        std::cout << "  Total write time: " << total_write_time_ms / 1000.0 << " seconds" << std::endl;
+        std::cout << "  Total write time: " << total_write_time_ms.load() / 1000.0 << " seconds" << std::endl;
         if (jobs_processed.load() > 0) {
-            std::cout << "  Average write time per chunk: " << total_write_time_ms / jobs_processed.load() << " ms" << std::endl;
-            std::cout << "  Average queue time per chunk: " << total_queue_time_ms / jobs_processed.load() << " ms" << std::endl;
+            std::cout << "  Average write time per chunk: " << total_write_time_ms.load() / jobs_processed.load() << " ms" << std::endl;
+            std::cout << "  Average queue time per chunk: " << total_queue_time_ms.load() / jobs_processed.load() << " ms" << std::endl;
         }
     }
-    
+
     double get_total_write_time_ms() const {
-        return total_write_time_ms;
+        return total_write_time_ms.load();
     }
     
     size_t get_jobs_processed() const {
@@ -1040,8 +1040,8 @@ private:
     std::atomic<size_t> jobs_processed{0}; /// total jobs processed
     std::thread writer_thread; /// writer thread
     
-    double total_write_time_ms;
-    double total_queue_time_ms;
+    std::atomic<double> total_write_time_ms{0.0};
+    std::atomic<double> total_queue_time_ms{0.0};
     
     /**
      * @brief writer function per thread to process queued jobs
@@ -1054,14 +1054,18 @@ private:
                 auto start_time = std::chrono::high_resolution_clock::now();
                 auto queue_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     start_time - job->queued_time).count();
-                total_queue_time_ms += queue_time_ms;
-                
+                total_queue_time_ms.store(
+                    total_queue_time_ms.load(std::memory_order_relaxed) + queue_time_ms,
+                    std::memory_order_relaxed);
+
                 job->func();
-                
+
                 auto end_time = std::chrono::high_resolution_clock::now();
                 auto write_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     end_time - start_time).count();
-                total_write_time_ms += write_time_ms;
+                total_write_time_ms.store(
+                    total_write_time_ms.load(std::memory_order_relaxed) + write_time_ms,
+                    std::memory_order_relaxed);
                 
                 jobs_processed.fetch_add(1, std::memory_order_relaxed);
                 

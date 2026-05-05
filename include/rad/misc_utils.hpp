@@ -148,12 +148,22 @@ namespace path_utils {
         dir = parent;
       }
   
-      // 3) Fallback: ./resources in your CWD
+      // 3) Compile-time source directory from CMake
+#ifdef RAD_SOURCE_DIR
+      {
+        bfs::path src_res = bfs::path(RAD_SOURCE_DIR) / "resources";
+        if (bfs::exists(src_res) && bfs::is_directory(src_res)) {
+          return bfs::canonical(src_res);
+        }
+      }
+#endif
+
+      // 4) Fallback: ./resources in your CWD
       bfs::path alt = bfs::current_path() / "resources";
       if (bfs::exists(alt) && bfs::is_directory(alt)) {
         return bfs::canonical(alt);
       }
-  
+
       throw std::runtime_error("Cannot locate 'resources' folder up the tree or in CWD");
     }
 
@@ -427,7 +437,6 @@ namespace whitelist_utils {
         { "10x_Vis_V5", "resources/wl/visium-v5_bitlist.csv.gz" },
 
         //10x Visium HD
-        { "visium_hd_v1", "resources/wl/visium_hd_v1_whitelist.csv.gz" },
         { "visium_hd_bc1", "resources/wl/visium_hd_bc1.csv.gz" },
         { "visium_hd_bc2", "resources/wl/visium_hd_bc2.csv.gz" }
         };

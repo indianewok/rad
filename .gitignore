@@ -42,6 +42,12 @@ CLAUDE.*
 # build artifacts
 /build/
 
+# dev-only source files
+src/barcode_test.cpp
+src/badread_sim.cpp
+src/synthetic_main.cpp
+include/rad/synthetic_generator.hpp
+
 # files that are too large
 resources/wl/visium_hd_coordinates.csv.gz
 

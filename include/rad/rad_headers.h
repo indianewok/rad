@@ -76,3 +76,4 @@
 #include "barcode_correction.hpp"
 #include "read_layout.hpp"
 #include "sigstring.hpp"
+#include "whitelist_generator.hpp"

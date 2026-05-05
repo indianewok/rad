@@ -15,11 +15,19 @@ endfunction()
 set_required_build_settings_for_GCC8()
 
 # --------------------------------------------------------------------------
-# OpenMP (Homebrew libomp on macOS)
+# OpenMP (auto-detect libomp on macOS via Homebrew or MacPorts)
 # --------------------------------------------------------------------------
 if(APPLE)
-# hardcoded--change it
-    list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/libomp")
+    # Check common Homebrew locations (Apple Silicon + Intel)
+    foreach(_omp_prefix
+        "/opt/homebrew/opt/libomp"
+        "/usr/local/opt/libomp"
+        "/opt/local"
+    )
+        if(EXISTS "${_omp_prefix}" AND NOT OpenMP_FOUND)
+            list(APPEND CMAKE_PREFIX_PATH "${_omp_prefix}")
+        endif()
+    endforeach()
 endif()
 find_package(OpenMP REQUIRED)
 
@@ -38,7 +46,7 @@ else()
   message(STATUS "pigz not found; will fall back to zlib at runtime")
 endif()
 
-find_package(Boost REQUIRED COMPONENTS filesystem system iostreams)
+find_package(Boost REQUIRED COMPONENTS filesystem iostreams)
 
 # --------------------------------------------------------------------------
 # third party libraries
@@ -64,7 +72,7 @@ file(GLOB_RECURSE RAD_HEADERS CONFIGURE_DEPENDS rad/*.hpp)
 
 add_library(rad_lib INTERFACE)
 target_sources(rad_lib INTERFACE ${RAD_HEADERS})
-target_compile_definitions(rad_lib INTERFACE HAVE_PIGZ=1 PIGZ_PATH="${PIGZ_EXE}")
+target_compile_definitions(rad_lib INTERFACE HAVE_PIGZ=1 PIGZ_PATH="${PIGZ_EXE}" RAD_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 target_include_directories(rad_lib INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -81,7 +89,6 @@ target_link_libraries(rad_lib INTERFACE
     OpenMP::OpenMP_CXX
     Boost::filesystem
     Boost::iostreams
-    Boost::system
     Boost::boost
     ZLIB::ZLIB
     edlib
@@ -94,18 +101,12 @@ target_link_libraries(rad_lib INTERFACE
 # --------------------------------------------------------------------------
 add_executable(rad src/main.cpp)
 add_executable(rad_config src/config_tools.cpp)
-add_executable(synth_gen src/synthetic_main.cpp)
-add_executable(error_model src/badread_sim.cpp)
-add_executable(correct_bc_dbg src/barcode_test.cpp)
 add_executable(generate_whitelist src/whitelist_generator.cpp)
 add_executable(discover_layout src/discover_layout.cpp)
 
 # pull in every dependency through rad_lib
 target_link_libraries(rad PRIVATE rad_lib)
 target_link_libraries(rad_config PRIVATE rad_lib)
-target_link_libraries(synth_gen PRIVATE rad_lib)
-target_link_libraries(error_model PRIVATE rad_lib)
-target_link_libraries(correct_bc_dbg PRIVATE rad_lib)
 target_link_libraries(generate_whitelist PRIVATE rad_lib)
 target_link_libraries(discover_layout PRIVATE rad_lib)
 
