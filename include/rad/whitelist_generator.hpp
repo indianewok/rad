@@ -1350,7 +1350,16 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
     // 9) COLLAPSE DECISION: combine left-tail fraction + spread check
     //    (a) left-tail %: if AF below threshold is small (≤10%), return ALL AF
     //    (b) spread: if both sides are narrow (≤1.0) OR full range ≤ 2.0, return ALL AF
-    const double LEFT_TAIL_MAX_FRAC = 0.10;  // 10%
+    // 9b) LEFT_BUDGET fallback: if collapse did not fire but left_frac is only
+    //     marginally over the collapse threshold (10% < left_frac ≤ 20%),
+    //     rescue the top LEFT_TAIL_MAX_FRAC * af_total barcodes from AF_left
+    //     (sorted by count desc). This recovers real cells that fall just
+    //     under the ZT-Poisson threshold without admitting the deep noise tail.
+    //     Above LEFT_TAIL_BUDGET_MAX_FRAC (20%) the threshold is treated as
+    //     unreliable / the data is too noisy and we fall back to the strict
+    //     "drop AF_left" behavior.
+    const double LEFT_TAIL_MAX_FRAC        = 0.10;  // 10%
+    const double LEFT_TAIL_BUDGET_MAX_FRAC = 0.20;  // 20% — upper bound for budget fallback
     const double SPREAD_EPS = 1.0;           // in log1p_ncpm units
     const int    MIN_SIDE_N = 5;             // avoid tiny/empty groups
 
@@ -1389,6 +1398,38 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
     const bool collapse_all_af = (af_total >= 10) &&
                                  ((left_frac <= LEFT_TAIL_MAX_FRAC) || narrow_both || narrow_full);
 
+    // Budget rescue: only fires when collapse didn't, and left_frac is in the
+    // borderline (LEFT_TAIL_MAX_FRAC, LEFT_TAIL_BUDGET_MAX_FRAC] window.
+    const bool use_left_budget = (af_total >= 10) && !collapse_all_af
+                              && (left_frac >  LEFT_TAIL_MAX_FRAC)
+                              && (left_frac <= LEFT_TAIL_BUDGET_MAX_FRAC);
+    std::unordered_set<std::string> budget_rescue;
+    size_t budget_n = 0;
+    if (use_left_budget) {
+        std::vector<size_t> af_left_idx;
+        af_left_idx.reserve(af_left);
+        for (size_t i = 0; i < barcode_stats.size(); ++i) {
+            const auto& s = barcode_stats[i];
+            if (s.log1p_ncpm >= FLOOR && s.log1p_ncpm < threshold) {
+                af_left_idx.push_back(i);
+            }
+        }
+        budget_n = static_cast<size_t>(LEFT_TAIL_MAX_FRAC * static_cast<double>(af_total));
+        if (budget_n > af_left_idx.size()) budget_n = af_left_idx.size();
+        if (budget_n > 0) {
+            std::partial_sort(
+                af_left_idx.begin(),
+                af_left_idx.begin() + budget_n,
+                af_left_idx.end(),
+                [&](size_t a, size_t b) {
+                    return barcode_stats[a].count > barcode_stats[b].count;
+                });
+            for (size_t i = 0; i < budget_n; ++i) {
+                budget_rescue.insert(barcode_stats[af_left_idx[i]].sequence);
+            }
+        }
+    }
+
     std::cout << "\n[AF split] floor=" << FLOOR
               << "  threshold=" << threshold
               << "  rule=" << rule
@@ -1398,7 +1439,17 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
               << "\n[Spread]  left_range="  << left_range
               << "  right_range=" << right_range
               << "  full_range="  << full_range
-              << "\n[Collapse] " << (collapse_all_af ? "YES → return ALL AF" : "NO") << "\n";
+              << "\n[Collapse] "
+              << (collapse_all_af
+                    ? "YES → return ALL AF"
+                    : (use_left_budget
+                          ? ("NO; LEFT_BUDGET fallback → +"
+                             + std::to_string(budget_n)
+                             + " AF_left rescues (top "
+                             + std::to_string(static_cast<int>(LEFT_TAIL_MAX_FRAC * 100.0))
+                             + "% of AF_total by count)")
+                          : "NO"))
+              << "\n";
 
     // 10) Write CSV — explicit outputs + annotation band
     //     final_barcode = TRUE iff:
@@ -1416,13 +1467,19 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
         if (above_floor) n_above_floor++;
 
         const bool over_threshold = (s.log1p_ncpm >= threshold);
-        const bool final_barcode  = collapse_all_af ? above_floor : over_threshold;
+        const bool budget_pass    = use_left_budget &&
+                                    above_floor && !over_threshold &&
+                                    (budget_rescue.find(s.sequence) != budget_rescue.end());
+        const bool final_barcode  = collapse_all_af
+                                      ? above_floor
+                                      : (over_threshold || budget_pass);
         if (final_barcode) n_final++;
 
         // Annotation:
         // - collapse mode: AF that pass are "high_confidence"
         // - otherwise:
         //     * ≥ chosen threshold: "high_confidence"
+        //     * budget rescue (10-20% borderline window): "high_sensitivity"
         //     * between t_saddle and t_purity50: "high_sensitivity"
         std::string ann;
         if (collapse_all_af) {
@@ -1433,6 +1490,9 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
         } else {
             if (over_threshold && above_floor) {
                 ann = "high_confidence";
+                high_conf_barcodes.push_back(s.sequence);
+            } else if (budget_pass) {
+                ann = "high_sensitivity";
                 high_conf_barcodes.push_back(s.sequence);
             } else if (have_band && above_floor && s.log1p_ncpm >= band_lo && s.log1p_ncpm < band_hi) {
                 ann = "high_sensitivity";
