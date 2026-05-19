@@ -50,3 +50,6 @@ include/rad/synthetic_generator.hpp
 
 # files that are too large
 resources/wl/visium_hd_coordinates.csv.gz
+
+# local notes / TODOs
+KNOWN_ISSUES.md
