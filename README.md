@@ -10,6 +10,7 @@ RAD is a read-structure agnostic demultiplexer for dealing with long-read sequen
 | Command flags + output files | [`docs/cli-reference.md`](docs/cli-reference.md) |
 | Layout + whitelist details (origins, sizes, pairings) | [`docs/layouts-and-whitelists.md`](docs/layouts-and-whitelists.md) |
 | What RAD does under the hood | [`docs/architecture.md`](docs/architecture.md) |
+| End-to-end smoke test on simulated data | [`test_data/README.md`](test_data/README.md) |
 
 ## Pipeline at a glance
 

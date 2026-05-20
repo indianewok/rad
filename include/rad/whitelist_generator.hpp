@@ -285,38 +285,6 @@ std::vector<extracted_bc> process_fastq(const std::string& input_path,
     return results;
 }
 
-// Read whitelist barcodes from file (supports .gz compression)
-std::vector<std::string> read_whitelist(const std::string& filename) {
-    std::vector<std::string> whitelist;
-    
-    gzFile fp = gzopen(filename.c_str(), "r");
-    if (!fp) {
-        std::cerr << "Error: Could not open whitelist file " << filename << std::endl;
-        return whitelist;
-    }
-    
-    char buffer[1024];
-    std::string line;
-    
-    while (gzgets(fp, buffer, sizeof(buffer)) != NULL) {
-        line = buffer;
-        
-        // Remove newline character if present
-        if (!line.empty() && line.back() == '\n') {
-            line.pop_back();
-        }
-        
-        // Remove whitespace and empty lines
-        line.erase(std::remove_if(line.begin(), line.end(), ::isspace), line.end());
-        if (!line.empty()) {
-            whitelist.push_back(line);
-        }
-    }
-    
-    gzclose(fp);
-    return whitelist;
-}
-
 // -----------------------------------------------------------------------
 // Two-part barcode (BC1 + BC2) support
 // -----------------------------------------------------------------------
@@ -1121,7 +1089,7 @@ static inline saddle_cut_result compute_saddle_cut_af(const std::vector<double>&
 }
 
 void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted_barcodes,
-                                      const std::vector<std::string>& whitelist,
+                                      const std::unordered_set<int64_seq>& whitelist_set,
                                       const std::string& output_csv, const std::string text_out,
                                       bool verbose = false)
 {
@@ -1131,19 +1099,17 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
     std::unordered_map<std::string, int> extracted_counts;
     extracted_counts.reserve(extracted_barcodes.size());
 
-    for (const auto& x : extracted_barcodes){ 
-        extracted_counts[x.sequence]++; 
+    for (const auto& x : extracted_barcodes){
+        extracted_counts[x.sequence]++;
     }
 
     std::cout << "Found " << extracted_counts.size() << " unique sequences from "
               << extracted_barcodes.size() << " total extractions\n";
 
     // 2) Whitelist lookup (optional - if empty, analyze all sequences)
-    bool use_whitelist = !whitelist.empty();
-    std::unordered_set<std::string> whitelist_set;
+    bool use_whitelist = !whitelist_set.empty();
     if (use_whitelist) {
-        whitelist_set.insert(whitelist.begin(), whitelist.end());
-        std::cout << "Built whitelist hash set with " << whitelist_set.size() << " barcodes\n";
+        std::cout << "Using whitelist with " << whitelist_set.size() << " barcodes\n";
     } else {
         std::cout << "No whitelist provided - analyzing all sequences\n";
     }
@@ -1161,8 +1127,11 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
         int cnt = kv.second;
         
         // Skip if whitelist provided and sequence not in whitelist
-        if (use_whitelist && whitelist_set.find(seq) == whitelist_set.end()) {
-            continue;
+        if (use_whitelist) {
+            int64_seq encoded(seq);
+            if (whitelist_set.find(encoded) == whitelist_set.end()) {
+                continue;
+            }
         }
         bc_wl_stats s;
         s.sequence = seq;
@@ -1690,7 +1659,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             std::string spat_mask_output = resolved_prefix + "_spat_mask.csv";
             write_spat_mask_csv(barcodes, bc1_wl, bc2_wl, spat_mask_output);
 
-            std::vector<std::string> empty_wl;
+            std::unordered_set<int64_seq> empty_wl;
             count_perfect_matches_with_stats(barcodes, empty_wl, csv_output, text_output, verbose);
         } else {
             std::cout << "Processing " << fastq_path << "...\n";
@@ -1717,11 +1686,11 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
                     std::cout << "Whitelist source: " << whitelist_file << "\n"
                               << "Resolved path: " << resolved_wl << "\n";
                 }
-                auto whitelist = read_whitelist(resolved_wl);
-                std::cout << "Loaded " << whitelist.size() << " whitelist barcodes\n";
-                count_perfect_matches_with_stats(barcodes, whitelist, csv_output, text_output, verbose);
+                auto wl_set = ::whitelist::load_barcodes(resolved_wl, bc_length, verbose);
+                std::cout << "Loaded " << wl_set.size() << " whitelist barcodes\n";
+                count_perfect_matches_with_stats(barcodes, wl_set, csv_output, text_output, verbose);
             } else {
-                std::vector<std::string> empty_whitelist;
+                std::unordered_set<int64_seq> empty_whitelist;
                 std::cout << " No whitelist provided; generating whitelist de novo.\n";
                 count_perfect_matches_with_stats(barcodes, empty_whitelist, csv_output, text_output, verbose);
             }
