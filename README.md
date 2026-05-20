@@ -1,96 +1,61 @@
-# Quickstart: Building **rad** from Source
+# RAD (Read-structure Agnostic Demultiplexer)
 
-Follow these steps in your terminal to install dependencies and build **rad** in Release mode.
+RAD is a read-structure agnostic demultiplexer for dealing with long-read sequencing. TL;DR: all you should have to do is define the read structure if you've got a super-wonky custom sequencing format, pass it to RAD, see if it preps nicely, and let it demultiplex! I've used it with a whole bunch of stuff--weirdest so far has been long-read targeted enrichment of BCR/TCR from Visium HD data, so if you've got weirder than that I'd love to see whether RAD works for you!
 
----
+## Docs map
 
-## 1. Prerequisites
+| Need | File |
+| --- | --- |
+| Install + first run (`prep -> demux -> reformat`) | [`docs/installation.md`](docs/installation.md) |
+| Command flags + output files | [`docs/cli-reference.md`](docs/cli-reference.md) |
+| Layout + whitelist details (origins, sizes, pairings) | [`docs/layouts-and-whitelists.md`](docs/layouts-and-whitelists.md) |
+| What RAD does under the hood | [`docs/architecture.md`](docs/architecture.md) |
+| End-to-end smoke test on simulated data | [`test_data/README.md`](test_data/README.md) |
 
-* **macOS** or **Linux**
-* A working **bash** (or similar) shell
-* **Homebrew** (macOS) or **conda** (Linux/HPC)
+## Pipeline at a glance
 
----
-
-## 2. Install Dependencies
-
-### macOS (Homebrew)
-
-```bash
-brew install llvm libomp boost cmake pigz zlib
+```mermaid
+flowchart LR
+    A["rad prep (layout + optional position map)"] --> B["rad demux (layout-aware extraction + filtering)"]
+    B --> C["rad reformat (header rewrite and/or CB split)"]
 ```
 
-### Linux / HPC (conda)
+## Minimal run
 
 ```bash
-conda install -c conda-forge boost-cpp cmake pigz zlib libomp-dev
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+build/rad prep -l five_prime --position-map -q reads.fq.gz -o run/demo
+build/rad demux -l five_prime -q reads.fq.gz -o demo -d run -t 8
+build/rad reformat -q run/demo.fq.gz --split-bc -o run/by_barcode -t 8
 ```
 
-> **Note:** `pigz` is optional but recommended for parallel gzip decompression. Set `RAD_NO_PIGZ=1` to disable at runtime.
+## Repo layout
 
----
+```text
+.
+├── src/                  # CLI entrypoints
+├── include/rad/          # core pipeline + algorithms
+├── resources/
+│   ├── read_layout/      # bundled layout templates
+│   └── wl/               # bundled whitelist resources
+├── docs/                 # user + methods docs
+└── CMakeLists.txt
+```
 
-## 3. Clone the Repository
+## Operational notes
+
+- RAD looks for `resources/` relative to the executable location, then `./resources`.
+- `pigz` is optional, but it usually improves gzip throughput a lot.
+- `rad demux --bc_split` is shown in help, but split output is handled by `rad reformat --split-bc` in the current build.
+- `rad_config set/rm` is process-local in the current build, so those updates won't persist across separate invocations.
+- After big source/header edits, do a clean rebuild:
 
 ```bash
-git clone https://github.com/indianewok/rad.git
+cmake --build build --clean-first
 ```
 
----
+## License
 
-## 4. Create and Enter the Build Directory
-
-```bash
-cd rad
-mkdir build && cd build
-```
-
----
-
-## 5. Configure & Build in Release Mode
-
-```bash
-# Generate Makefiles for a Release build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-
-# Compile
-cmake --build .
-```
-
----
-
-## 6. Run
-
-Your executables will now be in `build/`:
-
-```bash
-./rad --help
-./rad prep --help
-./rad demux --help
-./rad reformat --help
-```
-
-You're all set!
-
----
-
-## 7. Test Data
-
-A simulated long-read scRNA-seq dataset (scTagger benchmark, 10x 3' v3 chemistry) is available as a GitHub release asset for end-to-end testing.
-
-```bash
-# Download (~102 MB)
-curl -L -o shuffled_S_lr_synth.fq.gz \
-  https://github.com/indianewok/rad/releases/download/test-data-v1/shuffled_S_lr_synth.fq.gz
-
-# Run rad demux with the pre-registered sctagger layout
-./rad demux \
-  --layout sctagger_sim \
-  -i shuffled_S_lr_synth.fq.gz \
-  -o test_out/ \
-  -t 1
-```
-
-The dataset contains 98,873 reads across 50 simulated cells. True cell barcodes are encoded in each read header as `@<16bp_barcode>-<counter>`, so you can validate the `CB:Z` tag in the demultiplexed output directly against the header — no separate truth file required.
-
-See the [release page](https://github.com/indianewok/rad/releases/tag/test-data-v1) for full details.
+[`LICENSE`](LICENSE)
