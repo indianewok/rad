@@ -26,10 +26,13 @@ flowchart LR
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
-build/rad prep -l five_prime --position-map -q reads.fq.gz -o run/demo
-build/rad demux -l five_prime -q reads.fq.gz -o demo -d run -t 8
-build/rad reformat -q run/demo.fq.gz --split-bc -o run/by_barcode -t 8
+curl -L -o test.fq.gz \
+  https://github.com/indianewok/rad/releases/download/test-data-v1/shuffled_S_lr_synth.fq.gz
+
+build/rad demux -l sctagger -q test.fq.gz -d run -o demo -t 1
 ```
+
+See [`test_data/README.md`](test_data/README.md) for the full smoke test (scan-wl + demux + expected outputs).
 
 ## Repo layout
 
