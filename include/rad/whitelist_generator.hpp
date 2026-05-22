@@ -1576,7 +1576,13 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             case 'r': m_right = std::atoi(optarg); break;
             case 'm': max_reads = std::atoi(optarg); break;
             case 'e': max_error = std::atof(optarg); break;
-            case 'w': whitelist_file = optarg; break;
+            // --whitelist is declared `optional_argument`. Under
+            // POSIX getopt_long, optional_argument only binds the
+            // value when `--whitelist=VALUE` syntax is used; the
+            // space-separated `--whitelist VALUE` form leaves
+            // optarg = NULL. Guard against that to avoid a SIGSEGV
+            // in std::string::operator=(NULL).
+            case 'w': if (optarg) whitelist_file = optarg; break;
             case 't': num_threads = std::atoi(optarg); break;
             case 'k': chunk_size = std::atoi(optarg); break;
             case '1': bc1_whitelist_file = optarg; break;
