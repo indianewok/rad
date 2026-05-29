@@ -1,6 +1,12 @@
 // main.cpp
 #include "include/rad/rad_headers.h"
 
+// Version string (single source of truth = CMake project() version, injected
+// via target_compile_definitions). Fallback keeps non-CMake builds compiling.
+#ifndef RAD_VERSION
+#define RAD_VERSION "unknown"
+#endif
+
 // ============================================================================
 // USAGE FUNCTIONS
 // ============================================================================
@@ -1725,6 +1731,9 @@ int main(int argc, char *argv[]) {
     return cmd_help(argc - 1, argv + 1);
   } else if (command == "--help" || command == "-h") {
     print_main_usage(argv[0]);
+    return 0;
+  } else if (command == "--version" || command == "-V" || command == "version") {
+    std::cout << "rad " << RAD_VERSION << "\n";
     return 0;
   } else {
     std::cerr << "Unknown command: " << command << "\n\n";

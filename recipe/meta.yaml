@@ -1,5 +1,5 @@
 {% set name = "rad" %}
-{% set version = "0.6.1" %}
+{% set version = "1.0.0" %}
 
 package:
   name: {{ name }}
@@ -7,8 +7,8 @@ package:
 
 source:
   url: https://github.com/indianewok/rad/archive/refs/tags/v{{ version }}.tar.gz
-  # Replace with the real digest of the v0.6.1 tag tarball:
-  #   curl -sL https://github.com/indianewok/rad/archive/refs/tags/v0.6.1.tar.gz | sha256sum
+  # Replace with the real digest of the v1.0.0 tag tarball:
+  #   curl -sL https://github.com/indianewok/rad/archive/refs/tags/v1.0.0.tar.gz | sha256sum
   sha256: 0000000000000000000000000000000000000000000000000000000000000000
 
 build:
