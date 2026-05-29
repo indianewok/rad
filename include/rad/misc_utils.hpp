@@ -719,7 +719,6 @@ namespace config_utils {
         {"splitseq", "resources/read_layout/splitseq_read_layout.csv" },
         {"visium", "resources/read_layout/visium_three_prime_read_layout.csv" },
         {"visium_hd", "resources/read_layout/visium_hd_read_layout.csv" },
-        {"visium_hd_full_bc", "resources/read_layout/visium_hd_read_layout_full_bc.csv" },
         {"nanopore_rapid_bc", "resources/read_layout/nanopore_bulk_rapid_bc_read_layout.csv" }
         };
         return defaults;
