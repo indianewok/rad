@@ -113,3 +113,22 @@ target_link_libraries(discover_layout PRIVATE rad_lib)
 # --------------------------------------------------------------------------
 message(STATUS "Configure-time compiler: ${CMAKE_CXX_COMPILER}")
 message(STATUS "C++ flags: ${CMAKE_CXX_FLAGS}")
+
+# --------------------------------------------------------------------------
+# Install rules — make `cmake --install` actually install something (the conda
+# recipe and any `make install` rely on this; the v0.6.0 bioconda package was
+# broken because these were missing and only the bare binary was copied).
+# Layout:
+#   <prefix>/libexec/rad/rad        the real binary
+#   <prefix>/bin/rad                self-locating wrapper (sets RAD_RESOURCES)
+#   <prefix>/share/rad/resources/   bundled read_layout/ + wl/
+# The wrapper derives its prefix from its own path at runtime and exports
+# RAD_RESOURCES (checked first by path_utils::find_resource_root), so the
+# install keeps working after conda relocates the environment.
+# --------------------------------------------------------------------------
+include(GNUInstallDirs)
+install(TARGETS rad RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/rad)
+install(PROGRAMS ${CMAKE_SOURCE_DIR}/cmake/rad-wrapper.sh
+        DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME rad)
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/resources/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/rad/resources)
