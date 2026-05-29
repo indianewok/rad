@@ -95,18 +95,10 @@ public:
      * @return FILE* pointer to pipe, or nullptr on failure
      */
     inline FILE* open_pigz_read_pipe(const std::string& input_path, int threads = 4) {
-        // Allow disabling via environment variable
-        if (const char* no = std::getenv("RAD_NO_PIGZ"); no && *no) {
+        // Resolve pigz (PATH-first; honors RAD_PIGZ / RAD_NO_PIGZ). "" => skip.
+        const std::string& pigz = resolve_pigz();
+        if (pigz.empty()) {
             return nullptr;
-        }
-
-        #ifndef PIGZ_PATH
-        #  define PIGZ_PATH "pigz"
-        #endif
-        
-        std::string pigz = PIGZ_PATH;
-        if (const char* env = std::getenv("RAD_PIGZ"); env && *env) {
-            pigz = env;
         }
 
         const std::string path = sanitize_user_path(input_path);
@@ -154,21 +146,40 @@ public:
     }
 
     /**
-     * @brief Check if pigz is available on the system
-     * @return true if pigz is found in PATH
+     * @brief Resolve the pigz executable to use, preferring one on PATH (so a
+     * conda or system pigz "just works"), then the compile-time PIGZ_PATH build
+     * hint. Honors RAD_PIGZ (explicit override) and RAD_NO_PIGZ (disable).
+     * Returns "" when pigz is unavailable or disabled. Resolved once + cached.
+     */
+    static const std::string& resolve_pigz() {
+        static const std::string cached = []() -> std::string {
+            if (const char* no = std::getenv("RAD_NO_PIGZ"); no && *no) return "";
+            auto available = [](const std::string& exe) -> bool {
+                if (exe.empty()) return false;
+                std::string c = "command -v " + shell_quote_posix(exe) + " > /dev/null 2>&1";
+                return std::system(c.c_str()) == 0;
+            };
+            // explicit override wins (if it resolves)
+            if (const char* env = std::getenv("RAD_PIGZ"); env && *env) {
+                return available(env) ? std::string(env) : std::string();
+            }
+            // pigz on PATH -- the common case (conda run-dep, system install)
+            if (available("pigz")) return "pigz";
+            // fall back to the compile-time build hint if it still resolves
+            #ifdef PIGZ_PATH
+            { std::string p = PIGZ_PATH; if (p != "pigz" && available(p)) return p; }
+            #endif
+            return "";
+        }();
+        return cached;
+    }
+
+    /**
+     * @brief Check if pigz is available (on PATH, via RAD_PIGZ, or PIGZ_PATH)
+     * @return true if a usable pigz was found and is not disabled
      */
     static bool is_pigz_available() {
-        #ifndef PIGZ_PATH
-        #  define PIGZ_PATH "pigz"
-        #endif
-        
-        std::string pigz = PIGZ_PATH;
-        if (const char* env = std::getenv("RAD_PIGZ"); env && *env) {
-            pigz = env;
-        }
-        
-        std::string cmd = "command -v " + shell_quote_posix(pigz) + " > /dev/null 2>&1";
-        return system(cmd.c_str()) == 0;
+        return !resolve_pigz().empty();
     }
 };
 
@@ -667,13 +678,9 @@ public:
 class pigz_writing {
 public:
     inline FILE* open_pigz_pipe(const std::string& out_path, int threads, int level=1) {
-        if (const char* no = std::getenv("RAD_NO_PIGZ"); no && *no) return nullptr;
-
-    #ifndef PIGZ_PATH
-    #  define PIGZ_PATH "pigz"
-    #endif
-        std::string pigz = PIGZ_PATH;
-        if (const char* env = std::getenv("RAD_PIGZ"); env && *env) pigz = env;
+        // Resolve pigz (PATH-first; honors RAD_PIGZ / RAD_NO_PIGZ). "" => skip.
+        const std::string& pigz = pigz_reading::resolve_pigz();
+        if (pigz.empty()) return nullptr;
 
         std::string cmd = "'" + pigz + "' -c -p " + std::to_string(threads) +
                         " -" + std::to_string(level) + " > '" + out_path + "'";

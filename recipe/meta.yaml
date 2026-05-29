@@ -1,5 +1,5 @@
 {% set name = "rad" %}
-{% set version = "1.0.0" %}
+{% set version = "1.0.1" %}
 
 package:
   name: {{ name }}
@@ -7,44 +7,44 @@ package:
 
 source:
   url: https://github.com/indianewok/rad/archive/refs/tags/v{{ version }}.tar.gz
-  # Replace with the real digest of the v1.0.0 tag tarball:
-  #   curl -sL https://github.com/indianewok/rad/archive/refs/tags/v1.0.0.tar.gz | sha256sum
+  # Replace with the real digest of the v1.0.1 tag tarball:
+  #   curl -sL https://github.com/indianewok/rad/archive/refs/tags/v1.0.1.tar.gz | sha256sum
   sha256: 0000000000000000000000000000000000000000000000000000000000000000
 
 build:
   number: 0
   run_exports:
-    # Lock downstream consumers to >=this version, <1.0.
-    - {{ pin_subpackage(name, max_pin='x') }}
+    - {{ pin_subpackage('rad') }}
 
 requirements:
   build:
     - {{ compiler('cxx') }}
-    - {{ stdlib('c') }}
     - cmake >=3.18
     - make
   host:
-    # RAD links the COMPILED Boost libs (filesystem + iostreams), so it needs
-    # libboost-devel (libboost + headers), NOT the headers-only libboost-headers.
-    # (boost-cpp, used by the v0.6.0 recipe, is the archived legacy name.)
-    - libboost-devel
+    # RAD links the compiled Boost filesystem + iostreams libs. iostreams pulls
+    # in its compression backends, so zlib AND bzip2 must be present (bzip2 is
+    # new vs 0.6.0, which only linked filesystem+system).
+    - boost-cpp
     - zlib
+    - bzip2
     - llvm-openmp   # [osx]
     - libgomp       # [linux]
   run:
-    - libboost
+    - boost-cpp
     - llvm-openmp   # [osx]
     - libgomp       # [linux]
-    # Optional at runtime: RAD uses pigz as a subprocess for faster gzip I/O
-    # but falls back to zlib if it is absent (RAD_NO_PIGZ=1 also disables it).
+    # pigz is used for parallel gzip I/O; RAD discovers it on PATH at runtime
+    # and falls back to zlib if it is missing (RAD_NO_PIGZ=1 also disables it).
     - pigz
 
 test:
   commands:
     # Binary runs AND the bundled resources were installed + are discoverable.
     # (The v0.6.0 recipe tested only `rad --help`, which passed even though no
-    # resources shipped -- this test would have caught that.)
+    # resources shipped -- these checks would have caught that.)
     - rad --help
+    - rad --version
     - rad list
     - test -d "${PREFIX}/share/rad/resources/read_layout"
     - test -f "${PREFIX}/share/rad/resources/read_layout/sctagger_sim_read_layout.csv"
@@ -61,11 +61,11 @@ about:
   description: |
     rad is an alignment-based demultiplexer and whitelist/barcode-correction
     suite for Nanopore and PacBio single-cell long-read experiments. It bundles
-    edlib, ssw, csv-parser and fkYAML in-tree and depends only on Boost, zlib,
-    and an OpenMP runtime. Read-layout templates and barcode whitelists are
-    installed under $PREFIX/share/rad/resources and located at runtime via the
-    RAD_RESOURCES environment variable, which the installed `rad` wrapper sets
-    automatically from its own location.
+    edlib, ssw, and csv-parser in-tree and depends only on Boost, zlib, and an
+    OpenMP runtime (with optional pigz for parallel gzip). Read-layout templates
+    and barcode whitelists are installed under $PREFIX/share/rad/resources and
+    located at runtime via the RAD_RESOURCES environment variable, which the
+    installed `rad` wrapper sets automatically from its own location.
 
 extra:
   recipe-maintainers:
