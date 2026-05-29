@@ -1,5 +1,6 @@
 // main.cpp
 #include "include/rad/rad_headers.h"
+#include "include/rad/seqspec.hpp"  // seqspec YAML -> RAD layout (auto-detected)
 
 // ============================================================================
 // USAGE FUNCTIONS
@@ -284,10 +285,25 @@ int cmd_prep(int argc, char *argv[]) {
         std::cout << "[prep] Using custom layout: " << layout_key << "\n";
     }
 
+    // If --layout points at a seqspec YAML, translate it to a RAD layout CSV
+    // and feed that to the unchanged prep_new_layout() pipeline.
+    std::optional<std::string> seqspec_tmp;
+    if (seqspec::is_seqspec_file(layout_csv)) {
+      if (verbose)
+        std::cout << "[prep] Detected seqspec; translating to RAD layout...\n";
+      seqspec_tmp = seqspec::convert_to_temp_layout_csv(layout_csv, verbose);
+      layout_csv = *seqspec_tmp;
+    }
+
     // Prep layout
     if (verbose)
       std::cout << "[prep] Preparing layout...\n";
     read_layout.prep_new_layout(layout_csv, max_verbose);
+
+    if (seqspec_tmp) {
+      boost::system::error_code _ec;
+      boost::filesystem::remove(*seqspec_tmp, _ec);
+    }
 
     // Display layout if requested
     if (do_read_layout) {
@@ -1325,9 +1341,23 @@ int cmd_demux(int argc, char *argv[]) {
       read_layout.import_read_layout(outbase.string() + "_layout.csv",
                                      max_verbose);
     } else {
+      // Translate a seqspec YAML to a RAD layout CSV on the fly (cache-miss
+      // path only; a cached *_layout.csv short-circuits this above).
+      std::optional<std::string> seqspec_tmp;
+      std::string layout_src = layout_csv;
+      if (seqspec::is_seqspec_file(layout_src)) {
+        if (verbose)
+          std::cout << "[demux] Detected seqspec; translating to RAD layout...\n";
+        seqspec_tmp = seqspec::convert_to_temp_layout_csv(layout_src, verbose);
+        layout_src = *seqspec_tmp;
+      }
       if (verbose)
         std::cout << "[prep_new_layout] Generating read layout...\n";
-      read_layout.prep_new_layout(layout_csv, verbose);
+      read_layout.prep_new_layout(layout_src, verbose);
+      if (seqspec_tmp) {
+        boost::system::error_code _ec;
+        boost::filesystem::remove(*seqspec_tmp, _ec);
+      }
     }
     auto rl_gen_elapsed = std::chrono::steady_clock::now() - main_start;
     std::cout << "[main] Read layout generation time: "
