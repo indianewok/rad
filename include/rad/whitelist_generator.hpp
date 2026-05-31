@@ -556,14 +556,14 @@ struct batch_entry {
 };
 
 static bool ensure_output_directory(const std::string& prefix) {
-    std::filesystem::path p(prefix);
-    std::filesystem::path dir = p.parent_path();
+    boost::filesystem::path p(prefix);
+    boost::filesystem::path dir = p.parent_path();
     if (dir.empty()) {
         return true; // current directory
     }
 
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
+    boost::system::error_code ec;
+    boost::filesystem::create_directories(dir, ec);
     if (ec) {
         std::cerr << "Error: Could not create output directory " << dir << ": " << ec.message() << "\n";
         return false;

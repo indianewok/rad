@@ -108,8 +108,8 @@ public:
 
         // Avoid invoking pigz on a path that doesn't exist; this also makes it
         // much easier to diagnose hidden characters (e.g. CR, BOM) in the path.
-        std::error_code ec;
-        if (!std::filesystem::is_regular_file(path, ec)) {
+        boost::system::error_code ec;
+        if (!boost::filesystem::is_regular_file(path, ec)) {
             return nullptr;
         }
 
@@ -321,7 +321,7 @@ public:
     };
 
     std::unique_ptr<file_pointer> current_file;
-    std::filesystem::directory_iterator dir_iter;
+    boost::filesystem::directory_iterator dir_iter;
     bool dir_status;
     std::string path;
     int pigz_threads;
@@ -337,7 +337,7 @@ public:
         path = pigz_reading::sanitize_user_path(input_path);
         dir_status = is_directory(path);
         if (dir_status) {
-            dir_iter = std::filesystem::directory_iterator(path);
+            dir_iter = boost::filesystem::directory_iterator(path);
             open_next_file();
         } else if (is_fastqa(path)) {
             current_file = std::make_unique<file_pointer>(path, pigz_threads);
@@ -351,7 +351,7 @@ public:
 
     bool open_next_file() {
         if (!dir_status) return false;
-        while (dir_iter != std::filesystem::directory_iterator()) {
+        while (dir_iter != boost::filesystem::directory_iterator()) {
             const auto& entry = *dir_iter++;
             if (!is_file(get_file_path(entry))) continue;
             
@@ -384,14 +384,14 @@ public:
     }
 
     static bool is_directory(const std::string& path) {
-        return std::filesystem::is_directory(path);
+        return boost::filesystem::is_directory(path);
     }
 
     static bool is_file(const std::string& path) {
-        return std::filesystem::is_regular_file(path);
+        return boost::filesystem::is_regular_file(path);
     }
 
-    static std::string get_file_path(const std::filesystem::directory_entry& entry) {
+    static std::string get_file_path(const boost::filesystem::directory_entry& entry) {
         return entry.path().string();
     }
 

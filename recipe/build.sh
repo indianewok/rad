@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# macOS: keep CMake from preferring system frameworks / app bundles over $PREFIX,
-# and force the deployment target that std::filesystem needs (>= macOS 10.15).
-# bioconda pins osx-64 to 10.13; conda_build_config.yaml raises it for osx-64.
+# macOS: keep CMake from preferring system frameworks / app bundles over $PREFIX.
 if [[ "$(uname)" == "Darwin" ]]; then
-  EXTRA_CMAKE_ARGS=(
-    -DCMAKE_FIND_FRAMEWORK=NEVER
-    -DCMAKE_FIND_APPBUNDLE=NEVER
-    -DCMAKE_OSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-10.15}"
-  )
+  EXTRA_CMAKE_ARGS=(-DCMAKE_FIND_FRAMEWORK=NEVER -DCMAKE_FIND_APPBUNDLE=NEVER)
 else
   EXTRA_CMAKE_ARGS=()
 fi

@@ -446,11 +446,11 @@ namespace whitelist_utils {
     // Effective map (defaults + runtime overrides - tombstoned removals)
     static std::unordered_map<std::string, std::string> kit_wl_paths = default_kit_wl_paths();
 
-    inline std::filesystem::path whitelist_override_path() {
+    inline boost::filesystem::path whitelist_override_path() {
         if (const char* home = std::getenv("HOME"); home && *home) {
-            return std::filesystem::path(home) / ".rad" / "whitelist_overrides.tsv";
+            return boost::filesystem::path(home) / ".rad" / "whitelist_overrides.tsv";
         }
-        return std::filesystem::current_path() / ".rad_whitelist_overrides.tsv";
+        return boost::filesystem::current_path() / ".rad_whitelist_overrides.tsv";
     }
 
     inline std::unordered_set<std::string>& removed_whitelist_keys() {
@@ -467,7 +467,7 @@ namespace whitelist_utils {
         if (whitelist_overrides_loaded()) return;
         whitelist_overrides_loaded() = true;
 
-        std::ifstream in(whitelist_override_path());
+        std::ifstream in(whitelist_override_path().string());
         if (!in.is_open()) return;
 
         std::string line;
@@ -494,11 +494,11 @@ namespace whitelist_utils {
 
     inline bool persist_whitelist_overrides() {
         auto out_path = whitelist_override_path();
-        std::error_code ec;
-        std::filesystem::create_directories(out_path.parent_path(), ec);
+        boost::system::error_code ec;
+        boost::filesystem::create_directories(out_path.parent_path(), ec);
         if (ec) return false;
 
-        std::ofstream out(out_path);
+        std::ofstream out(out_path.string());
         if (!out.is_open()) return false;
 
         const auto& defaults = default_kit_wl_paths();
@@ -525,8 +525,8 @@ namespace whitelist_utils {
 
         if (rows.empty() && tombstones.empty()) {
             out.close();
-            std::error_code rm_ec;
-            std::filesystem::remove(out_path, rm_ec);
+            boost::system::error_code rm_ec;
+            boost::filesystem::remove(out_path, rm_ec);
             return true;
         }
 
@@ -726,11 +726,11 @@ namespace config_utils {
 
     static std::unordered_map<std::string, std::string> layout_files = default_layout_files();
 
-    inline std::filesystem::path layout_override_path() {
+    inline boost::filesystem::path layout_override_path() {
         if (const char* home = std::getenv("HOME"); home && *home) {
-            return std::filesystem::path(home) / ".rad" / "layout_overrides.tsv";
+            return boost::filesystem::path(home) / ".rad" / "layout_overrides.tsv";
         }
-        return std::filesystem::current_path() / ".rad_layout_overrides.tsv";
+        return boost::filesystem::current_path() / ".rad_layout_overrides.tsv";
     }
 
     inline std::unordered_set<std::string>& removed_layout_keys() {
@@ -747,7 +747,7 @@ namespace config_utils {
         if (layout_overrides_loaded()) return;
         layout_overrides_loaded() = true;
 
-        std::ifstream in(layout_override_path());
+        std::ifstream in(layout_override_path().string());
         if (!in.is_open()) return;
 
         std::string line;
@@ -774,11 +774,11 @@ namespace config_utils {
 
     inline bool persist_layout_overrides() {
         auto out_path = layout_override_path();
-        std::error_code ec;
-        std::filesystem::create_directories(out_path.parent_path(), ec);
+        boost::system::error_code ec;
+        boost::filesystem::create_directories(out_path.parent_path(), ec);
         if (ec) return false;
 
-        std::ofstream out(out_path);
+        std::ofstream out(out_path.string());
         if (!out.is_open()) return false;
 
         const auto& defaults = default_layout_files();
@@ -805,8 +805,8 @@ namespace config_utils {
 
         if (rows.empty() && tombstones.empty()) {
             out.close();
-            std::error_code rm_ec;
-            std::filesystem::remove(out_path, rm_ec);
+            boost::system::error_code rm_ec;
+            boost::filesystem::remove(out_path, rm_ec);
             return true;
         }
 
