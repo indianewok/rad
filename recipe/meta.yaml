@@ -7,7 +7,7 @@ package:
 
 source:
   url: https://github.com/indianewok/rad/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 0000000000000000000000000000000000000000000000000000000000000000  # backfilled after tagging v1.0.2
+  sha256: 6f5253456adf9b84de66583501d946656297f79645ac76d5b401e83d2f482af9
 
 build:
   number: 0
