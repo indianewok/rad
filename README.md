@@ -1,5 +1,7 @@
 # RAD (Read-structure Agnostic Demultiplexer)
 
+[![Bioconda version](https://img.shields.io/conda/vn/bioconda/rad.svg)](https://anaconda.org/bioconda/rad)
+
 RAD is a read-structure agnostic demultiplexer for dealing with long-read sequencing. TL;DR: all you should have to do is define the read structure if you've got a super-wonky custom sequencing format, pass it to RAD, see if it preps nicely, and let it demultiplex! I've used it with a whole bunch of stuff--weirdest so far has been long-read targeted enrichment of BCR/TCR from Visium HD data, so if you've got weirder than that I'd love to see whether RAD works for you!
 
 ## Docs map
@@ -34,6 +36,16 @@ build/rad demux -l sctagger -q test.fq.gz -d run -o demo -t 1
 
 See [`test_data/README.md`](test_data/README.md) for the full smoke test (scan-wl + demux + expected outputs).
 
+## Install via Bioconda
+
+RAD is also on [Bioconda](https://anaconda.org/bioconda/rad) (linux-64, linux-aarch64, osx-64, osx-arm64):
+
+```bash
+mamba install -c bioconda -c conda-forge rad   # or: conda install -c bioconda -c conda-forge rad
+```
+
+If you run into problems, building from source (above) is easier for us to help debug.
+
 ## Repo layout
 
 ```text
@@ -50,8 +62,8 @@ See [`test_data/README.md`](test_data/README.md) for the full smoke test (scan-w
 ## Operational notes
 
 - RAD looks for `resources/` relative to the executable location, then `./resources`.
-- `pigz` is optional, but it usually improves gzip throughput a lot.
-- `rad demux --bc_split` is shown in help, but split output is handled by `rad reformat --split-bc` in the current build.
+- Install `pigz` alongside the build deps — RAD uses it for parallel gzip I/O. (It will fall back to plain zlib if missing; `RAD_NO_PIGZ=1` forces that fallback.)
+- `rad demux --bc-split` is shown in help, but split output is handled by `rad reformat --split-bc` in the current build.
 - `rad_config set/rm` is process-local in the current build, so those updates won't persist across separate invocations.
 - After big source/header edits, do a clean rebuild:
 

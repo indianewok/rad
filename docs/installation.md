@@ -205,3 +205,14 @@ Clean rebuild:
 ```bash
 cmake --build build --clean-first
 ```
+
+## Install via Bioconda
+
+RAD is also packaged on [Bioconda](https://anaconda.org/bioconda/rad) (linux-64, linux-aarch64, osx-64, osx-arm64):
+
+```bash
+mamba install -c bioconda -c conda-forge rad
+rad --help
+```
+
+If you run into problems, building from source (above) is easier for us to help debug.
