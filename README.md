@@ -1,10 +1,5 @@
 # RAD (Read-structure Agnostic Demultiplexer)
 
-[![Bioconda version](https://img.shields.io/conda/vn/bioconda/rad.svg)](https://anaconda.org/bioconda/rad)
-[![Bioconda platforms](https://img.shields.io/conda/pn/bioconda/rad.svg)](https://anaconda.org/bioconda/rad)
-[![License: MIT](https://img.shields.io/github/license/indianewok/rad.svg)](LICENSE)
-[![Last commit](https://img.shields.io/github/last-commit/indianewok/rad.svg)](https://github.com/indianewok/rad/commits)
-
 RAD is a read-structure agnostic demultiplexer for dealing with long-read sequencing. TL;DR: all you should have to do is define the read structure if you've got a super-wonky custom sequencing format, pass it to RAD, see if it preps nicely, and let it demultiplex! I've used it with a whole bunch of stuff--weirdest so far has been long-read targeted enrichment of BCR/TCR from Visium HD data, so if you've got weirder than that I'd love to see whether RAD works for you!
 
 ## Docs map
@@ -38,16 +33,6 @@ build/rad demux -l sctagger -q test.fq.gz -d run -o demo -t 1
 ```
 
 See [`test_data/README.md`](test_data/README.md) for the full smoke test (scan-wl + demux + expected outputs).
-
-## Install via Bioconda
-
-RAD is also on [Bioconda](https://anaconda.org/bioconda/rad) (linux-64, linux-aarch64, osx-64, osx-arm64):
-
-```bash
-mamba install -c bioconda -c conda-forge rad   # or: conda install -c bioconda -c conda-forge rad
-```
-
-If you run into problems, building from source (above) is easier for us to help debug.
 
 ## Repo layout
 

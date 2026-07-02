@@ -1,27 +1,56 @@
 # Installation and first run
 
-This page covers dependency setup, build, and the standard first RAD run (`prep -> demux -> reformat`).
+This page takes you from a fresh machine to your first demultiplexed file. If you've never built a C++ tool before, you can copy-paste straight down the page — nothing here assumes prior experience.
 
-## 1) Required dependencies
+## 1) What RAD needs
 
-- CMake `>= 3.18`
-- C++17 compiler
-- OpenMP runtime
-- Boost (`filesystem`, `system`, `iostreams`)
-- zlib
+RAD is a small C++ program. Building it needs a handful of standard, free tools — that's the whole list:
 
-Optional:
-- `pigz` (usually much faster `.gz` I/O)
+| Dependency | What it's for |
+| --- | --- |
+| **CMake ≥ 3.18** | runs the build |
+| **A C++17 compiler** | compiles RAD (clang or gcc, recent enough for C++17) |
+| **OpenMP runtime** | multithreading (the `-t` flag) |
+| **Boost** (`filesystem`, `iostreams`) | file paths + compressed I/O |
+| **zlib** | reading/writing `.gz` files |
+| **pigz** | parallel gzip — RAD uses it for all `.gz` I/O and it's dramatically faster than plain zlib |
 
-## 2) Install dependencies by platform
+Everything else RAD needs (edlib, ssw, kseq, the CSV parser…) is bundled **inside the repo**, so there's nothing else to chase down.
 
-### macOS (Homebrew)
+## 2) Install the dependencies
+
+Pick the **one** line that matches your machine.
+
+**On a Mac (Homebrew):**
 
 ```bash
-brew install cmake boost libomp llvm pigz
+brew install cmake boost libomp pigz llvm
 ```
 
-Using Homebrew LLVM usually gives cleaner OpenMP linkage:
+(`llvm` gives you a clang with clean OpenMP support, which is the smoothest setup on macOS.)
+
+**On Linux, an HPC cluster, or anywhere you don't have admin/`sudo` rights (conda/mamba):**
+
+```bash
+mamba create -n rad -c conda-forge cxx-compiler cmake boost zlib pigz
+mamba activate rad
+```
+
+This puts the compiler **and** every dependency into one self-contained environment — no `sudo`, which is the usual situation on a shared cluster.
+
+> **Don't have `mamba`/`conda` yet?** Install [Miniforge](https://github.com/conda-forge/miniforge) first — it's the standard, no-admin-rights way to get `mamba`. Then come back and run the line above.
+
+## 3) Build RAD
+
+```bash
+git clone https://github.com/indianewok/rad.git
+cd rad
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+On a Mac, point CMake at Homebrew's clang for the cleanest OpenMP linkage:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -30,189 +59,64 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 cmake --build build -j
 ```
 
-### Ubuntu / Debian
+When it finishes you'll have a `build/rad` binary. Confirm it works:
 
 ```bash
-sudo apt update
-sudo apt install -y \
-  build-essential cmake \
-  libboost-all-dev zlib1g-dev \
-  libomp-dev pigz
+build/rad --help     # lists every command (prep, demux, reformat, scan-wl, list, modify)
+build/rad list       # shows the bundled layouts + whitelists RAD can find
 ```
 
-### RHEL / Rocky / Alma
+If `rad list` prints layout and whitelist paths, your build found its bundled `resources/` and you're ready to demultiplex.
+
+> **Typical build time:** compiling RAD takes **~15–20 seconds** from a clean checkout on a modern desktop (measured on an Apple M2 Max with `-j`). Installing the dependencies above adds a few minutes, depending on your platform and network.
+
+> **On Bioconda:** RAD is available on Bioconda — `mamba install -c bioconda rad` installs the binary and all dependencies (pigz included), so you can skip the manual dependency setup and build above.
+
+## 4) Your first run
+
+Let's run RAD end-to-end on a small simulated dataset so you can see it work.
+
+**Get the test reads** (~99k simulated long reads, 50 known cells):
 
 ```bash
-sudo dnf install -y \
-  gcc gcc-c++ cmake \
-  boost-devel zlib-devel \
-  libgomp pigz
+curl -L -o test.fq.gz \
+  https://github.com/indianewok/rad/releases/download/test-data-v1/shuffled_S_lr_synth.fq.gz
 ```
 
-### Conda/Mamba user-space toolchain
+**(Optional) Eyeball the read structure first.** RAD ships layout templates by key — here we use `sctagger`:
 
 ```bash
-mamba create -n rad-build -y \
-  cmake cxx-compiler compilers \
-  boost zlib libgomp pigz
-mamba activate rad-build
-
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+build/rad prep -l sctagger --read-layout
 ```
 
-## 3) Build RAD
+This just prints how RAD will interpret the reads; nothing is written. (For a custom format, pass a CSV path instead of a key: `-l /path/to/layout.csv`.)
+
+**Demultiplex:**
 
 ```bash
-git clone --recurse-submodules https://github.com/indianewok/rad.git
-cd rad
-
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+build/rad demux -l sctagger -q test.fq.gz -d run -o demo -t 4
 ```
 
-Quick verification:
+This writes `run/demo.fq.gz` with corrected `CB:Z` (cell barcode) and `UB:Z` (UMI) tags in each header. On this dataset you should see **~33,700 reads pass** the filter — if you do, everything is working. The run takes **~20 seconds** on a modern desktop (Apple M2 Max, `-t 4`).
+
+**(Optional) Tidy up the output.** Rewrite headers, or split into one file per cell barcode:
 
 ```bash
-build/rad --help
-build/rad_config --help
+build/rad reformat -q run/demo.fq.gz --reformat-header -t 4
+build/rad reformat -q run/demo.fq.gz --split-bc -o run/by_barcode -t 4
 ```
 
-## 4) First run (standard path)
-
-Create a run directory:
-
-```bash
-mkdir -p run
-```
-
-Assumes:
-- `build/rad` exists
-- input reads are available (for example `reads.fq.gz`)
-
-Check the layout:
-
-```bash
-build/rad prep -l five_prime --read-layout
-```
-
-Custom layouts work too:
-
-```bash
-build/rad prep -l /abs/path/layout.csv --read-layout
-```
-
-Build a position map:
-
-```bash
-build/rad prep \
-  -l five_prime \
-  --position-map \
-  -q reads.fq.gz \
-  -o run/demo \
-  -n 50000 \
-  -t 8
-```
-
-Expected files:
-- `run/demo_layout.csv`
-- `run/demo_position_map.csv`
-
-Run demux:
-
-```bash
-build/rad demux \
-  -l five_prime \
-  -q reads.fq.gz \
-  -o demo \
-  -d run \
-  -t 8
-```
-
-Expected file:
-- `run/demo.fq.gz`
-
-Optional debug run:
-
-```bash
-build/rad demux \
-  -l five_prime \
-  -q reads.fq.gz \
-  -o demo \
-  -d run/debug \
-  -t 8 \
-  -w
-```
-
-Debug outputs:
-- `run/debug/demo_dbg.sig.gz`
-- `run/debug/demo_dbg.csv.gz`
-- `run/debug/demo_dbg.fq.gz`
-- `run/debug/demo.metrics.tsv`
-
-Optional reformat step:
-
-```bash
-build/rad reformat -q run/demo.fq.gz --reformat-header -t 8
-build/rad reformat -q run/demo.fq.gz --split-bc -o run/by_barcode -t 8
-```
-
-Whitelist selection patterns:
-
-```bash
-build/rad demux -l five_prime -q reads.fq.gz -k 10x_5v1 -o demo -d run
-
-build/rad demux \
-  -l five_prime \
-  -q reads.fq.gz \
-  -g /data/global_wl.csv.gz \
-  -c /data/true_wl.csv.gz \
-  -o demo \
-  -d run
-```
-
-Workflow sketch:
-
-```mermaid
-flowchart TD
-    A["prep --read-layout"] --> B["prep --position-map"]
-    B --> C["demux"]
-    C --> D["reformat --reformat-header"]
-    C --> E["reformat --split-bc"]
-```
-
-Quick sanity checks:
-
-```bash
-build/rad --help
-build/rad prep --help
-build/rad demux --help
-build/rad reformat --help
-```
+That's the whole pipeline: **`prep` → `demux` → `reformat`**. For the full smoke test (including de-novo barcode discovery with `scan-wl` and exact expected numbers), see [`test_data/README.md`](../test_data/README.md).
 
 ## 5) Runtime notes
 
-RAD expects `resources/` to be discoverable from executable/CWD search paths.
-If binaries are moved, move `resources/` with them (or run from the repo tree).
-
-Environment knobs:
-- `RAD_PIGZ=/path/to/pigz`
-- `RAD_NO_PIGZ=1`
-- `RAD_PIGZ_THREADS=<N>`
-
-Clean rebuild:
+- RAD finds its `resources/` folder relative to the `rad` binary, then `./resources`. If you move the binary, move `resources/` with it (or just run from the repo).
+- Handy environment knobs:
+  - `RAD_PIGZ=/path/to/pigz` — point at a specific pigz
+  - `RAD_NO_PIGZ=1` — disable pigz, fall back to zlib
+  - `RAD_PIGZ_THREADS=<N>` — cap pigz threads
+- After big source/header edits, do a clean rebuild:
 
 ```bash
 cmake --build build --clean-first
 ```
-
-## Install via Bioconda
-
-RAD is also packaged on [Bioconda](https://anaconda.org/bioconda/rad) (linux-64, linux-aarch64, osx-64, osx-arm64):
-
-```bash
-mamba install -c bioconda -c conda-forge rad
-rad --help
-```
-
-If you run into problems, building from source (above) is easier for us to help debug.
