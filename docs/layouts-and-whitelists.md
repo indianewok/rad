@@ -5,7 +5,7 @@ This page is the practical map: what’s bundled, what it maps to, and what to t
 ## Bundled layouts in the current build
 
 ```bash
-build/rad_config layout list
+build/rad list --layouts
 ```
 
 | Layout key | Source file | Typical pattern | Default whitelist field in layout |
@@ -16,14 +16,15 @@ build/rad_config layout list
 | `splitseq` | `resources/read_layout/splitseq_read_layout.csv` | SPLiT-seq multi-round barcodes + linkers | `splitseq_bc1`, `splitseq_bc2` |
 | `visium` | `resources/read_layout/visium_three_prime_read_layout.csv` | Visium-like spatial 3' layout | `10x_Vis_V1` |
 | `nanopore_rapid_bc` | `resources/read_layout/nanopore_bulk_rapid_bc_read_layout.csv` | Nanopore bulk rapid barcode-like template | none |
+| `visium_hd` | `resources/read_layout/visium_hd_read_layout.csv` | Visium HD spatial 3' (UMI + joint BC1+BC2) | `visium_hd_bc1`, `visium_hd_bc2` |
 
 Where these come from:
 - all are local templates shipped in `resources/read_layout/`.
 - nothing is downloaded at runtime.
 
 Visium HD status note:
-- Visium HD support is being developed on `dev`.
-- In the current `main` build/docs format, treat Visium HD as not fully integrated into the stable layout/whitelist flow yet.
+- The `visium_hd` layout and its `visium_hd_bc1`/`visium_hd_bc2` whitelists are registered and usable, but the broader Visium HD spatial-binning workflow is still being finished on `dev`.
+- For split-barcode kits like Visium HD, run `rad scan-wl` in two-part (BC1+BC2) mode manually rather than `demux --auto-wl` (which is single-barcode only).
 
 ## Quick layout pick guide
 
@@ -31,6 +32,7 @@ Visium HD status note:
 - 10x 5' style library -> start with `five_prime`
 - SPLiT-seq -> start with `splitseq`
 - Visium -> start with `visium`
+- Visium HD -> `visium_hd` (split BC1+BC2; discover barcodes with `scan-wl` two-part mode)
 - unclear chemistry -> pick closest, run `prep --read-layout`, then edit a custom CSV
 
 ## Custom layout CSV schema
@@ -58,7 +60,7 @@ Direction notes:
 - if `direction` is omitted, RAD treats rows as forward and auto-generates reverse-complement counterparts.
 - `forward_only` / `reverse_only` can be used for one-sided elements.
 
-## Direction column examples (`both`, `forward_only`, `reverse_only`)
+## Direction column examples (omit/blank = both orientations, `forward_only`, `reverse_only`)
 
 ### 1) Both orientations (auto forward + reverse-complement)
 
@@ -93,7 +95,7 @@ barcode_rc,,16,variable,barcode,10x_5v1,reverse_only
 ## Bundled whitelist resources (current files + sizes)
 
 ```bash
-build/rad_config whitelist list
+build/rad list --whitelists
 ```
 
 Entry counts below are line counts from bundled `.gz` files.
@@ -109,6 +111,8 @@ Entry counts below are line counts from bundled `.gz` files.
 | `visium-v5_bitlist.csv.gz` | 14,337 | Visium v5 spatial barcodes |
 | `splitseq_bc1_bitlist.csv.gz` | 96 | SPLiT-seq barcode set |
 | `splitseq_bc2_bitlist.csv.gz` | 96 | SPLiT-seq barcode set |
+| `visium_hd_bc1.csv.gz` | 3,351 | Visium HD BC1 (first spatial barcode) |
+| `visium_hd_bc2.csv.gz` | 3,351 | Visium HD BC2 (second spatial barcode) |
 | `visium_hd_coordinates.csv.gz` | 11,222,501 | Visium HD coordinate table (auxiliary spatial resource) |
 
 ## How RAD stores barcodes internally (`int64_seq` + `barcode_entry`)
@@ -185,6 +189,7 @@ Example:
 | Visium v3/v4 | `10x_Vis_V3`, `10x_Vis_V4` | `visium-v3_v4_bitlist.csv.gz` |
 | Visium v5 | `10x_Vis_V5` | `visium-v5_bitlist.csv.gz` |
 | SPLiT-seq | `splitseq_bc1`, `splitseq_bc2` | `splitseq_bc1_bitlist.csv.gz`, `splitseq_bc2_bitlist.csv.gz` |
+| Visium HD | `visium_hd_bc1`, `visium_hd_bc2` | `visium_hd_bc1.csv.gz`, `visium_hd_bc2.csv.gz` |
 
 ## Common pairings (quick start)
 
@@ -194,6 +199,27 @@ Example:
 - `splitseq` + `splitseq_bc1` + `splitseq_bc2`
 
 If the best pairing is unclear, run a short pilot with `-w` and inspect debug outputs before scaling up.
+
+## Building a whitelist from your reads (`scan-wl`)
+
+Bundled kits are the *reference* of valid barcodes; they don't tell you which cells are in
+*your* data. `scan-wl` scans the reads and calls the barcodes actually present:
+
+```bash
+# single barcode (e.g. 10x 3'): adapter is the primer immediately 5' of the barcode
+build/rad scan-wl -i reads.fq.gz -p CTACACGACGCTCTTCCGATCT -n 16 -w 10x_3v3 -o barcodes
+# -> barcodes.txt (detected whitelist, one per line) + barcodes.csv (per-barcode stats)
+```
+
+Then demux against the detected list (use the `.txt`, which holds only the high-confidence barcodes):
+
+```bash
+build/rad demux -l three_prime -q reads.fq.gz -c barcodes.txt -o demo -d run
+```
+
+Or do both in one command with `demux -A/--auto-wl` (single-barcode layouts), which derives
+the adapter/length from the layout, runs the scan internally, and demuxes against the result.
+For split-barcode kits (SPLiT-seq, Visium HD), run `scan-wl` in two-part mode (`-1/-2/-u`).
 
 ## Custom whitelist files
 
@@ -208,6 +234,9 @@ build/rad demux \
   -o demo -d run
 ```
 
-## `rad_config` behavior in the current build
+## Managing layout/whitelist keys (`rad list` / `rad modify`)
 
-`rad_config set/rm` is process-local in the current implementation, so it doesn't persist across separate invocations.
+`rad list` shows the registered layout and whitelist keys with resolved paths; `rad modify`
+adds or removes them. These overrides **persist** to `~/.rad/layout_overrides.tsv` and
+`~/.rad/whitelist_overrides.tsv` (removals of built-in defaults are stored as tombstones),
+so they carry across invocations. The standalone `rad_config` helper writes the same files.

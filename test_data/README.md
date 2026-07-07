@@ -24,6 +24,21 @@ True cell barcodes are in each read header: `@<16bp_barcode>-<counter>`.
 ```
 Expect: `Final barcodes (TRUE): 50`
 
+Writes `sw.txt` (the detected whitelist — high-confidence barcodes, one per line) and
+`sw.csv` (per-barcode stats). Feed `sw.txt` (not `sw.csv`) to `demux -c`.
+
+## demux against the scan-wl whitelist
+
+```bash
+./rad demux -l sctagger -q test.fq.gz -d out_scanwl -k 10x_3v3 -c sw.txt -t 1
+```
+This corrects against the 50 barcodes RAD detected — the de-novo equivalent of the
+ground-truth run below. One-shot equivalent (scan + demux in a single command):
+
+```bash
+./rad demux -l sctagger -q test.fq.gz -d out_auto -A -t 1
+```
+
 ## demux (correction via 10x_3v3 only)
 
 ```bash

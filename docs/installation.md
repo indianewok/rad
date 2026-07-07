@@ -62,7 +62,7 @@ cmake --build build -j
 When it finishes you'll have a `build/rad` binary. Confirm it works:
 
 ```bash
-build/rad --help     # lists every command (prep, demux, reformat, scan-wl, list, modify)
+build/rad --help     # lists every command (prep, scan-wl, demux, reformat, list, modify, help)
 build/rad list       # shows the bundled layouts + whitelists RAD can find
 ```
 
@@ -99,6 +99,8 @@ build/rad demux -l sctagger -q test.fq.gz -d run -o demo -t 4
 
 This writes `run/demo.fq.gz` with corrected `CB:Z` (cell barcode) and `UB:Z` (UMI) tags in each header. On this dataset you should see **~33,700 reads pass** the filter — if you do, everything is working. The run takes **~20 seconds** on a modern desktop (Apple M2 Max, `-t 4`).
 
+The `sctagger` layout carries a default whitelist, so this corrects against the full 10x list. On your own data you usually want to **discover the barcodes actually present first** — run `rad scan-wl` (see [`test_data/README.md`](../test_data/README.md)), or add `-A/--auto-wl` to the `demux` line to fold that scan into a single command. (By default `UB:Z` is reverse-complemented on reverse reads so it matches `CB:Z`'s orientation; `--no-umi-rc` keeps UMIs exactly as extracted.)
+
 **(Optional) Tidy up the output.** Rewrite headers, or split into one file per cell barcode:
 
 ```bash
@@ -106,12 +108,13 @@ build/rad reformat -q run/demo.fq.gz --reformat-header -t 4
 build/rad reformat -q run/demo.fq.gz --split-bc -o run/by_barcode -t 4
 ```
 
-That's the whole pipeline: **`prep` → `demux` → `reformat`**. For the full smoke test (including de-novo barcode discovery with `scan-wl` and exact expected numbers), see [`test_data/README.md`](../test_data/README.md).
+That's the pipeline: **discover barcodes with `scan-wl`** (or `demux -A/--auto-wl`), **`demux`** against that whitelist, then optional **`reformat`**. (`prep` is a preliminary layout/position-map step; it's not part of the per-run barcode path.) For the full smoke test — including de-novo barcode discovery with `scan-wl` and exact expected numbers — see [`test_data/README.md`](../test_data/README.md).
 
 ## 5) Runtime notes
 
-- RAD finds its `resources/` folder relative to the `rad` binary, then `./resources`. If you move the binary, move `resources/` with it (or just run from the repo).
+- RAD finds its `resources/` folder by climbing up from the `rad` binary, then `./resources`. If you move the binary, move `resources/` with it (or just run from the repo) — or point `RAD_RESOURCES` at it.
 - Handy environment knobs:
+  - `RAD_RESOURCES=/path/to/resources` — override where RAD looks for its bundled resources (highest precedence)
   - `RAD_PIGZ=/path/to/pigz` — point at a specific pigz
   - `RAD_NO_PIGZ=1` — disable pigz, fall back to zlib
   - `RAD_PIGZ_THREADS=<N>` — cap pigz threads
