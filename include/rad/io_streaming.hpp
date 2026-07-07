@@ -727,6 +727,7 @@ private:
     format fmt;
     bool compress_;
     bool use_pigz_ = false;
+    bool rc_umi_ = true; // reverse-complement UMIs on reverse reads (FASTQA only)
 
     // --- pigz path ---
     pigz_writing pigz_;
@@ -749,8 +750,8 @@ private:
     inline void write_one_(const T& item) {
         switch (fmt) {
             case format::FASTQA:
-                if (use_pigz_) { pigz_buf_.append(item.to_fastqa()); pigz_flush_if_big_(); }
-                else           { out_ << item.to_fastqa(); }
+                if (use_pigz_) { pigz_buf_.append(item.to_fastqa(rc_umi_)); pigz_flush_if_big_(); }
+                else           { out_ << item.to_fastqa(rc_umi_); }
                 break;
             case format::SIGSTRING:
                 if (use_pigz_) { pigz_buf_.append(item.to_sigstring()); pigz_buf_.push_back('\n'); pigz_flush_if_big_(); }
@@ -804,6 +805,12 @@ public:
             out_.push(file_);
         }
     }
+
+    /// FASTQA only: if false, UMIs are written exactly as extracted (minus-strand
+    /// on reverse reads) instead of being flipped to plus-strand. Mirrors the
+    /// primary buffered path (SigString::to_fastqa_append) so --no-umi-rc is
+    /// honored by the debug FASTQA output too.
+    void set_rc_umi(bool v) { rc_umi_ = v; }
 
     template<typename T>
     void operator()(const std::vector<T>& chunk) {

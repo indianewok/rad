@@ -45,6 +45,26 @@ static void usage_demux(const char *prog) {
          "'defensive'\n"
       << "      --joint-bc-mode               'default' (permissive) or "
          "'strict' (all barcodes must pass)\n"
+      << "  -A, --auto-wl                     run scan-wl internally first and "
+         "demux against the\n"
+      << "                                    detected barcodes (single-barcode "
+         "layouts)\n"
+      << "      --scan-adapter                override the scan-wl adapter "
+         "(default: from layout)\n"
+      << "      --scan-bc-len                 override the scan-wl barcode "
+         "length (default: from layout)\n"
+      << "      --scan-max-error              scan-wl adapter max-error ratio "
+         "(default: 0.3)\n"
+      << "      --scan-max-reads              scan-wl read cap "
+         "(default: --max-reads)\n"
+      << "      --scan-chunk                  scan-wl chunk size "
+         "(default: --chunk-size)\n"
+      << "      --scan-threads                scan-wl threads "
+         "(default: --threads)\n"
+      << "      --no-umi-rc                   keep UMIs as-extracted; do NOT "
+         "reverse-complement\n"
+      << "                                    UB:Z on reverse reads (default: "
+         "reverse-complement)\n"
       << "  -M, --whitelist-mutation          mutation space for whitelist "
          "(default: 2)\n"
       << "  -m, --generated-mutation          mutation space for generated "
@@ -1056,6 +1076,141 @@ int cmd_reformat(int argc, char *argv[]) {
 // COMMAND: demux
 // ============================================================================
 
+// Internal "scan-wl then demux" pass for `demux --auto-wl`.
+//
+// The historical two-command workflow (`rad scan-wl` to detect the real
+// barcodes, then `rad demux` against that filtered list) surprised users who
+// ran `demux` straight against a full reference whitelist and got every
+// reference barcode corrected into (issue #4). This derives the scan-wl
+// parameters from the already-parsed layout, runs the same scan-wl core, and
+// hands the high-confidence barcode list back to demux so a single command
+// reproduces the intended pipeline.
+//
+// Returns the path to the generated <outbase>_scanwl.txt whitelist. Throws on
+// any layout it cannot scan single-handedly (e.g. split-barcode kits), so the
+// caller can surface a clear "run scan-wl manually" message.
+static std::string run_auto_whitelist(const ReadLayout &layout,
+                                      const std::string &fastq_path,
+                                      const std::string &outbase,
+                                      const std::string &adapter_override,
+                                      std::optional<int> bc_len_override,
+                                      const std::string &ref_whitelist,
+                                      double scan_error, size_t max_reads,
+                                      size_t chunk_size, int nthreads,
+                                      bool verbose) {
+  // 1) Locate the single forward barcode element.
+  const ReadElement *bc_elem = nullptr;
+  int n_barcodes = 0;
+  for (const auto &elem : layout.by_order()) {
+    if (elem.global_class == "barcode" && !seq_utils::is_rc(elem.class_id)) {
+      ++n_barcodes;
+      if (!bc_elem)
+        bc_elem = &elem;
+    }
+  }
+  if (n_barcodes == 0)
+    throw std::runtime_error(
+        "--auto-wl: layout has no barcode element to scan for");
+  if (n_barcodes > 1)
+    throw std::runtime_error(
+        "--auto-wl supports single-barcode layouts only; run "
+        "'rad scan-wl' manually for split-barcode kits, then pass its output "
+        "with -g/-c");
+
+  // 2) Adapter = nearest upstream forward static element that carries a
+  //    sequence (the primer immediately 5' of the barcode).
+  std::string adapter = adapter_override;
+  if (adapter.empty()) {
+    bool found = false;
+    int best_order = 0;
+    for (const auto &elem : layout.by_order()) {
+      if (elem.type == "static" && !seq_utils::is_rc(elem.class_id) &&
+          !elem.seq.empty() && elem.order < bc_elem->order) {
+        if (!found || elem.order > best_order) {
+          best_order = elem.order;
+          adapter = elem.seq;
+          found = true;
+        }
+      }
+    }
+  }
+  if (adapter.empty())
+    throw std::runtime_error(
+        "--auto-wl: could not derive an upstream adapter from the "
+        "layout; pass one explicitly with --scan-adapter SEQ");
+
+  // 3) Barcode length: override > expected_length > widest candidate > 16.
+  int bc_len = bc_len_override.value_or(bc_elem->expected_length.value_or(
+      bc_elem->length_candidates.empty() ? 16
+                                         : bc_elem->length_candidates.back()));
+
+  // 4) Reference for validation: user override, else the barcode's own kit,
+  //    else de-novo (no reference).
+  std::string ref = ref_whitelist.empty() ? bc_elem->whitelist_path
+                                          : ref_whitelist;
+
+  std::cout << "[auto-wl] Pre-scanning barcodes before demux\n"
+            << "  adapter (5' of barcode) : " << adapter << "\n"
+            << "  barcode length          : " << bc_len << "\n"
+            << "  adapter max-error ratio : " << scan_error << "\n"
+            << "  max reads               : "
+            << (max_reads == static_cast<size_t>(-1) ? "all"
+                                                     : std::to_string(max_reads))
+            << "\n"
+            << "  chunk size              : " << chunk_size << "\n"
+            << "  threads                 : " << nthreads << "\n"
+            << "  reference whitelist     : "
+            << (ref.empty() ? "[de novo]" : ref) << "\n";
+
+  // process_fastq takes an int cap where 0 == "all"; treat "all" (size_t -1)
+  // and any value beyond INT_MAX as unlimited rather than overflowing to a
+  // negative cap.
+  int scan_max_reads =
+      (max_reads == static_cast<size_t>(-1) ||
+       max_reads > static_cast<size_t>(std::numeric_limits<int>::max()))
+          ? 0
+          : static_cast<int>(max_reads);
+  auto barcodes =
+      process_fastq(fastq_path, adapter, bc_len, /*m_left=*/0, /*m_right=*/0,
+                    scan_max_reads, scan_error, static_cast<int>(chunk_size),
+                    nthreads);
+  std::cout << "[auto-wl] Extracted " << barcodes.size()
+            << " raw barcode observations\n";
+
+  const std::string csv_out = outbase + "_scanwl.csv";
+  const std::string txt_out = outbase + "_scanwl.txt";
+
+  std::unordered_set<int64_seq> wl_set;
+  if (!ref.empty()) {
+    try {
+      std::string resolved = whitelist_utils::kit_to_path(ref);
+      wl_set = whitelist::load_barcodes(resolved, static_cast<uint16_t>(bc_len),
+                                        verbose);
+      std::cout << "[auto-wl] Loaded " << wl_set.size()
+                << " reference barcodes for validation\n";
+    } catch (const std::exception &e) {
+      std::cerr << "[auto-wl] WARNING: could not load reference "
+                   "whitelist ("
+                << e.what() << "); falling back to de-novo detection\n";
+    }
+  }
+  count_perfect_matches_with_stats(barcodes, wl_set, csv_out, txt_out, verbose);
+
+  // The .txt only holds the final high-confidence barcodes; an empty/absent
+  // file means the scan called nothing, which would make demux a no-op.
+  if (!boost::filesystem::exists(txt_out) ||
+      boost::filesystem::file_size(txt_out) == 0) {
+    throw std::runtime_error(
+        "--auto-wl: scan produced no high-confidence barcodes (" +
+        txt_out +
+        "); check the derived adapter, --scan-max-error, or run scan-wl "
+        "manually");
+  }
+  std::cout << "[auto-wl] Whitelist ready: " << txt_out
+            << " (feeding into demux)\n";
+  return txt_out;
+}
+
 int cmd_demux(int argc, char *argv[]) {
   std::string layout_key, fastq_path, custom_kit, global_whitelist_path,
       custom_whitelist_path, output_prefix, output_dir, log_file;
@@ -1067,8 +1222,16 @@ int cmd_demux(int argc, char *argv[]) {
   size_t chunk_size = 5000;
   std::string bc_corr_mode = "offensive";
   std::string joint_bc_mode = "default";
+  bool rc_umi = true;          // reverse-complement UMIs on reverse reads (issue #4)
+  bool auto_whitelist = false; // run scan-wl internally before demux (issue #4)
+  double scan_max_error = 0.3; // adapter max-error ratio for the scan-wl pass
+  std::string scan_adapter;    // override the layout-derived scan adapter
+  std::optional<int> scan_bc_len;        // override the layout-derived barcode length
+  std::optional<size_t> scan_max_reads; // scan-wl read cap (default: --max-reads)
+  std::optional<size_t> scan_chunk;      // scan-wl chunk size (default: --chunk-size)
+  std::optional<int> scan_threads;       // scan-wl threads (default: --threads)
 
-  const char *optstring = "l:q:k:g:c:R:M:m:n:z:o:d:F:wbt:vDh";
+  const char *optstring = "l:q:k:g:c:R:M:m:n:z:o:d:F:wbAt:vDh";
   struct option longopts[] = {
       {"layout", required_argument, nullptr, 'l'},
       {"fastq", required_argument, nullptr, 'q'},
@@ -1086,6 +1249,14 @@ int cmd_demux(int argc, char *argv[]) {
       {"write-dbg", no_argument, nullptr, 'w'},
       {"bc-split", no_argument, nullptr, 'b'},
       {"joint-bc-mode", required_argument, nullptr, 1},
+      {"no-umi-rc", no_argument, nullptr, 2},
+      {"auto-wl", no_argument, nullptr, 'A'},
+      {"scan-max-error", required_argument, nullptr, 3},
+      {"scan-adapter", required_argument, nullptr, 4},
+      {"scan-max-reads", required_argument, nullptr, 5},
+      {"scan-chunk", required_argument, nullptr, 6},
+      {"scan-threads", required_argument, nullptr, 7},
+      {"scan-bc-len", required_argument, nullptr, 8},
       {"threads", required_argument, nullptr, 't'},
       {"verbose", no_argument, nullptr, 'v'},
       {"max-verbose", no_argument, nullptr, 'D'},
@@ -1154,6 +1325,30 @@ int cmd_demux(int argc, char *argv[]) {
       }
       break;
     }
+    case 2:
+      rc_umi = false;
+      break;
+    case 'A':
+      auto_whitelist = true;
+      break;
+    case 3:
+      scan_max_error = std::stod(optarg);
+      break;
+    case 4:
+      scan_adapter = optarg;
+      break;
+    case 5:
+      scan_max_reads = std::stoull(optarg);
+      break;
+    case 6:
+      scan_chunk = std::stoull(optarg);
+      break;
+    case 7:
+      scan_threads = std::stoi(optarg);
+      break;
+    case 8:
+      scan_bc_len = std::stoi(optarg);
+      break;
     case 't':
       nthreads = std::stoi(optarg);
       break;
@@ -1183,6 +1378,19 @@ int cmd_demux(int argc, char *argv[]) {
 
   if (chunk_size == 0) {
     std::cerr << "[ERROR] chunk_size must be greater than 0\n";
+    return 1;
+  }
+
+  if (auto_whitelist && (!std::isfinite(scan_max_error) || scan_max_error < 0.0)) {
+    std::cerr << "[ERROR] --scan-max-error must be a non-negative number\n";
+    return 1;
+  }
+  if (auto_whitelist && scan_chunk && *scan_chunk == 0) {
+    std::cerr << "[ERROR] --scan-chunk must be greater than 0\n";
+    return 1;
+  }
+  if (auto_whitelist && scan_threads && *scan_threads < 1) {
+    std::cerr << "[ERROR] --scan-threads must be >= 1\n";
     return 1;
   }
 
@@ -1283,6 +1491,10 @@ int cmd_demux(int argc, char *argv[]) {
               << "\n"
               << "  barcode correction mode      : " << bc_corr_mode << "\n"
               << "  joint barcode mode           : " << joint_bc_mode << "\n"
+              << "  auto-whitelist (scan-wl)     : " << std::boolalpha
+              << auto_whitelist << "\n"
+              << "  reverse-complement UMIs      : " << std::boolalpha
+              << rc_umi << "\n"
               << "  whitelist-generated mutations: "
               << (wl_mut ? std::to_string(*wl_mut) : "default(2)") << "\n"
               << "  read-generated mutations     : "
@@ -1392,7 +1604,25 @@ int cmd_demux(int argc, char *argv[]) {
       whitelist_path = kit_or_wl + ":" + custom_whitelist_path;
     }
 
-    if (whitelist_path) {
+    // --auto-wl: run scan-wl internally and demux against its filtered barcode
+    // list instead of a full reference (issue #4).
+    std::optional<std::string> auto_wl_path;
+    if (auto_whitelist) {
+      // Each scan-wl knob defaults to the matching demux setting unless the
+      // user overrode it with a --scan-* flag.
+      auto_wl_path = run_auto_whitelist(
+          read_layout, fastq_path, outbase.string(), scan_adapter, scan_bc_len,
+          kit_or_wl, scan_max_error, scan_max_reads.value_or(max_reads),
+          scan_chunk.value_or(chunk_size), scan_threads.value_or(nthreads),
+          verbose);
+    }
+
+    if (auto_wl_path) {
+      if (verbose)
+        std::cout << "[main] Loading auto-generated whitelist from scan-wl "
+                     "pass...\n";
+      read_layout.load_wl(auto_wl_path.value(), wl_mut, verbose, nthreads);
+    } else if (whitelist_path) {
       if (verbose)
         std::cout << "[main] Loading custom kit & whitelist...\n";
       read_layout.load_wl(whitelist_path.value(), wl_mut, verbose, nthreads);
@@ -1415,7 +1645,7 @@ int cmd_demux(int argc, char *argv[]) {
     size_t max_reads_param = (max_reads == -1) ? -1 : max_reads;
     SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut,
                         max_verbose, nthreads, chunk_size, max_reads_param,
-                        write_debug, bc_corr_mode, joint_bc_mode);
+                        write_debug, bc_corr_mode, joint_bc_mode, rc_umi);
 
     auto sig_time = std::chrono::steady_clock::now() - sigalign_start;
     std::cout

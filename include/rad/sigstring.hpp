@@ -3879,9 +3879,10 @@ public:
         int num_threads, 
         size_t chunk_size, 
         size_t max_reads, 
-        bool write_debug, 
+        bool write_debug,
         std::string mode,
-        std::string joint_bc_mode = "default"
+        std::string joint_bc_mode = "default",
+        bool rc_umi = true
     ) {
     const auto sigalign_wall_t0 = std::chrono::steady_clock::now();
 
@@ -3918,6 +3919,9 @@ public:
         debug_fastqa_writer = std::make_unique<sigstring_writing>(fastq_debug_path, sigstring_writing::format::FASTQA,
             compress_fastq, false, num_threads
         );
+        // Honor --no-umi-rc in the debug FASTQA output too (it flows through
+        // to_fastqa(), not the buffered to_fastqa_append() path).
+        debug_fastqa_writer->set_rc_umi(rc_umi);
 
         metrics_file_ptr = std::make_unique<std::ofstream>(metrics_path);
         *metrics_file_ptr << "chunk_id\tseqs_in_chunk\tseqs_passed\tin_flight\tprocess_time_ms\tqueue_time_ms\ttotal_time_ms\trss_mb\n";
@@ -3996,7 +4000,7 @@ public:
                     }
                     // Serialize directly to thread buffer--mod this to pigz_write?
                     if (sig.read_type != "filtered" && sig.read_type != "skipped") {
-                        sig.to_fastqa_append(thread_buffers[tid]);
+                        sig.to_fastqa_append(thread_buffers[tid], rc_umi);
                         passed_count.fetch_add(1, std::memory_order_relaxed);
                     }
                 }  // sig destroyed here
@@ -4233,7 +4237,7 @@ public:
  * it appends directly to an existing string buffer rather than returning a new string, which I don't have to
  * go through the overhead of creating intermediate strings.
  */
-    void to_fastqa_append(std::string& buffer) const {
+    void to_fastqa_append(std::string& buffer, bool rc_umi = true) const {
         if (read_type == "skipped") {
             return;
         }
@@ -4290,11 +4294,20 @@ public:
                 
                 if (elem.global_class == "umi") {
                     if (elem.seq.has_value()) {
-                        umi = elem.seq.value();
+                        // Reverse reads are extracted on the minus strand, so the raw
+                        // UMI comes out reverse-complemented relative to the molecule.
+                        // Barcodes are flipped back to plus-strand during correction
+                        // (correct_barcode revcomps before whitelist match), so unless
+                        // we mirror that here CB:Z ends up plus-strand while UB:Z stays
+                        // minus-strand. rc_umi (default on) keeps the two consistent;
+                        // pass rc_umi=false to leave UMIs exactly as extracted.
+                        umi = (rc_umi && dir == "reverse")
+                                  ? seq_utils::revcomp(elem.seq.value())
+                                  : elem.seq.value();
                     }
                     continue;
                 }
-                
+
                 if (elem.global_class == "read") {
                     read_seq = elem.seq.value();
                     if (elem.qual.has_value()) {
@@ -4388,7 +4401,7 @@ public:
  * it constructs and returns a new string containing the fastqa representation of the SigString. This is
  * an older, less efficient version of the writing process that's used in other contexts where we needed the string.
 */
-    std::string to_fastqa() const {
+    std::string to_fastqa(bool rc_umi = true) const {
         std::vector<std::string> dirs;
         if(read_type == "skipped"){
             return ""; // Skip if read type is "skipped"
@@ -4439,7 +4452,11 @@ public:
                 }
                 if (elem.global_class == "umi") {
                     if (elem.seq.has_value()) {
-                        umi = elem.seq.value();
+                        // Match to_fastqa_append: flip minus-strand (reverse) UMIs
+                        // back to plus-strand so UB:Z and CB:Z share an orientation.
+                        umi = (rc_umi && dir == "reverse")
+                                  ? seq_utils::revcomp(elem.seq.value())
+                                  : elem.seq.value();
                     }
                     continue;
                 }

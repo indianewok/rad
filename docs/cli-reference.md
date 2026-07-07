@@ -95,6 +95,16 @@ Whitelist/correction knobs:
 - `-M, --whitelist_mutation` (default `2`)
 - `-m, --generated_mutation` (default `2`)
 
+Auto-whitelist (run `scan-wl` + `demux` in one command):
+
+- `-A, --auto-wl` — before demultiplexing, scan the FASTQ for the barcodes actually present (the `scan-wl` step) and demux against that detected list instead of a full reference. Single-barcode layouts only; split-barcode kits (e.g. Visium HD) should run `rad scan-wl` manually. The adapter and barcode length are derived from the layout; the reference for validation is `-k`/`-g` if given, else the layout's own kit, else de-novo. Writes `<prefix>_scanwl.csv` / `<prefix>_scanwl.txt`.
+- `--scan-adapter` — override the derived scan adapter sequence
+- `--scan-bc-len` — override the derived barcode length
+- `--scan-max-error` (default `0.3`) — adapter max edit-distance ratio for the scan
+- `--scan-max-reads` (default `--max-reads`) — reads scanned for the whitelist
+- `--scan-chunk` (default `--chunk-size`) — scan chunk size
+- `--scan-threads` (default `--threads`) — scan threads
+
 Runtime/output knobs:
 
 - `-n, --max_reads` (default all)
@@ -105,6 +115,7 @@ Runtime/output knobs:
 - `-w, --write_dbg`
 - `-b, --bc_split`
 - `-t, --threads` (default `1`)
+- `--no-umi-rc` — keep UMIs exactly as extracted. By default, for reverse-oriented reads `UB:Z` is reverse-complemented so it shares `CB:Z`'s plus-strand orientation; this flag disables that (raw minus-strand UMIs, e.g. for debugging/metrics).
 - `-v, --verbose`
 - `-D, --max_verbose`
 - `-h, --help`
