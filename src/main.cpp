@@ -65,6 +65,11 @@ static void usage_demux(const char *prog) {
          "reverse-complement\n"
       << "                                    UB:Z on reverse reads (default: "
          "reverse-complement)\n"
+      << "      --min-read-length             min cDNA length to keep a read; "
+         "shorter inserts are\n"
+      << "                                    dropped (default: the layout's "
+         "combined element length;\n"
+      << "                                    0 keeps every read with any cDNA)\n"
       << "  -M, --whitelist-mutation          mutation space for whitelist "
          "(default: 2)\n"
       << "  -m, --generated-mutation          mutation space for generated "
@@ -1230,6 +1235,7 @@ int cmd_demux(int argc, char *argv[]) {
   std::optional<size_t> scan_max_reads; // scan-wl read cap (default: --max-reads)
   std::optional<size_t> scan_chunk;      // scan-wl chunk size (default: --chunk-size)
   std::optional<int> scan_threads;       // scan-wl threads (default: --threads)
+  int min_read_length = -1;    // min cDNA length to keep (-1 = layout static length)
 
   const char *optstring = "l:q:k:g:c:R:M:m:n:z:o:d:F:wbAt:vDh";
   struct option longopts[] = {
@@ -1257,6 +1263,7 @@ int cmd_demux(int argc, char *argv[]) {
       {"scan-chunk", required_argument, nullptr, 6},
       {"scan-threads", required_argument, nullptr, 7},
       {"scan-bc-len", required_argument, nullptr, 8},
+      {"min-read-length", required_argument, nullptr, 9},
       {"threads", required_argument, nullptr, 't'},
       {"verbose", no_argument, nullptr, 'v'},
       {"max-verbose", no_argument, nullptr, 'D'},
@@ -1349,6 +1356,9 @@ int cmd_demux(int argc, char *argv[]) {
     case 8:
       scan_bc_len = std::stoi(optarg);
       break;
+    case 9:
+      min_read_length = std::stoi(optarg);
+      break;
     case 't':
       nthreads = std::stoi(optarg);
       break;
@@ -1391,6 +1401,11 @@ int cmd_demux(int argc, char *argv[]) {
   }
   if (auto_whitelist && scan_threads && *scan_threads < 1) {
     std::cerr << "[ERROR] --scan-threads must be >= 1\n";
+    return 1;
+  }
+  if (min_read_length < -1) {
+    std::cerr << "[ERROR] --min-read-length must be >= 0 (0 keeps all reads with "
+                 "any cDNA)\n";
     return 1;
   }
 
@@ -1645,7 +1660,8 @@ int cmd_demux(int argc, char *argv[]) {
     size_t max_reads_param = (max_reads == -1) ? -1 : max_reads;
     SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut,
                         max_verbose, nthreads, chunk_size, max_reads_param,
-                        write_debug, bc_corr_mode, joint_bc_mode, rc_umi);
+                        write_debug, bc_corr_mode, joint_bc_mode, rc_umi,
+                        min_read_length);
 
     auto sig_time = std::chrono::steady_clock::now() - sigalign_start;
     std::cout

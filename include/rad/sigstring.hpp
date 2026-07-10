@@ -2274,11 +2274,20 @@ private:
  */
     // calculate the total expected length of static adapters
     int calc_total_static_len(const ReadLayout& layout) const {
+        // Combined expected length of one strand's structural elements
+        // (primers + poly-tail + barcode + UMI) — i.e. everything but the cDNA.
+        // Summed straight from the layout's forward-orientation elements so the
+        // value is a fixed property of the layout, not of a given read. Filtering
+        // on elem.direction (not an "rc_" prefix) is deliberate: the reverse
+        // poly-tail is named "poly_a", so a prefix test would miss it and the
+        // forward "poly_t" would still be counted. Earlier this iterated the
+        // read's sig_elements, which held BOTH orientations and double-counted
+        // the barcode/UMI/adapters, inflating the minimum read length.
         int total = 0;
-        for (const auto& elem : sig_elements) {
-            auto layout_elem = layout.by_id().find(elem.class_id);
-            if (layout_elem != layout.by_id().end() && layout_elem->expected_length) {
-                total += *layout_elem->expected_length;
+        for (const auto& elem : layout.by_order()) {
+            if (elem.direction != "forward") continue;
+            if (elem.expected_length) {
+                total += *elem.expected_length;
             }
         }
         return total;
@@ -2290,7 +2299,8 @@ private:
  * @param layout `ReadLayout` object containing layout elements
  * @return true if read length meets or exceeds total expected adapter length, false otherwise
  */
-    bool filter_short_reads(const std::vector<std::reference_wrapper<const seq_element>>& elems, const ReadLayout& layout) const {
+    bool filter_short_reads(const std::vector<std::reference_wrapper<const seq_element>>& elems,
+                            const ReadLayout& layout, int min_read_length = -1) const {
         size_t read_len = 0;
         // find the single "read" element
         for (auto& e_ref : elems) {
@@ -2300,14 +2310,16 @@ private:
                 break;
             }
         }
-        // if no read at all -> drop
+        // if no read (cDNA) at all -> drop
         if (read_len == 0){
             return false;
         }
-        // sum up all the expected static‐adapter lengths from the layout
-        int adapters = calc_total_static_len(layout);
+        // Minimum informative cDNA length. Default (min_read_length < 0) is the
+        // combined structural length (calc_total_static_len); users can override
+        // via --min-read-length, including 0 to keep every read with any cDNA.
+        int threshold = (min_read_length >= 0) ? min_read_length : calc_total_static_len(layout);
         // if the read is long enough, say yes; if the read is too short, say no
-        return read_len >= static_cast<size_t>(adapters);
+        return read_len >= static_cast<size_t>(threshold);
     }
 
 /**
@@ -2516,14 +2528,15 @@ private:
  * @return true if processing is successful, false if read is filtered
  */   
     bool process_direction_basic(
-        const std::string& direction, 
+        const std::string& direction,
         std::vector<std::reference_wrapper<const seq_element>>& elements,
-        const read_streaming::sequence& read, 
-        const ReadLayout& layout, 
-        std::string& filtered_because, 
-        bool verbose
+        const read_streaming::sequence& read,
+        const ReadLayout& layout,
+        std::string& filtered_because,
+        bool verbose,
+        int min_read_length = -1
     ) {
-        
+
         if(filter_direction_statics(elements, layout, direction)){
             filtered_because += direction + "_FILTERED_NO_STATIC_ELEMENTS";
             set_info(filtered_because);
@@ -2531,7 +2544,7 @@ private:
         }
 
         // Length filtering
-        if (!filter_short_reads(elements, layout)) {
+        if (!filter_short_reads(elements, layout, min_read_length)) {
             filtered_because += direction + "_FILTERED_READ_LENGTH";
             set_info(filtered_because);
             return false;
@@ -3791,8 +3804,8 @@ public:
  * final read type is determined based on the updated direction validity. 
  * This function also includes concatenate resolution logic.
  */
-    void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, int gen_mut, bool verbose, 
-        std::string mode, const std::string& joint_bc_mode
+    void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, int gen_mut, bool verbose,
+        std::string mode, const std::string& joint_bc_mode, int min_read_length = -1
     ) {
         
         constexpr char qual_mask = '\x7F';
@@ -3809,7 +3822,7 @@ public:
         // part 1: Process each direction for basic validation and masking
         for (auto& [direction, elements] : direction_elements) {
             direction_valid[direction] = process_direction_basic(
-                direction, elements, read, layout, filtered_because, verbose
+                direction, elements, read, layout, filtered_because, verbose, min_read_length
             );
             
             if (!direction_valid[direction]) {
@@ -3882,7 +3895,8 @@ public:
         bool write_debug,
         std::string mode,
         std::string joint_bc_mode = "default",
-        bool rc_umi = true
+        bool rc_umi = true,
+        int min_read_length = -1
     ) {
     const auto sigalign_wall_t0 = std::chrono::steady_clock::now();
 
@@ -3992,7 +4006,7 @@ public:
                     SigString sig(read.id, read.seq.length(),"undefined", layout.sequencing_type);
                     sig.sigalign_static(read, layout, verbose);
                     sig.sigalign_variable(read, layout, verbose);
-                    sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode, joint_bc_mode);
+                    sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode, joint_bc_mode, min_read_length);
 
                     // Keep for debug if needed
                     if (write_debug) {
