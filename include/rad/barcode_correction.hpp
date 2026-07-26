@@ -2290,13 +2290,22 @@ class whitelist {
             std::cout << "[check_if_bitlist] Detected element " << islist << " a bit-configured whitelist!" << std::endl;
         }
 
-        // read all lines (skipping header)  
-        auto lines = streaming_utils::import_text(path, SIZE_MAX);
-        /*if (!lines.empty()){
-            lines.erase(lines.begin());
-        }*/
+        // Stream whitelist rows directly into the set.  The previous
+        // import_text() call retained every source line while also building the
+        // encoded set, creating an avoidable second full-whitelist peak.
+        std::unique_ptr<std::istream> in;
+        if (path.size() > 3 && path.substr(path.size() - 3) == ".gz") {
+            in = std::make_unique<igzstream>(path.c_str());
+        } else {
+            in = std::make_unique<std::ifstream>(path);
+        }
+        if (!in || !*in) {
+            throw std::runtime_error("Failed to open whitelist: " + path);
+        }
+
         std::unordered_set<int64_seq> out;
-        for (auto &ln : lines) {
+        std::string ln;
+        while (std::getline(*in, ln)) {
             if (ln.empty()) continue;
             auto p = ln.find_first_of(",\t");
             std::string tok = (p == std::string::npos ? ln : ln.substr(0,p));
