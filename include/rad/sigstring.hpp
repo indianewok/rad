@@ -4120,12 +4120,16 @@ public:
         }
     };
 
-    // Start streaming with backpressure limit
+    // Stream one chunk at a time and parallelize within that chunk.  Running
+    // chunk_streaming with num_threads here created an outer OpenMP team which
+    // then entered the num_threads-wide region in process_chunk above.  With
+    // nested OpenMP enabled that could create num_threads^2 workers; with the
+    // usual nested-disabled runtime it instead kept num_threads full chunks in
+    // memory while each inner region ran serially.
     {
-        // Limit to 2-3 chunks in flight
         chunk_streaming<read_streaming::sequence, decltype(process_chunk)>streamer(chunk_size, pigz_threads);
         const int64_t limit = (max_reads > 0 ? static_cast<int64_t>(max_reads) : -1);
-        streamer.process_chunks(fastq_path, process_chunk, num_threads, limit);
+        streamer.process_chunks(fastq_path, process_chunk, /*chunk_workers=*/1, limit);
     }
 
     writer.stop();
