@@ -9,3 +9,7 @@
 ## Internals
 
 - [`architecture.md`](architecture.md): how layout parsing, whitelist correction, and chunked processing fit together.
+
+## Experimental investigations
+
+- [`experimental/README.md`](experimental/README.md): reproducible engineering investigations, benchmark evidence, limitations, and adoption decisions.
