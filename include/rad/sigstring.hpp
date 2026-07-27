@@ -2274,11 +2274,20 @@ private:
  */
     // calculate the total expected length of static adapters
     int calc_total_static_len(const ReadLayout& layout) const {
+        // Combined expected length of one strand's structural elements
+        // (primers + poly-tail + barcode + UMI) — i.e. everything but the cDNA.
+        // Summed straight from the layout's forward-orientation elements so the
+        // value is a fixed property of the layout, not of a given read. Filtering
+        // on elem.direction (not an "rc_" prefix) is deliberate: the reverse
+        // poly-tail is named "poly_a", so a prefix test would miss it and the
+        // forward "poly_t" would still be counted. Earlier this iterated the
+        // read's sig_elements, which held BOTH orientations and double-counted
+        // the barcode/UMI/adapters, inflating the minimum read length.
         int total = 0;
-        for (const auto& elem : sig_elements) {
-            auto layout_elem = layout.by_id().find(elem.class_id);
-            if (layout_elem != layout.by_id().end() && layout_elem->expected_length) {
-                total += *layout_elem->expected_length;
+        for (const auto& elem : layout.by_order()) {
+            if (elem.direction != "forward") continue;
+            if (elem.expected_length) {
+                total += *elem.expected_length;
             }
         }
         return total;
@@ -2290,7 +2299,8 @@ private:
  * @param layout `ReadLayout` object containing layout elements
  * @return true if read length meets or exceeds total expected adapter length, false otherwise
  */
-    bool filter_short_reads(const std::vector<std::reference_wrapper<const seq_element>>& elems, const ReadLayout& layout) const {
+    bool filter_short_reads(const std::vector<std::reference_wrapper<const seq_element>>& elems,
+                            const ReadLayout& layout, int min_read_length = -1) const {
         size_t read_len = 0;
         // find the single "read" element
         for (auto& e_ref : elems) {
@@ -2300,14 +2310,16 @@ private:
                 break;
             }
         }
-        // if no read at all -> drop
+        // if no read (cDNA) at all -> drop
         if (read_len == 0){
             return false;
         }
-        // sum up all the expected static‐adapter lengths from the layout
-        int adapters = calc_total_static_len(layout);
+        // Minimum informative cDNA length. Default (min_read_length < 0) is the
+        // combined structural length (calc_total_static_len); users can override
+        // via --min-read-length, including 0 to keep every read with any cDNA.
+        int threshold = (min_read_length >= 0) ? min_read_length : calc_total_static_len(layout);
         // if the read is long enough, say yes; if the read is too short, say no
-        return read_len >= static_cast<size_t>(adapters);
+        return read_len >= static_cast<size_t>(threshold);
     }
 
 /**
@@ -2516,14 +2528,15 @@ private:
  * @return true if processing is successful, false if read is filtered
  */   
     bool process_direction_basic(
-        const std::string& direction, 
+        const std::string& direction,
         std::vector<std::reference_wrapper<const seq_element>>& elements,
-        const read_streaming::sequence& read, 
-        const ReadLayout& layout, 
-        std::string& filtered_because, 
-        bool verbose
+        const read_streaming::sequence& read,
+        const ReadLayout& layout,
+        std::string& filtered_because,
+        bool verbose,
+        int min_read_length = -1
     ) {
-        
+
         if(filter_direction_statics(elements, layout, direction)){
             filtered_because += direction + "_FILTERED_NO_STATIC_ELEMENTS";
             set_info(filtered_because);
@@ -2531,7 +2544,7 @@ private:
         }
 
         // Length filtering
-        if (!filter_short_reads(elements, layout)) {
+        if (!filter_short_reads(elements, layout, min_read_length)) {
             filtered_because += direction + "_FILTERED_READ_LENGTH";
             set_info(filtered_because);
             return false;
@@ -3791,8 +3804,8 @@ public:
  * final read type is determined based on the updated direction validity. 
  * This function also includes concatenate resolution logic.
  */
-    void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, int gen_mut, bool verbose, 
-        std::string mode, const std::string& joint_bc_mode
+    void sigalign_filter(const read_streaming::sequence &read, const ReadLayout& layout, int gen_mut, bool verbose,
+        std::string mode, const std::string& joint_bc_mode, int min_read_length = -1
     ) {
         
         constexpr char qual_mask = '\x7F';
@@ -3809,7 +3822,7 @@ public:
         // part 1: Process each direction for basic validation and masking
         for (auto& [direction, elements] : direction_elements) {
             direction_valid[direction] = process_direction_basic(
-                direction, elements, read, layout, filtered_because, verbose
+                direction, elements, read, layout, filtered_because, verbose, min_read_length
             );
             
             if (!direction_valid[direction]) {
@@ -3879,9 +3892,11 @@ public:
         int num_threads, 
         size_t chunk_size, 
         size_t max_reads, 
-        bool write_debug, 
+        bool write_debug,
         std::string mode,
-        std::string joint_bc_mode = "default"
+        std::string joint_bc_mode = "default",
+        bool rc_umi = true,
+        int min_read_length = -1
     ) {
     const auto sigalign_wall_t0 = std::chrono::steady_clock::now();
 
@@ -3918,6 +3933,9 @@ public:
         debug_fastqa_writer = std::make_unique<sigstring_writing>(fastq_debug_path, sigstring_writing::format::FASTQA,
             compress_fastq, false, num_threads
         );
+        // Honor --no-umi-rc in the debug FASTQA output too (it flows through
+        // to_fastqa(), not the buffered to_fastqa_append() path).
+        debug_fastqa_writer->set_rc_umi(rc_umi);
 
         metrics_file_ptr = std::make_unique<std::ofstream>(metrics_path);
         *metrics_file_ptr << "chunk_id\tseqs_in_chunk\tseqs_passed\tin_flight\tprocess_time_ms\tqueue_time_ms\ttotal_time_ms\trss_mb\n";
@@ -3988,7 +4006,7 @@ public:
                     SigString sig(read.id, read.seq.length(),"undefined", layout.sequencing_type);
                     sig.sigalign_static(read, layout, verbose);
                     sig.sigalign_variable(read, layout, verbose);
-                    sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode, joint_bc_mode);
+                    sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode, joint_bc_mode, min_read_length);
 
                     // Keep for debug if needed
                     if (write_debug) {
@@ -3996,7 +4014,7 @@ public:
                     }
                     // Serialize directly to thread buffer--mod this to pigz_write?
                     if (sig.read_type != "filtered" && sig.read_type != "skipped") {
-                        sig.to_fastqa_append(thread_buffers[tid]);
+                        sig.to_fastqa_append(thread_buffers[tid], rc_umi);
                         passed_count.fetch_add(1, std::memory_order_relaxed);
                     }
                 }  // sig destroyed here
@@ -4102,12 +4120,16 @@ public:
         }
     };
 
-    // Start streaming with backpressure limit
+    // Stream one chunk at a time and parallelize within that chunk.  Running
+    // chunk_streaming with num_threads here created an outer OpenMP team which
+    // then entered the num_threads-wide region in process_chunk above.  With
+    // nested OpenMP enabled that could create num_threads^2 workers; with the
+    // usual nested-disabled runtime it instead kept num_threads full chunks in
+    // memory while each inner region ran serially.
     {
-        // Limit to 2-3 chunks in flight
         chunk_streaming<read_streaming::sequence, decltype(process_chunk)>streamer(chunk_size, pigz_threads);
         const int64_t limit = (max_reads > 0 ? static_cast<int64_t>(max_reads) : -1);
-        streamer.process_chunks(fastq_path, process_chunk, num_threads, limit);
+        streamer.process_chunks(fastq_path, process_chunk, /*chunk_workers=*/1, limit);
     }
 
     writer.stop();
@@ -4233,7 +4255,7 @@ public:
  * it appends directly to an existing string buffer rather than returning a new string, which I don't have to
  * go through the overhead of creating intermediate strings.
  */
-    void to_fastqa_append(std::string& buffer) const {
+    void to_fastqa_append(std::string& buffer, bool rc_umi = true) const {
         if (read_type == "skipped") {
             return;
         }
@@ -4290,11 +4312,20 @@ public:
                 
                 if (elem.global_class == "umi") {
                     if (elem.seq.has_value()) {
-                        umi = elem.seq.value();
+                        // Reverse reads are extracted on the minus strand, so the raw
+                        // UMI comes out reverse-complemented relative to the molecule.
+                        // Barcodes are flipped back to plus-strand during correction
+                        // (correct_barcode revcomps before whitelist match), so unless
+                        // we mirror that here CB:Z ends up plus-strand while UB:Z stays
+                        // minus-strand. rc_umi (default on) keeps the two consistent;
+                        // pass rc_umi=false to leave UMIs exactly as extracted.
+                        umi = (rc_umi && dir == "reverse")
+                                  ? seq_utils::revcomp(elem.seq.value())
+                                  : elem.seq.value();
                     }
                     continue;
                 }
-                
+
                 if (elem.global_class == "read") {
                     read_seq = elem.seq.value();
                     if (elem.qual.has_value()) {
@@ -4388,7 +4419,7 @@ public:
  * it constructs and returns a new string containing the fastqa representation of the SigString. This is
  * an older, less efficient version of the writing process that's used in other contexts where we needed the string.
 */
-    std::string to_fastqa() const {
+    std::string to_fastqa(bool rc_umi = true) const {
         std::vector<std::string> dirs;
         if(read_type == "skipped"){
             return ""; // Skip if read type is "skipped"
@@ -4439,7 +4470,11 @@ public:
                 }
                 if (elem.global_class == "umi") {
                     if (elem.seq.has_value()) {
-                        umi = elem.seq.value();
+                        // Match to_fastqa_append: flip minus-strand (reverse) UMIs
+                        // back to plus-strand so UB:Z and CB:Z share an orientation.
+                        umi = (rc_umi && dir == "reverse")
+                                  ? seq_utils::revcomp(elem.seq.value())
+                                  : elem.seq.value();
                     }
                     continue;
                 }

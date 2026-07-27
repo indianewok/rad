@@ -95,18 +95,10 @@ public:
      * @return FILE* pointer to pipe, or nullptr on failure
      */
     inline FILE* open_pigz_read_pipe(const std::string& input_path, int threads = 4) {
-        // Allow disabling via environment variable
-        if (const char* no = std::getenv("RAD_NO_PIGZ"); no && *no) {
+        // Resolve pigz (PATH-first; honors RAD_PIGZ / RAD_NO_PIGZ). "" => skip.
+        const std::string& pigz = resolve_pigz();
+        if (pigz.empty()) {
             return nullptr;
-        }
-
-        #ifndef PIGZ_PATH
-        #  define PIGZ_PATH "pigz"
-        #endif
-        
-        std::string pigz = PIGZ_PATH;
-        if (const char* env = std::getenv("RAD_PIGZ"); env && *env) {
-            pigz = env;
         }
 
         const std::string path = sanitize_user_path(input_path);
@@ -116,8 +108,8 @@ public:
 
         // Avoid invoking pigz on a path that doesn't exist; this also makes it
         // much easier to diagnose hidden characters (e.g. CR, BOM) in the path.
-        std::error_code ec;
-        if (!std::filesystem::is_regular_file(path, ec)) {
+        boost::system::error_code ec;
+        if (!boost::filesystem::is_regular_file(path, ec)) {
             return nullptr;
         }
 
@@ -154,21 +146,40 @@ public:
     }
 
     /**
-     * @brief Check if pigz is available on the system
-     * @return true if pigz is found in PATH
+     * @brief Resolve the pigz executable to use, preferring one on PATH (so a
+     * conda or system pigz "just works"), then the compile-time PIGZ_PATH build
+     * hint. Honors RAD_PIGZ (explicit override) and RAD_NO_PIGZ (disable).
+     * Returns "" when pigz is unavailable or disabled. Resolved once + cached.
+     */
+    static const std::string& resolve_pigz() {
+        static const std::string cached = []() -> std::string {
+            if (const char* no = std::getenv("RAD_NO_PIGZ"); no && *no) return "";
+            auto available = [](const std::string& exe) -> bool {
+                if (exe.empty()) return false;
+                std::string c = "command -v " + shell_quote_posix(exe) + " > /dev/null 2>&1";
+                return std::system(c.c_str()) == 0;
+            };
+            // explicit override wins (if it resolves)
+            if (const char* env = std::getenv("RAD_PIGZ"); env && *env) {
+                return available(env) ? std::string(env) : std::string();
+            }
+            // pigz on PATH -- the common case (conda run-dep, system install)
+            if (available("pigz")) return "pigz";
+            // fall back to the compile-time build hint if it still resolves
+            #ifdef PIGZ_PATH
+            { std::string p = PIGZ_PATH; if (p != "pigz" && available(p)) return p; }
+            #endif
+            return "";
+        }();
+        return cached;
+    }
+
+    /**
+     * @brief Check if pigz is available (on PATH, via RAD_PIGZ, or PIGZ_PATH)
+     * @return true if a usable pigz was found and is not disabled
      */
     static bool is_pigz_available() {
-        #ifndef PIGZ_PATH
-        #  define PIGZ_PATH "pigz"
-        #endif
-        
-        std::string pigz = PIGZ_PATH;
-        if (const char* env = std::getenv("RAD_PIGZ"); env && *env) {
-            pigz = env;
-        }
-        
-        std::string cmd = "command -v " + shell_quote_posix(pigz) + " > /dev/null 2>&1";
-        return system(cmd.c_str()) == 0;
+        return !resolve_pigz().empty();
     }
 };
 
@@ -310,7 +321,7 @@ public:
     };
 
     std::unique_ptr<file_pointer> current_file;
-    std::filesystem::directory_iterator dir_iter;
+    boost::filesystem::directory_iterator dir_iter;
     bool dir_status;
     std::string path;
     int pigz_threads;
@@ -326,7 +337,7 @@ public:
         path = pigz_reading::sanitize_user_path(input_path);
         dir_status = is_directory(path);
         if (dir_status) {
-            dir_iter = std::filesystem::directory_iterator(path);
+            dir_iter = boost::filesystem::directory_iterator(path);
             open_next_file();
         } else if (is_fastqa(path)) {
             current_file = std::make_unique<file_pointer>(path, pigz_threads);
@@ -340,7 +351,7 @@ public:
 
     bool open_next_file() {
         if (!dir_status) return false;
-        while (dir_iter != std::filesystem::directory_iterator()) {
+        while (dir_iter != boost::filesystem::directory_iterator()) {
             const auto& entry = *dir_iter++;
             if (!is_file(get_file_path(entry))) continue;
             
@@ -373,14 +384,14 @@ public:
     }
 
     static bool is_directory(const std::string& path) {
-        return std::filesystem::is_directory(path);
+        return boost::filesystem::is_directory(path);
     }
 
     static bool is_file(const std::string& path) {
-        return std::filesystem::is_regular_file(path);
+        return boost::filesystem::is_regular_file(path);
     }
 
-    static std::string get_file_path(const std::filesystem::directory_entry& entry) {
+    static std::string get_file_path(const boost::filesystem::directory_entry& entry) {
         return entry.path().string();
     }
 
@@ -667,13 +678,9 @@ public:
 class pigz_writing {
 public:
     inline FILE* open_pigz_pipe(const std::string& out_path, int threads, int level=1) {
-        if (const char* no = std::getenv("RAD_NO_PIGZ"); no && *no) return nullptr;
-
-    #ifndef PIGZ_PATH
-    #  define PIGZ_PATH "pigz"
-    #endif
-        std::string pigz = PIGZ_PATH;
-        if (const char* env = std::getenv("RAD_PIGZ"); env && *env) pigz = env;
+        // Resolve pigz (PATH-first; honors RAD_PIGZ / RAD_NO_PIGZ). "" => skip.
+        const std::string& pigz = pigz_reading::resolve_pigz();
+        if (pigz.empty()) return nullptr;
 
         std::string cmd = "'" + pigz + "' -c -p " + std::to_string(threads) +
                         " -" + std::to_string(level) + " > '" + out_path + "'";
@@ -720,6 +727,7 @@ private:
     format fmt;
     bool compress_;
     bool use_pigz_ = false;
+    bool rc_umi_ = true; // reverse-complement UMIs on reverse reads (FASTQA only)
 
     // --- pigz path ---
     pigz_writing pigz_;
@@ -742,8 +750,8 @@ private:
     inline void write_one_(const T& item) {
         switch (fmt) {
             case format::FASTQA:
-                if (use_pigz_) { pigz_buf_.append(item.to_fastqa()); pigz_flush_if_big_(); }
-                else           { out_ << item.to_fastqa(); }
+                if (use_pigz_) { pigz_buf_.append(item.to_fastqa(rc_umi_)); pigz_flush_if_big_(); }
+                else           { out_ << item.to_fastqa(rc_umi_); }
                 break;
             case format::SIGSTRING:
                 if (use_pigz_) { pigz_buf_.append(item.to_sigstring()); pigz_buf_.push_back('\n'); pigz_flush_if_big_(); }
@@ -797,6 +805,12 @@ public:
             out_.push(file_);
         }
     }
+
+    /// FASTQA only: if false, UMIs are written exactly as extracted (minus-strand
+    /// on reverse reads) instead of being flipped to plus-strand. Mirrors the
+    /// primary buffered path (SigString::to_fastqa_append) so --no-umi-rc is
+    /// honored by the debug FASTQA output too.
+    void set_rc_umi(bool v) { rc_umi_ = v; }
 
     template<typename T>
     void operator()(const std::vector<T>& chunk) {

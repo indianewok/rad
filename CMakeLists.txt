@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(rad VERSION 0.1.0 LANGUAGES C CXX)
+project(rad VERSION 1.0.2 LANGUAGES C CXX)
 include(FetchContent)
 # --------------------------------------------------------------------------
 #language standard
@@ -72,7 +72,7 @@ file(GLOB_RECURSE RAD_HEADERS CONFIGURE_DEPENDS rad/*.hpp)
 
 add_library(rad_lib INTERFACE)
 target_sources(rad_lib INTERFACE ${RAD_HEADERS})
-target_compile_definitions(rad_lib INTERFACE HAVE_PIGZ=1 PIGZ_PATH="${PIGZ_EXE}" RAD_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_compile_definitions(rad_lib INTERFACE HAVE_PIGZ=1 PIGZ_PATH="${PIGZ_EXE}" RAD_SOURCE_DIR="${CMAKE_SOURCE_DIR}" RAD_VERSION="${PROJECT_VERSION}")
 
 target_include_directories(rad_lib INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -113,3 +113,22 @@ target_link_libraries(discover_layout PRIVATE rad_lib)
 # --------------------------------------------------------------------------
 message(STATUS "Configure-time compiler: ${CMAKE_CXX_COMPILER}")
 message(STATUS "C++ flags: ${CMAKE_CXX_FLAGS}")
+
+# --------------------------------------------------------------------------
+# Install rules — make `cmake --install` actually install something (the conda
+# recipe and any `make install` rely on this; the v0.6.0 bioconda package was
+# broken because these were missing and only the bare binary was copied).
+# Layout:
+#   <prefix>/libexec/rad/rad        the real binary
+#   <prefix>/bin/rad                self-locating wrapper (sets RAD_RESOURCES)
+#   <prefix>/share/rad/resources/   bundled read_layout/ + wl/
+# The wrapper derives its prefix from its own path at runtime and exports
+# RAD_RESOURCES (checked first by path_utils::find_resource_root), so the
+# install keeps working after conda relocates the environment.
+# --------------------------------------------------------------------------
+include(GNUInstallDirs)
+install(TARGETS rad RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/rad)
+install(PROGRAMS ${CMAKE_SOURCE_DIR}/cmake/rad-wrapper.sh
+        DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME rad)
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/resources/
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/rad/resources)

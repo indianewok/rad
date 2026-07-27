@@ -1,0 +1,71 @@
+{% set name = "rad" %}
+{% set version = "1.0.2" %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  url: https://github.com/indianewok/rad/archive/refs/tags/v{{ version }}.tar.gz
+  sha256: 6f5253456adf9b84de66583501d946656297f79645ac76d5b401e83d2f482af9
+
+build:
+  number: 0
+  run_exports:
+    - {{ pin_subpackage('rad') }}
+
+requirements:
+  build:
+    - {{ compiler('cxx') }}
+    - {{ stdlib('c') }}
+    - cmake >=3.18
+    - make
+  host:
+    # RAD links the compiled Boost filesystem + iostreams libs. iostreams pulls
+    # in its compression backends, so zlib AND bzip2 must be present (bzip2 is
+    # new vs 0.6.0, which only linked filesystem+system).
+    - boost-cpp
+    - zlib
+    - bzip2
+    - llvm-openmp   # [osx]
+    - libgomp       # [linux]
+  run:
+    - boost-cpp
+    - llvm-openmp   # [osx]
+    - libgomp       # [linux]
+    # pigz is used for parallel gzip I/O; RAD discovers it on PATH at runtime
+    # and falls back to zlib if it is missing (RAD_NO_PIGZ=1 also disables it).
+    - pigz
+
+test:
+  commands:
+    # Binary runs AND the bundled resources were installed + are discoverable.
+    # (The v0.6.0 recipe tested only `rad --help`, which passed even though no
+    # resources shipped -- these checks would have caught that.)
+    - rad --help
+    - rad --version
+    - rad list
+    - test -d "${PREFIX}/share/rad/resources/read_layout"
+    - test -f "${PREFIX}/share/rad/resources/read_layout/sctagger_sim_read_layout.csv"
+    - test -f "${PREFIX}/share/rad/resources/wl/3M-february-2018-3v3.txt_bitlist.csv.gz"
+
+about:
+  home: "https://github.com/indianewok/rad"
+  dev_url: "https://github.com/indianewok/rad"
+  doc_url: "https://github.com/indianewok/rad/blob/v{{ version }}/README.md"
+  license: MIT
+  license_family: MIT
+  license_file: LICENSE
+  summary: "Read-structure Agnostic Demultiplexer for long-read single-cell RNA-seq."
+  description: |
+    rad is an alignment-based demultiplexer and whitelist/barcode-correction
+    suite for Nanopore and PacBio single-cell long-read experiments. It bundles
+    edlib, ssw, and csv-parser in-tree and depends only on Boost, zlib, and an
+    OpenMP runtime (with optional pigz for parallel gzip). Read-layout templates
+    and barcode whitelists are installed under $PREFIX/share/rad/resources and
+    located at runtime via the RAD_RESOURCES environment variable, which the
+    installed `rad` wrapper sets automatically from its own location.
+
+extra:
+  recipe-maintainers:
+    - indianewok

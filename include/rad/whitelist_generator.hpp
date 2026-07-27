@@ -10,6 +10,23 @@ struct extracted_bc {
     std::string barcode_2;
 };
 
+using barcode_count_map = std::unordered_map<std::string, uint64_t>;
+
+// scan-wl only needs the frequency of each extracted barcode.  Keeping one
+// extracted_bc (four std::strings) per matching read made memory scale with the
+// total read count, even though the per-read metadata was discarded as soon as
+// the whitelist statistics were calculated.
+struct barcode_count_result {
+    barcode_count_map counts;
+    uint64_t reads_processed = 0;
+    uint64_t total_extractions = 0;
+    bool filtered_to_whitelist = false;
+
+    uint64_t size() const {
+        return total_extractions;
+    }
+};
+
 static const EdlibEqualityPair kWildcardEqualities[8] = {
                 {'N', 'A'}, 
                 {'N', 'C'}, 
@@ -67,13 +84,16 @@ struct read_chunk {
     std::string sequence;
 };
 
-// Process a chunk of reads in parallel
-std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chunk,
-                                               const std::string& adapter_seq,
-                                               const std::string& adapter_seq_rc,
-                                               int bc_length, int m_left, int m_right,
-                                               double max_edit_distance_ratio) {
-    std::vector<extracted_bc> chunk_results;
+// Process a chunk of reads in parallel and collapse observations immediately.
+// Memory is therefore bounded by the chunk and the number of unique barcodes,
+// rather than by the number of matching reads.
+std::vector<std::string> process_read_chunk(const std::vector<read_chunk>& chunk,
+                                            const std::string& adapter_seq,
+                                            const std::string& adapter_seq_rc,
+                                            int bc_length, int m_left, int m_right,
+                                            double max_edit_distance_ratio) {
+    std::vector<std::string> chunk_sequences;
+    chunk_sequences.reserve(chunk.size() / 5);
 
     const int max_edits_forward = compute_max_edit_distance(adapter_seq.length(), max_edit_distance_ratio);
     const int max_edits_rc = compute_max_edit_distance(adapter_seq_rc.length(), max_edit_distance_ratio);
@@ -96,12 +116,10 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
             8);
     }
 
-    // Reserve space to avoid reallocations
-    chunk_results.reserve(chunk.size() / 5);
     #pragma omp parallel
     {
-        std::vector<extracted_bc> thread_results;
-        thread_results.reserve(chunk.size() / (10 * omp_get_num_threads()));
+        std::vector<std::string> thread_sequences;
+        thread_sequences.reserve(chunk.size() / (10 * omp_get_num_threads()) + 1);
         
         #pragma omp for schedule(dynamic, 100)
         for (size_t i = 0; i < chunk.size(); ++i) {
@@ -123,7 +141,7 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
                         false);
 
                     if (!barcode.empty()) {
-                        thread_results.push_back({read.read_id, barcode, adapter_seq_pos, false, "", ""});
+                        thread_sequences.push_back(std::move(barcode));
                     }
                 }
 
@@ -138,9 +156,9 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
                         bc_length,
                         m_left,
                         m_right,
-                            true);
+                        true);
                         if (!barcode.empty()) {
-                            thread_results.push_back({read.read_id, barcode, adapter_seq_pos, true, "", ""});
+                            thread_sequences.push_back(std::move(barcode));
                         }
                     }
                 }
@@ -162,7 +180,7 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
                                                     bc_length, m_left, m_right, false);
                 
                 if (!barcode.empty()) {
-                    thread_results.push_back({read.read_id, barcode, adapter_seq_pos, false, "", ""});
+                    thread_sequences.push_back(std::move(barcode));
                 }
             }
             edlibFreeAlignResult(result);
@@ -182,32 +200,38 @@ std::vector<extracted_bc> process_read_chunk(const std::vector<read_chunk>& chun
                 std::string barcode = extract_barcode(read.sequence, adapter_seq_pos, adapter_seq_rc.length(), 
                                                     bc_length, m_left, m_right, true);
                 if (!barcode.empty()) {
-                    thread_results.push_back({read.read_id, barcode, adapter_seq_pos, true, "", ""});
+                    thread_sequences.push_back(std::move(barcode));
                 }
             }
             edlibFreeAlignResult(result);
         }
         
-        // Merge thread results
+        // Keep only the barcode strings until the bounded chunk is complete.
         #pragma omp critical
         {
-            chunk_results.insert(chunk_results.end(), thread_results.begin(), thread_results.end());
+            chunk_sequences.insert(
+                chunk_sequences.end(),
+                std::make_move_iterator(thread_sequences.begin()),
+                std::make_move_iterator(thread_sequences.end()));
         }
     }
-    return chunk_results;
+    return chunk_sequences;
 }
 
 // Parse FASTQ file (regular or gzipped) and extract barcodes
-std::vector<extracted_bc> process_fastq(const std::string& input_path, 
-                                          const std::string& adapter_seq,
-                                          int bc_length, 
-                                          int m_left, 
-                                          int m_right,
-                                          int max_reads, 
-                                          double max_edit_distance_ratio = 0.1,
-                                          int chunk_size = 10000, 
-                                          int num_threads = 0) {
-    std::vector<extracted_bc> results;
+barcode_count_result process_fastq(const std::string& input_path,
+                                   const std::string& adapter_seq,
+                                   int bc_length,
+                                   int m_left,
+                                   int m_right,
+                                   int max_reads,
+                                   double max_edit_distance_ratio = 0.1,
+                                   int chunk_size = 10000,
+                                   int num_threads = 0,
+                                   const std::unordered_set<int64_seq>* whitelist_filter = nullptr) {
+    barcode_count_result results;
+    results.filtered_to_whitelist =
+        whitelist_filter != nullptr && !whitelist_filter->empty();
 
     if (!std::isfinite(max_edit_distance_ratio) || max_edit_distance_ratio < 0.0) {
         std::cerr << "Warning: invalid max_edit_distance_ratio (" << max_edit_distance_ratio
@@ -253,7 +277,8 @@ std::vector<extracted_bc> process_fastq(const std::string& input_path,
                 break;
             }
             reads_processed++;
-            chunk.push_back({rec->id, rec->seq});
+            // The single-barcode path never consumes the read ID.
+            chunk.push_back({"", std::move(rec->seq)});
 
         }
         
@@ -261,7 +286,7 @@ std::vector<extracted_bc> process_fastq(const std::string& input_path,
         
         chunks_processed++;
         if (chunks_processed % 100 == 0) {
-            std::cout << "Processed " << reads_processed << " reads in " << chunks_processed << " chunks, found " << results.size() 
+            std::cout << "Processed " << reads_processed << " reads in " << chunks_processed << " chunks, found " << results.total_extractions
                       << " barcodes so far" << std::endl;
         }
         
@@ -275,12 +300,43 @@ std::vector<extracted_bc> process_fastq(const std::string& input_path,
             m_right, 
             max_edit_distance_ratio);
         
-        // Merge results
-        results.insert(results.end(), chunk_results.begin(), chunk_results.end());
+        results.total_extractions += static_cast<uint64_t>(chunk_results.size());
+
+        // When a reference whitelist was supplied, downstream statistics
+        // discard non-whitelist sequences.  Filter the bounded chunk before it
+        // reaches the run-level map so error variants cannot make memory grow
+        // with the number of reads.  Count duplicates within the chunk first
+        // to avoid encoding and probing the reference once per observation.
+        if (results.filtered_to_whitelist) {
+            barcode_count_map chunk_counts;
+            chunk_counts.reserve(chunk_results.size());
+            for (auto& barcode : chunk_results) {
+                auto inserted = chunk_counts.try_emplace(std::move(barcode), 0);
+                ++inserted.first->second;
+            }
+            for (auto& kv : chunk_counts) {
+                int64_seq encoded(kv.first);
+                if (whitelist_filter->find(encoded) == whitelist_filter->end()) {
+                    continue;
+                }
+                auto inserted = results.counts.try_emplace(kv.first, 0);
+                inserted.first->second += kv.second;
+            }
+        } else {
+            for (auto& barcode : chunk_results) {
+                auto inserted = results.counts.try_emplace(std::move(barcode), 0);
+                ++inserted.first->second;
+            }
+        }
     };
+
+    results.reads_processed = static_cast<uint64_t>(reads_processed);
     
     std::cout << "Processing complete: " << reads_processed 
-              << " reads processed, " << results.size() << " barcodes extracted" << std::endl;
+              << " reads processed, " << results.total_extractions << " barcodes extracted"
+              << " (" << results.counts.size() << " unique"
+              << (results.filtered_to_whitelist ? " whitelist matches retained" : "")
+              << ")" << std::endl;
     
     return results;
 }
@@ -556,14 +612,14 @@ struct batch_entry {
 };
 
 static bool ensure_output_directory(const std::string& prefix) {
-    std::filesystem::path p(prefix);
-    std::filesystem::path dir = p.parent_path();
+    boost::filesystem::path p(prefix);
+    boost::filesystem::path dir = p.parent_path();
     if (dir.empty()) {
         return true; // current directory
     }
 
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
+    boost::system::error_code ec;
+    boost::filesystem::create_directories(dir, ec);
     if (ec) {
         std::cerr << "Error: Could not create output directory " << dir << ": " << ec.message() << "\n";
         return false;
@@ -698,13 +754,13 @@ std::vector<batch_entry> read_batch_csv(const std::string& filename) {
 // Barcode statistics structure
 struct bc_wl_stats {
     std::string sequence;
-    int count;
+    uint64_t count;
     double ncpm;
     double log1p_ncpm;
     double log1p_ncpm_ztpois;
     
     // Calculate NCPM per-barcode
-    void calculate_bc_ncpm(int barcode_count, double total_reads) {
+    void calculate_bc_ncpm(uint64_t barcode_count, double total_reads) {
         if (total_reads > 0.0) {
             ncpm = (static_cast<double>(barcode_count) / total_reads) * 1e6;
         } else {
@@ -1088,23 +1144,21 @@ static inline saddle_cut_result compute_saddle_cut_af(const std::vector<double>&
     return res;
 }
 
-void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted_barcodes,
+void count_perfect_matches_with_stats(const barcode_count_result& extracted_barcodes,
                                       const std::unordered_set<int64_seq>& whitelist_set,
                                       const std::string& output_csv, const std::string text_out,
                                       bool verbose = false)
 {
-    std::cout << "Building hash map of extracted sequences...\n";
-
-    // 1) Collapse read-level to barcode counts
-    std::unordered_map<std::string, int> extracted_counts;
-    extracted_counts.reserve(extracted_barcodes.size());
-
-    for (const auto& x : extracted_barcodes){
-        extracted_counts[x.sequence]++;
+    // Observations were collapsed online while the FASTQ was scanned, so this
+    // stage no longer allocates a second read-sized container.
+    const auto& extracted_counts = extracted_barcodes.counts;
+    std::cout << "Using streaming barcode counts: " << extracted_counts.size()
+              << " unique sequences from " << extracted_barcodes.total_extractions
+              << " total extractions";
+    if (extracted_barcodes.filtered_to_whitelist) {
+        std::cout << " (non-whitelist sequences discarded per chunk)";
     }
-
-    std::cout << "Found " << extracted_counts.size() << " unique sequences from "
-              << extracted_barcodes.size() << " total extractions\n";
+    std::cout << "\n";
 
     // 2) Whitelist lookup (optional - if empty, analyze all sequences)
     bool use_whitelist = !whitelist_set.empty();
@@ -1116,15 +1170,18 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
 
     // 3) Build stats (WL barcodes if provided, otherwise all)
     std::vector<bc_wl_stats> barcode_stats;
-    barcode_stats.reserve(extracted_counts.size());
+    barcode_stats.reserve(
+        use_whitelist
+            ? std::min(extracted_counts.size(), whitelist_set.size())
+            : extracted_counts.size());
 
-    double total_reads = static_cast<double>(extracted_barcodes.size());
-    int total_perfect_matches = 0;
-    int unique_matches = 0;
+    double total_reads = static_cast<double>(extracted_barcodes.total_extractions);
+    uint64_t total_perfect_matches = 0;
+    size_t unique_matches = 0;
 
     for (const auto& kv : extracted_counts) {
         const std::string& seq = kv.first;
-        int cnt = kv.second;
+        uint64_t cnt = kv.second;
         
         // Skip if whitelist provided and sequence not in whitelist
         if (use_whitelist) {
@@ -1484,12 +1541,18 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
 
     // 11) Console summary
     std::cout << "\nStatistical analysis complete!\n"
-              << "Total extracted sequences: " << extracted_barcodes.size() << "\n"
-              << "Unique extracted sequences: " << extracted_counts.size() << "\n"
-              << "Total perfect matches: " << total_perfect_matches << "\n"
+              << "Total extracted sequences: " << extracted_barcodes.total_extractions << "\n";
+    if (extracted_barcodes.filtered_to_whitelist) {
+        std::cout << "Unique whitelist-matching sequences retained: "
+                  << extracted_counts.size() << "\n";
+    } else {
+        std::cout << "Unique extracted sequences: " << extracted_counts.size() << "\n";
+    }
+    std::cout << "Total perfect matches: " << total_perfect_matches << "\n"
               << "Unique barcodes with perfect matches: " << unique_matches << "\n"
               << "Match rate: " << std::fixed << std::setprecision(2)
-              << (100.0 * total_perfect_matches / std::max<size_t>(1, extracted_barcodes.size())) << "%\n"
+              << (100.0 * static_cast<double>(total_perfect_matches) /
+                  std::max<double>(1.0, static_cast<double>(extracted_barcodes.total_extractions))) << "%\n"
               << "Above-floor barcodes: " << n_above_floor << "\n"
               << "Final barcodes (TRUE): " << n_final << "\n"
               << "Results written to: " << output_csv << "\n";
@@ -1501,6 +1564,23 @@ void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
         }
         std::cout << "High-confidence barcodes written to: " << text_out << "\n";
     }
+}
+
+// Two-part barcode mode still needs the observed BC1/BC2 pairs for its pair
+// matrix outputs.  Collapse its combined sequences before entering the shared
+// statistics path and, critically, avoid reserving hash buckets for every read.
+void count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted_barcodes,
+                                      const std::unordered_set<int64_seq>& whitelist_set,
+                                      const std::string& output_csv, const std::string text_out,
+                                      bool verbose = false)
+{
+    barcode_count_result counts;
+    counts.total_extractions = static_cast<uint64_t>(extracted_barcodes.size());
+    counts.counts.reserve(std::min<size_t>(extracted_barcodes.size(), 1u << 20));
+    for (const auto& x : extracted_barcodes) {
+        ++counts.counts[x.sequence];
+    }
+    count_perfect_matches_with_stats(counts, whitelist_set, output_csv, text_out, verbose);
 }
 
 
@@ -1673,12 +1753,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             std::cout << "Extracting " << bc_length << " bases with margins: left=" << m_left << ", right=" << m_right << "\n";
             std::cout << "Chunk size: " << chunk_size << " reads per chunk\n";
 
-            auto barcodes = process_fastq(
-                fastq_path, adapter_seq, bc_length, m_left, m_right,
-                max_reads, max_error, chunk_size, num_threads);
-
-            std::cout << "Found " << barcodes.size() << " barcodes\n";
-
+            std::unordered_set<int64_seq> wl_set;
             if (!whitelist_file.empty()) {
                 std::string resolved_wl;
                 try {
@@ -1687,13 +1762,23 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
                     std::cerr << "Error: could not resolve whitelist path: " << e.what() << "\n";
                     return;
                 }
-                std::cout << "\nLoading whitelist and performing perfect match analysis...\n";
+                std::cout << "\nLoading whitelist for streaming validation...\n";
                 if (verbose) {
                     std::cout << "Whitelist source: " << whitelist_file << "\n"
                               << "Resolved path: " << resolved_wl << "\n";
                 }
-                auto wl_set = ::whitelist::load_barcodes(resolved_wl, bc_length, verbose);
+                wl_set = ::whitelist::load_barcodes(resolved_wl, bc_length, verbose);
                 std::cout << "Loaded " << wl_set.size() << " whitelist barcodes\n";
+            }
+
+            auto barcodes = process_fastq(
+                fastq_path, adapter_seq, bc_length, m_left, m_right,
+                max_reads, max_error, chunk_size, num_threads,
+                wl_set.empty() ? nullptr : &wl_set);
+
+            std::cout << "Found " << barcodes.size() << " barcodes\n";
+
+            if (!whitelist_file.empty()) {
                 count_perfect_matches_with_stats(barcodes, wl_set, csv_output, text_output, verbose);
             } else {
                 std::unordered_set<int64_seq> empty_whitelist;

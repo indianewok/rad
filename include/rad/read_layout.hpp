@@ -920,10 +920,10 @@ public:
             return a.mean_start < b.mean_start;
         });
 
-        std::filesystem::path tmp_layout =
-            std::filesystem::temp_directory_path() / "rad_parts_forward_layout.csv";
+        boost::filesystem::path tmp_layout =
+            boost::filesystem::temp_directory_path() / "rad_parts_forward_layout.csv";
         {
-            std::ofstream tmp(tmp_layout);
+            std::ofstream tmp(tmp_layout.string());
             tmp << "Read Layout\nid,seq,masked_seq,expected_length,type,class,direction,class_id,whitelist,order\n";
             int tmp_order = 1;
             for (const auto& part : base_parts) {
@@ -1562,8 +1562,8 @@ public:
                     std::string resolved_mask = mask_spec;
                     try {
                         // If it's not an absolute path, try resolving as kit key
-                        if (!std::filesystem::path(mask_spec).is_absolute() &&
-                            !std::filesystem::exists(mask_spec)) {
+                        if (!boost::filesystem::path(mask_spec).is_absolute() &&
+                            !boost::filesystem::exists(mask_spec)) {
                             resolved_mask = whitelist_utils::kit_to_path(mask_spec);
                         }
                     } catch (...) {}
@@ -1694,8 +1694,8 @@ public:
 
             const std::string data = payload.str();
             if (data.empty()) {
-                std::error_code ec;
-                std::filesystem::remove(path, ec);
+                boost::system::error_code ec;
+                boost::filesystem::remove(path, ec);
                 if (verbose) {
                     std::cout << "[save_wl] No true whitelist entries with counts; skipping " << path << std::endl;
                 }
@@ -1725,8 +1725,8 @@ public:
 
                 const std::string data = payload.str();
                 if (data.empty()) {
-                    std::error_code ec;
-                    std::filesystem::remove(out_path, ec);
+                    boost::system::error_code ec;
+                    boost::filesystem::remove(out_path, ec);
                     if (verbose) {
                         std::cout << "[save_wl] No " << wl_type
                                   << " whitelist entries with counts; skipping " << out_path << std::endl;
