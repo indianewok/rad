@@ -514,85 +514,87 @@ namespace mutation_tools {
     }
 
 /**
- * @brief Generate all possible mutated barcodes within a specified number of mutation rounds. Loops over each position in the sequence and substitutes each possible nucleotide except the original, accumulating unique mutated barcodes.
-  Uses raw int64_t values for efficient mutation generation and duplicate checking.
+ * @brief Generate all possible mutated barcodes within a specified Hamming
+ * distance.
+ *
+ * Chooses each set of mutated positions exactly once, in increasing position
+ * order, and substitutes one of the three bases that differs from the
+ * original at each chosen position. This produces the same union of Hamming
+ * shells as round-by-round mutation, without generating and de-duplicating
+ * the same distance-two-or-greater barcode through every mutation ordering.
+ *
+ * This routine operates on the first (and only) 64-bit chunk, so it supports
+ * barcodes up to 32 bases.
  * @param seq The original barcode sequence as an `int64_seq`
  * @param mutation_rounds Number of mutation rounds (default: 1)
  * @return `unordered_set<int64_seq>` containing all unique mutated barcodes
  */
     std::unordered_set<int64_seq> generate_mutated_barcodes(const int64_seq &seq, int mutation_rounds = 1) {
-        if (seq.bits.empty()) return {};
-        
-        int sequence_length = seq.length;
-        int64_t initial_raw = seq.bits[0]; // Extract raw value once
-        
-        // *** HARD-CODED PRE-RESERVATION ***
-        size_t expected_total;
-        if (mutation_rounds == 1) {
-            expected_total = 100;
-        } else if (mutation_rounds == 2) {
-            expected_total = 2000;
-        } else if (mutation_rounds == 3) {
-            expected_total = 60000;
-        } else {
-            expected_total = 1000; // fallback
+        std::unordered_set<int64_seq> final_mutations;
+        if (seq.bits.empty() || mutation_rounds <= 0 ||
+            seq.length == 0 || seq.length > 32) {
+            return final_mutations;
         }
-        
-        // ALL GENERATION USING raw int64_t values
-        std::unordered_set<int64_t> all_mutations_raw;
-        all_mutations_raw.reserve(expected_total);
-        all_mutations_raw.insert(initial_raw);
-        
-        std::unordered_set<int64_t> current_round_raw;
-        current_round_raw.reserve(mutation_rounds == 1 ? 100 : 2000);
-        current_round_raw.insert(initial_raw);
-        
-        // Fast raw mutation generation
-        for (int round = 0; round < mutation_rounds; ++round) {
-            std::unordered_set<int64_t> next_round_raw;
-            
-            // Hard-coded reservation for next round
-            if (round == 0) {
-                next_round_raw.reserve(100); // Round 1
-            } else if (round == 1) {
-                next_round_raw.reserve(2000); // Round 2  
-            } else {
-                next_round_raw.reserve(15000); // Round 3+
-            }
-            
-            for (const auto candidate_raw : current_round_raw) {
-                // Generate mutations directly as raw int64_t - no function call overhead
-                for (int pos = 0; pos < sequence_length; ++pos) {
-                    int64_t original_nuc = (candidate_raw >> (2 * pos)) & 0b11;
-                    for (int64_t new_nuc = 0; new_nuc < 4; ++new_nuc) {
-                        if (new_nuc != original_nuc) {
-                            int64_t clear_mask = ~(0b11LL << (2 * pos));
-                            int64_t mutated_value = (candidate_raw & clear_mask) | (new_nuc << (2 * pos));
-                            
-                            // Fast duplicate check and insert using raw int64_t
-                            if (all_mutations_raw.insert(mutated_value).second) {
-                                next_round_raw.insert(mutated_value);
-                            }
+
+        const int sequence_length = seq.length;
+        const int max_distance = std::min(mutation_rounds, sequence_length);
+        const uint64_t initial_raw = static_cast<uint64_t>(seq.bits[0]);
+
+        // Exact through distance three, which covers the production paths.
+        // For larger distances this remains a useful lower-bound reservation.
+        size_t expected_total = static_cast<size_t>(sequence_length) * 3;
+        if (max_distance >= 2) {
+            expected_total +=
+                static_cast<size_t>(sequence_length) *
+                static_cast<size_t>(sequence_length - 1) * 9 / 2;
+        }
+        if (max_distance >= 3) {
+            expected_total +=
+                static_cast<size_t>(sequence_length) *
+                static_cast<size_t>(sequence_length - 1) *
+                static_cast<size_t>(sequence_length - 2) * 27 / 6;
+        }
+        final_mutations.reserve(expected_total);
+
+        const auto enumerate_distance =
+            [&](const auto& self, int next_position, int remaining,
+                uint64_t raw_bits) -> void {
+                if (remaining == 0) {
+                    final_mutations.emplace(
+                        static_cast<int64_t>(raw_bits), sequence_length);
+                    return;
+                }
+
+                // Leave enough positions after this one to finish the
+                // requested Hamming shell. Increasing positions make every
+                // set of substitutions unique by construction.
+                const int last_position = sequence_length - remaining;
+                for (int position = next_position;
+                     position <= last_position; ++position) {
+                    const int shift = 2 * position;
+                    const uint64_t position_mask = uint64_t{3} << shift;
+                    const uint64_t original_nucleotide =
+                        (initial_raw & position_mask) >> shift;
+
+                    for (uint64_t nucleotide = 0; nucleotide < 4;
+                         ++nucleotide) {
+                        if (nucleotide == original_nucleotide) {
+                            continue;
                         }
+                        const uint64_t mutated_bits =
+                            (raw_bits & ~position_mask) |
+                            (nucleotide << shift);
+                        self(self, position + 1, remaining - 1,
+                             mutated_bits);
                     }
                 }
-            }
-            
-            if (next_round_raw.empty()) break;
-            current_round_raw = std::move(next_round_raw);
+            };
+
+        for (int distance = 1; distance <= max_distance; ++distance) {
+            enumerate_distance(
+                enumerate_distance, 0, distance, initial_raw);
         }
-        // Remove the original sequence from raw mutations
-        all_mutations_raw.erase(initial_raw);
-        
-        // *** CONVERT TO int64_seq ONLY AT THE VERY END ***
-        std::unordered_set<int64_seq> final_mutations;
-        final_mutations.reserve(all_mutations_raw.size());
-        
-        // Single conversion pass - create int64_seq objects only here
-        for (const int64_t raw_mutation : all_mutations_raw) {
-            final_mutations.emplace(raw_mutation, sequence_length); // Use emplace for in-place construction
-        }
-        
+
         return final_mutations;
     }
 

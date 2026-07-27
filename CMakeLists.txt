@@ -118,6 +118,12 @@ if(BUILD_TESTING)
     add_executable(test_find_poly_tails tests/test_find_poly_tails.cpp)
     target_link_libraries(test_find_poly_tails PRIVATE rad_lib)
     add_test(NAME find_poly_tails_regression COMMAND test_find_poly_tails)
+
+    add_executable(test_generate_mutated_barcodes
+        tests/test_generate_mutated_barcodes.cpp)
+    target_link_libraries(test_generate_mutated_barcodes PRIVATE rad_lib)
+    add_test(NAME mutation_generator_equivalence
+        COMMAND test_generate_mutated_barcodes)
 endif()
 
 # --------------------------------------------------------------------------
