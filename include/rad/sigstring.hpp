@@ -543,26 +543,48 @@ public:
         static_alignments result;
         result.success = false;
         result.edit_distance = 1;
-        if (sequence.length() < static_cast<size_t>(window_size)) {
+        if (query.empty() || window_size <= 0 ||
+            sequence.length() < static_cast<size_t>(window_size)) {
             return result;
         }
-        char poly_base = std::toupper(query[0]);
+
+        // FASTQ bases are ASCII. Normalizing them directly avoids the
+        // locale-aware std::toupper call in every overlapping window.
+        const auto ascii_upper = [](char base) noexcept {
+            const unsigned char value = static_cast<unsigned char>(base);
+            return static_cast<char>(
+                value >= static_cast<unsigned char>('a') &&
+                value <= static_cast<unsigned char>('z')
+                    ? value - static_cast<unsigned char>('a') +
+                          static_cast<unsigned char>('A')
+                    : value
+            );
+        };
+        const char poly_base = ascii_upper(query[0]);
+        const auto is_poly_base = [poly_base, &ascii_upper](char base) noexcept {
+            return ascii_upper(base) == poly_base;
+        };
+
         int min_count = static_cast<int>(window_size * 0.9);
         int min_gap = 3;
+        const int last_window_start =
+            static_cast<int>(sequence.length()) - window_size;
         int i = 0;
-        while (i <= static_cast<int>(sequence.length()) - window_size) {
-            int count = std::count_if(
-                sequence.begin() + i,
-                sequence.begin() + i + window_size,
-                [poly_base](char c) { return std::toupper(c) == poly_base; }
-            );
+
+        // Seed the first window, then update its count in O(1) as it slides.
+        int count = 0;
+        for (int j = 0; j < window_size; ++j) {
+            count += is_poly_base(sequence[j]) ? 1 : 0;
+        }
+
+        while (i <= last_window_start) {
             if (count >= min_count) {
                 int current_start = i;
                 int current_end = i + window_size - 1;
                 int non_poly_count = 0;
                 int last_poly_pos = current_end;
                 while (current_end + 1 < static_cast<int>(sequence.length())) {
-                    if (std::toupper(sequence[current_end + 1]) == poly_base) {
+                    if (is_poly_base(sequence[current_end + 1])) {
                         if (non_poly_count <= min_gap) {
                             current_end++;
                             last_poly_pos = current_end;
@@ -586,11 +608,26 @@ public:
                 i = current_end + 1;
                 // Look for next potential poly-tail after a gap
                 i += min_gap;
+
+                // A detected tail jumps over an arbitrary number of bases.
+                // Re-seed the small window at the new position rather than
+                // walking every skipped window.
+                if (i <= last_window_start) {
+                    count = 0;
+                    for (int j = 0; j < window_size; ++j) {
+                        count += is_poly_base(sequence[i + j]) ? 1 : 0;
+                    }
+                }
             } else {
+                if (i == last_window_start) {
+                    break;
+                }
+                count -= is_poly_base(sequence[i]) ? 1 : 0;
+                count += is_poly_base(sequence[i + window_size]) ? 1 : 0;
                 i++;
             }
         }
-            return result;
+        return result;
     }
 };
 

@@ -111,6 +111,16 @@ target_link_libraries(generate_whitelist PRIVATE rad_lib)
 target_link_libraries(discover_layout PRIVATE rad_lib)
 
 # --------------------------------------------------------------------------
+# Tests
+# --------------------------------------------------------------------------
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(test_find_poly_tails tests/test_find_poly_tails.cpp)
+    target_link_libraries(test_find_poly_tails PRIVATE rad_lib)
+    add_test(NAME find_poly_tails_regression COMMAND test_find_poly_tails)
+endif()
+
+# --------------------------------------------------------------------------
 message(STATUS "Configure-time compiler: ${CMAKE_CXX_COMPILER}")
 message(STATUS "C++ flags: ${CMAKE_CXX_FLAGS}")
 
