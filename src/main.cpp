@@ -1176,32 +1176,41 @@ static std::string run_auto_whitelist(const ReadLayout &layout,
           ? 0
           : static_cast<int>(max_reads);
 
-  std::unordered_set<int64_seq> wl_set;
+  scan_whitelist_filter wl_filter;
   if (!ref.empty()) {
     try {
       std::string resolved = whitelist_utils::kit_to_path(ref);
-      wl_set = whitelist::load_barcodes(resolved, static_cast<uint16_t>(bc_len),
-                                        verbose);
-      std::cout << "[auto-wl] Loaded " << wl_set.size()
+      wl_filter = load_scan_whitelist(
+          resolved, static_cast<uint16_t>(bc_len), verbose);
+      std::cout << "[auto-wl] Loaded " << wl_filter.size()
                 << " reference barcodes for streaming validation\n";
+      if (wl_filter.empty()) {
+        throw std::runtime_error("reference whitelist contains no valid barcodes");
+      }
     } catch (const std::exception &e) {
-      std::cerr << "[auto-wl] WARNING: could not load reference "
-                   "whitelist ("
-                << e.what() << "); falling back to de-novo detection\n";
+      throw std::runtime_error(
+          std::string("--auto-wl: could not load reference whitelist: ") +
+          e.what());
     }
   }
 
   auto barcodes =
       process_fastq(fastq_path, adapter, bc_len, /*m_left=*/0, /*m_right=*/0,
                     scan_max_reads, scan_error, static_cast<int>(chunk_size),
-                    nthreads, wl_set.empty() ? nullptr : &wl_set);
+                    nthreads, wl_filter.empty() ? nullptr : &wl_filter);
+  if (!barcodes.succeeded) {
+    throw std::runtime_error("--auto-wl: could not scan input FASTQ");
+  }
   std::cout << "[auto-wl] Extracted " << barcodes.size()
             << " raw barcode observations\n";
 
   const std::string csv_out = outbase + "_scanwl.csv";
   const std::string txt_out = outbase + "_scanwl.txt";
 
-  count_perfect_matches_with_stats(barcodes, wl_set, csv_out, txt_out, verbose);
+  if (!count_perfect_matches_with_stats(
+          barcodes, wl_filter.long_barcodes, csv_out, txt_out, verbose)) {
+    throw std::runtime_error("--auto-wl: failed to write scan outputs");
+  }
 
   // The .txt only holds the final high-confidence barcodes; an empty/absent
   // file means the scan called nothing, which would make demux a no-op.
