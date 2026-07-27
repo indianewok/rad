@@ -1470,7 +1470,28 @@ public:
             return false;
         }
     }
-    
+
+    /**
+     * @brief Check whether an observed key maps to itself as a canonical value.
+     *
+     * Unlike check_wl_for(), this deliberately excludes mutation aliases:
+     * an association for `observed` is only an identity mapping when at least
+     * one associated whitelist entry has the same barcode sequence.
+     */
+    bool has_identity_mapping(const key& observed) const {
+        if (!observed.is_valid()) return false;
+
+        auto it = associations.find(observed);
+        if (it == associations.end()) return false;
+
+        for (const value* candidate : it->second) {
+            if (candidate != nullptr && candidate->barcode == observed) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Multimap-like find (returns iterator to first match)
     auto find(const key& k) const {
         return associations.find(k);

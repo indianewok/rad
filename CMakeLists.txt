@@ -125,6 +125,12 @@ if(BUILD_TESTING)
     add_test(NAME mutation_generator_equivalence
         COMMAND test_generate_mutated_barcodes)
 
+    add_executable(test_barcode_filter_precedence
+        tests/test_barcode_filter_precedence.cpp)
+    target_link_libraries(test_barcode_filter_precedence PRIVATE rad_lib)
+    add_test(NAME barcode_filter_precedence
+        COMMAND test_barcode_filter_precedence)
+
     add_executable(parsed_position_empty_test
         tests/parsed_position_empty.cpp)
     target_link_libraries(parsed_position_empty_test PRIVATE rad_lib)

@@ -1280,8 +1280,18 @@ namespace barcode_correction {
 
         // === filtering for messy barcodes ===
         bool filtered_hit = !wl.filter_bcs.empty() && (wl.filter_bcs.check_wl_for(bc) || wl.filter_bcs.check_wl_for(rc_bc));
+        // A sequence can legitimately be both a barcode and an exact k-mer
+        // from a static layout element. Only an identity mapping in the
+        // trusted whitelist may override that collision; mutation aliases and
+        // global-whitelist-only hits remain filtered.
+        bool bc_true_identity =
+            filtered_hit && wl.true_bcs.has_identity_mapping(bc);
+        bool rc_true_identity =
+            filtered_hit && wl.true_bcs.has_identity_mapping(rc_bc);
+        bool exact_true_identity =
+            bc_true_identity || rc_true_identity;
         bool seq_hit = !wl.filter_bcs.empty() && (seq_utils::int_kmerize(raw, 2) < 4 || mutation_tools::detect_hp(raw, hp_threshold));
-        if (filtered_hit || seq_hit) {
+        if ((filtered_hit && !exact_true_identity) || seq_hit) {
             if (verbose) {
                 #pragma omp critical
                 {
@@ -1291,6 +1301,18 @@ namespace barcode_correction {
                 }
             }
             return std::nullopt;
+        }
+        if (exact_true_identity) {
+            if (verbose) {
+                #pragma omp critical
+                {
+                    std::cout
+                        << "FILTER_CHECK_EXACT_TRUE_OVERRIDE ("
+                        << (bc_true_identity ? "direct" : "reverse-complement")
+                        << ")\n";
+                }
+            }
+            return bc_true_identity ? bc : rc_bc;
         }
 
         // === exact match in global whitelist ===

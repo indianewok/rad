@@ -32,6 +32,7 @@ umi,,10,variable,umi,
 file(WRITE "${whitelist_path}" [=[AACCGGTT
 CCTTAAGG
 ACGTACGT
+AAACATCG
 ]=])
 
 # Truth, in 1-based inclusive coordinates:
@@ -41,8 +42,14 @@ set(read_sequence
     "GATTACAAAACCGGTTCCACAGTCTCAAGCACGTGGATCCTTAAGGAGTCGTACGCCGATGCGAAACATCGGCCACACGTACGTTTGATTACAG")
 string(LENGTH "${read_sequence}" read_length)
 string(REPEAT "I" ${read_length} read_quality)
+set(read_sequence_bc2_collision
+    "GATTACAAAACCGGTTCCACAGTCTCAAGCACGTGGATAAACATCGAGTCGTACGCCGATGCGAAACATCGGCCACACGTACGTTTGATTACAG")
+set(read_sequence_bc3_collision
+    "GATTACAAAACCGGTTCCACAGTCTCAAGCACGTGGATCCTTAAGGAGTCGTACGCCGATGCGAAACATCGGCCACAAACATCGTTGATTACAG")
 file(WRITE "${fastq_path}"
-    "@splitseq_1\n${read_sequence}\n+\n${read_quality}\n")
+    "@splitseq_1\n${read_sequence}\n+\n${read_quality}\n"
+    "@splitseq_collision_bc2\n${read_sequence_bc2_collision}\n+\n${read_quality}\n"
+    "@splitseq_collision_bc3\n${read_sequence_bc3_collision}\n+\n${read_quality}\n")
 
 file(REMOVE
     "${output_base}_layout.csv"
@@ -108,7 +115,7 @@ execute_process(
         --dir "${RAD_TEST_DIR}"
         --threads 1
         --chunk-size 1
-        --max-reads 1
+        --max-reads 3
         --whitelist-mutation 0
         --generated-mutation 0
         --min-read-length 0
@@ -162,6 +169,8 @@ read_gzip("${debug_sig}" debug_sig_output)
 
 set(required_fastq_fragments
     "CB:Z:AACCGGTT-CCTTAAGG-ACGTACGT"
+    "CB:Z:AACCGGTT-AAACATCG-ACGTACGT"
+    "CB:Z:AACCGGTT-CCTTAAGG-AAACATCG"
     "UB:Z:TTGATTACAG"
     "\nGATTACAA\n"
     "\nIIIIIIII\n"
@@ -177,6 +186,8 @@ endforeach()
 
 set(required_debug_csv_fragments
     "splitseq_1,barcode_3,forward,ACGTACGT"
+    "splitseq_collision_bc2,barcode_2,forward,AAACATCG"
+    "splitseq_collision_bc3,barcode_3,forward,AAACATCG"
     "splitseq_1,read,forward,GATTACAA"
     "splitseq_1,umi,forward,TTGATTACAG"
 )
