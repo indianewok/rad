@@ -254,7 +254,8 @@ public:
          * @param pigz_threads Number of pigz threads for decompression
          * @note Automatically detects .gz files and uses pigz/gzip as needed
          */
-        file_pointer(const std::string& file_path, int pigz_threads = 4) 
+        file_pointer(const std::string& file_path, int pigz_threads = 4,
+                     bool allow_pigz = true)
             : fp_pigz(nullptr), fp_gzip(nullptr), seq_fd(nullptr), seq_gz(nullptr),
               fd(-1), path(file_path), using_pigz(false) {
             path = pigz_reading::sanitize_user_path(path);
@@ -267,7 +268,7 @@ public:
             
             if (is_compressed) {
                 // Try pigz first for parallel decompression
-                if (pigz_reading::is_pigz_available()) {
+                if (allow_pigz && pigz_reading::is_pigz_available()) {
                     fp_pigz = pigz_reader.open_pigz_read_pipe(path, pigz_threads);
                     if (fp_pigz) {
                         fd = fileno(fp_pigz);
@@ -325,6 +326,7 @@ public:
     bool dir_status;
     std::string path;
     int pigz_threads;
+    bool allow_pigz;
 
     /**
      * @brief Constructor to initialize file streaming
@@ -332,15 +334,17 @@ public:
      * @param threads Number of pigz threads for decompression
      * @throws std::runtime_error if file cannot be opened or path is invalid
      */
-    explicit file_streaming(const std::string& input_path, int threads = 4) 
-        : pigz_threads(threads) {
+    explicit file_streaming(const std::string& input_path, int threads = 4,
+                            bool use_pigz = true)
+        : pigz_threads(threads), allow_pigz(use_pigz) {
         path = pigz_reading::sanitize_user_path(input_path);
         dir_status = is_directory(path);
         if (dir_status) {
             dir_iter = boost::filesystem::directory_iterator(path);
             open_next_file();
         } else if (is_fastqa(path)) {
-            current_file = std::make_unique<file_pointer>(path, pigz_threads);
+            current_file = std::make_unique<file_pointer>(
+                path, pigz_threads, allow_pigz);
             if (!current_file->is_valid()) {
                 throw std::runtime_error("Failed to open sequence file: " + path);
             }
@@ -357,7 +361,8 @@ public:
             
             std::string file_path = entry.path().string();
             if (is_fastqa(file_path)) {
-                current_file = std::make_unique<file_pointer>(file_path, pigz_threads);
+                current_file = std::make_unique<file_pointer>(
+                    file_path, pigz_threads, allow_pigz);
                 if (current_file->is_valid()) {
                     return true;
                 }
@@ -422,8 +427,53 @@ public:
     };
 
     file_streaming& files;
+    int read_error_code_ = 0;
+    std::string read_error_path_;
     
     explicit read_streaming(file_streaming& f) : files(f) {}
+
+    bool read_failed() const {
+        return read_error_code_ < -1;
+    }
+
+    int read_error_code() const {
+        return read_error_code_;
+    }
+
+    const std::string& read_error_path() const {
+        return read_error_path_;
+    }
+
+    /**
+     * @brief Get a view of the next sequence without copying read metadata.
+     *
+     * The view remains valid only until the next read from this object.  This
+     * is intended for serial consumers that finish processing a sequence
+     * before advancing kseq.
+     */
+    std::optional<std::string_view> next_sequence_view() {
+        while (files.current_file || files.open_next_file()) {
+            auto& fp = files.current_file;
+            int l = fp->kseq_read_any();
+            if (l >= 0) {
+                return std::string_view(
+                    fp->seq_s(), static_cast<size_t>(l));
+            }
+            if (l < -1) {
+                read_error_code_ = l;
+                read_error_path_ = files.current_file_path();
+                return std::nullopt;
+            }
+
+            if (files.dir_status) {
+                files.current_file.reset();
+            } else {
+                break;
+            }
+        }
+        return std::nullopt;
+    }
+
     /**
      * @brief get the next sequence from the stream
      * @return sequence object, std::nullopt if end of stream
@@ -445,6 +495,11 @@ public:
                     r.qual = fp->qual_s();
                 }
                 return r;
+            }
+            if (l < -1) {
+                read_error_code_ = l;
+                read_error_path_ = files.current_file_path();
+                return std::nullopt;
             }
 
             // Move to next file if in directory mode

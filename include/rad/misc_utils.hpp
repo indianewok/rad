@@ -627,7 +627,9 @@ namespace whitelist_utils {
     bool check_if_bitlist(const std::string &field, bool verbose, size_t N = 10) {
         const std::string path = kit_to_path(field);
 
-        //skip the header and keep it moving
+        // Inspect the first rows without assuming that a header is present.
+        // Most bundled bitlists are headerless, while a few use a text header;
+        // dropping row zero unconditionally also misclassified one-row lists.
         auto lines = streaming_utils::import_text(path, N + 1);
         if (lines.empty()) {
             if(verbose) std::cerr << "[check_if_bitlist] ERROR: no lines read from " << path << "\n";
@@ -639,36 +641,44 @@ namespace whitelist_utils {
             if(verbose) std::cout << "  [" << i << "]: " << lines[i] << "\n";
         }
 
-        lines.erase(lines.begin());
-
-        if(verbose) std::cout << "[check_if_bitlist] debug: next up to " << N << " content lines (after header):\n";
-
-        for (size_t i = 0; i < lines.size() && i < N; ++i) {
-            if(verbose) std::cout << "  [" << i << "]: " << lines[i] << "\n";
-        }
-    
-        // 2) extract up to N tokens (before first comma/tab)
+        // Extract up to N tokens (before first comma/tab). A single leading
+        // non-numeric token is accepted as a header only when the remaining
+        // rows are numeric.
         std::vector<std::string> tokens;
         tokens.reserve(N);
         for (auto &ln : lines) {
-          if (tokens.size() >= N) break;
           if (ln.empty()) continue;
           auto p = ln.find_first_of(",\t");
-          tokens.push_back(p == std::string::npos ? ln : ln.substr(0, p));
+          std::string token = seq_utils::trim(
+              p == std::string::npos ? ln : ln.substr(0, p));
+          if (token.empty()) continue;
+          tokens.push_back(std::move(token));
         }
     
-        // nothing real to check?
-        if (tokens.empty()){
+        if (tokens.empty()) {
             return false;
         }
-        // 3) ensure every character in each token is a digit
-        for (auto &t : tokens) {
-          for (unsigned char c : t) {
-            if (!std::isdigit(c))
-              return false;
-          }
+
+        auto is_unsigned_integer = [](const std::string& token) {
+            return !token.empty() &&
+                   std::all_of(token.begin(), token.end(),
+                               [](unsigned char c) { return std::isdigit(c); });
+        };
+
+        size_t first_content = 0;
+        if (!is_unsigned_integer(tokens.front())) {
+            if (tokens.size() == 1) {
+                return false;
+            }
+            first_content = 1;
         }
-        return true;  // all N tokens passed the digit test
+        const size_t content_end = std::min(tokens.size(), first_content + N);
+        for (size_t i = first_content; i < content_end; ++i) {
+            if (!is_unsigned_integer(tokens[i])) {
+                return false;
+            }
+        }
+        return first_content < content_end;
       }
 
     inline const std::string& get_whitelist_path(const std::string &kit) {
