@@ -2663,15 +2663,22 @@ private:
         const read_streaming::sequence& read, bool verbose
     ) {
         
-        size_t start = elem.position.first - 1;
-        size_t length = elem.position.second - elem.position.first + 1;
-        
-        if (start + length >= masked_read.size() || start < 1 || length <= 1) {
+        // Element coordinates are 1-based and inclusive. Validate them before
+        // converting to size_t so a boundary sentinel (0 or read_length + 1)
+        // cannot underflow, and allow a valid element to touch either end of
+        // the read.
+        if (elem.position.first < 1 ||
+            elem.position.second <= elem.position.first ||
+            elem.position.second > static_cast<int>(masked_read.size())) {
             if (verbose) {
                 log_verbose("Skipping read element due to out-of-bounds parameters");
             }
             return;
         }
+
+        size_t start = static_cast<size_t>(elem.position.first - 1);
+        size_t length = static_cast<size_t>(
+            elem.position.second - elem.position.first + 1);
         
         // Extract and clean sequence
         std::string window = masked_read.substr(start, length);
@@ -3549,9 +3556,15 @@ public:
                 it->class_id,
                 it->global_class,
                 std::nullopt,
+                // Start/stop are virtual boundaries outside the 1-based,
+                // inclusive read coordinates. Position-map offsets such as
+                // start+1 and stop-1 therefore resolve to the first and last
+                // real bases instead of shifting terminal-derived elements.
                 (it->global_class == "start")
-                    ? std::make_pair(1, 1)
-                    : std::make_pair(static_cast<int>(read_length), static_cast<int>(read_length)),
+                    ? std::make_pair(0, 0)
+                    : std::make_pair(
+                        static_cast<int>(read_length) + 1,
+                        static_cast<int>(read_length) + 1),
                 "static",
                 it->order,
                 it->direction,

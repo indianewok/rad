@@ -142,7 +142,8 @@ static void usage_prep(const char *prog) {
          "sampling (default: 50000)\n"
       << "  -t, --threads                     number of threads (default: 1)\n"
       << "  -v, --verbose                     verbose mode\n"
-      << "  -D, --max-verbose                 maximum verbosity (debug)\n"
+      << "  -D, --max-verbose                 trace layout construction and "
+         "position assignments\n"
       << "  -h, --help                        show this help\n\n"
       << "Examples:\n"
       << "  rad " << prog << " -l five_prime --read-layout\n"
@@ -342,7 +343,7 @@ int cmd_prep(int argc, char *argv[]) {
       std::cout << "         LAYOUT STRUCTURE               \n";
       std::cout << "========================================\n\n";
 
-      read_layout.display_read_layout();
+      read_layout.display_read_layout(max_verbose);
 
       std::cout << "\n========================================\n";
       std::cout << "Layout contains " << read_layout.size() << " elements\n";
@@ -365,12 +366,12 @@ int cmd_prep(int argc, char *argv[]) {
       // Generate position mapping
       if (verbose)
         std::cout << "[prep] Generating position mapping...\n";
-      read_layout.generate_position_mapping();
+      read_layout.generate_position_mapping(max_verbose);
 
       // Display if max verbose
       if (verbose) {
         std::cout << "\n";
-        read_layout.display_read_layout();
+        read_layout.display_read_layout(max_verbose);
       }
 
       // Write updated files
