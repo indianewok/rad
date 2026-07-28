@@ -39,6 +39,11 @@ ground-truth run below. One-shot equivalent (scan + demux in a single command):
 ./rad demux -l sctagger -q test.fq.gz -d out_auto -A -t 1
 ```
 
+In both forms, `10x_3v3` remains the global barcode catalog and the 50 detected
+barcodes are the true-cell whitelist. An exact catalog barcode that is not one
+of those 50 cells is therefore filtered instead of being corrected into a
+different detected cell.
+
 ## demux (correction via 10x_3v3 only)
 
 ```bash
