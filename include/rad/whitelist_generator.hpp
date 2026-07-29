@@ -1533,6 +1533,582 @@ right_tail_area(const std::vector<double>& xs, const std::vector<double>& ys)
     return tail;
 }
 
+// ---------- Expanded-context upper-tail hazard diagnostic ----------
+//
+// The steepest log-count/log-rank slope has the following continuous
+// equivalent in RAD's x = log1p(NCPM) coordinate:
+//
+//   d log(count) / d log(rank)
+//       = -S(x) / ((1 - exp(-x)) f(x))
+//
+// where f is the density of unique-barcode scores and S is its upper-tail
+// survival.  Its strongest cliff therefore corresponds to a local minimum of
+//
+//   H(x) = (1 - exp(-x)) f(x) / S(x).
+//
+// The hazard curve is also used below to decide whether RAD's legacy floor is
+// hiding a stable left-hand separation.  A separate selector may accept that
+// separation as the final boundary only when it precedes the expanded saddle
+// and rescues no provisional ZT-Poisson background barcodes.
+struct weighted_score {
+    double x = 0.0;
+    size_t multiplicity = 0;  // number of unique barcodes, never read depth
+};
+
+struct hazard_candidate {
+    double x = 0.0;
+    double hazard = 0.0;
+    size_t estimated_rank = 0;  // empirical number of barcodes at or above x
+    double prominence = 0.0;    // relative depth versus nearby hazard flanks
+};
+
+struct upper_tail_hazard_result {
+    bool ok = false;
+    double bw = 0.0;
+    double grid_step = 0.0;
+    size_t n_barcodes = 0;
+    size_t n_distinct_scores = 0;
+    size_t n_prominent_minima = 0;
+    std::vector<hazard_candidate> prominent_minima;
+    std::optional<hazard_candidate> below_floor;
+    std::optional<hazard_candidate> associated_with_gate;
+    std::optional<hazard_candidate> above_gate;
+};
+
+static inline upper_tail_hazard_result
+compute_upper_tail_adjusted_hazard(
+    const std::vector<weighted_score>& input_scores,
+    double bandwidth,
+    double floor,
+    double rad_threshold,
+    double upper_mode_bound = std::numeric_limits<double>::infinity(),
+    double search_min = 1.0,
+    size_t min_survivors = 50,
+    double min_prominence = 0.05)
+{
+    upper_tail_hazard_result result;
+    result.bw = bandwidth;
+    if (!(bandwidth > 0.0) || !std::isfinite(bandwidth) ||
+        !std::isfinite(floor) || !std::isfinite(rad_threshold) ||
+        !std::isfinite(search_min) || input_scores.empty()) {
+        return result;
+    }
+
+    // Keep every finite score.  A single source more than four bandwidths
+    // below search_min has negligible influence, but a large collection of
+    // such sources need not.  Score-level compression keeps this affordable
+    // while avoiding a population-size-dependent boundary artefact.
+    std::vector<weighted_score> scores;
+    scores.reserve(input_scores.size());
+    for (const auto& score : input_scores) {
+        if (score.multiplicity == 0 || !std::isfinite(score.x)) {
+            continue;
+        }
+        scores.push_back(score);
+    }
+    if (scores.empty()) {
+        return result;
+    }
+
+    std::sort(scores.begin(), scores.end(),
+              [](const weighted_score& a, const weighted_score& b) {
+                  return a.x < b.x;
+              });
+
+    // Callers normally provide one row per raw-count level.  Merge again here
+    // so tests and future callers cannot accidentally turn runtime back into
+    // O(number of barcodes * number of grid points).
+    std::vector<weighted_score> merged;
+    merged.reserve(scores.size());
+    for (const auto& score : scores) {
+        if (!merged.empty() && score.x == merged.back().x) {
+            merged.back().multiplicity += score.multiplicity;
+        } else {
+            merged.push_back(score);
+        }
+    }
+    scores.swap(merged);
+
+    size_t n_barcodes = 0;
+    for (const auto& score : scores) {
+        n_barcodes += score.multiplicity;
+    }
+    result.n_barcodes = n_barcodes;
+    result.n_distinct_scores = scores.size();
+    if (n_barcodes < min_survivors || scores.size() < 2) {
+        return result;
+    }
+
+    const double grid_min = search_min - 4.0 * bandwidth;
+    const double grid_max = scores.back().x + 4.0 * bandwidth;
+    if (!(grid_max > grid_min)) {
+        return result;
+    }
+
+    // Keep at least twelve grid intervals per bandwidth while bounding the
+    // diagnostic cost.  RAD's x range is small enough that the upper clamp is
+    // reached only for unusually tiny bandwidths.
+    const double target_step = bandwidth / 12.0;
+    const double desired_points =
+        std::ceil((grid_max - grid_min) / target_step) + 1.0;
+    size_t n_points = 4096;
+    if (std::isfinite(desired_points) && desired_points < 4096.0) {
+        n_points = std::max<size_t>(
+            512, static_cast<size_t>(desired_points));
+    }
+    const double step =
+        (grid_max - grid_min) / static_cast<double>(n_points - 1);
+    result.grid_step = step;
+
+    std::vector<double> xs(n_points, 0.0);
+    std::vector<double> density(n_points, 0.0);
+    const double inv_norm =
+        1.0 / (static_cast<double>(n_barcodes) * bandwidth *
+               std::sqrt(2.0 * M_PI));
+    for (size_t i = 0; i < n_points; ++i) {
+        const double x = grid_min + static_cast<double>(i) * step;
+        xs[i] = x;
+        double kernel_sum = 0.0;
+        for (const auto& score : scores) {
+            const double z = (x - score.x) / bandwidth;
+            kernel_sum += static_cast<double>(score.multiplicity) *
+                          std::exp(-0.5 * z * z);
+        }
+        density[i] = kernel_sum * inv_norm;
+    }
+
+    const std::vector<double> survival = right_tail_area(xs, density);
+    if (survival.empty() || !(survival.front() > 0.0)) {
+        return result;
+    }
+
+    std::vector<size_t> suffix(scores.size(), 0);
+    size_t suffix_total = 0;
+    for (size_t i = scores.size(); i-- > 0;) {
+        suffix_total += scores[i].multiplicity;
+        suffix[i] = suffix_total;
+    }
+
+    std::vector<double> hazard(n_points,
+                               std::numeric_limits<double>::quiet_NaN());
+    std::vector<size_t> empirical_rank(n_points, 0);
+    for (size_t i = 0; i < n_points; ++i) {
+        const double x = xs[i];
+        // Evaluate enough of the left context to measure a candidate's full
+        // prominence window.  Candidate reporting still begins at search_min;
+        // this merely prevents that reporting bound from creating a false
+        // one-sided minimum.
+        if (!(x > 0.0) || !(survival[i] > 1e-15)) {
+            continue;
+        }
+        const auto level = std::lower_bound(
+            scores.begin(), scores.end(), x,
+            [](const weighted_score& score, double value) {
+                return score.x < value;
+            });
+        const size_t level_index =
+            static_cast<size_t>(level - scores.begin());
+        const size_t rank =
+            (level_index < suffix.size()) ? suffix[level_index] : 0;
+        empirical_rank[i] = rank;
+        if (rank < min_survivors) {
+            continue;
+        }
+
+        const double adjustment = -std::expm1(-x);
+        const double value = adjustment * density[i] / survival[i];
+        if (std::isfinite(value) && value >= 0.0) {
+            hazard[i] = value;
+        }
+    }
+
+    const size_t prominence_radius = std::max<size_t>(
+        3, static_cast<size_t>(std::ceil(2.0 * bandwidth / step)));
+    const double gate_slack = 0.5 * bandwidth;
+
+    auto consider = [](std::optional<hazard_candidate>& slot,
+                       const hazard_candidate& candidate) {
+        if (!slot ||
+            candidate.hazard < slot->hazard ||
+            (candidate.hazard == slot->hazard &&
+             candidate.prominence > slot->prominence)) {
+            slot = candidate;
+        }
+    };
+
+    for (size_t i = 1; i + 1 < n_points; ++i) {
+        if (xs[i] < search_min) {
+            continue;
+        }
+        if (!std::isfinite(hazard[i - 1]) ||
+            !std::isfinite(hazard[i]) ||
+            !std::isfinite(hazard[i + 1])) {
+            continue;
+        }
+        if (!(hazard[i] <= hazard[i - 1] &&
+              hazard[i] < hazard[i + 1])) {
+            continue;
+        }
+
+        double left_max = hazard[i];
+        double right_max = hazard[i];
+        const size_t left_begin =
+            (i > prominence_radius) ? i - prominence_radius : 0;
+        const size_t right_end =
+            std::min(n_points - 1, i + prominence_radius);
+        for (size_t j = left_begin; j <= i; ++j) {
+            if (std::isfinite(hazard[j])) {
+                left_max = std::max(left_max, hazard[j]);
+            }
+        }
+        for (size_t j = i; j <= right_end; ++j) {
+            if (std::isfinite(hazard[j])) {
+                right_max = std::max(right_max, hazard[j]);
+            }
+        }
+        const double flank = std::min(left_max, right_max);
+        const double prominence =
+            (flank > 0.0)
+                ? std::max(0.0, 1.0 - hazard[i] / flank)
+                : 0.0;
+        if (prominence < min_prominence) {
+            continue;
+        }
+
+        const hazard_candidate candidate{
+            xs[i], hazard[i], empirical_rank[i], prominence};
+        ++result.n_prominent_minima;
+        result.prominent_minima.push_back(candidate);
+        if (candidate.x < floor) {
+            consider(result.below_floor, candidate);
+        } else if (candidate.x <= rad_threshold + gate_slack) {
+            consider(result.associated_with_gate, candidate);
+        } else if (!std::isfinite(upper_mode_bound) ||
+                   candidate.x <= upper_mode_bound) {
+            consider(result.above_gate, candidate);
+        }
+    }
+
+    result.ok = true;
+    return result;
+}
+
+enum class adaptive_floor_decision {
+    not_evaluated,
+    no_interior_minimum,
+    no_stable_minimum,
+    boundary_minimum,
+    no_observed_level,
+    insufficient_side_support,
+    insufficient_gain,
+    candidate_ready
+};
+
+static inline const char*
+adaptive_floor_decision_name(adaptive_floor_decision decision)
+{
+    switch (decision) {
+        case adaptive_floor_decision::not_evaluated:
+            return "not_evaluated";
+        case adaptive_floor_decision::no_interior_minimum:
+            return "no_interior_minimum";
+        case adaptive_floor_decision::no_stable_minimum:
+            return "no_stable_minimum";
+        case adaptive_floor_decision::boundary_minimum:
+            return "boundary_minimum";
+        case adaptive_floor_decision::no_observed_level:
+            return "no_observed_level";
+        case adaptive_floor_decision::insufficient_side_support:
+            return "insufficient_side_support";
+        case adaptive_floor_decision::insufficient_gain:
+            return "insufficient_gain";
+        case adaptive_floor_decision::candidate_ready:
+            return "candidate_ready";
+    }
+    return "unknown";
+}
+
+struct adaptive_floor_result {
+    bool evaluated = false;
+    bool has_three_bandwidth_candidates = false;
+    bool stable = false;
+    bool sufficient_side_support = false;
+    bool material_gain = false;
+    bool candidate_ready = false;
+
+    double legacy_floor = 2.0;
+    double bandwidth = 0.0;
+    double candidate_x_08 = std::numeric_limits<double>::quiet_NaN();
+    double candidate_x_10 = std::numeric_limits<double>::quiet_NaN();
+    double candidate_x_125 = std::numeric_limits<double>::quiet_NaN();
+    double candidate_spread = std::numeric_limits<double>::quiet_NaN();
+    double candidate_hazard = std::numeric_limits<double>::quiet_NaN();
+    double candidate_prominence = std::numeric_limits<double>::quiet_NaN();
+    double snapped_floor = std::numeric_limits<double>::quiet_NaN();
+
+    size_t legacy_above_floor = 0;
+    size_t candidate_above_floor = 0;
+    size_t left_interval_barcodes = 0;
+    size_t added_barcodes = 0;
+    size_t required_gain = 0;
+    adaptive_floor_decision decision =
+        adaptive_floor_decision::not_evaluated;
+};
+
+// Find a reproducible adjusted-hazard candidate strictly between search_min
+// and the legacy floor.  This function establishes only the candidate's
+// stability, boundary clearance, observed score level, and support.  The
+// downstream hazard/saddle selector decides whether it may replace RAD's
+// legacy saddle.
+static inline adaptive_floor_result
+compute_adaptive_hazard_floor(
+    const std::vector<weighted_score>& input_scores,
+    double bandwidth,
+    double legacy_floor = 2.0,
+    double search_min = 1.0,
+    size_t min_side_barcodes = 50,
+    size_t min_absolute_gain = 50,
+    double min_fractional_gain = 0.01,
+    double max_stability_spread_h = 0.5,
+    double min_prominence = 0.05)
+{
+    adaptive_floor_result result;
+    result.legacy_floor = legacy_floor;
+    result.bandwidth = bandwidth;
+    result.evaluated =
+        bandwidth > 0.0 && std::isfinite(bandwidth) &&
+        std::isfinite(legacy_floor) && std::isfinite(search_min) &&
+        std::isfinite(min_fractional_gain) &&
+        min_fractional_gain >= 0.0 &&
+        legacy_floor > search_min && !input_scores.empty();
+    if (!result.evaluated) {
+        return result;
+    }
+
+    // Evaluate exactly the same floor interval at three bandwidths.  We retain
+    // every prominent minimum so that the same feature can be matched across
+    // smoothing scales; independently choosing each curve's deepest minimum
+    // can compare three unrelated troughs.
+    const upper_tail_hazard_result hazard_08 =
+        compute_upper_tail_adjusted_hazard(
+            input_scores, 0.8 * bandwidth, legacy_floor, legacy_floor,
+            legacy_floor, search_min, min_side_barcodes, min_prominence);
+    const upper_tail_hazard_result hazard_10 =
+        compute_upper_tail_adjusted_hazard(
+            input_scores, bandwidth, legacy_floor, legacy_floor,
+            legacy_floor, search_min, min_side_barcodes, min_prominence);
+    const upper_tail_hazard_result hazard_125 =
+        compute_upper_tail_adjusted_hazard(
+            input_scores, 1.25 * bandwidth, legacy_floor, legacy_floor,
+            legacy_floor, search_min, min_side_barcodes, min_prominence);
+
+    auto is_interior = [&](const upper_tail_hazard_result& hazard,
+                           const hazard_candidate& candidate) {
+        if (!hazard.ok) return false;
+        const double edge_margin = 2.0 * hazard.grid_step;
+        return candidate.x > search_min + edge_margin &&
+               candidate.x < legacy_floor - edge_margin;
+    };
+
+    std::vector<const hazard_candidate*> candidates_08;
+    std::vector<const hazard_candidate*> candidates_10;
+    std::vector<const hazard_candidate*> candidates_125;
+    for (const auto& candidate : hazard_08.prominent_minima) {
+        if (candidate.x < legacy_floor &&
+            is_interior(hazard_08, candidate)) {
+            candidates_08.push_back(&candidate);
+        }
+    }
+    for (const auto& candidate : hazard_10.prominent_minima) {
+        if (candidate.x < legacy_floor &&
+            is_interior(hazard_10, candidate)) {
+            candidates_10.push_back(&candidate);
+        }
+    }
+    for (const auto& candidate : hazard_125.prominent_minima) {
+        if (candidate.x < legacy_floor &&
+            is_interior(hazard_125, candidate)) {
+            candidates_125.push_back(&candidate);
+        }
+    }
+    if (candidates_08.empty() || candidates_10.empty() ||
+        candidates_125.empty()) {
+        result.decision = adaptive_floor_decision::no_interior_minimum;
+        return result;
+    }
+
+    const hazard_candidate* selected_08 = nullptr;
+    const hazard_candidate* selected_10 = nullptr;
+    const hazard_candidate* selected_125 = nullptr;
+    double selected_spread = std::numeric_limits<double>::infinity();
+    const double maximum_spread =
+        max_stability_spread_h * bandwidth;
+    for (const hazard_candidate* candidate_10 : candidates_10) {
+        const hazard_candidate* matched_08 = nullptr;
+        const hazard_candidate* matched_125 = nullptr;
+        double matched_spread = std::numeric_limits<double>::infinity();
+        for (const hazard_candidate* candidate_08 : candidates_08) {
+            for (const hazard_candidate* candidate_125 :
+                 candidates_125) {
+                const double min_x = std::min(
+                    {candidate_08->x, candidate_10->x,
+                     candidate_125->x});
+                const double max_x = std::max(
+                    {candidate_08->x, candidate_10->x,
+                     candidate_125->x});
+                const double spread = max_x - min_x;
+                if (spread <= maximum_spread &&
+                    spread < matched_spread) {
+                    matched_08 = candidate_08;
+                    matched_125 = candidate_125;
+                    matched_spread = spread;
+                }
+            }
+        }
+        if (!matched_08 || !matched_125) continue;
+
+        result.has_three_bandwidth_candidates = true;
+        const bool better =
+            !selected_10 ||
+            candidate_10->hazard < selected_10->hazard ||
+            (candidate_10->hazard == selected_10->hazard &&
+             candidate_10->prominence > selected_10->prominence) ||
+            (candidate_10->hazard == selected_10->hazard &&
+             candidate_10->prominence == selected_10->prominence &&
+             candidate_10->x > selected_10->x);
+        if (better) {
+            selected_08 = matched_08;
+            selected_10 = candidate_10;
+            selected_125 = matched_125;
+            selected_spread = matched_spread;
+        }
+    }
+    if (!selected_10) {
+        result.decision = adaptive_floor_decision::no_stable_minimum;
+        return result;
+    }
+    result.stable = true;
+    result.candidate_x_08 = selected_08->x;
+    result.candidate_x_10 = selected_10->x;
+    result.candidate_x_125 = selected_125->x;
+    result.candidate_spread = selected_spread;
+    result.candidate_hazard = selected_10->hazard;
+    result.candidate_prominence = selected_10->prominence;
+
+    // The globally deepest stable minimum wins before any acceptance guard is
+    // applied.  In particular, do not discard a boundary/count-stratum
+    // minimum and fall through to a shallower minimum farther right.
+    const bool clear_of_search_boundary =
+        selected_08->x > search_min + 0.5 * hazard_08.bw &&
+        selected_10->x > search_min + 0.5 * hazard_10.bw &&
+        selected_125->x > search_min + 0.5 * hazard_125.bw;
+    if (!clear_of_search_boundary) {
+        result.decision = adaptive_floor_decision::boundary_minimum;
+        return result;
+    }
+
+    // Merge repeated score levels, then snap the continuous KDE minimum to the
+    // first observed score on its right.  This makes the selected barcode rank
+    // deterministic and preserves every barcode at that raw-count level.
+    std::vector<weighted_score> scores;
+    scores.reserve(input_scores.size());
+    for (const auto& score : input_scores) {
+        if (score.multiplicity > 0 && std::isfinite(score.x)) {
+            scores.push_back(score);
+        }
+    }
+    std::sort(scores.begin(), scores.end(),
+              [](const weighted_score& a, const weighted_score& b) {
+                  return a.x < b.x;
+              });
+    std::vector<weighted_score> merged;
+    merged.reserve(scores.size());
+    for (const auto& score : scores) {
+        if (!merged.empty() && score.x == merged.back().x) {
+            merged.back().multiplicity += score.multiplicity;
+        } else {
+            merged.push_back(score);
+        }
+    }
+    scores.swap(merged);
+    if (scores.empty()) {
+        return result;
+    }
+
+    std::vector<size_t> suffix(scores.size(), 0);
+    size_t total_barcodes = 0;
+    for (size_t i = scores.size(); i-- > 0;) {
+        total_barcodes += scores[i].multiplicity;
+        suffix[i] = total_barcodes;
+    }
+
+    const auto legacy_level = std::lower_bound(
+        scores.begin(), scores.end(), legacy_floor,
+        [](const weighted_score& score, double value) {
+            return score.x < value;
+        });
+    const size_t legacy_index =
+        static_cast<size_t>(legacy_level - scores.begin());
+    result.legacy_above_floor =
+        (legacy_index < suffix.size()) ? suffix[legacy_index] : 0;
+
+    const auto snapped_level = std::lower_bound(
+        scores.begin(), scores.end(), result.candidate_x_10,
+        [](const weighted_score& score, double value) {
+            return score.x < value;
+        });
+    if (snapped_level == scores.end()) {
+        result.decision = adaptive_floor_decision::no_observed_level;
+        return result;
+    }
+    const size_t snapped_index =
+        static_cast<size_t>(snapped_level - scores.begin());
+    result.snapped_floor = snapped_level->x;
+    if (!(result.snapped_floor > search_min) ||
+        !(result.snapped_floor < legacy_floor)) {
+        result.decision = adaptive_floor_decision::no_observed_level;
+        return result;
+    }
+
+    result.candidate_above_floor = suffix[snapped_index];
+    result.added_barcodes =
+        (result.candidate_above_floor > result.legacy_above_floor)
+            ? result.candidate_above_floor - result.legacy_above_floor
+            : 0;
+    const auto search_level = std::lower_bound(
+        scores.begin(), scores.end(), search_min,
+        [](const weighted_score& score, double value) {
+            return score.x < value;
+        });
+    const size_t search_index =
+        static_cast<size_t>(search_level - scores.begin());
+    for (size_t i = search_index; i < snapped_index; ++i) {
+        result.left_interval_barcodes += scores[i].multiplicity;
+    }
+    const size_t fractional_gain = static_cast<size_t>(
+        std::ceil(min_fractional_gain *
+                  static_cast<double>(result.legacy_above_floor)));
+    result.required_gain =
+        std::max(min_absolute_gain, fractional_gain);
+    result.sufficient_side_support =
+        result.left_interval_barcodes >= min_side_barcodes &&
+        result.added_barcodes >= min_side_barcodes;
+    result.material_gain =
+        result.added_barcodes >= result.required_gain;
+    if (!result.sufficient_side_support) {
+        result.decision =
+            adaptive_floor_decision::insufficient_side_support;
+        return result;
+    }
+    if (!result.material_gain) {
+        result.decision = adaptive_floor_decision::insufficient_gain;
+        return result;
+    }
+    result.candidate_ready = true;
+    result.decision = adaptive_floor_decision::candidate_ready;
+    return result;
+}
+
 // ---------- AF saddle cut ----------
 struct saddle_cut_result {
     bool   ok              = false;  // found >= 2 peaks and a valley
@@ -1543,11 +2119,35 @@ struct saddle_cut_result {
     bool   used_flat_widen = false;
 
     double valley_height   = 0.0;
+    double sole_peak       = std::numeric_limits<double>::quiet_NaN();
     double left_peak       = 0.0;
     double right_peak      = 0.0;
     double plateau_left    = 0.0;    // widened plateau interval (for logging)
     double plateau_right   = 0.0;
 };
+
+static inline bool should_force_all_af_for_single_peak_ztpois(
+    const saddle_cut_result& saddle,
+    double ztpois_cut,
+    double floor)
+{
+    // A sole peak immediately above the truncation floor can be a boundary
+    // pile-up rather than a cell mode (as in the SN controls).  Likewise, a
+    // ZTP cutoff many bandwidths into the tail is not splitting the modal
+    // core.  Only override ZTP when both the peak and cutoff geometry show
+    // that the fallback line actually bisects an interior unimodal lobe.
+    const double modal_radius = 2.0 * saddle.bw;
+    return !saddle.ok &&
+           saddle.n_peaks == 1 &&
+           saddle.bw > 0.0 &&
+           std::isfinite(saddle.bw) &&
+           std::isfinite(saddle.sole_peak) &&
+           std::isfinite(ztpois_cut) &&
+           std::isfinite(floor) &&
+           saddle.sole_peak - floor >= modal_radius &&
+           ztpois_cut >= saddle.sole_peak &&
+           ztpois_cut - saddle.sole_peak <= modal_radius;
+}
 
 static inline saddle_cut_result compute_saddle_cut_af(const std::vector<double>& af_x, double bw = -1.0, int n_points = 512,
                       double min_height_ratio = 0.20, bool debug = false,
@@ -1571,6 +2171,9 @@ static inline saddle_cut_result compute_saddle_cut_af(const std::vector<double>&
     // 3) Peaks on AF KDE
     auto pkx = find_peaks(d, /*min_height=*/min_height_ratio, /*debug=*/debug);
     res.n_peaks = static_cast<int>(pkx.size());
+    if (pkx.size() == 1) {
+        res.sole_peak = pkx.front();
+    }
     if (pkx.size() < 2) {
         if (debug) std::cerr << "[saddle] < 2 peaks → no saddle\n";
         return res;
@@ -1670,6 +2273,144 @@ static inline saddle_cut_result compute_saddle_cut_af(const std::vector<double>&
     return res;
 }
 
+enum class adaptive_saddle_decision {
+    not_evaluated,
+    candidate_unavailable,
+    no_expanded_saddle,
+    invalid_hazard_saddle_order,
+    rescued_background,
+    accepted
+};
+
+static inline const char*
+adaptive_saddle_decision_name(adaptive_saddle_decision decision)
+{
+    switch (decision) {
+        case adaptive_saddle_decision::not_evaluated:
+            return "not_evaluated";
+        case adaptive_saddle_decision::candidate_unavailable:
+            return "candidate_unavailable";
+        case adaptive_saddle_decision::no_expanded_saddle:
+            return "no_expanded_saddle";
+        case adaptive_saddle_decision::invalid_hazard_saddle_order:
+            return "invalid_hazard_saddle_order";
+        case adaptive_saddle_decision::rescued_background:
+            return "rescued_background";
+        case adaptive_saddle_decision::accepted:
+            return "accepted";
+    }
+    return "unknown";
+}
+
+struct adaptive_saddle_result {
+    bool evaluated = false;
+    bool applied = false;
+    double hazard_floor = std::numeric_limits<double>::quiet_NaN();
+    size_t rescued_total = 0;
+    size_t rescued_lr = 0;
+    size_t rescued_bg = 0;
+    saddle_cut_result expanded_saddle;
+    adaptive_saddle_decision decision =
+        adaptive_saddle_decision::not_evaluated;
+};
+
+static inline bool
+valid_adaptive_hazard_saddle_order(double hazard, double left_peak,
+                                   double saddle, double right_peak)
+{
+    return hazard < left_peak &&
+           left_peak < saddle &&
+           saddle < right_peak;
+}
+
+static inline bool
+in_adaptive_rescued_band(double score, double hazard, double saddle)
+{
+    return score >= hazard && score < saddle;
+}
+
+// Decide whether a stable pre-floor hazard is the foreground boundary rather
+// than merely context for RAD's saddle.  The candidate floor is evaluated
+// provisionally: rejected candidates never alter the legacy x>=2 population.
+// A hazard may replace the saddle only when the expanded KDE has the topology
+//
+//     hazard < left peak < saddle < right peak
+//
+// and every barcode rescued between the hazard and saddle remains on the
+// legacy ZT-Poisson LR side.  The rescued interval is [hazard, saddle), so all
+// raw-count ties at the selected hazard are kept deterministically.
+static inline adaptive_saddle_result
+evaluate_adaptive_hazard_saddle(
+    const adaptive_floor_result& candidate,
+    const std::vector<bc_wl_stats>& barcode_stats,
+    double ztpois_rule = 95.0)
+{
+    adaptive_saddle_result result;
+    if (!candidate.candidate_ready ||
+        !std::isfinite(candidate.snapped_floor)) {
+        result.decision =
+            adaptive_saddle_decision::candidate_unavailable;
+        return result;
+    }
+
+    result.evaluated = true;
+    result.hazard_floor = candidate.snapped_floor;
+
+    std::vector<double> expanded_af;
+    expanded_af.reserve(barcode_stats.size());
+    for (const auto& stats : barcode_stats) {
+        if (stats.log1p_ncpm >= result.hazard_floor) {
+            expanded_af.push_back(stats.log1p_ncpm);
+        }
+    }
+    if (expanded_af.size() < 10) {
+        result.decision =
+            adaptive_saddle_decision::no_expanded_saddle;
+        return result;
+    }
+
+    result.expanded_saddle = compute_saddle_cut_af(
+        expanded_af, /*bw=*/-1.0, /*n_points=*/512,
+        /*min_height_ratio=*/0.20, /*debug=*/false);
+    if (!result.expanded_saddle.ok) {
+        result.decision =
+            adaptive_saddle_decision::no_expanded_saddle;
+        return result;
+    }
+
+    const double left_peak = result.expanded_saddle.left_peak;
+    const double saddle = result.expanded_saddle.final_cut;
+    const double right_peak = result.expanded_saddle.right_peak;
+    if (!valid_adaptive_hazard_saddle_order(
+            result.hazard_floor, left_peak, saddle, right_peak)) {
+        result.decision =
+            adaptive_saddle_decision::invalid_hazard_saddle_order;
+        return result;
+    }
+
+    for (const auto& stats : barcode_stats) {
+        if (!in_adaptive_rescued_band(
+                stats.log1p_ncpm, result.hazard_floor, saddle)) {
+            continue;
+        }
+        ++result.rescued_total;
+        if (stats.log1p_ncpm_ztpois >= ztpois_rule) {
+            ++result.rescued_lr;
+        } else {
+            ++result.rescued_bg;
+        }
+    }
+    if (result.rescued_bg != 0) {
+        result.decision =
+            adaptive_saddle_decision::rescued_background;
+        return result;
+    }
+
+    result.applied = true;
+    result.decision = adaptive_saddle_decision::accepted;
+    return result;
+}
+
 bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barcodes,
                                       const std::unordered_set<int64_seq>& whitelist_set,
                                       const std::string& output_csv, const std::string text_out,
@@ -1743,10 +2484,105 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         s.calculate_bc_ztpois_pct(s.log1p_ncpm, lambda);
     }
 
-    // 5) Above-floor population (log1p scale)
-    const double FLOOR = 2.0; // this number used to be 1,
-    // and then i modified the code to handle reverse complements and now 2 works great. why? same reason as 1.
+    // 5) Above-floor population (log1p scale).  The legacy floor remains the
+    // default.  It moves left only when the upper-tail hazard has the same
+    // prominent interior minimum across three bandwidths and that move adds a
+    // material, well-supported population.
+    const double LEGACY_FLOOR = 2.0;
     const double ZTPOIS_RULE = 95.0; // fallback percentile if saddle/50% fail
+
+    std::vector<double> legacy_af_x;
+    legacy_af_x.reserve(barcode_stats.size());
+    std::unordered_map<uint64_t, size_t> multiplicity_by_count;
+    for (const auto& s : barcode_stats) {
+        if (s.log1p_ncpm >= LEGACY_FLOOR) {
+            legacy_af_x.push_back(s.log1p_ncpm);
+        }
+        ++multiplicity_by_count[s.count];
+    }
+
+    std::vector<weighted_score> hazard_scores;
+    hazard_scores.reserve(multiplicity_by_count.size());
+    if (total_reads > 0.0) {
+        for (const auto& count_level : multiplicity_by_count) {
+            const double ncpm =
+                (static_cast<double>(count_level.first) / total_reads) *
+                1e6;
+            hazard_scores.push_back(
+                {std::log1p(ncpm), count_level.second});
+        }
+    }
+
+    double adaptive_bandwidth = 0.0;
+    adaptive_floor_result adaptive_floor;
+    if (legacy_af_x.size() >= 10 && !hazard_scores.empty()) {
+        adaptive_bandwidth =
+            calculate_silverman_bandwidth(legacy_af_x);
+        if (!(adaptive_bandwidth > 0.0) ||
+            !std::isfinite(adaptive_bandwidth)) {
+            adaptive_bandwidth = 0.1;
+        }
+        adaptive_floor = compute_adaptive_hazard_floor(
+            hazard_scores, adaptive_bandwidth, LEGACY_FLOOR,
+            /*search_min=*/1.0, /*min_side_barcodes=*/50,
+            /*min_absolute_gain=*/50,
+            /*min_fractional_gain=*/0.01,
+            /*max_stability_spread_h=*/0.5,
+            /*min_prominence=*/0.05);
+    }
+    const adaptive_saddle_result adaptive_saddle =
+        evaluate_adaptive_hazard_saddle(
+            adaptive_floor, barcode_stats, ZTPOIS_RULE);
+    const double FLOOR = adaptive_saddle.applied
+        ? adaptive_saddle.hazard_floor
+        : LEGACY_FLOOR;
+
+    std::cout << "[hazard floor candidate] legacy=" << LEGACY_FLOOR
+              << "  bw=" << adaptive_bandwidth;
+    if (adaptive_floor.stable) {
+        std::cout << "  candidates="
+                  << adaptive_floor.candidate_x_08 << "/"
+                  << adaptive_floor.candidate_x_10 << "/"
+                  << adaptive_floor.candidate_x_125
+                  << "  spread=" << adaptive_floor.candidate_spread;
+        if (std::isfinite(adaptive_floor.snapped_floor)) {
+            std::cout << "  snapped=" << adaptive_floor.snapped_floor;
+        } else {
+            std::cout << "  snapped=unavailable";
+        }
+    } else {
+        std::cout << "  candidate=none";
+    }
+    std::cout << "  left_support="
+              << adaptive_floor.left_interval_barcodes
+              << "  gain=" << adaptive_floor.added_barcodes
+              << "  required=" << adaptive_floor.required_gain
+              << "  decision="
+              << adaptive_floor_decision_name(adaptive_floor.decision)
+              << "\n";
+
+    std::cout << "[hazard/saddle selector] ";
+    if (adaptive_saddle.evaluated) {
+        std::cout << "hazard=" << adaptive_saddle.hazard_floor;
+        if (adaptive_saddle.expanded_saddle.ok) {
+            std::cout << "  peaks="
+                      << adaptive_saddle.expanded_saddle.left_peak
+                      << "/"
+                      << adaptive_saddle.expanded_saddle.right_peak
+                      << "  saddle="
+                      << adaptive_saddle.expanded_saddle.final_cut;
+        } else {
+            std::cout << "  saddle=unavailable";
+        }
+        std::cout << "  rescued=" << adaptive_saddle.rescued_total
+                  << "  LR_rescued=" << adaptive_saddle.rescued_lr
+                  << "  BG_rescued=" << adaptive_saddle.rescued_bg;
+    } else {
+        std::cout << "hazard=unavailable";
+    }
+    std::cout << "  decision="
+              << adaptive_saddle_decision_name(adaptive_saddle.decision)
+              << "  effective_floor=" << FLOOR << "\n";
 
     std::vector<double> af_x; // log1p_ncpm for AF
     af_x.reserve(barcode_stats.size());
@@ -1760,12 +2596,28 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
     double threshold = FLOOR;                // numeric gate (log1p_ncpm)
     std::string rule = "af_kde_saddle";
     bool have_threshold = false;
+    bool force_all_af_single_peak = false;
+    bool force_all_af_adaptive_hazard = false;
 
     double t_saddle = std::numeric_limits<double>::quiet_NaN();
     bool   have_saddle = false;
     saddle_cut_result sd;
 
-    if (af_x.size() >= 10) {
+    if (adaptive_saddle.applied) {
+        sd = adaptive_saddle.expanded_saddle;
+        t_saddle = sd.final_cut;
+        threshold = FLOOR;
+        have_threshold = true;
+        have_saddle = true;
+        force_all_af_adaptive_hazard = true;
+        rule = "adaptive_hazard_bg0";
+        std::cout << "\n[AF-KDE saddle] peaks @ " << sd.left_peak
+                  << " & " << sd.right_peak
+                  << "  → saddle cut=" << sd.final_cut
+                  << " (bw = " << sd.bw
+                  << "); stable pre-saddle hazard accepted at "
+                  << threshold;
+    } else if (af_x.size() >= 10) {
         sd = compute_saddle_cut_af(af_x, /*bw=*/-1.0, /*n_points=*/512, /*min_height_ratio=*/0.20, /*debug=*/verbose);
         if (sd.ok) {
             t_saddle = sd.final_cut;
@@ -1790,10 +2642,23 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
             }
         }
         if (std::isfinite(best)) {
-            threshold = best;
             have_threshold = true;
-            std::cout << "[ZT-Poisson fallback] threshold = " << threshold << " (first x with ≥ "
+            std::cout << "[ZT-Poisson fallback] threshold = " << best << " (first x with ≥ "
                       << ZTPOIS_RULE << "%)\n";
+            // A cutoff on or beyond the only accepted AF mode is not a
+            // between-population boundary.  Keep RAD's hard floor in that
+            // case instead of discarding the modal above-floor population.
+            if (should_force_all_af_for_single_peak_ztpois(
+                    sd, best, FLOOR)) {
+                threshold = FLOOR;
+                force_all_af_single_peak = true;
+                rule = "single_peak_ztpois_guard";
+                std::cout << "[ZT-Poisson single-peak guard] candidate " << best
+                          << " is at/right of sole AF-KDE peak " << sd.sole_peak
+                          << " — using FLOOR = " << FLOOR << " (return all AF)\n";
+            } else {
+                threshold = best;
+            }
         } else {
             threshold = FLOOR;
             std::cout << "[ZT-Poisson fallback] No items ≥ " << ZTPOIS_RULE
@@ -1807,7 +2672,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
     lr_x.reserve(af_x.size());
     bg_x.reserve(af_x.size());
     for (const auto& s : barcode_stats) {
-        if (s.log1p_ncpm <= FLOOR) {
+        if (s.log1p_ncpm < FLOOR) {
             continue;
         }
         if (s.log1p_ncpm_ztpois >= ZTPOIS_RULE) {
@@ -1867,7 +2732,16 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         } else {
             std::cout << "[t_purity50] could not compute.\n";
         }
-        if (t_purity50 > sd.right_peak) {
+        if ((force_all_af_single_peak ||
+             force_all_af_adaptive_hazard) &&
+            have_tpurity50) {
+            std::cout << "[t_purity50] diagnostic ignored because "
+                      << (force_all_af_adaptive_hazard
+                              ? "the accepted pre-saddle hazard"
+                              : "the single-peak ZT-Poisson guard")
+                      << " forced an above-floor result\n";
+            have_tpurity50 = false;
+        } else if (t_purity50 > sd.right_peak) {
             std::cout << "[t_purity50] " << t_purity50 << " exceeds right peak " 
                   << sd.right_peak << " — invalid, using saddle only\n";
             have_tpurity50 = false;
@@ -1889,6 +2763,95 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         std::cout << "\n[AF mixture diagnostics] " << "  |AF|=" << af_x.size()
                   << "  |LR_in_AF|=" << lr_x.size() << "  |BG_in_AF|=" << bg_x.size() <<   "\n";
         std::cout << "\n[AF mixture diagnostics] Skipped (need ≥10 in AF/LR/BG).\n";
+    }
+
+    // Expanded-context smooth upper-tail hazard diagnostic.
+    // This is intentionally verbose-only and cannot mutate RAD's threshold.
+    if (verbose) {
+        if (af_x.size() >= 10 && sd.bw > 0.0 &&
+            std::isfinite(sd.bw)) {
+            double upper_mode_bound =
+                std::numeric_limits<double>::infinity();
+            if (sd.ok && std::isfinite(sd.right_peak)) {
+                upper_mode_bound = sd.right_peak;
+            } else if (std::isfinite(sd.sole_peak)) {
+                upper_mode_bound = sd.sole_peak;
+            } else if (!af_x.empty()) {
+                upper_mode_bound =
+                    *std::max_element(af_x.begin(), af_x.end());
+            }
+
+            const upper_tail_hazard_result hazard_result =
+                compute_upper_tail_adjusted_hazard(
+                    hazard_scores, sd.bw, FLOOR, threshold,
+                    upper_mode_bound, /*search_min=*/1.0,
+                    /*min_survivors=*/50,
+                    /*min_prominence=*/0.05);
+
+            std::cout
+                << "\n[upper-tail hazard diagnostic] "
+                << (hazard_result.ok ? "computed" : "unavailable")
+                << " (diagnostic only; RAD gate remains " << threshold << ")"
+                << "\n         source_barcodes="
+                << hazard_result.n_barcodes
+                << "  distinct_scores="
+                << hazard_result.n_distinct_scores
+                << "  bw=" << hazard_result.bw
+                << "  grid_step=" << hazard_result.grid_step
+                << "  prominent_minima="
+                << hazard_result.n_prominent_minima << "\n";
+
+            auto print_hazard_candidate =
+                [](const char* label,
+                   const std::optional<hazard_candidate>& candidate) {
+                    std::cout << "[hazard " << label << "] ";
+                    if (!candidate) {
+                        std::cout << "none\n";
+                        return;
+                    }
+                    std::cout << "x=" << candidate->x
+                              << "  H=" << candidate->hazard
+                              << "  empirical_rank="
+                              << candidate->estimated_rank
+                              << "  prominence="
+                              << candidate->prominence << "\n";
+                };
+
+            print_hazard_candidate(
+                "below-floor", hazard_result.below_floor);
+            print_hazard_candidate(
+                "gate-associated",
+                hazard_result.associated_with_gate);
+            if (hazard_result.associated_with_gate) {
+                const double hazard_gate =
+                    hazard_result.associated_with_gate->x;
+                const double interval_lo =
+                    std::min(hazard_gate, threshold);
+                const double interval_hi =
+                    std::max(hazard_gate, threshold);
+                size_t changed_if_substituted = 0;
+                for (const auto& s : barcode_stats) {
+                    if (s.log1p_ncpm >= FLOOR &&
+                        s.log1p_ncpm >= interval_lo &&
+                        s.log1p_ncpm < interval_hi) {
+                        ++changed_if_substituted;
+                    }
+                }
+                std::cout
+                    << "[hazard gate comparison] |x_hazard-x_RAD|="
+                    << std::fabs(hazard_gate - threshold)
+                    << "  barcodes_between="
+                    << changed_if_substituted
+                    << " (RAD decision retained)\n";
+            }
+            print_hazard_candidate(
+                "above-gate", hazard_result.above_gate);
+        } else {
+            std::cout
+                << "\n[upper-tail hazard diagnostic] unavailable "
+                   "(need >=10 above-floor barcodes and a valid AF bandwidth; "
+                   "RAD decision retained)\n";
+        }
     }
 
     // Prepare the "between" band for annotation (only when both lines exist)
@@ -1949,8 +2912,10 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
     const bool narrow_both   = have_left && have_right &&
                                (left_range <= SPREAD_EPS) && (right_range <= SPREAD_EPS);
     const bool narrow_full   = (full_range > 0.0) && (full_range <= 2.0 * SPREAD_EPS);
-    const bool collapse_all_af = (af_total >= 10) &&
-                                 ((left_frac <= LEFT_TAIL_MAX_FRAC) || narrow_both || narrow_full);
+    const bool collapse_all_af = force_all_af_single_peak ||
+                                 force_all_af_adaptive_hazard ||
+                                 ((af_total >= 10) &&
+                                  ((left_frac <= LEFT_TAIL_MAX_FRAC) || narrow_both || narrow_full));
 
     // Budget rescue: only fires when collapse didn't, and left_frac is in the
     // borderline (LEFT_TAIL_MAX_FRAC, LEFT_TAIL_BUDGET_MAX_FRAC] window.
