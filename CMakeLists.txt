@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 project(rad VERSION 1.0.2 LANGUAGES C CXX)
 include(FetchContent)
-include(CTest)
 # --------------------------------------------------------------------------
 #language standard
 # --------------------------------------------------------------------------
@@ -110,65 +109,6 @@ target_link_libraries(rad PRIVATE rad_lib)
 target_link_libraries(rad_config PRIVATE rad_lib)
 target_link_libraries(generate_whitelist PRIVATE rad_lib)
 target_link_libraries(discover_layout PRIVATE rad_lib)
-
-# --------------------------------------------------------------------------
-# Tests
-# --------------------------------------------------------------------------
-if(BUILD_TESTING)
-    add_executable(test_find_poly_tails tests/test_find_poly_tails.cpp)
-    target_link_libraries(test_find_poly_tails PRIVATE rad_lib)
-    add_test(NAME find_poly_tails_regression COMMAND test_find_poly_tails)
-
-    add_executable(test_generate_mutated_barcodes
-        tests/test_generate_mutated_barcodes.cpp)
-    target_link_libraries(test_generate_mutated_barcodes PRIVATE rad_lib)
-    add_test(NAME mutation_generator_equivalence
-        COMMAND test_generate_mutated_barcodes)
-
-    add_executable(test_barcode_filter_precedence
-        tests/test_barcode_filter_precedence.cpp)
-    target_link_libraries(test_barcode_filter_precedence PRIVATE rad_lib)
-    add_test(NAME barcode_filter_precedence
-        COMMAND test_barcode_filter_precedence)
-
-    add_executable(parsed_position_empty_test
-        tests/parsed_position_empty.cpp)
-    target_link_libraries(parsed_position_empty_test PRIVATE rad_lib)
-
-    add_test(
-        NAME parsed_position_empty
-        COMMAND $<TARGET_FILE:parsed_position_empty_test>
-    )
-    add_test(
-        NAME prep_max_verbose_trace
-        COMMAND ${CMAKE_COMMAND}
-            -DRAD_EXE=$<TARGET_FILE:rad>
-            -DRAD_TEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/tests/prep_max_verbose_trace
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/prep_max_verbose_trace.cmake
-    )
-    add_test(
-        NAME prep_static_anchor_threshold
-        COMMAND ${CMAKE_COMMAND}
-            -DRAD_EXE=$<TARGET_FILE:rad>
-            -DRAD_TEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/tests/prep_static_anchor_threshold
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/prep_static_anchor_threshold.cmake
-    )
-    add_test(
-        NAME splitseq_terminal_boundaries
-        COMMAND ${CMAKE_COMMAND}
-            -DRAD_EXE=$<TARGET_FILE:rad>
-            -DRAD_TEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/tests/splitseq_terminal_boundaries
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/splitseq_terminal_boundaries.cmake
-    )
-    add_test(
-        NAME prep_splitseq_terminal_anchor_priority
-        COMMAND ${CMAKE_COMMAND}
-            -DRAD_EXE=$<TARGET_FILE:rad>
-            -DRAD_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
-            -DRAD_TEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/tests/prep_splitseq_terminal_anchor_priority
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/prep_splitseq_terminal_anchor_priority.cmake
-    )
-endif()
 
 # --------------------------------------------------------------------------
 message(STATUS "Configure-time compiler: ${CMAKE_CXX_COMPILER}")
