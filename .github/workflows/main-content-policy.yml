@@ -1,0 +1,49 @@
+name: Main branch content policy
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  keep-dev-only-content-out-of-main:
+    name: Keep dev-only content out of main
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the proposed main tree
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Reject dev-only content
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          violations=()
+          if [[ -e tests ]]; then
+            violations+=("tests/")
+          fi
+          if [[ -e docs/experimental ]]; then
+            violations+=("docs/experimental/")
+          fi
+          if grep -R -n --include='*.md' 'experimental/' docs; then
+            violations+=("references to experimental/ in docs")
+          fi
+          if grep -n 'tests/' CMakeLists.txt; then
+            violations+=("references to tests/ in CMakeLists.txt")
+          fi
+
+          if (( ${#violations[@]} > 0 )); then
+            printf 'main contains dev-only content:\n' >&2
+            printf '  - %s\n' "${violations[@]}" >&2
+            exit 1
+          fi
+
+          echo "main contains no dev-only tests or experimental docs."

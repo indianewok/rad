@@ -46,10 +46,12 @@ static void usage_demux(const char *prog) {
          "'defensive'\n"
       << "      --joint-bc-mode               'default' (permissive) or "
          "'strict' (all barcodes must pass)\n"
-      << "  -A, --auto-wl                     run scan-wl internally first and "
-         "demux against the\n"
-      << "                                    detected barcodes (single-barcode "
-         "layouts)\n"
+      << "  -A, --auto-wl                     run scan-wl internally first; "
+         "demux uses the\n"
+      << "                                    reference as the global whitelist "
+         "and detected\n"
+      << "                                    barcodes as the true whitelist "
+         "(single-barcode layouts)\n"
       << "      --scan-adapter                override the scan-wl adapter "
          "(default: from layout)\n"
       << "      --scan-bc-len                 override the scan-wl barcode "
@@ -142,7 +144,8 @@ static void usage_prep(const char *prog) {
          "sampling (default: 50000)\n"
       << "  -t, --threads                     number of threads (default: 1)\n"
       << "  -v, --verbose                     verbose mode\n"
-      << "  -D, --max-verbose                 maximum verbosity (debug)\n"
+      << "  -D, --max-verbose                 trace layout construction and "
+         "position assignments\n"
       << "  -h, --help                        show this help\n\n"
       << "Examples:\n"
       << "  rad " << prog << " -l five_prime --read-layout\n"
@@ -342,7 +345,7 @@ int cmd_prep(int argc, char *argv[]) {
       std::cout << "         LAYOUT STRUCTURE               \n";
       std::cout << "========================================\n\n";
 
-      read_layout.display_read_layout();
+      read_layout.display_read_layout(max_verbose);
 
       std::cout << "\n========================================\n";
       std::cout << "Layout contains " << read_layout.size() << " elements\n";
@@ -365,12 +368,12 @@ int cmd_prep(int argc, char *argv[]) {
       // Generate position mapping
       if (verbose)
         std::cout << "[prep] Generating position mapping...\n";
-      read_layout.generate_position_mapping();
+      read_layout.generate_position_mapping(max_verbose);
 
       // Display if max verbose
       if (verbose) {
         std::cout << "\n";
-        read_layout.display_read_layout();
+        read_layout.display_read_layout(max_verbose);
       }
 
       // Write updated files
@@ -1104,21 +1107,34 @@ int cmd_reformat(int argc, char *argv[]) {
 // ran `demux` straight against a full reference whitelist and got every
 // reference barcode corrected into (issue #4). This derives the scan-wl
 // parameters from the already-parsed layout, runs the same scan-wl core, and
-// hands the high-confidence barcode list back to demux so a single command
-// reproduces the intended pipeline.
+// hands both the validation reference and high-confidence barcode list back to
+// demux so a single command reproduces the intended two-whitelist pipeline.
 //
-// Returns the path to the generated <outbase>_scanwl.txt whitelist. Throws on
-// any layout it cannot scan single-handedly (e.g. split-barcode kits), so the
-// caller can surface a clear "run scan-wl manually" message.
-static std::string run_auto_whitelist(const ReadLayout &layout,
-                                      const std::string &fastq_path,
-                                      const std::string &outbase,
-                                      const std::string &adapter_override,
-                                      std::optional<int> bc_len_override,
-                                      const std::string &ref_whitelist,
-                                      double scan_error, size_t max_reads,
-                                      size_t chunk_size, int nthreads,
-                                      bool verbose) {
+// The reference must survive the handoff: during demux it is the global
+// whitelist, while the generated list is the smaller true-cell whitelist.
+// Without that distinction, a valid global barcode omitted by cell calling can
+// be fuzzy-corrected into a different called cell.
+struct AutoWhitelistResult {
+  std::string detected_path;
+  std::string reference_spec;
+
+  std::string demux_spec() const {
+    return reference_spec.empty() ? detected_path
+                                  : reference_spec + ":" + detected_path;
+  }
+};
+
+// Returns the reference/list pair required by demux. Throws on any layout it
+// cannot scan single-handedly (e.g. split-barcode kits), so the caller can
+// surface a clear "run scan-wl manually" message.
+static AutoWhitelistResult
+run_auto_whitelist(const ReadLayout &layout, const std::string &fastq_path,
+                   const std::string &outbase,
+                   const std::string &adapter_override,
+                   std::optional<int> bc_len_override,
+                   const std::string &ref_whitelist, double scan_error,
+                   size_t max_reads, size_t chunk_size, int nthreads,
+                   bool verbose) {
   // 1) Locate the single forward barcode element.
   const ReadElement *bc_elem = nullptr;
   int n_barcodes = 0;
@@ -1240,7 +1256,7 @@ static std::string run_auto_whitelist(const ReadLayout &layout,
   }
   std::cout << "[auto-wl] Whitelist ready: " << txt_out
             << " (feeding into demux)\n";
-  return txt_out;
+  return {txt_out, ref};
 }
 
 int cmd_demux(int argc, char *argv[]) {
@@ -1660,24 +1676,31 @@ int cmd_demux(int argc, char *argv[]) {
       whitelist_path = kit_or_wl + ":" + custom_whitelist_path;
     }
 
-    // --auto-wl: run scan-wl internally and demux against its filtered barcode
-    // list instead of a full reference (issue #4).
-    std::optional<std::string> auto_wl_path;
+    // --auto-wl: run scan-wl internally, retaining its validation reference as
+    // the global catalog and using the detected barcode list as true cells.
+    std::optional<AutoWhitelistResult> auto_wl;
     if (auto_whitelist) {
       // Each scan-wl knob defaults to the matching demux setting unless the
       // user overrode it with a --scan-* flag.
-      auto_wl_path = run_auto_whitelist(
+      auto_wl = run_auto_whitelist(
           read_layout, fastq_path, outbase.string(), scan_adapter, scan_bc_len,
           kit_or_wl, scan_max_error, scan_max_reads.value_or(max_reads),
           scan_chunk.value_or(chunk_size), scan_threads.value_or(nthreads),
           verbose);
     }
 
-    if (auto_wl_path) {
-      if (verbose)
-        std::cout << "[main] Loading auto-generated whitelist from scan-wl "
-                     "pass...\n";
-      read_layout.load_wl(auto_wl_path.value(), wl_mut, verbose, nthreads);
+    if (auto_wl) {
+      const std::string auto_wl_spec = auto_wl->demux_spec();
+      if (verbose) {
+        std::cout
+            << "[main] Loading auto-whitelist pair for demux\n"
+            << "  global reference : "
+            << (auto_wl->reference_spec.empty() ? "[none; de novo]"
+                                                : auto_wl->reference_spec)
+            << "\n"
+            << "  true barcodes    : " << auto_wl->detected_path << "\n";
+      }
+      read_layout.load_wl(auto_wl_spec, wl_mut, verbose, nthreads);
     } else if (whitelist_path) {
       if (verbose)
         std::cout << "[main] Loading custom kit & whitelist...\n";

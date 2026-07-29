@@ -10,11 +10,15 @@
  */
 struct ParsedPosition {
     std::string ref_id; // Reference element ID this position is based on
-    bool is_start; // True if this is a start position, false for stop
-    int offset; // Offset from the reference position
+    bool is_start = false; // True if this is a start position, false for stop
+    int offset = 0; // Offset from the reference position
     std::string add_flags; // Additional flags (e.g., "terminal_linked", "skipped")
 
     std::string to_string() const {
+        if (ref_id.empty()) {
+            return "";
+        }
+
         std::stringstream ss;
         ss << ref_id << "|"
            << (is_start ? "start" : "stop")
@@ -28,7 +32,7 @@ struct ParsedPosition {
     static ParsedPosition from_string(const std::string& pos_str, bool verbose) {
         ParsedPosition pos;
         if(pos_str.empty()){
-            std::cout << "[from_string] Empty position string\n"; 
+            if(verbose) std::cout << "[from_string] Empty position string\n";
             return pos;
         }
 
@@ -48,6 +52,13 @@ struct ParsedPosition {
             if(verbose){
                 std::cout << "[from_string] Found part: '" << temp << "'\n";
             }
+        }
+
+        if(parts.empty() || parts[0].empty()) {
+            if(verbose) {
+                std::cout << "[from_string] Empty reference ID; treating position as unset\n";
+            }
+            return pos;
         }
                 
         if(parts.size() >= 1) {
@@ -1401,7 +1412,7 @@ public:
     }
 
     // Generate position map
-    void generate_position_mapping(){
+    void generate_position_mapping(bool verbose = false){
         auto& dir_ordered = by_dir_order();
         auto current_direction = dir_ordered.begin();
         while (current_direction != dir_ordered.end()) {
@@ -1409,7 +1420,7 @@ public:
             auto end_of_direction = dir_ordered.upper_bound(
                 boost::make_tuple(direction, std::numeric_limits<int>::max())
             );
-            process_reads(current_direction, end_of_direction);
+            process_reads(current_direction, end_of_direction, verbose);
                 auto& id_index = by_id();
                 for (const auto& pos_pair : position_map) {
                     auto elem_it = id_index.find(pos_pair.first);
@@ -1761,7 +1772,88 @@ public:
     }
 
     // print full layout
-void display_read_layout() {
+void display_read_layout(bool max_verbose = false) {
+    if (max_verbose) {
+        auto format_position = [](const ParsedPosition& pos) {
+            return pos.ref_id.empty() ? std::string("[unset]") : pos.to_string();
+        };
+        auto format_optional_int = [](const std::optional<int>& value) {
+            return value ? std::to_string(*value) : std::string("[unset]");
+        };
+
+        std::cout << "[read_layout] Complete read layout (max verbose):\n";
+        for (const auto& elem : by_dir_order()) {
+            std::cout << "[read_layout] Element " << elem.class_id << ":\n"
+                      << "  Sequence: " << (elem.seq.empty() ? "[empty]" : elem.seq) << "\n"
+                      << "  Masked sequence: "
+                      << (elem.masked_seq.empty() ? "[empty]" : elem.masked_seq) << "\n"
+                      << "  Type: " << elem.type << "\n"
+                      << "  Global class: " << elem.global_class << "\n"
+                      << "  Direction: " << elem.direction << "\n"
+                      << "  Order: " << elem.order << "\n"
+                      << "  Expected length: "
+                      << format_optional_int(elem.expected_length) << "\n"
+                      << "  Length candidates: "
+                      << (elem.length_candidates.empty()
+                              ? "[none]"
+                              : format_length_candidates(elem.length_candidates))
+                      << "\n"
+                      << "  Whitelist: "
+                      << (elem.whitelist_path.empty() ? "[none]" : elem.whitelist_path)
+                      << "\n"
+                      << "  Flags: " << (elem.flags.empty() ? "[none]" : elem.flags)
+                      << "\n";
+
+            if (elem.misalignment_threshold) {
+                const auto [lower, mean, upper] = *elem.misalignment_threshold;
+                std::cout << "  Misalignment threshold: "
+                          << lower << "|" << mean << "|" << upper << "\n";
+            } else {
+                std::cout << "  Misalignment threshold: [unset]\n";
+            }
+
+            if (elem.aligned_positions) {
+                const auto& aligned = *elem.aligned_positions;
+                std::cout << "  Aligned start (mean|variance): "
+                          << aligned.start_stats.first << "|"
+                          << aligned.start_stats.second << "\n"
+                          << "  Aligned stop (mean|variance): "
+                          << aligned.stop_stats.first << "|"
+                          << aligned.stop_stats.second << "\n";
+            } else {
+                std::cout << "  Aligned positions: [unset]\n";
+            }
+
+            if (elem.misaligned_positions) {
+                const auto& misaligned = *elem.misaligned_positions;
+                std::cout << "  Misaligned start (mean|variance): "
+                          << misaligned.start_stats.first << "|"
+                          << misaligned.start_stats.second << "\n"
+                          << "  Misaligned stop (mean|variance): "
+                          << misaligned.stop_stats.first << "|"
+                          << misaligned.stop_stats.second << "\n";
+            } else {
+                std::cout << "  Misaligned positions: [unset]\n";
+            }
+
+            if (elem.ref_pos) {
+                const auto& positions = *elem.ref_pos;
+                std::cout << "  Primary Start: "
+                          << format_position(positions.primary_start) << "\n"
+                          << "  Secondary Start: "
+                          << format_position(positions.secondary_start) << "\n"
+                          << "  Primary Stop: "
+                          << format_position(positions.primary_stop) << "\n"
+                          << "  Secondary Stop: "
+                          << format_position(positions.secondary_stop) << "\n";
+            } else {
+                std::cout << "  Position references: [unset]\n";
+            }
+        }
+        std::cout << "\n";
+        return;
+    }
+
     std::cout << "[read_layout] Complete read layout:\n";
 
     auto colorize = [](const std::string& text, const std::string& color_code) {
@@ -1785,6 +1877,9 @@ void display_read_layout() {
         return clean.to_string();
     };
     auto fmt_ref = [&](const ParsedPosition& pos) {
+        if (pos.ref_id.empty()) {
+            return std::string("[unset]");
+        }
         std::ostringstream oss;
         oss << term_print_utils::colorize(pos.ref_id, class_color_by_id(pos.ref_id))
             << "|" << (pos.is_start ? "start" : "stop");
@@ -1852,13 +1947,79 @@ void display_read_layout() {
 
 private:
 
-    void process_left_side(Layout_Struct::index<dir_order_tag>::type::iterator it) {
+    static std::string describe_debug_element(const ReadElement* elem) {
+        if (elem == nullptr) return "[none]";
+
+        std::ostringstream oss;
+        oss << elem->class_id
+            << " (order=" << elem->order
+            << ", type=" << elem->type
+            << ", class=" << elem->global_class
+            << ", direction=" << elem->direction << ")";
+        return oss.str();
+    }
+
+    static std::string describe_debug_position(const ParsedPosition& position) {
+        return position.ref_id.empty() ? std::string("[unset]") : position.to_string();
+    }
+
+    void print_position_context(
+        const std::string& phase,
+        const ReadElement& elem,
+        const ReadElement* prev,
+        const ReadElement* next,
+        const ReadElement* prev_prev,
+        const ReadElement* next_next
+    ) const {
+        std::cout << "\n[position_map] Processing " << phase
+                  << " element: " << elem.class_id << "\n"
+                  << "  Element: " << describe_debug_element(&elem) << "\n"
+                  << "  Previous: " << describe_debug_element(prev) << "\n"
+                  << "  Next: " << describe_debug_element(next) << "\n"
+                  << "  Previous-previous: "
+                  << describe_debug_element(prev_prev) << "\n"
+                  << "  Next-next: " << describe_debug_element(next_next) << "\n";
+    }
+
+    void print_position_assignment(
+        const std::string& phase,
+        const std::string& class_id,
+        const ReferencePositions& positions
+    ) const {
+        std::cout << "[position_map] " << phase << " positions for "
+                  << class_id << ":\n"
+                  << "  Primary Start: "
+                  << describe_debug_position(positions.primary_start) << "\n"
+                  << "  Secondary Start: "
+                  << describe_debug_position(positions.secondary_start) << "\n"
+                  << "  Primary Stop: "
+                  << describe_debug_position(positions.primary_stop) << "\n"
+                  << "  Secondary Stop: "
+                  << describe_debug_position(positions.secondary_stop) << "\n";
+    }
+
+    void process_left_side(
+        Layout_Struct::index<dir_order_tag>::type::iterator it,
+        bool verbose
+    ) {
         auto& ordered = by_order();
         auto next = ordered.find(it->order + 1);
-            auto next_next = ordered.find(it->order + 2);
+        auto next_next = ordered.find(it->order + 2);
 
         auto prev = ordered.find(it->order - 1);
+        auto prev_prev = ordered.find(it->order - 2);
         if (prev == ordered.end()) return;
+
+        if (verbose) {
+            print_position_context(
+                "left",
+                *it,
+                &*prev,
+                next != ordered.end() ? &*next : nullptr,
+                prev_prev != ordered.end() ? &*prev_prev : nullptr,
+                next_next != ordered.end() ? &*next_next : nullptr
+            );
+        }
 
         ReferencePositions positions;
         int offset = it->expected_length.value_or(1);
@@ -1870,17 +2031,35 @@ private:
         // Handle secondary positions based on types
         if (prev->type == "static") {
             // Check for static anchor
-            if (next != ordered.end() && next->type == "static" && 
-                next->expected_length.value_or(0) >= 13 && 
+            if (next != ordered.end() && next->type == "static" &&
+                next->expected_length.value_or(0) >= 13 &&
                 next->global_class != "poly_tail") {
+                    if (verbose) {
+                        std::cout << "  Secondary selection: next static anchor "
+                                  << next->class_id << "\n";
+                    }
                     positions.secondary_start = {next->class_id, true, -offset, ""};
                     positions.secondary_stop = {next->class_id, true, -1, ""};
             } else {
-                if(next->type == "variable" && next_next->global_class != "read" && next_next->type == "static"){
+                if (next != ordered.end() && next->type == "variable" &&
+                    next_next != ordered.end() && next_next->type == "static" &&
+                    next_next->global_class != "read" &&
+                    next_next->global_class != "poly_tail" &&
+                    next_next->global_class != "start" &&
+                    next_next->global_class != "stop" &&
+                    next_next->expected_length.value_or(0) >= 13) {
+                    if (verbose) {
+                        std::cout << "  Secondary selection: next-next static anchor "
+                                  << next_next->class_id << "\n";
+                    }
                     int length_offset = next->expected_length.value_or(1);
                     positions.secondary_start = {next_next->class_id, true, -length_offset - offset, ""};
-                   positions.secondary_stop = {next_next->class_id, true, -length_offset - 1, ""};
+                    positions.secondary_stop = {next_next->class_id, true, -length_offset - 1, ""};
                 } else {
+                    if (verbose) {
+                        std::cout << "  Secondary selection: previous static fallback "
+                                  << prev->class_id << "\n";
+                    }
                     positions.secondary_start = {prev->class_id, false, 1, "left_terminal_linked"};
                     positions.secondary_stop = {prev->class_id, false, offset, "left_terminal_linked"};
                 }
@@ -1889,36 +2068,119 @@ private:
             std::string flag_type = prev->type == "variable" ? "var_chained" : "poly_chained";
             positions.primary_start.add_flags = flag_type + "_start";
             positions.primary_stop.add_flags = flag_type + "_stop";
-            // Look for previous static anchor first
+            // Prefer a reliable static anchor; use sequence boundaries only as fallbacks.
             auto prev_static = ordered.find(it->order - 2);  // Look two positions back
             if (prev_static != ordered.end() && prev_static->type == "static" && 
-                prev_static->global_class != "poly_tail") {
+                prev_static->global_class != "poly_tail" &&
+                prev_static->global_class != "start" &&
+                prev_static->global_class != "stop" &&
+                prev_static->expected_length.value_or(0) >= 13) {
+                if (verbose) {
+                    std::cout << "  Secondary selection: previous-previous static anchor "
+                              << prev_static->class_id << "\n";
+                }
                 int prev_length = prev->expected_length.value_or(1);
                 positions.secondary_start = {prev_static->class_id, false, 1 + prev_length, ""};
                 positions.secondary_stop = {prev_static->class_id, false, offset + prev_length, ""};
-            } else if (next != ordered.end() && next->type == "static") {
-                // Then try next static
+            } else if (next != ordered.end() && next->type == "static" &&
+                       next->global_class != "poly_tail" &&
+                       next->global_class != "start" &&
+                       next->global_class != "stop" &&
+                       next->expected_length.value_or(0) >= 13) {
+                if (verbose) {
+                    std::cout << "  Secondary selection: next static anchor "
+                              << next->class_id << "\n";
+                }
+                positions.secondary_start = {next->class_id, true, -offset, ""};
+                positions.secondary_stop = {next->class_id, true, -1, ""};
+            } else if (prev_static != ordered.end() && prev_static->type == "static" &&
+                       (prev_static->global_class == "start" ||
+                        prev_static->global_class == "stop")) {
+                if (verbose) {
+                    std::cout << "  Secondary selection: previous-previous terminal fallback "
+                              << prev_static->class_id << "\n";
+                }
+                int prev_length = prev->expected_length.value_or(1);
+                positions.secondary_start = {prev_static->class_id, false, 1 + prev_length, ""};
+                positions.secondary_stop = {prev_static->class_id, false, offset + prev_length, ""};
+            } else if (next != ordered.end() && next->type == "static" &&
+                       (next->global_class == "start" ||
+                        next->global_class == "stop")) {
+                if (verbose) {
+                    std::cout << "  Secondary selection: next terminal fallback "
+                              << next->class_id << "\n";
+                }
                 positions.secondary_start = {next->class_id, true, -offset, ""};
                 positions.secondary_stop = {next->class_id, true, -1, ""};
             } else if (auto prev_pos = position_map.find(prev->class_id); prev_pos != position_map.end()) {
                 // Finally fall back to chaining
+                if (verbose) {
+                    std::cout << "  Secondary selection: chained through previous "
+                              << prev->class_id << "\n";
+                }
                 int prev_length = prev->expected_length.value_or(1);
                 positions.secondary_start = {prev_pos->second.primary_start.ref_id, false, 1 + prev_length, "chained_start"};
                 positions.secondary_stop = {prev_pos->second.primary_stop.ref_id, false, 1 + prev_length + offset, "chained_stop"};
             }
         }
 
+        auto is_terminal = [](const ReadElement& elem) {
+            return elem.global_class == "start" || elem.global_class == "stop";
+        };
+        auto is_reliable_static = [](const ReadElement& elem) {
+            return elem.type == "static" &&
+                   elem.global_class != "poly_tail" &&
+                   elem.global_class != "start" &&
+                   elem.global_class != "stop" &&
+                   elem.expected_length.value_or(0) >= 13;
+        };
+        const bool primary_is_terminal_linked =
+            is_terminal(*prev) ||
+            (prev->type == "variable" && prev_prev != ordered.end() &&
+             is_terminal(*prev_prev));
+        auto& id_index = by_id();
+        auto secondary = id_index.find(positions.secondary_start.ref_id);
+        if (primary_is_terminal_linked &&
+            positions.secondary_start.ref_id == positions.secondary_stop.ref_id &&
+            secondary != id_index.end() && is_reliable_static(*secondary)) {
+            if (verbose) {
+                std::cout << "  Primary selection: promoting static anchor "
+                          << secondary->class_id
+                          << " over terminal-linked chain\n";
+            }
+            std::swap(positions.primary_start, positions.secondary_start);
+            std::swap(positions.primary_stop, positions.secondary_stop);
+        }
+
         position_map[it->class_id] = positions;
+        if (verbose) {
+            print_position_assignment("Parse Left", it->class_id, positions);
+        }
     }
 
-    void process_right_side(Layout_Struct::index<dir_order_tag>::type::iterator it) {
+    void process_right_side(
+        Layout_Struct::index<dir_order_tag>::type::iterator it,
+        bool verbose
+    ) {
         auto& ordered = by_order();
         auto next = ordered.find(it->order + 1);
 
         auto prev = ordered.find(it->order - 1);
-            auto prev_prev = ordered.find(it->order - 2);
+        auto prev_prev = ordered.find(it->order - 2);
+        auto next_next = ordered.find(it->order + 2);
 
         if (next == ordered.end()) return;
+
+        if (verbose) {
+            print_position_context(
+                "right",
+                *it,
+                prev != ordered.end() ? &*prev : nullptr,
+                &*next,
+                prev_prev != ordered.end() ? &*prev_prev : nullptr,
+                next_next != ordered.end() ? &*next_next : nullptr
+            );
+        }
 
         ReferencePositions positions;
         int offset = it->expected_length.value_or(1);
@@ -1930,18 +2192,36 @@ private:
         // Handle secondary positions based on types
         if (next->type == "static") {
             // Check for static anchor
-            if (prev != ordered.end() && prev->type == "static" && 
-                prev->expected_length.value_or(0) >= 13 && 
+            if (prev != ordered.end() && prev->type == "static" &&
+                prev->expected_length.value_or(0) >= 13 &&
                 prev->global_class != "poly_tail") {
+                    if (verbose) {
+                        std::cout << "  Secondary selection: previous static anchor "
+                                  << prev->class_id << "\n";
+                    }
                     positions.secondary_start = {prev->class_id, false, 1, ""};
                     positions.secondary_stop = {prev->class_id, false, offset, ""};
             } else {
 
-                if(prev->type == "variable" && prev_prev->global_class != "read" && prev_prev->type == "static"){
+                if (prev != ordered.end() && prev->type == "variable" &&
+                    prev_prev != ordered.end() && prev_prev->type == "static" &&
+                    prev_prev->global_class != "read" &&
+                    prev_prev->global_class != "poly_tail" &&
+                    prev_prev->global_class != "start" &&
+                    prev_prev->global_class != "stop" &&
+                    prev_prev->expected_length.value_or(0) >= 13) {
+                    if (verbose) {
+                        std::cout << "  Secondary selection: previous-previous static anchor "
+                                  << prev_prev->class_id << "\n";
+                    }
                     int length_offset = prev->expected_length.value_or(1);
                     positions.secondary_start = {prev_prev->class_id, false, length_offset + 1, ""};
                     positions.secondary_stop = {prev_prev->class_id, false, length_offset + offset, ""};
                 } else {
+                    if (verbose) {
+                        std::cout << "  Secondary selection: next static fallback "
+                                  << next->class_id << "\n";
+                    }
                     positions.secondary_start = {next->class_id, true, -offset, "right_terminal_linked"};
                     positions.secondary_stop = {next->class_id, true, -1, "right_terminal_linked"};
                 }
@@ -1951,29 +2231,101 @@ private:
             positions.primary_start.add_flags = flag_type + "_start";
             positions.primary_stop.add_flags = flag_type + "_stop";
 
-            // Look for next static anchor first
+            // Prefer a reliable static anchor; use sequence boundaries only as fallbacks.
             auto next_static = ordered.find(it->order + 2);  // Look two positions ahead
             if (next_static != ordered.end() && next_static->type == "static" && 
-                next_static->global_class != "poly_tail") {
+                next_static->global_class != "poly_tail" &&
+                next_static->global_class != "start" &&
+                next_static->global_class != "stop" &&
+                next_static->expected_length.value_or(0) >= 13) {
+                if (verbose) {
+                    std::cout << "  Secondary selection: next-next static anchor "
+                              << next_static->class_id << "\n";
+                }
                 int next_length = next->expected_length.value_or(1);
                 positions.secondary_start = {next_static->class_id, true, -next_length - offset, ""};
-                positions.secondary_stop = {next_static->class_id, true,  -next_length - 1, ""};
-            } else if (prev != ordered.end() && prev->type == "static") {
-                // Then try previous static
+                positions.secondary_stop = {next_static->class_id, true, -next_length - 1, ""};
+            } else if (prev != ordered.end() && prev->type == "static" &&
+                       prev->global_class != "poly_tail" &&
+                       prev->global_class != "start" &&
+                       prev->global_class != "stop" &&
+                       prev->expected_length.value_or(0) >= 13) {
+                if (verbose) {
+                    std::cout << "  Secondary selection: previous static anchor "
+                              << prev->class_id << "\n";
+                }
+                positions.secondary_start = {prev->class_id, false, 1, ""};
+                positions.secondary_stop = {prev->class_id, false, offset, ""};
+            } else if (next_static != ordered.end() && next_static->type == "static" &&
+                       (next_static->global_class == "start" ||
+                        next_static->global_class == "stop")) {
+                if (verbose) {
+                    std::cout << "  Secondary selection: next-next terminal fallback "
+                              << next_static->class_id << "\n";
+                }
+                int next_length = next->expected_length.value_or(1);
+                positions.secondary_start = {next_static->class_id, true, -next_length - offset, ""};
+                positions.secondary_stop = {next_static->class_id, true, -next_length - 1, ""};
+            } else if (prev != ordered.end() && prev->type == "static" &&
+                       (prev->global_class == "start" ||
+                        prev->global_class == "stop")) {
+                if (verbose) {
+                    std::cout << "  Secondary selection: previous terminal fallback "
+                              << prev->class_id << "\n";
+                }
                 positions.secondary_start = {prev->class_id, false, 1, ""};
                 positions.secondary_stop = {prev->class_id, false, offset, ""};
             } else if (auto next_pos = position_map.find(next->class_id); next_pos != position_map.end()) {
                 // Finally fall back to chaining
+                if (verbose) {
+                    std::cout << "  Secondary selection: chained through next "
+                              << next->class_id << "\n";
+                }
                 int next_length = next->expected_length.value_or(1);
                 positions.secondary_start = {next_pos->second.primary_start.ref_id, true, -offset - next_length, "chained_start"};
                 positions.secondary_stop = {next_pos->second.primary_stop.ref_id, true, -next_length, "chained_stop"};
             }
         }
 
+        auto is_terminal = [](const ReadElement& elem) {
+            return elem.global_class == "start" || elem.global_class == "stop";
+        };
+        auto is_reliable_static = [](const ReadElement& elem) {
+            return elem.type == "static" &&
+                   elem.global_class != "poly_tail" &&
+                   elem.global_class != "start" &&
+                   elem.global_class != "stop" &&
+                   elem.expected_length.value_or(0) >= 13;
+        };
+        const bool primary_is_terminal_linked =
+            is_terminal(*next) ||
+            (next->type == "variable" && next_next != ordered.end() &&
+             is_terminal(*next_next));
+        auto& id_index = by_id();
+        auto secondary = id_index.find(positions.secondary_start.ref_id);
+        if (primary_is_terminal_linked &&
+            positions.secondary_start.ref_id == positions.secondary_stop.ref_id &&
+            secondary != id_index.end() && is_reliable_static(*secondary)) {
+            if (verbose) {
+                std::cout << "  Primary selection: promoting static anchor "
+                          << secondary->class_id
+                          << " over terminal-linked chain\n";
+            }
+            std::swap(positions.primary_start, positions.secondary_start);
+            std::swap(positions.primary_stop, positions.secondary_stop);
+        }
+
         position_map[it->class_id] = positions;
+        if (verbose) {
+            print_position_assignment("Parse Right", it->class_id, positions);
+        }
     }
 
-    void process_reads(Layout_Struct::index<dir_order_tag>::type::iterator start, Layout_Struct::index<dir_order_tag>::type::iterator end) {
+    void process_reads(
+        Layout_Struct::index<dir_order_tag>::type::iterator start,
+        Layout_Struct::index<dir_order_tag>::type::iterator end,
+        bool verbose
+    ) {
         auto& ordered = by_order();
         // First find the read in this direction
         auto read_it = start;
@@ -1983,28 +2335,37 @@ private:
             }
         }
         if (read_it == end) return;
+        if (verbose) {
+            std::cout << "\n[position_map] Processing direction "
+                      << read_it->direction << " around read "
+                      << read_it->class_id << "\n";
+        }
         // Process elements before the read with left-side anchoring
         for (auto it = start; it != read_it; ++it) {
             if (it->type == "variable") {
-                process_left_side(it);
+                process_left_side(it, verbose);
             }
         }
         // Process read positions
         auto prev = ordered.find(read_it->order - 1);
         if (prev != ordered.end()) {
-            find_read_positions(*read_it, *prev);
+            find_read_positions(*read_it, *prev, verbose);
         }
         // Process elements after the read with right-side anchoring
         auto after_read = read_it;
         ++after_read;
         for (auto it = after_read; it != end; ++it) {
             if (it->type == "variable") {
-                process_right_side(it);
+                process_right_side(it, verbose);
             }
         }
     }
     
-    void find_read_positions(const ReadElement& read, const ReadElement& prev) {
+    void find_read_positions(
+        const ReadElement& read,
+        const ReadElement& prev,
+        bool verbose
+    ) {
         auto& ordered = by_order();
         ReferencePositions positions;
         positions.primary_start = {prev.class_id, false, 1, ""};
@@ -2012,6 +2373,17 @@ private:
         auto next_it = ordered.find(read.order + 1);
         auto next_next_it = ordered.find(read.order + 2);
         auto pre_prev_it = ordered.find(read.order - 2);
+
+        if (verbose) {
+            print_position_context(
+                "read",
+                read,
+                &prev,
+                next_it != ordered.end() ? &*next_it : nullptr,
+                pre_prev_it != ordered.end() ? &*pre_prev_it : nullptr,
+                next_next_it != ordered.end() ? &*next_next_it : nullptr
+            );
+        }
 
         if (next_it != ordered.end()) {
             positions.primary_stop = {next_it->class_id, true, -1, ""};
@@ -2038,7 +2410,17 @@ private:
             };
         }
 
+        if (positions.secondary_start.ref_id.empty()) {
+            positions.secondary_start = positions.primary_start;
+        }
+        if (positions.secondary_stop.ref_id.empty()) {
+            positions.secondary_stop = positions.primary_stop;
+        }
+
         position_map[read.class_id] = positions;
+        if (verbose) {
+            print_position_assignment("Read", read.class_id, positions);
+        }
     }
 
     const auto& get_pos_map() const { 

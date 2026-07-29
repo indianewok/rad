@@ -153,7 +153,7 @@ Whitelist/correction knobs:
 
 Auto-whitelist (run `scan-wl` + `demux` in one command):
 
-- `-A, --auto-wl` — before demultiplexing, scan the FASTQ for the barcodes actually present (the `scan-wl` step) and demux against that detected list instead of a full reference. Single-barcode layouts only; split-barcode kits (e.g. Visium HD) should run `rad scan-wl` manually. The adapter and barcode length are derived from the layout; the reference for validation is `-k`/`-g` if given, else the layout's own kit, else de-novo. Writes `<prefix>_scanwl.csv` / `<prefix>_scanwl.txt`.
+- `-A, --auto-wl` — before demultiplexing, scan the FASTQ for the barcodes actually present (the `scan-wl` step). RAD retains the scan reference as the **global** barcode catalog and loads the detected list as the **true-cell** whitelist. Consequently, an exact catalog barcode omitted by cell calling is filtered rather than fuzzy-corrected into another called cell. Single-barcode layouts only; split-barcode kits (e.g. Visium HD) should run `rad scan-wl` manually. The adapter and barcode length are derived from the layout; the reference is `-k`/`-g` if given, else the layout's own kit, else de-novo. Writes `<prefix>_scanwl.csv` / `<prefix>_scanwl.txt`.
 - `--scan-adapter` — override the derived scan adapter sequence
 - `--scan-bc-len` — override the derived barcode length
 - `--scan-max-error` (default `0.3`) — adapter max edit-distance ratio for the scan
