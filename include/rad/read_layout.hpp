@@ -3130,9 +3130,22 @@ private:
                     continue;
                 }
 
-                double mean = misalignment_stats[adapter_id].mean;
-                if(mean < 1.0){
-                    mean = seq.length() * 0.25;
+                auto& misalignment = misalignment_stats[adapter_id];
+                double mean = misalignment.mean;
+                constexpr size_t kMinMisalignmentObservations = 100;
+                constexpr double kFallbackAdapterErrorFraction = 0.30;
+                const int fallback_threshold = std::max(
+                    1,
+                    static_cast<int>(std::ceil(
+                        static_cast<double>(seq.length()) *
+                        kFallbackAdapterErrorFraction)));
+                const bool use_fallback_threshold =
+                    misalignment.count < kMinMisalignmentObservations ||
+                    !std::isfinite(mean) ||
+                    mean < 1.0;
+                if (use_fallback_threshold) {
+                    mean = static_cast<double>(fallback_threshold);
+                    sd = 0.0;
                 }
 
                 double misal_start = 0.0;
@@ -3152,6 +3165,12 @@ private:
                 << "| original seq                 | " << seq << "\n"
                 << "| misalignment mean            | " << mean << "\n"
                 << "| misalignment sd              | " << sd << "\n"
+                << "| misalignment observations    | " << misalignment.count << "\n"
+                << "| threshold source             | "
+                << (use_fallback_threshold
+                        ? "fallback ceil(0.30 * adapter length)"
+                        : "observed misalignment distribution")
+                << "\n"
                 << "| perfect adapter count        | " << adapter_stats[adapter_id].count << "\n"
                 << "| forward count                | " << adapter_stats[adapter_id].dir_counts.first << "\n"
                 << "| reverse count                | " << adapter_stats[adapter_id].dir_counts.second << "\n"
@@ -3161,11 +3180,16 @@ private:
                 << "| misaligned stop pos (mean)   | " << misalign_pos.stop_stats.first << "\n"
                 << "+------------------------------+----------------------+\n";
 
-                std::tuple<int, int, int> threshold{
-                    static_cast<int>(std::round(mean - sd)),
-                    static_cast<int>(std::floor(mean)),
-                    static_cast<int>(std::round(mean + sd))
-                };
+                std::tuple<int, int, int> threshold =
+                    use_fallback_threshold
+                        ? std::make_tuple(
+                              fallback_threshold,
+                              fallback_threshold,
+                              fallback_threshold)
+                        : std::make_tuple(
+                              static_cast<int>(std::round(mean - sd)),
+                              static_cast<int>(std::floor(mean)),
+                              static_cast<int>(std::round(mean + sd)));
                 
 
                 by_id_index.modify(it, [&](ReadElement& elem) {
