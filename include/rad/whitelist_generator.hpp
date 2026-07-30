@@ -404,6 +404,12 @@ static inline std::optional<adapter_match> find_adapter_match(
     bool exact_match_only,
     const EdlibAlignConfig& forward_config,
     const EdlibAlignConfig& rc_config) {
+    // Edlib's HW/LOC empty-target result reports one location but does not
+    // allocate startLocations. Treat an empty read as having no adapter.
+    if (sequence.empty()) {
+        return std::nullopt;
+    }
+
     if (exact_match_only) {
         const auto forward_pos = sequence.find(adapter_seq);
         if (forward_pos != std::string::npos &&
@@ -433,7 +439,8 @@ static inline std::optional<adapter_match> find_adapter_match(
     EdlibAlignResult result = edlibAlign(
         adapter_seq.c_str(), adapter_seq.length(),
         sequence.data(), sequence.length(), forward_config);
-    if (result.status == EDLIB_STATUS_OK && result.numLocations > 0) {
+    if (result.status == EDLIB_STATUS_OK && result.numLocations > 0 &&
+        result.startLocations != nullptr) {
         const int position = result.startLocations[0];
         edlibFreeAlignResult(result);
         return adapter_match{position, false};
@@ -450,7 +457,8 @@ static inline std::optional<adapter_match> find_adapter_match(
     result = edlibAlign(
         adapter_seq_rc.c_str(), adapter_seq_rc.length(),
         sequence.data(), sequence.length(), rc_config);
-    if (result.status == EDLIB_STATUS_OK && result.numLocations > 0) {
+    if (result.status == EDLIB_STATUS_OK && result.numLocations > 0 &&
+        result.startLocations != nullptr) {
         const int position = result.startLocations[0];
         edlibFreeAlignResult(result);
         return adapter_match{position, true};

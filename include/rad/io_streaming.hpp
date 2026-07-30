@@ -429,6 +429,7 @@ public:
     file_streaming& files;
     int read_error_code_ = 0;
     std::string read_error_path_;
+    uint64_t empty_sequences_skipped_ = 0;
     
     explicit read_streaming(file_streaming& f) : files(f) {}
 
@@ -444,6 +445,24 @@ public:
         return read_error_path_;
     }
 
+    uint64_t empty_sequences_skipped() const {
+        return empty_sequences_skipped_;
+    }
+
+    void note_empty_sequence(file_streaming::file_pointer& fp) {
+        ++empty_sequences_skipped_;
+        if (empty_sequences_skipped_ <= 10) {
+            const char* name = fp.name_s();
+            std::cerr << "Warning: skipping zero-length sequence record"
+                      << (name ? " '" + std::string(name) + "'" : "")
+                      << " in " << files.current_file_path() << "\n";
+        } else if (empty_sequences_skipped_ == 11) {
+            std::cerr
+                << "Warning: additional zero-length sequence warnings "
+                   "suppressed\n";
+        }
+    }
+
     /**
      * @brief Get a view of the next sequence without copying read metadata.
      *
@@ -455,7 +474,11 @@ public:
         while (files.current_file || files.open_next_file()) {
             auto& fp = files.current_file;
             int l = fp->kseq_read_any();
-            if (l >= 0) {
+            if (l == 0) {
+                note_empty_sequence(*fp);
+                continue;
+            }
+            if (l > 0) {
                 return std::string_view(
                     fp->seq_s(), static_cast<size_t>(l));
             }
@@ -482,7 +505,11 @@ public:
         while (files.current_file || files.open_next_file()) {
             auto& fp = files.current_file;
             int l = fp->kseq_read_any();
-            if (l >= 0) {
+            if (l == 0) {
+                note_empty_sequence(*fp);
+                continue;
+            }
+            if (l > 0) {
                 sequence r;
                 r.id = fp->name_s();
                 r.seq = fp->seq_s();
