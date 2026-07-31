@@ -1,5 +1,6 @@
 #pragma once
 #include "rad_headers.h"
+#include <boost/math/distributions/poisson.hpp>
 
 struct extracted_bc {
     std::string read_id;
@@ -1345,6 +1346,35 @@ struct bc_wl_stats {
         log1p_ncpm_ztpois = zt_cdf * 100.0;
     }
 
+    // Raw barcode counts can be much larger than the transformed observations
+    // used by the legacy path.  Evaluate their Poisson CDF with Boost's
+    // incomplete-gamma implementation instead of looping from zero through k.
+    void calculate_bc_ztpois_pct(uint64_t k, double lambda) {
+        if (k == 0 || !(lambda > 0.0) || !std::isfinite(lambda)) {
+            log1p_ncpm_ztpois = 0.0;
+            return;
+        }
+
+        const boost::math::poisson_distribution<double> distribution(lambda);
+        const double k_as_double = static_cast<double>(k);
+        const double prob_zero = std::exp(-lambda);
+        const double truncation_denom = -std::expm1(-lambda);
+        const double upper_tail = boost::math::cdf(
+            boost::math::complement(distribution, k_as_double));
+
+        double zt_cdf = 0.0;
+        if (upper_tail <= truncation_denom / 2.0) {
+            zt_cdf = 1.0 - upper_tail / truncation_denom;
+        } else {
+            const double regular_cdf =
+                boost::math::cdf(distribution, k_as_double);
+            zt_cdf = (regular_cdf - prob_zero) / truncation_denom;
+        }
+
+        zt_cdf = std::max(0.0, std::min(1.0, zt_cdf));
+        log1p_ncpm_ztpois = zt_cdf * 100.0;
+    }
+
 };
 
 // Silverman's bandwidth calculation
@@ -1554,10 +1584,10 @@ right_tail_area(const std::vector<double>& xs, const std::vector<double>& ys)
 //
 //   H(x) = (1 - exp(-x)) f(x) / S(x).
 //
-// The hazard curve is also used below to decide whether RAD's legacy floor is
-// hiding a stable left-hand separation.  A separate selector may accept that
-// separation as the final boundary only when it precedes the expanded saddle
-// and rescues no provisional ZT-Poisson background barcodes.
+// The hazard curve is also used below to decide whether RAD's preliminary gate
+// has hidden a stronger whole-whitelist boundary.  A prominent minimum at or
+// below that gate may own the final rank-like cutoff; minima above the gate
+// remain diagnostic because they would only tighten the existing callset.
 struct weighted_score {
     double x = 0.0;
     size_t multiplicity = 0;  // number of unique barcodes, never read depth
@@ -2478,18 +2508,21 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         unique_matches++;
     }
 
-    // 4) zt_poisson on log1p_ncpm
+    // 4) zt_poisson on raw barcode counts
     double lambda = 0.0;
     if (!barcode_stats.empty()) {
         double sum = 0.0;
-        for (const auto& s : barcode_stats) sum += s.log1p_ncpm;
+        for (const auto& s : barcode_stats) {
+            sum += static_cast<double>(s.count);
+        }
         lambda = sum / barcode_stats.size();
     }
-    std::cout << "Calculated lambda for zero-truncated Poisson (log1p_ncpm): " << lambda << "\n";
+    std::cout << "Calculated lambda for zero-truncated Poisson (raw count): "
+              << lambda << "\n";
 
     // ZT-Poisson percentile for each barcode
     for (auto& s : barcode_stats) {
-        s.calculate_bc_ztpois_pct(s.log1p_ncpm, lambda);
+        s.calculate_bc_ztpois_pct(s.count, lambda);
     }
 
     // 5) Above-floor population (log1p scale).  The legacy floor remains the
@@ -2541,7 +2574,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
     const adaptive_saddle_result adaptive_saddle =
         evaluate_adaptive_hazard_saddle(
             adaptive_floor, barcode_stats, ZTPOIS_RULE);
-    const double FLOOR = adaptive_saddle.applied
+    double FLOOR = adaptive_saddle.applied
         ? adaptive_saddle.hazard_floor
         : LEGACY_FLOOR;
 
@@ -2606,6 +2639,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
     bool have_threshold = false;
     bool force_all_af_single_peak = false;
     bool force_all_af_adaptive_hazard = false;
+    bool force_final_hazard = false;
 
     double t_saddle = std::numeric_limits<double>::quiet_NaN();
     bool   have_saddle = false;
@@ -2672,6 +2706,170 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
             std::cout << "[ZT-Poisson fallback] No items ≥ " << ZTPOIS_RULE
                       << "% — using FLOOR = " << FLOOR << "\n";
         }
+    }
+
+    // 7b) WHOLE-WHITELIST HAZARD SELECTOR
+    //
+    // The preliminary saddle/fallback gate supplies the bandwidth and an
+    // upper search context, but it does not own the result when the expanded
+    // whole-whitelist hazard contains a stronger pre-gate boundary.  Prefer a
+    // minimum associated with the preliminary gate.  A below-floor minimum
+    // must either match RAD's stable three-bandwidth feature or lie within
+    // half a hazard bandwidth of the current floor, where endpoint smoothing
+    // can erase a real boundary.  Above-gate minima remain diagnostic:
+    // selecting them could only remove barcodes already accepted by the
+    // preliminary selector.
+    const double preliminary_threshold = threshold;
+    const double preliminary_floor = FLOOR;
+    upper_tail_hazard_result hazard_result;
+    if (af_x.size() >= 10 && sd.bw > 0.0 &&
+        std::isfinite(sd.bw)) {
+        double upper_mode_bound =
+            std::numeric_limits<double>::infinity();
+        if (sd.ok && std::isfinite(sd.right_peak)) {
+            upper_mode_bound = sd.right_peak;
+        } else if (std::isfinite(sd.sole_peak)) {
+            upper_mode_bound = sd.sole_peak;
+        } else if (!af_x.empty()) {
+            upper_mode_bound =
+                *std::max_element(af_x.begin(), af_x.end());
+        }
+
+        hazard_result = compute_upper_tail_adjusted_hazard(
+            hazard_scores, sd.bw, preliminary_floor,
+            preliminary_threshold, upper_mode_bound,
+            /*search_min=*/1.0, /*min_survivors=*/50,
+            /*min_prominence=*/0.05);
+    }
+
+    auto print_hazard_candidate =
+        [](const char* label,
+           const std::optional<hazard_candidate>& candidate) {
+            std::cout << "[hazard " << label << "] ";
+            if (!candidate) {
+                std::cout << "none\n";
+                return;
+            }
+            std::cout << "x=" << candidate->x
+                      << "  H=" << candidate->hazard
+                      << "  empirical_rank="
+                      << candidate->estimated_rank
+                      << "  prominence="
+                      << candidate->prominence << "\n";
+        };
+
+    if (verbose) {
+        std::cout
+            << "\n[upper-tail hazard diagnostic] "
+            << (hazard_result.ok ? "computed" : "unavailable")
+            << " (preliminary RAD gate " << preliminary_threshold << ")"
+            << "\n         source_barcodes="
+            << hazard_result.n_barcodes
+            << "  distinct_scores="
+            << hazard_result.n_distinct_scores
+            << "  bw=" << hazard_result.bw
+            << "  grid_step=" << hazard_result.grid_step
+            << "  prominent_minima="
+            << hazard_result.n_prominent_minima << "\n";
+        print_hazard_candidate(
+            "below-floor", hazard_result.below_floor);
+        print_hazard_candidate(
+            "gate-associated", hazard_result.associated_with_gate);
+        print_hazard_candidate(
+            "above-gate", hazard_result.above_gate);
+    }
+
+    std::optional<hazard_candidate> selected_hazard;
+    const char* selected_hazard_source = nullptr;
+    const char* selected_hazard_acceptance = nullptr;
+    bool below_floor_considered = false;
+    bool below_floor_stable_match = false;
+    bool below_floor_adjacent = false;
+    double below_floor_gap = std::numeric_limits<double>::quiet_NaN();
+    double below_floor_adjacency_limit =
+        std::numeric_limits<double>::quiet_NaN();
+    if (hazard_result.associated_with_gate &&
+        hazard_result.associated_with_gate->x <
+            preliminary_threshold) {
+        selected_hazard = hazard_result.associated_with_gate;
+        selected_hazard_source = "gate-associated";
+        selected_hazard_acceptance = "gate-associated";
+    } else if (hazard_result.below_floor &&
+               hazard_result.below_floor->x <
+                   preliminary_threshold) {
+        below_floor_considered = true;
+        below_floor_gap =
+            preliminary_floor - hazard_result.below_floor->x;
+        below_floor_adjacency_limit = 0.5 * hazard_result.bw;
+        below_floor_adjacent =
+            below_floor_gap >= 0.0 &&
+            below_floor_adjacency_limit > 0.0 &&
+            below_floor_gap <= below_floor_adjacency_limit;
+
+        // candidate_x_10 is the same-bandwidth member of the stable
+        // 0.8x/1.0x/1.25x triplet.  Require the selected whole-whitelist
+        // minimum to match that feature rather than allowing an unrelated
+        // stable trough elsewhere in the sub-floor interval to authorize it.
+        const double stable_match_limit =
+            0.5 * adaptive_bandwidth;
+        below_floor_stable_match =
+            adaptive_floor.candidate_ready &&
+            stable_match_limit > 0.0 &&
+            std::isfinite(adaptive_floor.candidate_x_10) &&
+            std::fabs(hazard_result.below_floor->x -
+                      adaptive_floor.candidate_x_10) <=
+                stable_match_limit;
+
+        if (below_floor_stable_match || below_floor_adjacent) {
+            selected_hazard = hazard_result.below_floor;
+            selected_hazard_source = "below-floor";
+            selected_hazard_acceptance =
+                below_floor_stable_match
+                    ? "three-bandwidth-stable"
+                    : "floor-adjacent";
+        }
+    }
+
+    if (selected_hazard) {
+        FLOOR = selected_hazard->x;
+        threshold = selected_hazard->x;
+        have_threshold = true;
+        force_final_hazard = true;
+        rule = "guarded_upper_tail_hazard_minimum";
+
+        // The accepted hazard can sit on either side of the old hard floor.
+        // Rebuild the population used by every downstream diagnostic so the
+        // public above-floor set and final whitelist describe the same cutoff.
+        af_x.clear();
+        for (const auto& s : barcode_stats) {
+            if (s.log1p_ncpm >= FLOOR) {
+                af_x.push_back(s.log1p_ncpm);
+            }
+        }
+
+        std::cout
+            << "[upper-tail hazard selector] accepted "
+            << selected_hazard_source
+            << " x=" << selected_hazard->x
+            << "  empirical_rank=" << selected_hazard->estimated_rank
+            << "  previous_floor=" << preliminary_floor
+            << "  previous_gate=" << preliminary_threshold
+            << "  acceptance=" << selected_hazard_acceptance
+            << "\n";
+    } else {
+        if (below_floor_considered) {
+            std::cout
+                << "[upper-tail hazard guard] rejected below-floor x="
+                << hazard_result.below_floor->x
+                << "  three_bandwidth_match="
+                << (below_floor_stable_match ? "true" : "false")
+                << "  floor_gap=" << below_floor_gap
+                << "  adjacency_limit="
+                << below_floor_adjacency_limit << "\n";
+        }
+        std::cout
+            << "[upper-tail hazard selector] no eligible pre-gate minimum; "
+            << "floor/gate remain " << FLOOR << "/" << threshold << "\n";
     }
 
     // 8) DENSITY CALCS : AF mixture using a provisional LR/BG split (ZT-Poisson 95)
@@ -2741,12 +2939,15 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
             std::cout << "[t_purity50] could not compute.\n";
         }
         if ((force_all_af_single_peak ||
-             force_all_af_adaptive_hazard) &&
+             force_all_af_adaptive_hazard ||
+             force_final_hazard) &&
             have_tpurity50) {
             std::cout << "[t_purity50] diagnostic ignored because "
-                      << (force_all_af_adaptive_hazard
-                              ? "the accepted pre-saddle hazard"
-                              : "the single-peak ZT-Poisson guard")
+                      << (force_final_hazard
+                              ? "the whole-whitelist hazard owns the cutoff"
+                              : (force_all_af_adaptive_hazard
+                                    ? "the accepted pre-saddle hazard"
+                                    : "the single-peak ZT-Poisson guard"))
                       << " forced an above-floor result\n";
             have_tpurity50 = false;
         } else if (t_purity50 > sd.right_peak) {
@@ -2755,13 +2956,13 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
             have_tpurity50 = false;
         }
 
-        // If we have t_purity50 (and maybe a saddle), choose the greater of the two.
+        // A purity boundary derived from the provisional ZT-Poisson split is
+        // not independent evidence and must not override a stable empirical
+        // saddle.  Keep it as a diagnostic when the saddle exists; retain it
+        // only as a selector for the no-saddle case.
         if (have_tpurity50 && have_saddle) {
-            double prev = threshold;
-            threshold = std::max(t_saddle, t_purity50);
-            rule = "max(saddle, t_purity50)";
-            std::cout << "[gate] prev=" << prev << "  → chosen=max(" << t_saddle
-                      << ", " << t_purity50 << ") = " << threshold << "\n";
+            std::cout << "[t_purity50] diagnostic only; stable saddle "
+                      << t_saddle << " remains the final threshold\n";
         } else if (have_tpurity50 && !have_saddle) {
             double prev = threshold;
             threshold = std::max({t_purity50, FLOOR, prev});
@@ -2771,95 +2972,6 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         std::cout << "\n[AF mixture diagnostics] " << "  |AF|=" << af_x.size()
                   << "  |LR_in_AF|=" << lr_x.size() << "  |BG_in_AF|=" << bg_x.size() <<   "\n";
         std::cout << "\n[AF mixture diagnostics] Skipped (need ≥10 in AF/LR/BG).\n";
-    }
-
-    // Expanded-context smooth upper-tail hazard diagnostic.
-    // This is intentionally verbose-only and cannot mutate RAD's threshold.
-    if (verbose) {
-        if (af_x.size() >= 10 && sd.bw > 0.0 &&
-            std::isfinite(sd.bw)) {
-            double upper_mode_bound =
-                std::numeric_limits<double>::infinity();
-            if (sd.ok && std::isfinite(sd.right_peak)) {
-                upper_mode_bound = sd.right_peak;
-            } else if (std::isfinite(sd.sole_peak)) {
-                upper_mode_bound = sd.sole_peak;
-            } else if (!af_x.empty()) {
-                upper_mode_bound =
-                    *std::max_element(af_x.begin(), af_x.end());
-            }
-
-            const upper_tail_hazard_result hazard_result =
-                compute_upper_tail_adjusted_hazard(
-                    hazard_scores, sd.bw, FLOOR, threshold,
-                    upper_mode_bound, /*search_min=*/1.0,
-                    /*min_survivors=*/50,
-                    /*min_prominence=*/0.05);
-
-            std::cout
-                << "\n[upper-tail hazard diagnostic] "
-                << (hazard_result.ok ? "computed" : "unavailable")
-                << " (diagnostic only; RAD gate remains " << threshold << ")"
-                << "\n         source_barcodes="
-                << hazard_result.n_barcodes
-                << "  distinct_scores="
-                << hazard_result.n_distinct_scores
-                << "  bw=" << hazard_result.bw
-                << "  grid_step=" << hazard_result.grid_step
-                << "  prominent_minima="
-                << hazard_result.n_prominent_minima << "\n";
-
-            auto print_hazard_candidate =
-                [](const char* label,
-                   const std::optional<hazard_candidate>& candidate) {
-                    std::cout << "[hazard " << label << "] ";
-                    if (!candidate) {
-                        std::cout << "none\n";
-                        return;
-                    }
-                    std::cout << "x=" << candidate->x
-                              << "  H=" << candidate->hazard
-                              << "  empirical_rank="
-                              << candidate->estimated_rank
-                              << "  prominence="
-                              << candidate->prominence << "\n";
-                };
-
-            print_hazard_candidate(
-                "below-floor", hazard_result.below_floor);
-            print_hazard_candidate(
-                "gate-associated",
-                hazard_result.associated_with_gate);
-            if (hazard_result.associated_with_gate) {
-                const double hazard_gate =
-                    hazard_result.associated_with_gate->x;
-                const double interval_lo =
-                    std::min(hazard_gate, threshold);
-                const double interval_hi =
-                    std::max(hazard_gate, threshold);
-                size_t changed_if_substituted = 0;
-                for (const auto& s : barcode_stats) {
-                    if (s.log1p_ncpm >= FLOOR &&
-                        s.log1p_ncpm >= interval_lo &&
-                        s.log1p_ncpm < interval_hi) {
-                        ++changed_if_substituted;
-                    }
-                }
-                std::cout
-                    << "[hazard gate comparison] |x_hazard-x_RAD|="
-                    << std::fabs(hazard_gate - threshold)
-                    << "  barcodes_between="
-                    << changed_if_substituted
-                    << " (RAD decision retained)\n";
-            }
-            print_hazard_candidate(
-                "above-gate", hazard_result.above_gate);
-        } else {
-            std::cout
-                << "\n[upper-tail hazard diagnostic] unavailable "
-                   "(need >=10 above-floor barcodes and a valid AF bandwidth; "
-                   "RAD decision retained)\n";
-        }
     }
 
     // Prepare the "between" band for annotation (only when both lines exist)
@@ -2920,14 +3032,18 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
     const bool narrow_both   = have_left && have_right &&
                                (left_range <= SPREAD_EPS) && (right_range <= SPREAD_EPS);
     const bool narrow_full   = (full_range > 0.0) && (full_range <= 2.0 * SPREAD_EPS);
-    const bool collapse_all_af = force_all_af_single_peak ||
-                                 force_all_af_adaptive_hazard ||
-                                 ((af_total >= 10) &&
-                                  ((left_frac <= LEFT_TAIL_MAX_FRAC) || narrow_both || narrow_full));
+    const bool collapse_all_af =
+        !force_final_hazard &&
+        (force_all_af_single_peak ||
+         force_all_af_adaptive_hazard ||
+         ((af_total >= 10) &&
+          ((left_frac <= LEFT_TAIL_MAX_FRAC) ||
+           narrow_both || narrow_full)));
 
     // Budget rescue: only fires when collapse didn't, and left_frac is in the
     // borderline (LEFT_TAIL_MAX_FRAC, LEFT_TAIL_BUDGET_MAX_FRAC] window.
-    const bool use_left_budget = (af_total >= 10) && !collapse_all_af
+    const bool use_left_budget = !force_final_hazard
+                              && (af_total >= 10) && !collapse_all_af
                               && (left_frac >  LEFT_TAIL_MAX_FRAC)
                               && (left_frac <= LEFT_TAIL_BUDGET_MAX_FRAC);
     std::unordered_set<std::string> budget_rescue;
