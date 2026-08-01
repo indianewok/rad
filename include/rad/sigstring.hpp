@@ -1562,6 +1562,18 @@ namespace barcode_correction {
     }
 };
 
+struct sigalign_run_stats {
+    size_t total_reads = 0;
+    size_t reads_passing_filter = 0;
+    size_t reads_demultiplexed = 0;
+    size_t records_serialized = 0;
+    size_t chunks_processed = 0;
+    double wall_time_seconds = 0.0;
+    double process_time_seconds = 0.0;
+    double output_staging_time_seconds = 0.0;
+    double overhead_time_seconds = 0.0;
+};
+
 /**
  * @class SigString
  * @brief Container for a sequencing read and its aligned elements with multi-indexed access
@@ -3955,7 +3967,7 @@ public:
  * @param write_debug flag to enable writing debug output files
  * @param mode `std::string` correction mode for barcode correction (offensive or defensive, which whitelist to check first)
  */
-    static void sigalign(
+    static sigalign_run_stats sigalign(
         const std::string& fastq_path, 
         const ReadLayout& layout, 
         const std::string& output_prefix, 
@@ -4023,6 +4035,8 @@ public:
 
     std::atomic<size_t> total_reads{0};
     std::atomic<size_t> total_passed{0};
+    std::atomic<size_t> total_demultiplexed{0};
+    std::atomic<size_t> total_records_written{0};
     std::atomic<size_t> chunk_id_ctr{0};
     std::atomic<long long> total_process_time_ms{0};
     std::atomic<long long> total_queue_time_ms{0};
@@ -4036,11 +4050,13 @@ public:
         }
 
         const size_t my_chunk_id = ++chunk_id_ctr;
-        const auto wall_t0 = std::chrono::high_resolution_clock::now();
+        const auto wall_t0 = std::chrono::steady_clock::now();
 
         // Thread-local buffers for serialized FASTQ output
         std::vector<std::string> thread_buffers(num_threads);
         std::atomic<size_t> passed_count{0};
+        std::atomic<size_t> demultiplexed_count{0};
+        std::atomic<size_t> records_written_count{0};
         
         std::vector<SigString> debug_sigs;
         if (write_debug) {
@@ -4054,7 +4070,7 @@ public:
         #pragma omp parallel num_threads(num_threads)
         {
             int tid = omp_get_thread_num();
-            auto thread_start = std::chrono::high_resolution_clock::now();
+            auto thread_start = std::chrono::steady_clock::now();
             
             // Pre-allocate thread-local buffer
 
@@ -4086,13 +4102,20 @@ public:
                     }
                     // Serialize directly to thread buffer--mod this to pigz_write?
                     if (sig.read_type != "filtered" && sig.read_type != "skipped") {
-                        sig.to_fastqa_append(thread_buffers[tid], rc_umi);
                         passed_count.fetch_add(1, std::memory_order_relaxed);
+                        const size_t records_written =
+                            sig.to_fastqa_append(thread_buffers[tid], rc_umi);
+                        if (records_written > 0) {
+                            demultiplexed_count.fetch_add(
+                                1, std::memory_order_relaxed);
+                            records_written_count.fetch_add(
+                                records_written, std::memory_order_relaxed);
+                        }
                     }
                 }  // sig destroyed here
             }
             
-            auto thread_end = std::chrono::high_resolution_clock::now();
+            auto thread_end = std::chrono::steady_clock::now();
             thread_times[tid] = std::chrono::duration_cast<std::chrono::milliseconds>(
                 thread_end - thread_start).count();
 
@@ -4107,7 +4130,7 @@ public:
             }
         }
 
-        const auto wall_t1 = std::chrono::high_resolution_clock::now();
+        const auto wall_t1 = std::chrono::steady_clock::now();
         
         // Calculate actual work time (max across all threads)
         double actual_process_ms = 0.0;
@@ -4138,11 +4161,13 @@ public:
             }
         }
 
-        const auto wall_t2 = std::chrono::high_resolution_clock::now();
+        const auto wall_t2 = std::chrono::steady_clock::now();
 
         // Update counters
         total_reads += chunk.size();
         total_passed += passed_count.load();
+        total_demultiplexed += demultiplexed_count.load();
+        total_records_written += records_written_count.load();
 
         const double wall_process_ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall_t1 - wall_t0).count();
         const double queue_ms = std::chrono::duration_cast<std::chrono::milliseconds>(wall_t2 - wall_t1).count();
@@ -4228,10 +4253,19 @@ public:
     std::cout << "[sigalign] Total reads processed: " << total_reads.load() << "\n";
     std::cout << "[sigalign] Reads passing filter: " << total_passed.load() << " ("
               << (total_reads > 0 ? (total_passed.load() * 100.0 / (double)total_reads.load()) : 0.0) << "%)\n";
+    std::cout << "[sigalign] Reads demultiplexed: "
+              << total_demultiplexed.load() << " ("
+              << (total_reads > 0
+                      ? (total_demultiplexed.load() * 100.0 /
+                         static_cast<double>(total_reads.load()))
+                      : 0.0)
+              << "%)\n";
+    std::cout << "[sigalign] Output records serialized: "
+              << total_records_written.load() << "\n";
     std::cout << "[sigalign] Timing breakdown:\n";
     std::cout << "  - Accounted chunk runtime: " << accounted_s << " seconds\n";
     std::cout << "  - Process time: " << process_s << " seconds\n";
-    std::cout << "  - Queue time: " << queue_s << " seconds\n";
+    std::cout << "  - Output staging time: " << queue_s << " seconds\n";
     std::cout << "  - Overhead (writer drain/setup): " << overhead_s << " seconds\n";
 
     if (write_debug) {
@@ -4244,6 +4278,18 @@ public:
         std::cout << "\n[sigalign] Output written to:\n"
                   << "[sigalign][fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n";
     }
+
+    return sigalign_run_stats{
+        total_reads.load(),
+        total_passed.load(),
+        total_demultiplexed.load(),
+        total_records_written.load(),
+        chunk_id_ctr.load(),
+        wall_total_s,
+        process_s,
+        queue_s,
+        overhead_s
+    };
 }
 
 /**
@@ -4318,6 +4364,7 @@ public:
 /**
  * @brief append fastqa representation of SigString to a buffer
  * @param buffer `std::string&` buffer to be appended to
+ * @return number of FASTQ/FASTA records appended
  * 
  * @brief this function generates and writes the fastqa version of a sigstring. 
  * It handles different read types including "forward", "reverse", "concatenate", and "skipped".
@@ -4327,10 +4374,11 @@ public:
  * it appends directly to an existing string buffer rather than returning a new string, which I don't have to
  * go through the overhead of creating intermediate strings.
  */
-    void to_fastqa_append(std::string& buffer, bool rc_umi = true) const {
+    size_t to_fastqa_append(std::string& buffer, bool rc_umi = true) const {
         if (read_type == "skipped") {
-            return;
+            return 0;
         }
+        size_t records_written = 0;
         std::vector<std::string> dirs;
         if (read_type == "concatenate") {
             dirs = {
@@ -4480,7 +4528,9 @@ public:
                 buffer += read_qual;
                 buffer += '\n';
             }
+            ++records_written;
         }
+        return records_written;
     }
 
 /** 

@@ -5,6 +5,7 @@
 // ————————————————————————————————————————————————————————————————
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,7 @@
 #endif
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <queue>
@@ -28,6 +30,11 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include <sys/resource.h>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 // ————————————————————————————————————————————————————————————————
 // Parallelism

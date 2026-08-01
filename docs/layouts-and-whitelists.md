@@ -208,17 +208,28 @@ Bundled kits are the *reference* of valid barcodes; they don't tell you which ce
 ```bash
 # single barcode (e.g. 10x 3'): adapter is the primer immediately 5' of the barcode
 build/rad scan-wl -i reads.fq.gz -p CTACACGACGCTCTTCCGATCT -n 16 -w 10x_3v3 -o barcodes
-# -> barcodes.txt (detected whitelist, one per line) + barcodes.csv (per-barcode stats)
+# -> barcodes.txt (selected whitelist) + barcodes.csv (per-barcode stats)
+#    + barcodes_scan_wl.log (compact scan summary)
 ```
 
-Then demux against the detected list (use the `.txt`, which holds only the high-confidence barcodes):
+Then demux against the detected list (use the `.txt`, which holds the
+high-specificity final calls by default):
 
 ```bash
 build/rad demux -l three_prime -q reads.fq.gz -c barcodes.txt -o demo -d run
 ```
 
+For a more sensitive call set, add `--af-bcs`; this writes every barcode above
+the scan's noise floor to `.txt` while retaining the same per-barcode
+annotations in `.csv`. Use `--hs-bcs` to request the default high-specificity
+final calls explicitly.
+
 Or do both in one command with `demux -A/--auto-wl` (single-barcode layouts), which derives
 the adapter/length from the layout, runs the scan internally, and demuxes against the result.
+Add `--af-bcs` to make that one-shot path consume the above-floor set, or
+`--hs-bcs` to request the default high-specificity set explicitly. In both
+modes the reference kit/file remains the global whitelist and the selected
+scan set becomes the true-cell whitelist.
 For split-barcode kits (SPLiT-seq, Visium HD), run `scan-wl` in two-part mode (`-1/-2/-u`).
 
 ## Custom whitelist files

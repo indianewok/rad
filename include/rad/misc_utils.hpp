@@ -55,46 +55,63 @@ namespace memory_utils {
     inline double to_mib(std::size_t bytes) {
         return double(bytes) / 1024.0 / 1024.0;
     }
-    
-    // pointer mem size
-    inline constexpr std::size_t get_pointer_mem() {
-        return sizeof(void*);
-    }
 
-    inline void get_rss() {
+    inline std::optional<double> current_rss_gib() {
         #if defined(__APPLE__)
-            // macOS: ask the Mach kernel for our task’s resident size
             mach_task_basic_info info;
             mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
             if (task_info(mach_task_self(),
                           MACH_TASK_BASIC_INFO,
                           reinterpret_cast<task_info_t>(&info),
                           &count) == KERN_SUCCESS) {
-                double rss_gb = double(info.resident_size) / (1024.0 * 1024.0 * 1024.0);
-                std::cout << "[memory_utils] RSS: " << rss_gb << " GiB\n";
-            } else {
-                std::cerr << "[memory_utils] RSS: failed to get task_info\n";
+                return double(info.resident_size) /
+                       (1024.0 * 1024.0 * 1024.0);
             }
         #elif defined(__linux__)
-            // Linux: read our own /proc/self/statm
-            long page_size = sysconf(_SC_PAGESIZE);
+            const long page_size = sysconf(_SC_PAGESIZE);
             if (page_size <= 0) {
-                std::cerr << "[memory_utils] RSS: sysconf(_SC_PAGESIZE) failed\n";
-                return;
+                return std::nullopt;
             }
             std::ifstream statm("/proc/self/statm");
-            if (!statm) {
-                std::cerr << "[memory_utils] RSS: cannot open /proc/self/statm\n";
-                return;
+            long total_pages = 0;
+            long resident_pages = 0;
+            if (statm && (statm >> total_pages >> resident_pages)) {
+                return (double(resident_pages) * double(page_size)) /
+                       (1024.0 * 1024.0 * 1024.0);
             }
-            long total_pages = 0, resident_pages = 0;
-            statm >> total_pages >> resident_pages;
-            double rss_bytes = double(resident_pages) * double(page_size);
-            double rss_gb = rss_bytes / (1024.0 * 1024.0 * 1024.0);
-            std::cout << "[memory_utils] RSS: " << rss_gb << " GiB\n";
-        #else
-            std::cout << "[memory_utils] RSS: unsupported platform\n";
         #endif
+        return std::nullopt;
+    }
+
+    inline std::optional<double> peak_rss_gib() {
+        struct rusage usage {};
+        if (getrusage(RUSAGE_SELF, &usage) != 0) {
+            return std::nullopt;
+        }
+        #if defined(__APPLE__)
+            // macOS reports ru_maxrss in bytes.
+            return double(usage.ru_maxrss) /
+                   (1024.0 * 1024.0 * 1024.0);
+        #elif defined(__linux__)
+            // Linux reports ru_maxrss in KiB.
+            return double(usage.ru_maxrss) / (1024.0 * 1024.0);
+        #else
+            return std::nullopt;
+        #endif
+    }
+
+    // pointer mem size
+    inline constexpr std::size_t get_pointer_mem() {
+        return sizeof(void*);
+    }
+
+    inline void get_rss() {
+        const auto rss = current_rss_gib();
+        if (rss) {
+            std::cout << "[memory_utils] RSS: " << *rss << " GiB\n";
+        } else {
+            std::cerr << "[memory_utils] RSS: unavailable\n";
+        }
     }
 };
 

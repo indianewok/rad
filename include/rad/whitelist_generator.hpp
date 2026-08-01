@@ -1092,7 +1092,8 @@ std::vector<extracted_bc> process_fastq_split_barcode(
     int max_reads,
     double max_edit_distance_ratio = kDefaultScanWlMaxErrorRatio,
     int chunk_size = 10000,
-    int num_threads = 0)
+    int num_threads = 0,
+    uint64_t* reads_processed_out = nullptr)
 {
     std::vector<extracted_bc> results;
 
@@ -1139,6 +1140,9 @@ std::vector<extracted_bc> process_fastq_split_barcode(
 
     std::cout << "Done: " << reads_processed << " reads, "
               << results.size() << " BC pairs extracted\n";
+    if (reads_processed_out) {
+        *reads_processed_out = static_cast<uint64_t>(reads_processed);
+    }
     return results;
 }
 
@@ -1379,6 +1383,73 @@ struct bc_wl_stats {
     }
 
 };
+
+enum class scan_whitelist_selection {
+    high_specificity,
+    above_floor
+};
+
+inline const char* scan_whitelist_selection_name(
+    scan_whitelist_selection selection) {
+    return selection == scan_whitelist_selection::above_floor
+               ? "above_floor"
+               : "high_specificity";
+}
+
+struct whitelist_scan_stats {
+    uint64_t reads_processed = 0;
+    uint64_t total_extractions = 0;
+    size_t unique_sequences = 0;
+    uint64_t total_perfect_matches = 0;
+    size_t unique_perfect_matches = 0;
+    double match_rate_percent = 0.0;
+    double floor = 0.0;
+    double threshold = 0.0;
+    std::string threshold_rule;
+    size_t above_floor_barcodes = 0;
+    size_t final_barcodes = 0;
+    size_t selected_barcodes = 0;
+    scan_whitelist_selection selection =
+        scan_whitelist_selection::high_specificity;
+};
+
+inline bool write_whitelist_scan_log(const std::string& output_path,
+                                     const std::string& input_path,
+                                     const whitelist_scan_stats& stats,
+                                     double wall_time_seconds) {
+    std::ofstream out(output_path);
+    if (!out) {
+        std::cerr << "Error: could not open whitelist scan log for writing: "
+                  << output_path << "\n";
+        return false;
+    }
+
+    out << "RAD whitelist scan summary\n"
+        << "input=" << input_path << "\n"
+        << "selection=" << scan_whitelist_selection_name(stats.selection)
+        << "\n"
+        << "reads_processed=" << stats.reads_processed << "\n"
+        << "total_extractions=" << stats.total_extractions << "\n"
+        << "unique_sequences=" << stats.unique_sequences << "\n"
+        << "total_perfect_matches=" << stats.total_perfect_matches << "\n"
+        << "unique_perfect_matches=" << stats.unique_perfect_matches << "\n"
+        << std::fixed << std::setprecision(6)
+        << "match_rate_percent=" << stats.match_rate_percent << "\n"
+        << "floor=" << stats.floor << "\n"
+        << "threshold=" << stats.threshold << "\n"
+        << "threshold_rule=" << stats.threshold_rule << "\n"
+        << "above_floor_barcodes=" << stats.above_floor_barcodes << "\n"
+        << "high_specificity_barcodes=" << stats.final_barcodes << "\n"
+        << "selected_barcodes=" << stats.selected_barcodes << "\n"
+        << "wall_time_seconds=" << wall_time_seconds << "\n";
+
+    if (!out) {
+        std::cerr << "Error: failed while writing whitelist scan log: "
+                  << output_path << "\n";
+        return false;
+    }
+    return true;
+}
 
 // Silverman's bandwidth calculation
 double calculate_silverman_bandwidth(const std::vector<double>& data) {
@@ -2455,7 +2526,10 @@ evaluate_adaptive_hazard_saddle(
 bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barcodes,
                                       const std::unordered_set<int64_seq>& whitelist_set,
                                       const std::string& output_csv, const std::string text_out,
-                                      bool verbose = false)
+                                      bool verbose = false,
+                                      scan_whitelist_selection selection =
+                                          scan_whitelist_selection::high_specificity,
+                                      whitelist_scan_stats* summary = nullptr)
 {
     // Observations were collapsed online while the FASTQ was scanned, so this
     // stage no longer allocates a second read-sized container.
@@ -3111,7 +3185,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
                   << output_csv << "\n";
         return false;
     }
-    std::vector<std::string> high_conf_barcodes;
+    std::vector<std::string> selected_barcodes;
 
     csv_out << "barcode,count,ncpm,log1p_ncpm,ztpois_percentile,above_floor,over_threshold,"
                "final_barcode,final_bc_annotation\n";
@@ -3140,20 +3214,25 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         if (collapse_all_af) {
             if (final_barcode){
                 ann = "high_confidence";
-                high_conf_barcodes.push_back(s.sequence);
             }
         } else {
             if (over_threshold && above_floor) {
                 ann = "high_confidence";
-                high_conf_barcodes.push_back(s.sequence);
             } else if (budget_pass) {
                 ann = "high_sensitivity";
-                high_conf_barcodes.push_back(s.sequence);
             } else if (have_band && above_floor && s.log1p_ncpm >= band_lo && s.log1p_ncpm < band_hi) {
                 ann = "high_sensitivity";
             } else {
                 ann = "low_confidence";
             }
+        }
+
+        const bool selected =
+            selection == scan_whitelist_selection::above_floor
+                ? above_floor
+                : final_barcode;
+        if (selected) {
+            selected_barcodes.push_back(s.sequence);
         }
 
         csv_out << s.sequence << ","
@@ -3190,7 +3269,29 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
                   std::max<double>(1.0, static_cast<double>(extracted_barcodes.total_extractions))) << "%\n"
               << "Above-floor barcodes: " << n_above_floor << "\n"
               << "Final barcodes (TRUE): " << n_final << "\n"
+              << "Selected barcodes (" << scan_whitelist_selection_name(selection)
+              << "): " << selected_barcodes.size() << "\n"
               << "Results written to: " << output_csv << "\n";
+
+    if (summary) {
+        summary->reads_processed = extracted_barcodes.reads_processed;
+        summary->total_extractions = extracted_barcodes.total_extractions;
+        summary->unique_sequences = extracted_counts.size();
+        summary->total_perfect_matches = total_perfect_matches;
+        summary->unique_perfect_matches = unique_matches;
+        summary->match_rate_percent =
+            100.0 * static_cast<double>(total_perfect_matches) /
+            std::max<double>(
+                1.0,
+                static_cast<double>(extracted_barcodes.total_extractions));
+        summary->floor = FLOOR;
+        summary->threshold = threshold;
+        summary->threshold_rule = rule;
+        summary->above_floor_barcodes = n_above_floor;
+        summary->final_barcodes = n_final;
+        summary->selected_barcodes = selected_barcodes.size();
+        summary->selection = selection;
+    }
 
     if (!text_out.empty()) {
         std::ofstream hc_out(text_out);
@@ -3199,7 +3300,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
                       << text_out << "\n";
             return false;
         }
-        for (const auto& bc : high_conf_barcodes) {
+        for (const auto& bc : selected_barcodes) {
             hc_out << bc << "\n";
         }
         hc_out.close();
@@ -3208,7 +3309,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
                       << text_out << "\n";
             return false;
         }
-        std::cout << "High-confidence barcodes written to: " << text_out << "\n";
+        std::cout << "Selected whitelist written to: " << text_out << "\n";
     }
     return true;
 }
@@ -3219,16 +3320,21 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
 bool count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted_barcodes,
                                       const std::unordered_set<int64_seq>& whitelist_set,
                                       const std::string& output_csv, const std::string text_out,
-                                      bool verbose = false)
+                                      bool verbose = false,
+                                      scan_whitelist_selection selection =
+                                          scan_whitelist_selection::high_specificity,
+                                      whitelist_scan_stats* summary = nullptr)
 {
     barcode_count_result counts;
+    counts.reads_processed = static_cast<uint64_t>(extracted_barcodes.size());
     counts.total_extractions = static_cast<uint64_t>(extracted_barcodes.size());
     counts.counts.reserve(std::min<size_t>(extracted_barcodes.size(), 1u << 20));
     for (const auto& x : extracted_barcodes) {
         ++counts.counts[x.sequence];
     }
     return count_perfect_matches_with_stats(
-        counts, whitelist_set, output_csv, text_out, verbose);
+        counts, whitelist_set, output_csv, text_out, verbose, selection,
+        summary);
 }
 
 
@@ -3248,6 +3354,8 @@ void usage_scan_wl(const char* program_name) {
               << "  -w, --whitelist FILE        Barcode whitelist kit key or path (optional)\n"
               << "  -t, --threads INT           Number of threads for parallel processing [default: auto]\n"
               << "  -k, --chunk-size INT        Chunk size for parallel processing [default: 10000]\n"
+              << "      --af-bcs                Write above-floor barcodes to .txt\n"
+              << "      --hs-bcs                Write high-specificity final calls to .txt [default]\n"
               << "  -v, --verbose               Enable verbose/debug output\n"
               << "  -h, --help                  Show this help message\n"
               << "\nTwo-part barcode options (BC1+BC2 mode):\n"
@@ -3265,7 +3373,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
     int bc_length = 16, m_left = 0, m_right = 0, max_reads = 0, num_threads = 0, chunk_size = 10000;
     int umi_length = 9, offset_min = 0, offset_max = 3;
     double max_error = kDefaultScanWlMaxErrorRatio;
-    bool verbose = false;
+    bool verbose = false, af_bcs = false, hs_bcs = false;
 
     static struct option long_options[] = {
         {"input",          required_argument, 0, 'i'},
@@ -3285,6 +3393,8 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
         {"umi-length",     required_argument, 0, 'u'},
         {"offset-min",     required_argument, 0,  3 },
         {"offset-max",     required_argument, 0,  4 },
+        {"af-bcs",          no_argument,       0,  5 },
+        {"hs-bcs",          no_argument,       0,  6 },
         // Backward-compatible aliases
         {"hd-offset-min",  required_argument, 0,  3 },
         {"hd-offset-max",  required_argument, 0,  4 },
@@ -3313,6 +3423,8 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             case 'u': umi_length = std::atoi(optarg); break;
             case  3 : offset_min = std::atoi(optarg); break;
             case  4 : offset_max = std::atoi(optarg); break;
+            case  5 : af_bcs = true; break;
+            case  6 : hs_bcs = true; break;
             case 'v': verbose = true; break;
             case 'h': usage_scan_wl(argv[0]); return 0;
             default: usage_scan_wl(argv[0]); return 1;
@@ -3326,6 +3438,10 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
     }
     if (chunk_size <= 0) {
         std::cerr << "Error: Chunk size must be greater than zero\n";
+        return 1;
+    }
+    if (af_bcs && hs_bcs) {
+        std::cerr << "Error: --af-bcs and --hs-bcs are mutually exclusive\n";
         return 1;
     }
 
@@ -3346,6 +3462,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
     bool run_failed = false;
 
     auto run_single = [&](const std::string& fastq_path, const std::string& output_prefix) {
+        const auto scan_started = std::chrono::steady_clock::now();
         std::string resolved_prefix = output_prefix.empty() ? "barcodes" : output_prefix;
         if (!ensure_output_directory(resolved_prefix)) {
             run_failed = true;
@@ -3354,6 +3471,12 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
 
         std::string csv_output  = resolved_prefix + ".csv";
         std::string text_output = resolved_prefix + ".txt";
+        std::string scan_log_output = resolved_prefix + "_scan_wl.log";
+        whitelist_scan_stats scan_stats;
+        const scan_whitelist_selection selection =
+            af_bcs
+                ? scan_whitelist_selection::above_floor
+                : scan_whitelist_selection::high_specificity;
 
         if (split_barcode_mode) {
             std::string bc1_path, bc2_path;
@@ -3383,11 +3506,13 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             }
             std::cout << "Loaded " << bc1_wl.seqs.size() << " BC1 / " << bc2_wl.seqs.size() << " BC2 sequences\n";
 
+            uint64_t split_reads_processed = 0;
             auto barcodes = process_fastq_split_barcode(
                 fastq_path, adapter_seq,
                 umi_length, bc1_wl.seqs, bc1_wl.lengths, bc2_wl.seqs, bc2_wl.lengths,
                 offset_min, offset_max,
-                max_reads, max_error, chunk_size, num_threads);
+                max_reads, max_error, chunk_size, num_threads,
+                &split_reads_processed);
 
             std::string pair_counts_output = resolved_prefix + "_valid_pairs.csv";
             write_split_pair_counts(barcodes, pair_counts_output);
@@ -3398,10 +3523,12 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
 
             std::unordered_set<int64_seq> empty_wl;
             if (!count_perfect_matches_with_stats(
-                    barcodes, empty_wl, csv_output, text_output, verbose)) {
+                    barcodes, empty_wl, csv_output, text_output, verbose,
+                    selection, &scan_stats)) {
                 run_failed = true;
                 return;
             }
+            scan_stats.reads_processed = split_reads_processed;
         } else {
             std::cout << "Processing " << fastq_path << "...\n";
             std::cout << "Adapter: " << adapter_seq << "\n";
@@ -3450,7 +3577,8 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             if (!whitelist_file.empty()) {
                 if (!count_perfect_matches_with_stats(
                         barcodes, wl_filter.long_barcodes,
-                        csv_output, text_output, verbose)) {
+                        csv_output, text_output, verbose, selection,
+                        &scan_stats)) {
                     run_failed = true;
                     return;
                 }
@@ -3459,12 +3587,26 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
                 std::cout << " No whitelist provided; generating whitelist de novo.\n";
                 if (!count_perfect_matches_with_stats(
                         barcodes, empty_whitelist,
-                        csv_output, text_output, verbose)) {
+                        csv_output, text_output, verbose, selection,
+                        &scan_stats)) {
                     run_failed = true;
                     return;
                 }
             }
         }
+
+        const double scan_wall_seconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - scan_started)
+                .count();
+        if (!write_whitelist_scan_log(
+                scan_log_output, fastq_path, scan_stats,
+                scan_wall_seconds)) {
+            run_failed = true;
+            return;
+        }
+        std::cout << "Whitelist scan summary written to: "
+                  << scan_log_output << "\n";
     };
 
     if (using_batch) {

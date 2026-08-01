@@ -100,7 +100,8 @@ Required:
 
 - `-i, --input` — input FASTQ(.gz) (or `-b, --batch-csv` for batch mode)
 - `-p, --adapter_seq` — primer/adapter sequence immediately 5' of the barcode
-- `-o, --output-prefix` — output prefix (writes `PREFIX.txt` and `PREFIX.csv`)
+- `-o, --output-prefix` — output prefix (writes `PREFIX.txt`, `PREFIX.csv`,
+  and `PREFIX_scan_wl.log`)
 
 Common options:
 
@@ -109,6 +110,9 @@ Common options:
 - `-w, --whitelist` — reference kit key or path to validate against (optional)
 - `-l, --left-margin` / `-r, --right-margin` (default `0`) — extra bases each side
 - `-m, --max-reads` (default all), `-k, --chunk-size` (default `10000`), `-t, --threads`
+- `--af-bcs` — put every barcode passing the scan's noise floor in `<prefix>.txt`
+- `--hs-bcs` — put only the high-specificity final calls in `<prefix>.txt`
+  (default)
 - `-v, --verbose`, `-h, --help`
 
 Two-part barcode mode (BC1+BC2, e.g. SPLiT-seq / Visium HD): `-1/--bc1-whitelist`,
@@ -116,8 +120,11 @@ Two-part barcode mode (BC1+BC2, e.g. SPLiT-seq / Visium HD): `-1/--bc1-whitelist
 
 Files written:
 
-- `<prefix>.txt` — the detected whitelist: high-confidence barcodes, one per line (feed this to `demux -c`)
+- `<prefix>.txt` — the selected whitelist, one barcode per line (high-specificity
+  final calls by default; above-floor calls with `--af-bcs`; feed this to `demux -c`)
 - `<prefix>.csv` — per-barcode stats (counts + `final_barcode` TRUE/FALSE columns)
+- `<prefix>_scan_wl.log` — compact scan summary: read/extraction counts, match
+  rate, floor/threshold rule, above-floor/final/selected counts, and wall time
 
 ---
 
@@ -153,13 +160,18 @@ Whitelist/correction knobs:
 
 Auto-whitelist (run `scan-wl` + `demux` in one command):
 
-- `-A, --auto-wl` — before demultiplexing, scan the FASTQ for the barcodes actually present (the `scan-wl` step). RAD retains the scan reference as the **global** barcode catalog and loads the detected list as the **true-cell** whitelist. Consequently, an exact catalog barcode omitted by cell calling is filtered rather than fuzzy-corrected into another called cell. Single-barcode layouts only; split-barcode kits (e.g. Visium HD) should run `rad scan-wl` manually. The adapter and barcode length are derived from the layout; the reference is `-k`/`-g` if given, else the layout's own kit, else de-novo. Writes `<prefix>_scanwl.csv` / `<prefix>_scanwl.txt`.
+- `-A, --auto-wl` — before demultiplexing, scan the FASTQ for the barcodes actually present (the `scan-wl` step). RAD retains the scan reference as the **global** barcode catalog and loads the detected list as the **true-cell** whitelist. Consequently, an exact catalog barcode omitted by cell calling is filtered rather than fuzzy-corrected into another called cell. Single-barcode layouts only; split-barcode kits (e.g. Visium HD) should run `rad scan-wl` manually. The adapter and barcode length are derived from the layout; the reference is `-k`/`-g` if given, else the layout's own kit, else de-novo. Writes `<prefix>_scanwl.csv`, `<prefix>_scanwl.txt`, and `<prefix>_scan_wl.log`.
 - `--scan-adapter` — override the derived scan adapter sequence
 - `--scan-bc-len` — override the derived barcode length
 - `--scan-max-error` (default `0.3`) — adapter max edit-distance ratio for the scan
 - `--scan-max-reads` (default `--max-reads`) — reads scanned for the whitelist
 - `--scan-chunk` (default `--chunk-size`) — scan chunk size
 - `--scan-threads` (default `--threads`) — scan threads
+- `--af-bcs` — use every above-floor scan barcode as the true-cell whitelist
+  (requires `--auto-wl` with `demux`)
+- `--hs-bcs` — use only the high-specificity final calls (default). The
+  reference kit/file remains loaded as the global whitelist in either mode.
+  An explicit `--hs-bcs` also requires `--auto-wl` with `demux`.
 
 Runtime/output knobs:
 
@@ -167,7 +179,8 @@ Runtime/output knobs:
 - `-z, --chunk-size` (default `5000`, must be `> 0`)
 - `-o, --output` (default `output`)
 - `-d, --dir` (default current dir)
-- `-F, --log-file`
+- `-F, --log-file` — optional full console-output log (separate from the
+  automatically written compact stage summaries)
 - `-w, --write-dbg`
 - `-b, --bc-split`
 - `-t, --threads` (default `1`)
@@ -183,8 +196,13 @@ Practical note:
 Files written:
 
 - primary output: `<outdir>/<prefix>.fq.gz` or `<outdir>/<prefix>.fa.gz` (extension follows input-type logic)
+- demultiplexing summary: `<outdir>/<prefix>_demux.log` (processed,
+  filter-passing, demultiplexed, and serialized-record counts; timing totals;
+  and final/peak RSS for the RAD process)
 - whitelist summaries: `<outdir>/<prefix>_whitelist_true.csv`, `<outdir>/<prefix>_whitelist_global.csv`
-- with `-A/--auto-wl`: `<outdir>/<prefix>_scanwl.csv`, `<outdir>/<prefix>_scanwl.txt` (the internally generated whitelist)
+- with `-A/--auto-wl`: `<outdir>/<prefix>_scanwl.csv`,
+  `<outdir>/<prefix>_scanwl.txt`, and `<outdir>/<prefix>_scan_wl.log`
+  (detailed calls, selected whitelist, and compact scan summary)
 - with `-w`: `<outdir>/<prefix>_dbg.sig.gz`, `<outdir>/<prefix>_dbg.csv.gz`, `<outdir>/<prefix>_dbg.fq.gz` (or `_dbg.fa.gz` — extension follows input-type logic), `<outdir>/<prefix>.metrics.tsv`
 
 Practical note:

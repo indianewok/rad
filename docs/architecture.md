@@ -35,14 +35,14 @@ flowchart TD
     C2 --> C3["write layout + position map"]
 
     S --> S1["scan reads for barcodes after the adapter"]
-    S1 --> S2["call high-confidence set, write scanwl.txt / scanwl.csv"]
+    S1 --> S2["select above-floor or final calls; write TXT, CSV, and scan log"]
     S2 -. "whitelist" .-> D2
 
     D --> D0["-A/--auto-wl? run scan-wl core first"]
     D0 --> D1["resolve/import layout + map"]
     D1 --> D2["load whitelist maps (true + global)"]
     D2 --> D3["chunked sigalign (extract, correct, tag CB:Z/UB:Z)"]
-    D3 --> D4["write FASTQ + optional debug outputs"]
+    D3 --> D4["write FASTQ, demux log, and optional debug outputs"]
 
     E --> E1["stream reads"]
     E1 --> E2["header collapse, CB split, and/or coordinate rewrite"]

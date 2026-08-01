@@ -65,6 +65,10 @@ static void usage_demux(const char *prog) {
          "(default: --chunk-size)\n"
       << "      --scan-threads                scan-wl threads "
          "(default: --threads)\n"
+      << "      --af-bcs                      demux against above-floor scan "
+         "barcodes\n"
+      << "      --hs-bcs                      demux against high-specificity "
+         "final calls (default)\n"
       << "      --no-umi-rc                   keep UMIs as-extracted; do NOT "
          "reverse-complement\n"
       << "                                    UB:Z on reverse reads (default: "
@@ -1101,6 +1105,76 @@ int cmd_reformat(int argc, char *argv[]) {
 // COMMAND: demux
 // ============================================================================
 
+static bool write_demux_run_log(
+    const std::string &output_path, const std::string &layout,
+    const std::string &input_path, const std::string &output_prefix,
+    const sigalign_run_stats &stats, double total_wall_time_seconds,
+    int threads, bool auto_whitelist, bool af_bcs) {
+  std::ofstream out(output_path);
+  if (!out) {
+    std::cerr << "[ERROR] Cannot open run statistics log: " << output_path
+              << "\n";
+    return false;
+  }
+
+  const auto current_rss = memory_utils::current_rss_gib();
+  const auto peak_rss = memory_utils::peak_rss_gib();
+  const double pass_rate =
+      stats.total_reads > 0
+          ? 100.0 * static_cast<double>(stats.reads_demultiplexed) /
+                static_cast<double>(stats.total_reads)
+          : 0.0;
+
+  out << "RAD demultiplexing summary\n"
+      << "status=success\n"
+      << "rad_version=" << RAD_VERSION << "\n"
+      << "layout=" << layout << "\n"
+      << "input=" << input_path << "\n"
+      << "output_prefix=" << output_prefix << "\n"
+      << "threads=" << threads << "\n"
+      << "auto_whitelist=" << (auto_whitelist ? "true" : "false") << "\n"
+      << "scan_selection="
+      << (auto_whitelist
+              ? (af_bcs ? "above_floor" : "high_specificity")
+              : "not_applicable")
+      << "\n";
+  if (auto_whitelist) {
+    out << "whitelist_scan_log=" << output_prefix << "_scan_wl.log\n";
+  }
+  out << "total_reads=" << stats.total_reads << "\n"
+      << "reads_passing_filter=" << stats.reads_passing_filter << "\n"
+      << "reads_demultiplexed=" << stats.reads_demultiplexed << "\n"
+      << "records_serialized=" << stats.records_serialized << "\n"
+      << std::fixed << std::setprecision(6)
+      << "demultiplex_rate_percent=" << pass_rate << "\n"
+      << "chunks_processed=" << stats.chunks_processed << "\n"
+      << "sigalign_wall_time_seconds=" << stats.wall_time_seconds << "\n"
+      << "process_time_seconds=" << stats.process_time_seconds << "\n"
+      << "output_staging_time_seconds="
+      << stats.output_staging_time_seconds << "\n"
+      << "overhead_time_seconds=" << stats.overhead_time_seconds << "\n"
+      << "total_wall_time_seconds=" << total_wall_time_seconds << "\n"
+      << "memory_scope=rad_process_only\n";
+
+  if (current_rss) {
+    out << "final_rss_gib=" << *current_rss << "\n";
+  } else {
+    out << "final_rss_gib=unavailable\n";
+  }
+  if (peak_rss) {
+    out << "peak_rss_gib=" << *peak_rss << "\n";
+  } else {
+    out << "peak_rss_gib=unavailable\n";
+  }
+
+  if (!out) {
+    std::cerr << "[ERROR] Failed while writing run statistics log: "
+              << output_path << "\n";
+    return false;
+  }
+  return true;
+}
+
 // Internal "scan-wl then demux" pass for `demux --auto-wl`.
 //
 // The historical two-command workflow (`rad scan-wl` to detect the real
@@ -1135,7 +1209,8 @@ run_auto_whitelist(const ReadLayout &layout, const std::string &fastq_path,
                    std::optional<int> bc_len_override,
                    const std::string &ref_whitelist, double scan_error,
                    size_t max_reads, size_t chunk_size, int nthreads,
-                   bool verbose) {
+                   bool af_bcs, bool verbose) {
+  const auto scan_started = std::chrono::steady_clock::now();
   // 1) Locate the single forward barcode element.
   const ReadElement *bc_elem = nullptr;
   int n_barcodes = 0;
@@ -1198,7 +1273,10 @@ run_auto_whitelist(const ReadLayout &layout, const std::string &fastq_path,
             << "  chunk size              : " << chunk_size << "\n"
             << "  threads                 : " << nthreads << "\n"
             << "  reference whitelist     : "
-            << (ref.empty() ? "[de novo]" : ref) << "\n";
+            << (ref.empty() ? "[de novo]" : ref) << "\n"
+            << "  barcode selection       : "
+            << (af_bcs ? "above_floor" : "high_specificity")
+            << "\n";
 
   // process_fastq takes an int cap where 0 == "all"; treat "all" (size_t -1)
   // and any value beyond INT_MAX as unlimited rather than overflowing to a
@@ -1239,24 +1317,41 @@ run_auto_whitelist(const ReadLayout &layout, const std::string &fastq_path,
 
   const std::string csv_out = outbase + "_scanwl.csv";
   const std::string txt_out = outbase + "_scanwl.txt";
+  const std::string scan_log_out = outbase + "_scan_wl.log";
+  whitelist_scan_stats scan_stats;
+  const scan_whitelist_selection selection =
+      af_bcs
+          ? scan_whitelist_selection::above_floor
+          : scan_whitelist_selection::high_specificity;
 
   if (!count_perfect_matches_with_stats(
-          barcodes, wl_filter.long_barcodes, csv_out, txt_out, verbose)) {
+          barcodes, wl_filter.long_barcodes, csv_out, txt_out, verbose,
+          selection, &scan_stats)) {
     throw std::runtime_error("--auto-wl: failed to write scan outputs");
   }
 
-  // The .txt only holds the final high-confidence barcodes; an empty/absent
-  // file means the scan called nothing, which would make demux a no-op.
+  const double scan_wall_seconds =
+      std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - scan_started)
+          .count();
+  if (!write_whitelist_scan_log(
+          scan_log_out, fastq_path, scan_stats, scan_wall_seconds)) {
+    throw std::runtime_error("--auto-wl: failed to write scan summary");
+  }
+
+  // The .txt holds the selected barcode population; an empty/absent file means
+  // the scan called nothing, which would make demux a no-op.
   if (!boost::filesystem::exists(txt_out) ||
       boost::filesystem::file_size(txt_out) == 0) {
     throw std::runtime_error(
-        "--auto-wl: scan produced no high-confidence barcodes (" +
+        "--auto-wl: scan produced no selected barcodes (" +
         txt_out +
         "); check the derived adapter, --scan-max-error, or run scan-wl "
         "manually");
   }
   std::cout << "[auto-wl] Whitelist ready: " << txt_out
-            << " (feeding into demux)\n";
+            << " (feeding into demux)\n"
+            << "[auto-wl] Scan summary: " << scan_log_out << "\n";
   return {txt_out, ref};
 }
 
@@ -1273,6 +1368,7 @@ int cmd_demux(int argc, char *argv[]) {
   std::string joint_bc_mode = "default";
   bool rc_umi = true;          // reverse-complement UMIs on reverse reads (issue #4)
   bool auto_whitelist = false; // run scan-wl internally before demux (issue #4)
+  bool af_bcs = false, hs_bcs = false;
   double scan_max_error =
       kDefaultScanWlMaxErrorRatio; // adapter max-error ratio for scan-wl
   std::string scan_adapter;    // override the layout-derived scan adapter
@@ -1309,6 +1405,8 @@ int cmd_demux(int argc, char *argv[]) {
       {"scan-threads", required_argument, nullptr, 7},
       {"scan-bc-len", required_argument, nullptr, 8},
       {"min-read-length", required_argument, nullptr, 9},
+      {"af-bcs", no_argument, nullptr, 10},
+      {"hs-bcs", no_argument, nullptr, 11},
       {"threads", required_argument, nullptr, 't'},
       {"verbose", no_argument, nullptr, 'v'},
       {"max-verbose", no_argument, nullptr, 'D'},
@@ -1404,6 +1502,12 @@ int cmd_demux(int argc, char *argv[]) {
     case 9:
       min_read_length = std::stoi(optarg);
       break;
+    case 10:
+      af_bcs = true;
+      break;
+    case 11:
+      hs_bcs = true;
+      break;
     case 't':
       nthreads = std::stoi(optarg);
       break;
@@ -1446,6 +1550,14 @@ int cmd_demux(int argc, char *argv[]) {
   }
   if (auto_whitelist && scan_threads && *scan_threads < 1) {
     std::cerr << "[ERROR] --scan-threads must be >= 1\n";
+    return 1;
+  }
+  if (af_bcs && hs_bcs) {
+    std::cerr << "[ERROR] --af-bcs and --hs-bcs are mutually exclusive\n";
+    return 1;
+  }
+  if ((af_bcs || hs_bcs) && !auto_whitelist) {
+    std::cerr << "[ERROR] --af-bcs and --hs-bcs require --auto-wl for demux\n";
     return 1;
   }
   if (min_read_length < -1) {
@@ -1553,6 +1665,11 @@ int cmd_demux(int argc, char *argv[]) {
               << "  joint barcode mode           : " << joint_bc_mode << "\n"
               << "  auto-whitelist (scan-wl)     : " << std::boolalpha
               << auto_whitelist << "\n"
+              << "  scan barcode selection       : "
+              << (auto_whitelist
+                      ? (af_bcs ? "above_floor" : "high_specificity")
+                      : "not_applicable")
+              << "\n"
               << "  reverse-complement UMIs      : " << std::boolalpha
               << rc_umi << "\n"
               << "  whitelist-generated mutations: "
@@ -1688,7 +1805,7 @@ int cmd_demux(int argc, char *argv[]) {
           read_layout, fastq_path, outbase.string(), scan_adapter, scan_bc_len,
           kit_or_wl, scan_max_error, scan_max_reads.value_or(max_reads),
           scan_chunk.value_or(chunk_size), scan_threads.value_or(nthreads),
-          verbose);
+          af_bcs, verbose);
     }
 
     if (auto_wl) {
@@ -1724,12 +1841,18 @@ int cmd_demux(int argc, char *argv[]) {
     memory_utils::get_rss();
 
     size_t max_reads_param = (max_reads == -1) ? -1 : max_reads;
-    SigString::sigalign(fastq_path, read_layout, outbase.string(), gen_mut,
-                        max_verbose, nthreads, chunk_size, max_reads_param,
-                        write_debug, bc_corr_mode, joint_bc_mode, rc_umi,
-                        min_read_length);
+    sigalign_run_stats demux_stats = SigString::sigalign(
+        fastq_path, read_layout, outbase.string(), gen_mut, max_verbose,
+        nthreads, chunk_size, max_reads_param, write_debug, bc_corr_mode,
+        joint_bc_mode, rc_umi, min_read_length);
 
     auto sig_time = std::chrono::steady_clock::now() - sigalign_start;
+    demux_stats.wall_time_seconds =
+        std::chrono::duration<double>(sig_time).count();
+    demux_stats.overhead_time_seconds = std::max(
+        0.0,
+        demux_stats.wall_time_seconds - demux_stats.process_time_seconds -
+            demux_stats.output_staging_time_seconds);
     std::cout
         << "[sigalign] End-to-end wall time: "
         << std::chrono::duration_cast<std::chrono::seconds>(sig_time).count()
@@ -1767,6 +1890,20 @@ int cmd_demux(int argc, char *argv[]) {
                   << std::endl;
       }
     }
+
+    const double total_wall_time_seconds =
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - main_start)
+            .count();
+    const std::string demux_log_path = outbase.string() + "_demux.log";
+    if (!write_demux_run_log(
+            demux_log_path, layout_key, fastq_path, outbase.string(),
+            demux_stats, total_wall_time_seconds, nthreads, auto_whitelist,
+            af_bcs)) {
+      throw std::runtime_error("could not write post-run statistics log");
+    }
+    std::cout << "[main] Demux statistics written to: "
+              << demux_log_path << "\n";
 
     // Restore cout if logging
     if (cout_backup) {
