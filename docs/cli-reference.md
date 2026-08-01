@@ -105,7 +105,7 @@ Required:
 Common options:
 
 - `-n, --barcode-length` (default `16`) — bases to extract after the adapter
-- `-e, --max-error` (default `0.1`) — adapter max edit-distance ratio
+- `-e, --max-error` (default `0.3`) — adapter max edit-distance ratio
 - `-w, --whitelist` — reference kit key or path to validate against (optional)
 - `-l, --left-margin` / `-r, --right-margin` (default `0`) — extra bases each side
 - `-m, --max-reads` (default all), `-k, --chunk-size` (default `10000`), `-t, --threads`

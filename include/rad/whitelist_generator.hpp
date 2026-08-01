@@ -2,6 +2,8 @@
 #include "rad_headers.h"
 #include <boost/math/distributions/poisson.hpp>
 
+inline constexpr double kDefaultScanWlMaxErrorRatio = 0.3;
+
 struct extracted_bc {
     std::string read_id;
     std::string sequence;
@@ -617,7 +619,8 @@ barcode_count_result process_fastq(const std::string& input_path,
                                    int m_left,
                                    int m_right,
                                    int max_reads,
-                                   double max_edit_distance_ratio = 0.1,
+                                   double max_edit_distance_ratio =
+                                       kDefaultScanWlMaxErrorRatio,
                                    int chunk_size = 10000,
                                    int num_threads = 0,
                                    scan_whitelist_filter* whitelist_filter = nullptr) {
@@ -1087,7 +1090,7 @@ std::vector<extracted_bc> process_fastq_split_barcode(
     int search_extra_min,
     int search_extra_max,
     int max_reads,
-    double max_edit_distance_ratio = 0.1,
+    double max_edit_distance_ratio = kDefaultScanWlMaxErrorRatio,
     int chunk_size = 10000,
     int num_threads = 0)
 {
@@ -3240,7 +3243,8 @@ void usage_scan_wl(const char* program_name) {
               << "  -l, --left-margin INT       Bases to include on left side [default: 0]\n"
               << "  -r, --right-margin INT      Bases to include on right side [default: 0]\n"
               << "  -m, --max-reads INT         Maximum number of reads to process [default: all]\n"
-              << "  -e, --max-error FLOAT       Maximum edit distance ratio [default: 0.1]\n"
+              << "  -e, --max-error FLOAT       Maximum edit distance ratio [default: "
+              << kDefaultScanWlMaxErrorRatio << "]\n"
               << "  -w, --whitelist FILE        Barcode whitelist kit key or path (optional)\n"
               << "  -t, --threads INT           Number of threads for parallel processing [default: auto]\n"
               << "  -k, --chunk-size INT        Chunk size for parallel processing [default: 10000]\n"
@@ -3260,7 +3264,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
     std::string bc1_whitelist_file, bc2_whitelist_file;
     int bc_length = 16, m_left = 0, m_right = 0, max_reads = 0, num_threads = 0, chunk_size = 10000;
     int umi_length = 9, offset_min = 0, offset_max = 3;
-    double max_error = 0.1;
+    double max_error = kDefaultScanWlMaxErrorRatio;
     bool verbose = false;
 
     static struct option long_options[] = {

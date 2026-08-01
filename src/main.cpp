@@ -57,7 +57,8 @@ static void usage_demux(const char *prog) {
       << "      --scan-bc-len                 override the scan-wl barcode "
          "length (default: from layout)\n"
       << "      --scan-max-error              scan-wl adapter max-error ratio "
-         "(default: 0.3)\n"
+         "(default: "
+      << kDefaultScanWlMaxErrorRatio << ")\n"
       << "      --scan-max-reads              scan-wl read cap "
          "(default: --max-reads)\n"
       << "      --scan-chunk                  scan-wl chunk size "
@@ -1272,7 +1273,8 @@ int cmd_demux(int argc, char *argv[]) {
   std::string joint_bc_mode = "default";
   bool rc_umi = true;          // reverse-complement UMIs on reverse reads (issue #4)
   bool auto_whitelist = false; // run scan-wl internally before demux (issue #4)
-  double scan_max_error = 0.3; // adapter max-error ratio for the scan-wl pass
+  double scan_max_error =
+      kDefaultScanWlMaxErrorRatio; // adapter max-error ratio for scan-wl
   std::string scan_adapter;    // override the layout-derived scan adapter
   std::optional<int> scan_bc_len;        // override the layout-derived barcode length
   std::optional<size_t> scan_max_reads; // scan-wl read cap (default: --max-reads)
