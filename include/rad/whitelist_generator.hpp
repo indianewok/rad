@@ -1687,6 +1687,147 @@ struct upper_tail_hazard_result {
     std::optional<hazard_candidate> above_gate;
 };
 
+// A whole-whitelist hazard may propose moving left of an already credible
+// saddle.  Measure that expansion against the finite barcode design rather
+// than an expected cell count:
+//
+//   q0  = (M - n_positive) / M
+//   rho = (K_hazard - K_preliminary) / (M - K_preliminary)
+//
+// The proposal is inside the finite-population trust region when rho <= q0.
+// Cross multiplication avoids division; long-double products are exact for
+// RAD's supported whitelist sizes while avoiding uint64_t multiplication
+// overflow.  This helper only evaluates population sizes; the caller is
+// responsible for invoking it solely for a credible preliminary saddle and
+// count-tied callsets.
+enum class finite_population_hazard_decision {
+    invalid_universe,
+    invalid_observed_count,
+    invalid_preliminary_count,
+    invalid_hazard_count,
+    not_an_expansion,
+    accepted,
+    rejected
+};
+
+static inline const char* finite_population_hazard_decision_name(
+    finite_population_hazard_decision decision)
+{
+    switch (decision) {
+        case finite_population_hazard_decision::invalid_universe:
+            return "invalid_universe";
+        case finite_population_hazard_decision::invalid_observed_count:
+            return "invalid_observed_count";
+        case finite_population_hazard_decision::invalid_preliminary_count:
+            return "invalid_preliminary_count";
+        case finite_population_hazard_decision::invalid_hazard_count:
+            return "invalid_hazard_count";
+        case finite_population_hazard_decision::not_an_expansion:
+            return "not_an_expansion";
+        case finite_population_hazard_decision::accepted:
+            return "accepted";
+        case finite_population_hazard_decision::rejected:
+            return "rejected";
+    }
+    return "unknown";
+}
+
+struct finite_population_hazard_result {
+    bool valid = false;
+    bool accept = false;
+    uint64_t universe_size = 0;
+    uint64_t observed_positive = 0;
+    uint64_t zero_count = 0;
+    uint64_t preliminary_count = 0;
+    uint64_t hazard_count = 0;
+    uint64_t expansion_count = 0;
+    double zero_fraction = std::numeric_limits<double>::quiet_NaN();
+    double residual_expansion_fraction =
+        std::numeric_limits<double>::quiet_NaN();
+    double finite_population_ratio =
+        std::numeric_limits<double>::quiet_NaN();
+    finite_population_hazard_decision decision =
+        finite_population_hazard_decision::invalid_universe;
+};
+
+static inline finite_population_hazard_result
+evaluate_finite_population_hazard_expansion(
+    uint64_t universe_size,
+    uint64_t observed_positive,
+    uint64_t preliminary_count,
+    uint64_t hazard_count)
+{
+    finite_population_hazard_result result;
+    result.universe_size = universe_size;
+    result.observed_positive = observed_positive;
+    result.preliminary_count = preliminary_count;
+    result.hazard_count = hazard_count;
+
+    if (universe_size == 0) {
+        result.decision =
+            finite_population_hazard_decision::invalid_universe;
+        return result;
+    }
+    if (observed_positive > universe_size) {
+        result.decision =
+            finite_population_hazard_decision::invalid_observed_count;
+        return result;
+    }
+    if (preliminary_count > observed_positive) {
+        result.decision =
+            finite_population_hazard_decision::invalid_preliminary_count;
+        return result;
+    }
+    if (hazard_count > observed_positive ||
+        hazard_count < preliminary_count) {
+        result.decision =
+            finite_population_hazard_decision::invalid_hazard_count;
+        return result;
+    }
+
+    result.valid = true;
+    result.zero_count = universe_size - observed_positive;
+    result.expansion_count = hazard_count - preliminary_count;
+    result.zero_fraction =
+        static_cast<double>(result.zero_count) /
+        static_cast<double>(universe_size);
+
+    if (result.expansion_count == 0) {
+        result.accept = true;
+        result.residual_expansion_fraction = 0.0;
+        result.finite_population_ratio = 0.0;
+        result.decision =
+            finite_population_hazard_decision::not_an_expansion;
+        return result;
+    }
+
+    const uint64_t residual_universe =
+        universe_size - preliminary_count;
+    // A positive expansion implies preliminary_count < observed_positive <= M,
+    // so residual_universe is non-zero after the validation above.
+    result.residual_expansion_fraction =
+        static_cast<double>(result.expansion_count) /
+        static_cast<double>(residual_universe);
+    result.finite_population_ratio =
+        result.zero_fraction > 0.0
+            ? result.residual_expansion_fraction / result.zero_fraction
+            : std::numeric_limits<double>::infinity();
+
+    // delta / (M - K0) <= (M - n+) / M
+    // Products of two uint64_t values may overflow, so compare in long double.
+    const long double lhs =
+        static_cast<long double>(result.expansion_count) *
+        static_cast<long double>(universe_size);
+    const long double rhs =
+        static_cast<long double>(result.zero_count) *
+        static_cast<long double>(residual_universe);
+    result.accept = lhs <= rhs;
+    result.decision = result.accept
+        ? finite_population_hazard_decision::accepted
+        : finite_population_hazard_decision::rejected;
+    return result;
+}
+
 static inline upper_tail_hazard_result
 compute_upper_tail_adjusted_hazard(
     const std::vector<weighted_score>& input_scores,
@@ -2904,6 +3045,63 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
                 below_floor_stable_match
                     ? "three-bandwidth-stable"
                     : "floor-adjacent";
+        }
+    }
+
+    // A credible KDE saddle already defines a count-tied preliminary
+    // population.  Before a whole-whitelist hazard is allowed to expand that
+    // population, account for saturation of the finite barcode design.  This
+    // is deliberately not applied to a ZT-Poisson/no-saddle fallback: there is
+    // no competing saddle population in that case.
+    finite_population_hazard_result finite_population_guard;
+    if (selected_hazard && have_saddle && sd.ok &&
+        std::isfinite(t_saddle) &&
+        selected_hazard->x < preliminary_threshold) {
+        uint64_t preliminary_count = 0;
+        uint64_t hazard_count = 0;
+        for (const auto& stats : barcode_stats) {
+            if (stats.log1p_ncpm >= preliminary_threshold) {
+                ++preliminary_count;
+            }
+            if (stats.log1p_ncpm >= selected_hazard->x) {
+                ++hazard_count;
+            }
+        }
+        finite_population_guard =
+            evaluate_finite_population_hazard_expansion(
+                extracted_barcodes.reference_whitelist_size,
+                static_cast<uint64_t>(barcode_stats.size()),
+                preliminary_count, hazard_count);
+        std::cout
+            << "\n[finite-whitelist hazard correction] M="
+            << finite_population_guard.universe_size
+            << "  n_positive="
+            << finite_population_guard.observed_positive
+            << "  n_zero=" << finite_population_guard.zero_count
+            << "  K_preliminary="
+            << finite_population_guard.preliminary_count
+            << "  K_hazard=" << finite_population_guard.hazard_count
+            << "  delta=" << finite_population_guard.expansion_count;
+        if (finite_population_guard.valid) {
+            std::cout
+                << "  q0=" << finite_population_guard.zero_fraction
+                << "  rho="
+                << finite_population_guard.residual_expansion_fraction
+                << "  ratio="
+                << finite_population_guard.finite_population_ratio;
+        }
+        std::cout
+            << "  decision="
+            << finite_population_hazard_decision_name(
+                   finite_population_guard.decision)
+            << "\n";
+
+        // Invalid/missing M fails open for backwards compatibility.  Normal
+        // scan-wl runs with a supplied whitelist populate M; replay/tests must
+        // pass it explicitly to exercise this correction.
+        if (finite_population_guard.valid &&
+            !finite_population_guard.accept) {
+            selected_hazard.reset();
         }
     }
 
