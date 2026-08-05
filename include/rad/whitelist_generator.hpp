@@ -1,6 +1,7 @@
 #pragma once
 #include "rad_headers.h"
 #include <boost/math/distributions/poisson.hpp>
+#include <cerrno>
 
 inline constexpr double kDefaultScanWlMaxErrorRatio = 0.3;
 
@@ -3535,6 +3536,242 @@ bool count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
         summary);
 }
 
+struct scan_wl_rescan_input {
+    barcode_count_result counts;
+    uint64_t input_rows = 0;
+};
+
+inline std::string scan_wl_rescan_trim(const std::string& value) {
+    const auto first = std::find_if_not(
+        value.begin(), value.end(),
+        [](unsigned char ch) { return std::isspace(ch); });
+    if (first == value.end()) {
+        return "";
+    }
+    const auto last = std::find_if_not(
+                          value.rbegin(), value.rend(),
+                          [](unsigned char ch) { return std::isspace(ch); })
+                          .base();
+    return std::string(first, last);
+}
+
+inline std::string scan_wl_rescan_lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) {
+                       return static_cast<char>(std::tolower(ch));
+                   });
+    return value;
+}
+
+inline bool scan_wl_rescan_ends_with(const std::string& value,
+                                     const std::string& suffix) {
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) ==
+               0;
+}
+
+inline std::vector<std::string> scan_wl_rescan_split_delimited(
+    const std::string& line, char delimiter) {
+    std::vector<std::string> fields;
+    std::string field;
+    bool quoted = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        const char ch = line[i];
+        if (quoted) {
+            if (ch == '"') {
+                if (i + 1 < line.size() && line[i + 1] == '"') {
+                    field.push_back('"');
+                    ++i;
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field.push_back(ch);
+            }
+        } else if (ch == '"') {
+            quoted = true;
+        } else if (ch == delimiter) {
+            fields.push_back(scan_wl_rescan_trim(field));
+            field.clear();
+        } else if (ch != '\r') {
+            field.push_back(ch);
+        }
+    }
+    if (quoted) {
+        throw std::runtime_error("unterminated quoted field");
+    }
+    fields.push_back(scan_wl_rescan_trim(field));
+    return fields;
+}
+
+inline std::vector<std::string> scan_wl_rescan_split(
+    const std::string& line, char& delimiter) {
+    if (delimiter == '\0') {
+        if (line.find(',') != std::string::npos) {
+            delimiter = ',';
+        } else if (line.find('\t') != std::string::npos) {
+            delimiter = '\t';
+        } else {
+            delimiter = ' ';
+        }
+    }
+    if (delimiter != ' ') {
+        return scan_wl_rescan_split_delimited(line, delimiter);
+    }
+
+    std::vector<std::string> fields;
+    std::istringstream input(line);
+    std::string field;
+    while (input >> field) {
+        fields.push_back(std::move(field));
+    }
+    return fields;
+}
+
+inline uint64_t scan_wl_rescan_parse_count(const std::string& text,
+                                           size_t line_number) {
+    if (text.empty() || text.front() == '-') {
+        throw std::runtime_error(
+            "line " + std::to_string(line_number) +
+            " has an invalid positive count: " + text);
+    }
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long value = std::strtoull(text.c_str(), &end, 10);
+    if (errno == ERANGE || end == text.c_str() || *end != '\0' || value == 0) {
+        throw std::runtime_error(
+            "line " + std::to_string(line_number) +
+            " has an invalid positive count: " + text);
+    }
+    return static_cast<uint64_t>(value);
+}
+
+inline scan_wl_rescan_input read_scan_wl_rescan_counts(
+    const std::string& input_path) {
+    std::ifstream file(input_path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("could not open rescan input: " + input_path);
+    }
+
+    boost::iostreams::filtering_istream input;
+    if (scan_wl_rescan_ends_with(
+            scan_wl_rescan_lower(input_path), ".gz")) {
+        input.push(boost::iostreams::gzip_decompressor());
+    }
+    input.push(file);
+
+    scan_wl_rescan_input result;
+    result.counts.filtered_to_whitelist = true;
+    char delimiter = '\0';
+    bool columns_known = false;
+    size_t barcode_column = 0;
+    size_t count_column = 1;
+    size_t line_number = 0;
+    std::string line;
+
+    while (std::getline(input, line)) {
+        ++line_number;
+        const std::string trimmed = scan_wl_rescan_trim(line);
+        if (trimmed.empty() || trimmed.front() == '#') {
+            continue;
+        }
+
+        std::vector<std::string> fields;
+        try {
+            fields = scan_wl_rescan_split(trimmed, delimiter);
+        } catch (const std::exception& error) {
+            throw std::runtime_error(
+                "line " + std::to_string(line_number) + ": " + error.what());
+        }
+        if (fields.size() < 2) {
+            throw std::runtime_error(
+                "line " + std::to_string(line_number) +
+                " has fewer than two columns");
+        }
+
+        if (!columns_known) {
+            if (fields.front().size() >= 3 &&
+                static_cast<unsigned char>(fields.front()[0]) == 0xef &&
+                static_cast<unsigned char>(fields.front()[1]) == 0xbb &&
+                static_cast<unsigned char>(fields.front()[2]) == 0xbf) {
+                fields.front().erase(0, 3);
+            }
+            size_t named_barcode = fields.size();
+            size_t named_count = fields.size();
+            for (size_t i = 0; i < fields.size(); ++i) {
+                const std::string name = scan_wl_rescan_lower(fields[i]);
+                if (name == "barcode") {
+                    named_barcode = i;
+                } else if (name == "count") {
+                    named_count = i;
+                }
+            }
+            if (named_barcode != fields.size() || named_count != fields.size()) {
+                if (named_barcode == fields.size() || named_count == fields.size()) {
+                    throw std::runtime_error(
+                        "header must contain both barcode and count columns");
+                }
+                barcode_column = named_barcode;
+                count_column = named_count;
+                columns_known = true;
+                continue;
+            }
+            columns_known = true;
+        }
+
+        const size_t required_column = std::max(barcode_column, count_column);
+        if (fields.size() <= required_column) {
+            throw std::runtime_error(
+                "line " + std::to_string(line_number) +
+                " is missing a barcode or count value");
+        }
+        const std::string barcode = scan_wl_rescan_trim(fields[barcode_column]);
+        if (barcode.empty()) {
+            throw std::runtime_error(
+                "line " + std::to_string(line_number) +
+                " has an empty barcode");
+        }
+        const uint64_t count =
+            scan_wl_rescan_parse_count(fields[count_column], line_number);
+        uint64_t& aggregate = result.counts.counts[barcode];
+        if (count > std::numeric_limits<uint64_t>::max() - aggregate ||
+            count > std::numeric_limits<uint64_t>::max() -
+                        result.counts.total_extractions) {
+            throw std::runtime_error(
+                "count overflow at line " + std::to_string(line_number));
+        }
+        aggregate += count;
+        result.counts.total_extractions += count;
+        ++result.input_rows;
+    }
+
+    if (!input.eof()) {
+        throw std::runtime_error(
+            "failed while reading rescan input: " + input_path);
+    }
+    if (result.counts.counts.empty()) {
+        throw std::runtime_error(
+            "rescan input contains no barcode/count rows: " + input_path);
+    }
+    result.counts.reference_whitelist_size =
+        static_cast<uint64_t>(result.counts.counts.size());
+    return result;
+}
+
+inline std::string default_scan_wl_rescan_prefix(std::string input_path) {
+    if (scan_wl_rescan_ends_with(
+            scan_wl_rescan_lower(input_path), ".gz")) {
+        input_path.resize(input_path.size() - 3);
+    }
+    const std::string::size_type slash = input_path.find_last_of("/\\");
+    const std::string::size_type dot = input_path.find_last_of('.');
+    if (dot != std::string::npos &&
+        (slash == std::string::npos || dot > slash)) {
+        input_path.resize(dot);
+    }
+    return input_path + "_rescan";
+}
+
 
 void usage_scan_wl(const char* program_name) {
     std::cout << "Usage: " << program_name << " [options]\n"
@@ -3554,6 +3791,8 @@ void usage_scan_wl(const char* program_name) {
               << "  -k, --chunk-size INT        Chunk size for parallel processing [default: 10000]\n"
               << "      --af-bcs                Write above-floor barcodes to .txt\n"
               << "      --hs-bcs                Write high-specificity final calls to .txt [default]\n"
+              << "      --rescan                Treat --input as barcode/count data and rerun only\n"
+              << "                              the statistical selector (no FASTQ scan)\n"
               << "  -v, --verbose               Enable verbose/debug output\n"
               << "  -h, --help                  Show this help message\n"
               << "\nTwo-part barcode options (BC1+BC2 mode):\n"
@@ -3571,7 +3810,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
     int bc_length = 16, m_left = 0, m_right = 0, max_reads = 0, num_threads = 0, chunk_size = 10000;
     int umi_length = 9, offset_min = 0, offset_max = 3;
     double max_error = kDefaultScanWlMaxErrorRatio;
-    bool verbose = false, af_bcs = false, hs_bcs = false;
+    bool verbose = false, af_bcs = false, hs_bcs = false, rescan = false;
 
     static struct option long_options[] = {
         {"input",          required_argument, 0, 'i'},
@@ -3593,6 +3832,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
         {"offset-max",     required_argument, 0,  4 },
         {"af-bcs",          no_argument,       0,  5 },
         {"hs-bcs",          no_argument,       0,  6 },
+        {"rescan",          no_argument,       0,  7 },
         // Backward-compatible aliases
         {"hd-offset-min",  required_argument, 0,  3 },
         {"hd-offset-max",  required_argument, 0,  4 },
@@ -3623,13 +3863,14 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             case  4 : offset_max = std::atoi(optarg); break;
             case  5 : af_bcs = true; break;
             case  6 : hs_bcs = true; break;
+            case  7 : rescan = true; break;
             case 'v': verbose = true; break;
             case 'h': usage_scan_wl(argv[0]); return 0;
             default: usage_scan_wl(argv[0]); return 1;
         }
     }
     
-    if (adapter_seq.empty()) {
+    if (!rescan && adapter_seq.empty()) {
         std::cerr << "Error: Missing required adapter sequence\n";
         usage_scan_wl(argv[0]);
         return 1;
@@ -3654,6 +3895,72 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
 
     if (using_batch && using_single) {
         std::cout << "Batch CSV provided - ignoring single --input value\n";
+    }
+
+    if (rescan) {
+        if (using_batch) {
+            std::cerr << "Error: --rescan does not support --batch-csv\n";
+            return 1;
+        }
+        if (!bc1_whitelist_file.empty() || !bc2_whitelist_file.empty()) {
+            std::cerr << "Error: --rescan is not compatible with split-barcode options\n";
+            return 1;
+        }
+
+        const auto rescan_started = std::chrono::steady_clock::now();
+        const std::string resolved_prefix =
+            output_prefix.empty()
+                ? default_scan_wl_rescan_prefix(input_file)
+                : output_prefix;
+        if (!ensure_output_directory(resolved_prefix)) {
+            return 1;
+        }
+        const std::string csv_output = resolved_prefix + ".csv";
+        const std::string text_output = resolved_prefix + ".txt";
+        const std::string scan_log_output =
+            resolved_prefix + "_scan_wl.log";
+        if (csv_output == input_file || text_output == input_file) {
+            std::cerr << "Error: --rescan output would overwrite its input\n";
+            return 1;
+        }
+
+        scan_wl_rescan_input retained;
+        try {
+            retained = read_scan_wl_rescan_counts(input_file);
+        } catch (const std::exception& error) {
+            std::cerr << "Error: " << error.what() << "\n";
+            return 1;
+        }
+        std::cout << "Rescanning " << retained.input_rows
+                  << " barcode/count rows ("
+                  << retained.counts.counts.size() << " unique barcodes)\n"
+                  << "Total extractions from count sum: "
+                  << retained.counts.total_extractions << "\n"
+                  << "Whitelist universe from unique input barcodes: "
+                  << retained.counts.reference_whitelist_size << "\n";
+
+        whitelist_scan_stats scan_stats;
+        const scan_whitelist_selection selection =
+            af_bcs ? scan_whitelist_selection::above_floor
+                   : scan_whitelist_selection::high_specificity;
+        const std::unordered_set<int64_seq> no_secondary_filter;
+        if (!count_perfect_matches_with_stats(
+                retained.counts, no_secondary_filter, csv_output, text_output,
+                verbose, selection, &scan_stats)) {
+            return 1;
+        }
+        const double rescan_wall_seconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - rescan_started)
+                .count();
+        if (!write_whitelist_scan_log(
+                scan_log_output, input_file, scan_stats,
+                rescan_wall_seconds)) {
+            return 1;
+        }
+        std::cout << "Whitelist rescan summary written to: "
+                  << scan_log_output << "\n";
+        return 0;
     }
 
     const bool split_barcode_mode = !bc1_whitelist_file.empty() && !bc2_whitelist_file.empty();
