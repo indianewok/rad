@@ -319,6 +319,31 @@ public:
         return std::to_string(lengths.front()) + "-" + std::to_string(lengths.back());
     }
 
+    // Hand-written layouts carry a "Read Layout[:mode]" title row ahead of the column
+    // header; caches written before the title was persisted do not, so the header row
+    // has to be detected rather than assumed.
+    static int detect_header_row(const std::string& input_file) {
+        std::ifstream fin(input_file);
+        std::string first;
+        if (!std::getline(fin, first)) return 0;
+        if (first.rfind("\xEF\xBB\xBF", 0) == 0) first.erase(0, 3);
+        return first.rfind("Read Layout", 0) == 0 ? 1 : 0;
+    }
+
+    // A generated cache carries the internal schema: reverse elements already derived
+    // and orders already assigned. Re-deriving those collides on the unique class_id
+    // index, so the rows would be dropped rather than merged.
+    static bool is_generated_cache(const std::string& input_file) {
+        const int header = detect_header_row(input_file);
+        std::ifstream fin(input_file);
+        std::string line;
+        for (int i = 0; i <= header; ++i) {
+            if (!std::getline(fin, line)) return false;
+        }
+        return line.find("class_id") != std::string::npos
+            && line.find("order") != std::string::npos;
+    }
+
     // get read layout mode
     std::string get_rl_mode(std::string input_file) const {
         std::string mode;
@@ -381,9 +406,14 @@ public:
             std::cout << "[prep_new_layout] Build mode: " << (build_forward_only ? "forward"  : build_reverse_only  ? "reverse" : "both")<< "\n";    
         }
         
+        if (is_generated_cache(input_file)) {
+            throw std::runtime_error(
+                "'" + input_file + "' is a generated layout; pass the original to prep.");
+        }
+
         // Configure CSV reader
         csv::CSVFormat format;
-        format.delimiter(',').header_row(1);
+        format.delimiter(',').header_row(detect_header_row(input_file));
         csv::CSVReader reader(input_file, format);
 
         const auto& headers = reader.get_col_names();
@@ -1062,6 +1092,8 @@ public:
         if(which_file == "layout" || which_file == "both") {
             // Basic layout information
             std::ofstream layout_file(path_prefix + "_layout.csv");
+            layout_file << "Read Layout" << (sequencing_type.empty() ? "" : ":" + sequencing_type)
+                        << ",,,,,,,,,,,\n";
             layout_file << "id,seq,masked_seq,expected_length,length_candidates,flags,type,class,direction,class_id,whitelist,order\n";
             for (const auto& element : by_order()) {
                 layout_file << "\"" << element.class_id << "\","
@@ -1140,10 +1172,12 @@ public:
     // Import layout from CSVs
     void import_from_csv(const std::string& base_path = "", bool verbose = false) {
         // Read main layout file
+        const std::string layout_path = base_path + "_layout.csv";
+        if (std::regex_search(get_rl_mode(layout_path), std::regex("bulk"))) sequencing_type = "bulk";
         csv::CSVFormat format;
-        format.delimiter(',').quote('"').header_row(0);
+        format.delimiter(',').quote('"').header_row(detect_header_row(layout_path));
         format.variable_columns(csv::VariableColumnPolicy::THROW);
-        csv::CSVReader layout_reader(base_path + "_layout.csv", format);
+        csv::CSVReader layout_reader(layout_path, format);
 
         //int order_counter = 1;
         for (auto& row : layout_reader) {
@@ -1251,10 +1285,16 @@ public:
     }
     
     // import a read layout .csv
-    void import_read_layout(const std::string& layout_csv, bool verbose){
+    void import_read_layout(const std::string& layout_csv, bool verbose,
+                            const std::string& mode_source = ""){
         using namespace csv;
+        // Caches written before the mode was persisted carry no title row; fall back to
+        // the layout the caller supplied, since losing bulk here drops every read.
+        std::string mode = get_rl_mode(layout_csv);
+        if (mode.empty() && !mode_source.empty()) mode = get_rl_mode(mode_source);
+        if (std::regex_search(mode, std::regex("bulk"))) sequencing_type = "bulk";
         CSVFormat fmt;
-        fmt.delimiter(',').quote('"').header_row(0)
+        fmt.delimiter(',').quote('"').header_row(detect_header_row(layout_csv))
         .variable_columns(VariableColumnPolicy::THROW);
         CSVReader reader(layout_csv, fmt);
         for (auto &row : reader) {

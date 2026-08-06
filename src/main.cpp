@@ -1355,6 +1355,19 @@ run_auto_whitelist(const ReadLayout &layout, const std::string &fastq_path,
   return {txt_out, ref};
 }
 
+// A layout written by an earlier run is named <prefix>_layout.csv and sits beside
+// its <prefix>_position_map.csv. Returns that companion path, or an empty string
+// when the name does not follow the convention (e.g. a hand-written layout).
+static std::string companion_position_map(const std::string &layout_path) {
+  static const std::string suffix = "_layout.csv";
+  if (layout_path.size() <= suffix.size() ||
+      layout_path.compare(layout_path.size() - suffix.size(), suffix.size(),
+                          suffix) != 0)
+    return "";
+  return layout_path.substr(0, layout_path.size() - suffix.size()) +
+         "_position_map.csv";
+}
+
 int cmd_demux(int argc, char *argv[]) {
   std::string layout_key, fastq_path, custom_kit, global_whitelist_path,
       custom_whitelist_path, output_prefix, output_dir, log_file;
@@ -1708,6 +1721,7 @@ int cmd_demux(int argc, char *argv[]) {
     }
 
     // Import or generate layout
+    bool imported_companion_map = false;
     bool have_layout =
         boost::filesystem::exists(outbase.string() + "_layout.csv");
     bool have_map =
@@ -1718,7 +1732,7 @@ int cmd_demux(int argc, char *argv[]) {
         std::cout << "[import_read_layout] from "
                   << outbase.string() + "_layout.csv\n";
       read_layout.import_read_layout(outbase.string() + "_layout.csv",
-                                     max_verbose);
+                                     max_verbose, layout_csv);
     } else {
       // Translate a seqspec YAML to a RAD layout CSV on the fly (cache-miss
       // path only; a cached *_layout.csv short-circuits this above).
@@ -1730,9 +1744,30 @@ int cmd_demux(int argc, char *argv[]) {
         seqspec_tmp = seqspec::convert_to_temp_layout_csv(layout_src, verbose);
         layout_src = *seqspec_tmp;
       }
-      if (verbose)
-        std::cout << "[prep_new_layout] Generating read layout...\n";
-      read_layout.prep_new_layout(layout_src, verbose);
+      // An -l pointing at a previous run's layout cannot be re-derived — its
+      // reverse elements and orders already exist — so import it instead. When
+      // the companion position map sits beside it, take that too and skip
+      // recalibration entirely.
+      if (ReadLayout::is_generated_cache(layout_src)) {
+        if (verbose)
+          std::cout << "[import_read_layout] -l is a generated layout; importing "
+                    << layout_src << "\n";
+        read_layout.import_read_layout(layout_src, max_verbose, layout_src);
+        const std::string companion = companion_position_map(layout_src);
+        if (!companion.empty() && boost::filesystem::exists(companion)) {
+          if (verbose)
+            std::cout << "[pos_map] Importing companion map " << companion << "\n";
+          read_layout.import_position_map(companion, max_verbose);
+          imported_companion_map = true;
+        } else if (verbose) {
+          std::cout << "[pos_map] No companion position map beside -l; "
+                       "generating fresh\n";
+        }
+      } else {
+        if (verbose)
+          std::cout << "[prep_new_layout] Generating read layout...\n";
+        read_layout.prep_new_layout(layout_src, verbose);
+      }
       if (seqspec_tmp) {
         boost::system::error_code _ec;
         boost::filesystem::remove(*seqspec_tmp, _ec);
@@ -1753,7 +1788,7 @@ int cmd_demux(int argc, char *argv[]) {
         std::cout << "[pos_map] Importing position map...\n";
       read_layout.import_position_map(outbase.string() + "_position_map.csv",
                                       max_verbose);
-    } else {
+    } else if (!imported_companion_map) {
       if (verbose)
         std::cout << "[pos_map] Generating position map...\n";
       read_layout.generate_position_mapping();
@@ -1766,7 +1801,7 @@ int cmd_demux(int argc, char *argv[]) {
               << " ms\n";
 
     // Misalignment if needed
-    if (!have_layout || !have_map) {
+    if ((!have_layout || !have_map) && !imported_companion_map) {
       read_layout.write_to_csv(outbase.string(), "layout");
       if (verbose)
         std::cout << "[misalignment_stats] Computing misalignment...\n";
@@ -1784,6 +1819,11 @@ int cmd_demux(int argc, char *argv[]) {
         read_layout.display_read_layout();
       read_layout.write_to_csv(outbase.string(), "both");
     }
+
+    // The pair came from beside -l rather than from this output prefix; write it
+    // here too so the output directory stands on its own for later runs.
+    if (imported_companion_map)
+      read_layout.write_to_csv(outbase.string(), "both");
 
     memory_utils::get_rss();
 
