@@ -2081,8 +2081,18 @@ class whitelist {
                 true_seeds.build(true_entries, verbose);
             }
             auto global_entries = global_bcs.get_unique_entries();
-            if (!global_entries.empty()) {
+            constexpr size_t max_global_seed_barcodes = 10000;
+            if (global_entries.size() > max_global_seed_barcodes) {
+                global_seeds = seed_idx{};
+                if (verbose) {
+                    std::cout << "[seed_idx] Skipping global index: "
+                              << global_entries.size()
+                              << " unique barcodes exceed the 10,000-barcode cap\n";
+                }
+            } else if (!global_entries.empty()) {
                 global_seeds.build(global_entries, verbose);
+            } else {
+                global_seeds = seed_idx{};
             }
         }
 
