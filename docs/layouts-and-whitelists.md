@@ -8,19 +8,26 @@ This page is the practical map: what’s bundled, what it maps to, and what to t
 build/rad list --layouts
 ```
 
-| Layout key | Source file | Typical pattern | Default whitelist field in layout |
+| Layout key | Source file | Bundled barcode/UMI contract | Default whitelist field in layout |
 | --- | --- | --- | --- |
-| `five_prime` | `resources/read_layout/five_prime_read_layout.csv` | 10x-like 5' (primer, barcode, UMI, TSO, read) | `10x_5v1` |
-| `three_prime` | `resources/read_layout/three_prime_read_layout.csv` | 10x-like 3' (primer, barcode, UMI, polyT, read) | `10x_3v3` |
-| `sctagger` | `resources/read_layout/sctagger_sim_read_layout.csv` | simulated/tagging 3'-style layout | `10x_3v3` |
-| `splitseq` | `resources/read_layout/splitseq_read_layout.csv` | SPLiT-seq multi-round barcodes + linkers | `splitseq_bc1`, `splitseq_bc2` |
-| `visium` | `resources/read_layout/visium_three_prime_read_layout.csv` | Visium-like spatial 3' layout | `10x_Vis_V1` |
+| `five_prime` | `resources/read_layout/five_prime_read_layout.csv` | 10x 5' v1/v2-style: 16 bp barcode + 10 bp UMI | `10x_5v1` |
+| `three_prime` | `resources/read_layout/three_prime_read_layout.csv` | 10x 3' v3/v3.1-style: 16 bp barcode + 12 bp UMI | `10x_3v3` |
+| `sctagger` | `resources/read_layout/sctagger_sim_read_layout.csv` | bundled simulation only: 16 bp barcode + 10 bp UMI | `10x_3v3` |
+| `splitseq` | `resources/read_layout/splitseq_read_layout.csv` | three 8 bp barcodes + 10 bp UMI | `splitseq_bc1`, `splitseq_bc2` |
+| `visium` | `resources/read_layout/visium_three_prime_read_layout.csv` | Visium v1/v2-style: 16 bp spatial barcode + 12 bp UMI | `10x_Vis_V1` |
 | `nanopore_rapid_bc` | `resources/read_layout/nanopore_bulk_rapid_bc_read_layout.csv` | Nanopore bulk rapid barcode-like template | none |
-| `visium_hd` | `resources/read_layout/visium_hd_read_layout.csv` | Visium HD spatial 3' (UMI + joint BC1+BC2) | `visium_hd_bc1`, `visium_hd_bc2` |
+| `visium_hd` | `resources/read_layout/visium_hd_read_layout.csv` | 9 bp UMI + joint 15-16 bp BC1 + 14-15 bp BC2 | `visium_hd_bc1`, `visium_hd_bc2` |
 
 Where these come from:
 - all are local templates shipped in `resources/read_layout/`.
 - nothing is downloaded at runtime.
+- the default build validates every bundled barcode/UMI length and its registered
+  layout/whitelist path; a mismatch stops the build.
+
+Layout lengths are chemistry-specific. `-k/--kit` chooses a barcode catalog; it does
+not rewrite barcode or UMI lengths in the selected layout. Use a custom layout for a
+chemistry whose structure differs from the bundled template (for example, 10x 5' v3
+uses a 12 bp UMI rather than the bundled `five_prime` template's 10 bp UMI).
 
 Visium HD status note:
 - The `visium_hd` layout and its `visium_hd_bc1`/`visium_hd_bc2` whitelists are registered and usable, but the broader Visium HD spatial-binning workflow is still being finished on `dev`.
@@ -28,8 +35,8 @@ Visium HD status note:
 
 ## Quick layout pick guide
 
-- 10x 3' style library -> start with `three_prime`
-- 10x 5' style library -> start with `five_prime`
+- 10x 3' v3/v3.1-style library -> start with `three_prime`
+- 10x 5' v1/v2-style library -> start with `five_prime`
 - SPLiT-seq -> start with `splitseq`
 - Visium -> start with `visium`
 - Visium HD -> `visium_hd` (split BC1+BC2; discover barcodes with `scan-wl` two-part mode)
@@ -193,12 +200,15 @@ Example:
 
 ## Common pairings (quick start)
 
-- `three_prime` + `10x_3v3` (or the specific 3' alias for the kit)
-- `five_prime` + `10x_5v1`/`10x_5v2`/`10x_5v3` (chemistry-dependent)
+- `three_prime` + `10x_3v3`/`10x_3v3.1`/`10x_3HTv3.1`/`10x_3v4`
+- `five_prime` + `10x_5v1`/`10x_5v2`/`10x_5HTv2`
 - `visium` + `10x_Vis_V1`..`10x_Vis_V5`
 - `splitseq` + `splitseq_bc1` + `splitseq_bc2`
 
-If the best pairing is unclear, run a short pilot with `-w` and inspect debug outputs before scaling up.
+These pairings share the bundled layout's barcode/UMI lengths. A catalog alias alone
+does not make a different chemistry layout-compatible; for example, `10x_5v3` needs
+a 12 bp UMI custom layout. If the best pairing is unclear, run a short pilot with `-w`
+and inspect debug outputs before scaling up.
 
 ## Building a whitelist from your reads (`scan-wl`)
 

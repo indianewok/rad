@@ -110,6 +110,17 @@ target_link_libraries(rad_config PRIVATE rad_lib)
 target_link_libraries(generate_whitelist PRIVATE rad_lib)
 target_link_libraries(discover_layout PRIVATE rad_lib)
 
+# Keep the bundled layout resources and their registered kit paths in sync.
+# This target is part of the default build so a chemistry-length regression
+# (for example, restoring a 10 bp UMI to the 10x 3' v3 layout) fails loudly.
+add_custom_target(validate_default_layouts ALL
+    COMMAND ${CMAKE_COMMAND}
+            -DRAD_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate-default-layouts.cmake
+    COMMENT "Validating bundled read-layout and kit contracts"
+    VERBATIM
+)
+
 # --------------------------------------------------------------------------
 message(STATUS "Configure-time compiler: ${CMAKE_CXX_COMPILER}")
 message(STATUS "C++ flags: ${CMAKE_CXX_FLAGS}")
