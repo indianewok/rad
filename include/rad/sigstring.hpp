@@ -1164,9 +1164,15 @@ namespace barcode_correction {
             std::cout << "[kmer_fuzzy_wl_search] No direct k-mer hits, trying k-mer mutations..." << std::endl;
         }
     }
-    if (wl.has_seed_idx()) {
-        // Query both true and global seed indices
-        auto seed_entries = wl.query_bc_seeds(original_barcode, "both");
+    constexpr size_t true_seed_threshold = 10000;
+    const size_t true_unique_size = wl.true_bcs.unique_val_size();
+
+    // Preserve the exhaustive-only path used for smaller selected-cell
+    // whitelists.  For larger whitelists, use the true-barcode seed index as
+    // a fast first attempt, then fall through to the same exhaustive scorer
+    // below whenever the seed shortlist does not produce an accepted call.
+    if (true_unique_size > true_seed_threshold && wl.true_seeds.ready) {
+        auto seed_entries = wl.query_bc_seeds(original_barcode, "true");
         if (verbose) {
             #pragma omp critical
             {
@@ -1182,18 +1188,9 @@ namespace barcode_correction {
                 if (e) seed_candidates.insert(e->barcode);
             }
 
-            // Check true seeds first, then global (offensive order)
-            const std::string first_src  = (mode == "defensive") ? "global" : "true";
-            const std::string second_src = (mode == "defensive") ? "true" : "global";
-
             auto seed_result = check_against_wl(
-                original_barcode, seed_candidates, first_src, 2, verbose, mode, &wl
+                original_barcode, seed_candidates, "true", 2, verbose, mode, &wl
             );
-            if (!seed_result.has_value()) {
-                seed_result = check_against_wl(
-                    original_barcode, seed_candidates, second_src, 2, verbose, mode, &wl
-                );
-            }
             if (seed_result.has_value()) {
                 if (verbose) {
                     #pragma omp critical
@@ -1209,28 +1206,16 @@ namespace barcode_correction {
 
     int64_seq exp_bc;
     exp_bc.sequence_to_bits(expanded_seq);
-    // Exhaustive true-whitelist scan is expensive; cap by unique true barcodes.
-    constexpr size_t true_exhaustive_cap = 10000;
-    const size_t true_unique_size = wl.true_bcs.unique_val_size();
-    if (true_unique_size <= true_exhaustive_cap) {
-       auto true_result = exhaustive_check_against_wl(exp_bc, "true", 2, verbose, mode, &wl);
-       if (true_result.has_value()) {
-            if (verbose) {
-                #pragma omp critical
-                {
-                    std::cout << "[kmer_fuzzy_wl_search] KMER_MUTATION_HIT (true): "
-                              << true_result.value().bits_to_sequence() << std::endl;
-                }
+    auto true_result = exhaustive_check_against_wl(exp_bc, "true", 2, verbose, mode, &wl);
+    if (true_result.has_value()) {
+        if (verbose) {
+            #pragma omp critical
+            {
+                std::cout << "[kmer_fuzzy_wl_search] KMER_MUTATION_HIT (true): "
+                          << true_result.value().bits_to_sequence() << std::endl;
             }
-            return true_result;
         }
-    } else if (verbose) {
-        #pragma omp critical
-        {
-            std::cout << "[kmer_fuzzy_wl_search] Skipping exhaustive true whitelist search "
-                      << "(unique_true_barcodes=" << true_unique_size
-                      << ", cap=" << true_exhaustive_cap << ")\n";
-        }
+        return true_result;
     }
     if (verbose) {
         #pragma omp critical
