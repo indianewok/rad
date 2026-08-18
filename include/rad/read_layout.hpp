@@ -2930,6 +2930,7 @@ private:
         size_t total_reads,
         std::string direction
     ) {
+        bool all_perfect = true;
         // loop over adapters
         for (const auto& [id, seq] : adapters) {
             int max_adapter_error_permissible = static_cast<int>(seq.length()*0.25); 
@@ -2983,9 +2984,13 @@ private:
             }
 
             edlibFreeAlignResult(result);
-            if(!is_perfect) return false;
+            // Continue through the remaining adapters even when this adapter
+            // is not perfect.  Layout calibration needs observations for
+            // every static element; returning here previously skipped later
+            // elements such as rc_forw_primer and left their map rows blank.
+            all_perfect = all_perfect && is_perfect;
         }
-        return true;
+        return all_perfect;
     }
 
 /**
@@ -3173,12 +3178,8 @@ private:
                 auto& misalignment = misalignment_stats[adapter_id];
                 double mean = misalignment.mean;
                 constexpr size_t kMinMisalignmentObservations = 100;
-                constexpr double kFallbackAdapterErrorFraction = 0.30;
-                const int fallback_threshold = std::max(
-                    1,
-                    static_cast<int>(std::ceil(
-                        static_cast<double>(seq.length()) *
-                        kFallbackAdapterErrorFraction)));
+                const int fallback_threshold =
+                    adapter_thresholds::fallback_max_edit_distance(seq.length());
                 const bool use_fallback_threshold =
                     misalignment.count < kMinMisalignmentObservations ||
                     !std::isfinite(mean) ||

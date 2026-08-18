@@ -3594,13 +3594,14 @@ public:
             continue;
         }
 
-        // Update max_distance from misalignment_threshold if available; 
-        //if not, set to ~20% of the adapter seq length
-        // this will be the case for R1/R2 reads
+        // Use the calibrated threshold when available.  Otherwise use the
+        // same ceil(30%) fallback as layout preparation so an omitted map row
+        // cannot silently tighten an adapter from seven edits to four.
         if (it->misalignment_threshold) {
             max_distance = std::get<0>(*it->misalignment_threshold);
         } else {
-            max_distance = static_cast<int>(it->seq.length() * 0.2);
+            max_distance =
+                adapter_thresholds::fallback_max_edit_distance(it->seq.length());
         }
 
         // poly-tail solution--importantly, only will look for poly-tails if you tell it to
