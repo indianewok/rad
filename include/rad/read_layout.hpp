@@ -1483,6 +1483,64 @@ public:
         wl_map.lists.clear();
         wl_map.maps.clear();
 
+        // A joint element's axis:mask declaration is not the generic
+        // global:true dual-whitelist syntax. Resolve it before catalog import.
+        auto joint_group = [](const ReadElement& elem) -> std::optional<int> {
+            std::string flags = elem.flags;
+            std::transform(flags.begin(), flags.end(), flags.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            for (char& c : flags) {
+                if (c == ',' || c == ';' || c == '|') c = ' ';
+            }
+            std::istringstream tokens(flags);
+            std::string token;
+            std::optional<int> group;
+            while (tokens >> token) {
+                if (token.rfind("joint_barcode", 0) != 0) continue;
+                std::smatch match;
+                static const std::regex grammar("^joint_barcode(?::([0-9]+)(?:_([0-9]+))?)?$");
+                if (!std::regex_match(token, match, grammar) || group.has_value()) {
+                    throw std::runtime_error("Invalid joint barcode flags for " + elem.class_id);
+                }
+                group = match[1].matched ? std::stoi(match[1].str()) : 0;
+            }
+            return group;
+        };
+        std::map<int, std::vector<const ReadElement*>> joint_groups;
+        std::unordered_map<std::string, std::string> joint_axis_specs;
+        std::string mask_csv_path;
+        std::optional<int> masked_group;
+        for (const auto& elem : by_order()) {
+            if (elem.global_class != "barcode" || elem.type != "variable") continue;
+            auto group = joint_group(elem);
+            if (!group) continue;
+            auto colon = elem.whitelist_path.find(':');
+            std::string axis = elem.whitelist_path.substr(0, colon);
+            joint_axis_specs[seq_utils::remove_rc(elem.class_id)] = axis;
+            if (elem.direction == "forward") joint_groups[*group].push_back(&elem);
+            if (colon == std::string::npos) continue;
+            std::string mask = elem.whitelist_path.substr(colon + 1);
+            if (axis.empty() || mask.empty() || mask.find(':') != std::string::npos) {
+                throw std::runtime_error("Expected axis:mask for joint barcode " + elem.class_id);
+            }
+            std::string resolved = whitelist_utils::kit_to_path(mask);
+            if ((masked_group && *masked_group != *group) ||
+                (!mask_csv_path.empty() && mask_csv_path != resolved)) {
+                throw std::runtime_error("Conflicting spatial mask declarations; only one masked joint group is supported");
+            }
+            masked_group = *group;
+            mask_csv_path = resolved;
+        }
+        if (masked_group) {
+            if (wl_path) {
+                throw std::runtime_error("A whitelist override cannot be combined with a declared joint spatial mask");
+            }
+            if (joint_groups.size() != 1 || joint_groups[*masked_group].size() != 2) {
+                throw std::runtime_error("A spatial mask requires exactly one joint group with two forward-defined barcode axes");
+            }
+        }
+
         // 1) collect static seqs for filter_bcs
         std::vector<std::string> static_seqs;
         for (auto const &elem : layout) {
@@ -1511,6 +1569,7 @@ public:
 
             // resolve the on-disk path--BUG HERE--ELEM.WHITELIST_PATH CAN BE EMPTY
             std::string spec = wl_path ? wl_path.value() : elem.whitelist_path;
+            if (!wl_path && joint_axis_specs.count(key)) spec = joint_axis_specs.at(key);
             if(spec.empty() || spec == "" || elem.whitelist_path.empty() && wl_path){
                 std::cout << "'[load_wl] No whitelist path provided for " << elem.class_id << "\n";
             }
@@ -1519,7 +1578,10 @@ public:
             std::cout << "[load_wl] [" << elem.class_id << "] [" << spec << "] @ "<< path<<"\n";
 
             // import into the pool if not already
-            auto pit = wl_map.lists.find(path);
+            // Isolate masked axes from other elements that reuse their catalog.
+            const std::string pool_key = masked_group && joint_axis_specs.count(key)
+                ? path + "#joint:" + key : path;
+            auto pit = wl_map.lists.find(pool_key);
             if (pit == wl_map.lists.end()) {
                 if (verbose) std::cout << "[load_wl] Loading from " << path << " ...\n";
                 auto t1 = high_resolution_clock::now();
@@ -1564,7 +1626,7 @@ public:
                 double ms = duration<double, std::milli>(t2 - t1).count();
                 std::cout << "[load_wl] loaded in " << (ms/1000.0) << " s\n";
                 memory_utils::get_rss();
-                pit = wl_map.lists.emplace(path, std::move(entry)).first;
+                pit = wl_map.lists.emplace(pool_key, std::move(entry)).first;
             }
 
             // alias into maps by reference
@@ -1590,65 +1652,60 @@ public:
             }
         }
 
-        // Load spat_mask for joint barcode elements whose whitelist field
-        // contains a colon separator (e.g. "visium_hd_bc1:spat_mask.csv").
-        // The mask CSV path is the same for both bc1 and bc2 — passed on either.
-        // We load it once onto the first joint barcode element's wl_entry.
-        {
-            std::string mask_csv_path;
-            std::string bc1_wl_path, bc2_wl_path;
-            std::string first_joint_key;
-
-            for (auto const& elem : layout) {
-                if (elem.global_class != "barcode" || elem.type != "variable") continue;
-                if (elem.flags.find("joint_barcode") == std::string::npos) continue;
-
-                // Check if whitelist field has a colon (individual_wl:spat_mask_path)
-                auto colon = elem.whitelist_path.find(':');
-                if (colon != std::string::npos) {
-                    std::string individual_spec = elem.whitelist_path.substr(0, colon);
-                    std::string mask_spec = elem.whitelist_path.substr(colon + 1);
-
-                    // Resolve the mask path
-                    std::string resolved_mask = mask_spec;
-                    try {
-                        // If it's not an absolute path, try resolving as kit key
-                        if (!boost::filesystem::path(mask_spec).is_absolute() &&
-                            !boost::filesystem::exists(mask_spec)) {
-                            resolved_mask = whitelist_utils::kit_to_path(mask_spec);
-                        }
-                    } catch (...) {}
-
-                    if (mask_csv_path.empty()) {
-                        mask_csv_path = resolved_mask;
-                    }
-
-                    // Resolve individual whitelist path for axis mapping
-                    std::string resolved_wl = whitelist_utils::kit_to_path(individual_spec);
-                    if (bc1_wl_path.empty()) {
-                        bc1_wl_path = resolved_wl;
-                        first_joint_key = seq_utils::remove_rc(elem.class_id);
-                    } else if (bc2_wl_path.empty()) {
-                        bc2_wl_path = resolved_wl;
+        // Validate the matrix strictly before the legacy loader consumes it.
+        // A requested but unusable mask must never turn into an unrestricted run.
+        if (masked_group) {
+            const auto& members = joint_groups.at(*masked_group);
+            const std::string bc1_path = whitelist_utils::kit_to_path(joint_axis_specs.at(seq_utils::remove_rc(members[0]->class_id)));
+            const std::string bc2_path = whitelist_utils::kit_to_path(joint_axis_specs.at(seq_utils::remove_rc(members[1]->class_id)));
+            auto axis_size = [](const std::string& path) {
+                std::unordered_set<std::string> seen;
+                bool first = true;
+                for (const auto& raw : streaming_utils::import_text(path)) {
+                    std::string line = seq_utils::trim(raw);
+                    if (line.empty()) continue;
+                    if (first && line == "whitelist_bcs") { first = false; continue; }
+                    first = false;
+                    if (line.size() > 32 || line.find_first_not_of("ACGT") != std::string::npos ||
+                        !seen.insert(line).second) {
+                        throw std::runtime_error("Spatial mask axes require unique DNA barcode lines: " + path);
                     }
                 }
-            }
-
-            if (!mask_csv_path.empty() && !bc1_wl_path.empty() && !bc2_wl_path.empty()) {
-                auto mit = wl_map.maps.find(first_joint_key);
-                if (mit != wl_map.maps.end()) {
-                    auto& entry = mit->second.get();
-                    entry.spat_wl.emplace();
-                    bool ok = entry.spat_wl->load(mask_csv_path, bc1_wl_path, bc2_wl_path, verbose);
-                    if (!ok) {
-                        entry.spat_wl.reset();
-                        std::cerr << "[load_wl] Failed to load spat_mask from " << mask_csv_path << "\n";
-                    } else {
-                        std::cout << "[load_wl] Spatial mask loaded: "
-                                  << entry.spat_wl->count_valid() << " valid pairs\n";
+                if (seen.empty() || seen.size() > std::numeric_limits<uint16_t>::max()) {
+                    throw std::runtime_error("Invalid spatial mask axis size: " + path);
+                }
+                return seen.size();
+            };
+            const size_t rows = axis_size(bc1_path), cols = axis_size(bc2_path);
+            std::ifstream matrix(mask_csv_path);
+            if (!matrix) throw std::runtime_error("Cannot open spatial mask: " + mask_csv_path);
+            size_t row_count = 0;
+            std::string line;
+            while (std::getline(matrix, line)) {
+                size_t col_count = 0, start = 0;
+                while (true) {
+                    auto comma = line.find(',', start);
+                    std::string value = seq_utils::trim(line.substr(start, comma == std::string::npos ? comma : comma - start));
+                    if (value != "0" && value != "1") {
+                        throw std::runtime_error("Spatial mask must contain only comma-separated 0/1 values: " + mask_csv_path);
                     }
+                    ++col_count;
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+                if (col_count != cols || ++row_count > rows) {
+                    throw std::runtime_error("Spatial mask dimensions do not match its barcode axes: " + mask_csv_path);
                 }
             }
+            if (matrix.bad() || row_count != rows) {
+                throw std::runtime_error("Incomplete spatial mask: " + mask_csv_path);
+            }
+            auto& entry = wl_map.maps.at(seq_utils::remove_rc(members[0]->class_id)).get();
+            entry.spat_wl.emplace();
+            if (!entry.spat_wl->load(mask_csv_path, bc1_path, bc2_path, verbose)) {
+                throw std::runtime_error("Failed to load requested spatial mask: " + mask_csv_path);
+            }
+            std::cout << "[load_wl] Spatial mask loaded: " << entry.spat_wl->count_valid() << " valid pairs\n";
         }
 
         for (auto & [key, entry_ref] : wl_map.maps) {

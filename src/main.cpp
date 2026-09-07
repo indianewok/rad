@@ -1,6 +1,7 @@
 // main.cpp
 #include "include/rad/rad_headers.h"
 #include "include/rad/seqspec.hpp"  // seqspec YAML -> RAD layout (auto-detected)
+#include "include/rad/spatial.hpp"
 
 // Version string (single source of truth = CMake project() version, injected
 // via target_compile_definitions). Fallback keeps non-CMake builds compiling.
@@ -46,6 +47,7 @@ static void usage_demux(const char *prog) {
          "'defensive'\n"
       << "      --joint-bc-mode               'default' (permissive) or "
          "'strict' (all barcodes must pass)\n"
+      << "                                    default retains passing components of incomplete groups\n"
       << "  -A, --auto-wl                     run scan-wl internally first; "
          "demux uses the\n"
       << "                                    reference as the global whitelist "
@@ -53,7 +55,7 @@ static void usage_demux(const char *prog) {
       << "                                    barcodes as the true whitelist "
          "(single-barcode layouts)\n"
       << "      --scan-adapter                override the scan-wl adapter "
-         "(default: from layout)\n"
+         "or masked pattern (N=capture, n=match-only; default: from layout)\n"
       << "      --scan-bc-len                 override the scan-wl barcode "
          "length (default: from layout)\n"
       << "      --scan-max-error              scan-wl adapter max-error ratio "
@@ -106,7 +108,7 @@ static void usage_reformat(const char *prog) {
             << "Options:\n"
             << "  -q, --fastq           input FASTQ/FASTA (.fq/.fa/.gz)\n"
             << "  -o, --outdir          output directory for per-barcode "
-               "fastqs (required if --split-bc)\n"
+               "fastqs; new output directory with --spatial\n"
             << "      --split-bc        split reads into per-barcode .fq.gz "
                "files (CB:Z tag)\n"
             << "      --reformat-header collapse headers to QNAME_CB_UB "
@@ -115,8 +117,10 @@ static void usage_reformat(const char *prog) {
                "(single char; use \" \" for space)\n"
             << "      --coordinate[=MODE] rewrite headers using coordinate "
                "mode (default MODE: vizHD-v1)\n"
+            << "      --spatial         format spatial assignments; keep unassigned reads\n"
+            << "      --spatial-strict  format spatial assignments; exclude unassigned reads\n"
             << "      --bin-size INT    target bin size in microns for "
-               "coordinate mode (default: 2)\n"
+               "--coordinate or --spatial (default: 2)\n"
             << "  -t, --threads         worker threads (default: 2)\n"
             << "  -v, --verbose         verbose logging\n"
             << "  -h, --help            show this help\n\n"
@@ -124,6 +128,7 @@ static void usage_reformat(const char *prog) {
                "collapsed before splitting.\n"
             << "If only --reformat-header is set, the input file is streamed "
                "and rewritten in place.\n";
+  usage_reformat_spatial();
 }
 
 static void usage_prep(const char *prog) {
@@ -684,7 +689,7 @@ static std::string make_spatial_mapping_id(int bin_size_um, int x_bin,
                                            int y_bin) {
   std::ostringstream oss;
   oss << "s_" << std::setw(3) << std::setfill('0') << bin_size_um << "um_"
-      << zpad(x_bin, 5) << "_" << zpad(y_bin, 5) << "-1";
+      << zpad(y_bin, 5) << "_" << zpad(x_bin, 5) << "-1";
   return oss.str();
 }
 
@@ -705,6 +710,13 @@ int cmd_reformat(int argc, char *argv[]) {
   bool do_split = false;
   bool do_reformat = false;
   bool do_coordinate = false;
+  bool do_spatial = false;
+  bool do_spatial_strict = false;
+  bool spatial_options_used = false;
+  bool explicit_coordinate = false;
+  bool explicit_header = false;
+  bool explicit_threads = false;
+  spatial_reformat_options spatial_options;
   std::string coordinate_mode = "vizHD-v1";
   int bin_size_um = 2;
   char reformat_sep = '_';
@@ -724,6 +736,15 @@ int cmd_reformat(int argc, char *argv[]) {
       // Backward-compatible aliases:
       {"visium-hd-header", no_argument, nullptr, 6},
       {"visium-hd-sample", required_argument, nullptr, 7},
+      {"spatial", no_argument, nullptr, 8},
+      {"map", required_argument, nullptr, 9},
+      {"bc1-axis", required_argument, nullptr, 10},
+      {"bc2-axis", required_argument, nullptr, 11},
+      {"metadata", required_argument, nullptr, 12},
+      {"sample", required_argument, nullptr, 13},
+      {"unit", required_argument, nullptr, 14},
+      {"in-tissue-only", no_argument, nullptr, 15},
+      {"spatial-strict", no_argument, nullptr, 16},
       {nullptr, 0, nullptr, 0}};
 
   int c;
@@ -737,6 +758,7 @@ int cmd_reformat(int argc, char *argv[]) {
       break;
     case 't':
       nthreads = std::max(1, std::stoi(optarg));
+      explicit_threads = true;
       break;
     case 'v':
       verbose = true;
@@ -746,8 +768,10 @@ int cmd_reformat(int argc, char *argv[]) {
       break;
     case 2:
       do_reformat = true;
+      explicit_header = true;
       break;
     case 3: {
+      explicit_header = true;
       std::string arg = optarg ? optarg : "";
       if (arg == "\\t") {
         reformat_sep = '\t';
@@ -767,6 +791,7 @@ int cmd_reformat(int argc, char *argv[]) {
       break;
     }
     case 4: {
+      explicit_coordinate = true;
       do_coordinate = true;
       do_reformat = true;
       if (optarg && *optarg) {
@@ -791,6 +816,7 @@ int cmd_reformat(int argc, char *argv[]) {
       break;
     }
     case 6: {
+      explicit_coordinate = true;
       do_coordinate = true;
       do_reformat = true;
       if (coordinate_mode.empty())
@@ -798,6 +824,7 @@ int cmd_reformat(int argc, char *argv[]) {
       break;
     }
     case 7: {
+      explicit_coordinate = true;
       int parsed = 0;
       std::string arg = optarg ? optarg : "";
       if (!parse_legacy_bin_token(arg, parsed)) {
@@ -811,6 +838,40 @@ int cmd_reformat(int argc, char *argv[]) {
       do_reformat = true;
       break;
     }
+    case 8:
+      do_spatial = true;
+      break;
+    case 9:
+      spatial_options.map_path = optarg;
+      spatial_options_used = true;
+      break;
+    case 10:
+      spatial_options.bc1_path = optarg;
+      spatial_options_used = true;
+      break;
+    case 11:
+      spatial_options.bc2_path = optarg;
+      spatial_options_used = true;
+      break;
+    case 12:
+      spatial_options.metadata_path = optarg;
+      spatial_options_used = true;
+      break;
+    case 13:
+      spatial_options.sample = optarg;
+      spatial_options_used = true;
+      break;
+    case 14:
+      spatial_options.unit = optarg;
+      spatial_options_used = true;
+      break;
+    case 15:
+      spatial_options.tissue_only = true;
+      spatial_options_used = true;
+      break;
+    case 16:
+      do_spatial_strict = true;
+      break;
     case 'h':
       usage_reformat(argv[0]);
       return 0;
@@ -820,6 +881,34 @@ int cmd_reformat(int argc, char *argv[]) {
     }
   }
 
+  if (do_spatial || do_spatial_strict) {
+    if (do_spatial && do_spatial_strict) {
+      std::cerr << "[ERROR] Choose --spatial or --spatial-strict\n";
+      return 1;
+    }
+    if (do_split || explicit_header || explicit_coordinate) {
+      std::cerr << "[ERROR] Spatial reformat cannot be combined with --split-bc, "
+                   "--reformat-header/--reformat-delim, or --coordinate and its aliases\n";
+      return 1;
+    }
+    if (explicit_threads && nthreads != 1) {
+      std::cerr << "[ERROR] Spatial reformat currently supports --threads 1\n";
+      return 1;
+    }
+    if (optind != argc) {
+      std::cerr << "[ERROR] Unexpected positional argument in spatial reformat\n";
+      return 1;
+    }
+    spatial_options.input = fastq_path;
+    spatial_options.output = outdir;
+    spatial_options.bin_size = bin_size_um;
+    spatial_options.strict = do_spatial_strict;
+    return reformat_spatial(spatial_options);
+  }
+  if (spatial_options_used) {
+    std::cerr << "[ERROR] Spatial map, sample, unit and tissue options require --spatial or --spatial-strict\n";
+    return 1;
+  }
   if (!do_split && !do_reformat) {
     std::cerr << "[ERROR] must specify --split-bc and/or --reformat-header\n\n";
     usage_reformat(argv[0]);
@@ -843,6 +932,10 @@ int cmd_reformat(int argc, char *argv[]) {
 
   std::optional<vizhd_axis_reference> spatial_ref;
   if (do_coordinate) {
+    if (bin_size_um < 2 || bin_size_um % 2 != 0) {
+      std::cerr << "[ERROR] Visium HD bin size must be a positive multiple of 2 um\n";
+      return 1;
+    }
     std::string mode_lc = to_lower_copy(coordinate_mode);
     if (!(mode_lc == "vizhd-v1" || mode_lc == "visium-hd-v1" ||
           mode_lc == "visium_hd_v1")) {
@@ -1009,7 +1102,8 @@ int cmd_reformat(int argc, char *argv[]) {
 
         // If ID was previously collapsed, restore qname and recover CB/UB from
         // the ID.
-        if (auto parsed = parse_collapsed_id(r.id, reformat_sep);
+        if (auto parsed = (!cb && !ub) ? parse_collapsed_id(r.id, reformat_sep)
+                                      : std::nullopt;
             parsed.has_value()) {
           auto [parsed_qname, parsed_cb, parsed_ub] = *parsed;
           qname = parsed_qname;
@@ -1058,7 +1152,7 @@ int cmd_reformat(int argc, char *argv[]) {
           ref_writer &w = get_writer(*cb);
           write_record(w, r, true);
         } else {
-          write_record(*single_writer, r, false);
+          write_record(*single_writer, r, true);
         }
 
         size_t now = total.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1080,7 +1174,6 @@ int cmd_reformat(int argc, char *argv[]) {
       // replace original
       boost::filesystem::path orig(fastq_path);
       boost::filesystem::path tmp(single_tmp);
-      boost::filesystem::remove(orig);
       boost::filesystem::rename(tmp, orig);
     }
 
@@ -1256,6 +1349,22 @@ run_auto_whitelist(const ReadLayout &layout, const std::string &fastq_path,
   int bc_len = bc_len_override.value_or(bc_elem->expected_length.value_or(
       bc_elem->length_candidates.empty() ? 16
                                          : bc_elem->length_candidates.back()));
+  const size_t masked_capture_length =
+      scan_masked_capture_length(adapter);
+  if (masked_capture_length > 0) {
+    if (masked_capture_length >
+        static_cast<size_t>(std::numeric_limits<uint16_t>::max())) {
+      throw std::runtime_error(
+          "--auto-wl: masked barcode is too long");
+    }
+    if (bc_len_override &&
+        *bc_len_override != static_cast<int>(masked_capture_length)) {
+      throw std::runtime_error(
+          "--auto-wl: --scan-bc-len must equal the number of uppercase N "
+          "bases in --scan-adapter or be omitted");
+    }
+    bc_len = static_cast<int>(masked_capture_length);
+  }
 
   // 4) Reference for validation: user override, else the barcode's own kit,
   //    else de-novo (no reference).
@@ -1263,8 +1372,11 @@ run_auto_whitelist(const ReadLayout &layout, const std::string &fastq_path,
                                           : ref_whitelist;
 
   std::cout << "[auto-wl] Pre-scanning barcodes before demux\n"
-            << "  adapter (5' of barcode) : " << adapter << "\n"
-            << "  barcode length          : " << bc_len << "\n"
+            << "  adapter/search pattern  : " << adapter << "\n"
+            << "  barcode length          : " << bc_len
+            << (masked_capture_length > 0
+                    ? " (uppercase-N masked capture)\n"
+                    : "\n")
             << "  adapter max-error ratio : " << scan_error << "\n"
             << "  max reads               : "
             << (max_reads == static_cast<size_t>(-1) ? "all"

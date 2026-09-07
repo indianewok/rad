@@ -33,6 +33,7 @@ struct seq_element {
     // Resolved during barcode correction — avoids redundant lookups in update_bc_counts.
     counter* resolved_counter = nullptr;       // pointer to the matched whitelist entry's counter
     bool     resolved_corrected = false;       // true if barcode was error-corrected (not just RC)
+    bool query_complete = true;               // static-query coverage; independent of legacy acceptance
 
     seq_element(
         std::string class_id,
@@ -73,12 +74,13 @@ struct seq_element {
  */
 struct static_alignments {
     std::vector<std::pair<int, int>> positions;
-    int edit_distance;
-    bool success;
+    int edit_distance = -1;
+    bool success = false;
+    bool query_complete = false;
     std::string seq;
     std::string cigar; 
-    int score;
-    std::pair<int,int> pos; 
+    int score = 0;
+    std::pair<int,int> pos{0, 0};
 };
 
 // Tags for the multi-index container
@@ -376,9 +378,10 @@ public:
     static_alignments align_static_elements(
         const std::string& query, const std::string& target, bool verbose, int max_edit_distance = -1, 
         const std::string& masked_query = "", bool primary = true, int expected_start = 1, 
-        int expected_end = -1) {
+        int expected_end = -1, static_alignments* additional_hits = nullptr) {
 
         static_alignments alignment;
+        if (additional_hits) *additional_hits = static_alignments{};
         alignment.success = false;
         alignment.edit_distance = -1;
         // Our threshold for a “good” alignment
@@ -439,6 +442,15 @@ public:
                 }
                 candidates.push_back(current);
             }
+            // Retain the already allocated, actual LOC intervals rather than
+            // copying them or treating an overlap union as a real alignment.
+            // All share editDistance; primary/SSW selection stays unchanged.
+            if (additional_hits) {
+                additional_hits->positions = std::move(intervals);
+                additional_hits->edit_distance = edlibResult.editDistance;
+                additional_hits->success = true;
+                additional_hits->query_complete = true;
+            }
         }
 
         // --- early out: If Edlib returned exactly one candidate and it is within the expected region, use it
@@ -447,6 +459,7 @@ public:
             if (cand.first >= expected_start && cand.second <= expected_end) {
                 alignment.positions.push_back(cand);
                 alignment.success = true;
+                alignment.query_complete = true;
                 alignment.edit_distance = edlibResult.editDistance;
                 // Optionally set alignment.seq, alignment.cigar, etc.
                 alignment.seq = target.substr(cand.first - 1, cand.second - cand.first + 1);
@@ -521,6 +534,10 @@ public:
                 alignment.positions.push_back({ssw_start, ssw_end});
                 alignment.edit_distance = compute_edit_distance(sswAlign.cigar_string.c_str());
                 alignment.success = alignment.edit_distance < max_edit_distance + 1 ? true : false;
+                // RAD passes the adapter as SSW's reference, not its query.
+                // Read-span/edit-distance consistency cannot detect all clipping.
+                alignment.query_complete = sswAlign.ref_begin == 0 &&
+                    sswAlign.ref_end == static_cast<int>(query.size()) - 1;
                 alignment.cigar = sswAlign.cigar_string;
                 alignment.seq = target.substr(ssw_start - 1, ssw_end - ssw_start + 1);
             }
@@ -1559,6 +1576,16 @@ struct sigalign_run_stats {
     double overhead_time_seconds = 0.0;
 };
 
+// A bounded molecule and its assigned static evidence, before any variable
+// extraction or barcode-count side effects. Coordinates are parent-relative.
+struct static_segment {
+    std::pair<int, int> position;
+    std::string direction;
+    std::vector<seq_element> elements;
+    int edit_distance = 0;
+    bool ambiguous = false;
+};
+
 /**
  * @class SigString
  * @brief Container for a sequencing read and its aligned elements with multi-indexed access
@@ -1580,6 +1607,7 @@ class SigString {
     int sequence_length;
     std::string read_type;
     std::string additional_info;
+    bool from_concatemer = false;
 
 public:
     SigString(
@@ -2561,14 +2589,14 @@ private:
                 ? barcode_counts::corrected
                 : barcode_counts::raw);
 
-            if (type == "forward" && elem.direction == "forward") {
-                cnt.increment(barcode_counts::forw);
-            } else if (type == "reverse" && elem.direction == "reverse") {
-                cnt.increment(barcode_counts::rev);
-            } else if (type == "concatenate") {
+            if (from_concatemer || type == "concatenate") {
                 cnt.increment(elem.direction == "forward"
                     ? barcode_counts::forw_concat
                     : barcode_counts::rev_concat);
+            } else if (type == "forward" && elem.direction == "forward") {
+                cnt.increment(barcode_counts::forw);
+            } else if (type == "reverse" && elem.direction == "reverse") {
+                cnt.increment(barcode_counts::rev);
             }
         }
     }
@@ -2956,7 +2984,34 @@ private:
         int64_seq bits;
         bits.sequence_to_bits(seq);
         if (!bits.is_valid()) return false;
-        return wl.true_bcs.check_wl_for(bits) || wl.global_bcs.check_wl_for(bits);
+        // Precomputed mutation aliases are not exact barcode identities.
+        return wl.true_bcs.has_identity_mapping(bits) || wl.global_bcs.check_wl_for(bits);
+    }
+
+    bool joint_barcode_pair_allowed(
+        const std::vector<std::reference_wrapper<const seq_element>>& group,
+        const ReadLayout& layout,
+        const std::vector<int64_seq>& identities
+    ) const {
+        if (group.size() != identities.size()) return false;
+        if (group.size() != 2) return true;
+
+        // Pair masks use forward molecule order, including on reverse reads.
+        bool reverse = group[0].get().direction == "reverse";
+        size_t first = reverse
+            ? (group[0].get().position.second >= group[1].get().position.second ? 0 : 1)
+            : (group[0].get().position.first <= group[1].get().position.first ? 0 : 1);
+        size_t second = 1 - first;
+        for (const auto& ref : group) {
+            auto found = layout.wl_map.maps.find(seq_utils::remove_rc(ref.get().class_id));
+            if (found == layout.wl_map.maps.end()) return false;
+            const auto& mask = found->second.get().spat_wl;
+            if (mask.has_value() &&
+                (mask->empty() || !mask->check(identities[first], identities[second]))) {
+                return false;
+            }
+        }
+        return true;
     }
 
 /**
@@ -2976,8 +3031,12 @@ private:
         const ReadLayout& layout,
         const read_streaming::sequence& read,
         const joint_barcode_info& jb_info,
-        bool verbose
+        bool verbose,
+        bool* ambiguous = nullptr,
+        bool* rejected_pair = nullptr
     ) {
+        if (ambiguous) *ambiguous = false;
+        if (rejected_pair) *rejected_pair = false;
         if (group.size() < 2) return false;
 
         // Validate: all must be barcodes, same direction
@@ -3028,6 +3087,23 @@ private:
             return members[a].position.first < members[b].position.first;
         });
 
+        // A fixed-length UMI directly before the chain shares its molecular
+        // boundary with BC1. Primer-based extraction may have been shifted; the
+        // resolved barcode placement supplies the more specific boundary.
+        std::string adjacent_umi_id;
+        int adjacent_umi_length = 0;
+        const auto* first_layout = find_layout_element(layout, members[order[0]].elem->class_id);
+        if (first_layout) {
+            const auto& ordered_layout = layout.by_order();
+            auto previous = ordered_layout.find(first_layout->order + (reverse ? 1 : -1));
+            if (previous != ordered_layout.end() && previous->direction == direction &&
+                previous->global_class == "umi" && previous->type == "variable" &&
+                previous->expected_length.value_or(0) > 0 && previous->length_candidates.size() <= 1) {
+                adjacent_umi_id = previous->class_id;
+                adjacent_umi_length = *previous->expected_length;
+            }
+        }
+
         // Build offset search order centered on 0
         const int off_min = jb_info.offset_min;
         const int off_max = jb_info.offset_max;
@@ -3052,9 +3128,42 @@ private:
         // cursor = current position in the oriented read (1-based)
         // depth  = which member in `order` we're trying to match
         std::vector<member_hit> hits(members.size());
+        std::vector<member_hit> accepted_hits;
+        std::string accepted_umi;
+        bool conflicting_identity = false;
+        bool mask_rejected_candidate = false;
 
-        std::function<bool(int, size_t)> search_chain = [&](int cursor, size_t depth) -> bool {
-            if (depth == order.size()) return true; // all matched
+        std::function<void(int, size_t)> search_chain = [&](int cursor, size_t depth) {
+            if (conflicting_identity) return;
+            if (depth == order.size()) {
+                std::vector<int64_seq> identities;
+                identities.reserve(hits.size());
+                for (const auto& hit : hits) identities.emplace_back(hit.seq);
+                if (!joint_barcode_pair_allowed(group, layout, identities)) {
+                    mask_rejected_candidate = true;
+                    return;
+                }
+                std::string candidate_umi;
+                if (adjacent_umi_length > 0) {
+                    const int start = hits[order[0]].start - adjacent_umi_length;
+                    if (start < 1) return;
+                    candidate_umi = oriented_read.substr(static_cast<size_t>(start - 1),
+                                                         static_cast<size_t>(adjacent_umi_length));
+                }
+                if (accepted_hits.empty()) {
+                    accepted_hits = hits;
+                    accepted_umi = std::move(candidate_umi);
+                } else {
+                    if (candidate_umi != accepted_umi) conflicting_identity = true;
+                    for (size_t i = 0; i < hits.size(); ++i) {
+                        if (hits[i].seq != accepted_hits[i].seq) {
+                            conflicting_identity = true;
+                            break;
+                        }
+                    }
+                }
+                return;
+            }
             size_t mi = order[depth];
             const auto& m = members[mi];
             for (int len : m.lengths) {
@@ -3065,46 +3174,27 @@ private:
                     static_cast<size_t>(start - 1), static_cast<size_t>(len));
                 if (!exact_whitelist_match(*m.wl, seq)) continue;
                 hits[mi] = {seq, start, end};
-                if (search_chain(end + 1, depth + 1)) return true;
+                search_chain(end + 1, depth + 1);
+                if (conflicting_identity) return;
             }
-            return false;
         };
 
-        bool found = false;
         for (int off : offset_order) {
             int start = anchor_start + off;
             if (start < 1) continue;
-            if (search_chain(start, 0)) {
-                found = true;
-                break;
-            }
+            search_chain(start, 0);
+            if (conflicting_identity) break;
         }
-        if (!found) return false;
-
-        // Validate the pair against the joint_spat_wl if loaded.
-        // For a two-member group: check the (BC1, BC2) bit in the sparse mask.
-        if (group.size() == 2) {
-            size_t first_idx = order[0];
-            size_t second_idx = order[1];
-            auto wl_it = layout.wl_map.maps.find(
-                seq_utils::remove_rc(members[first_idx].elem->class_id));
-            if (wl_it != layout.wl_map.maps.end()) {
-                const auto& wl_entry = wl_it->second.get();
-                if (wl_entry.spat_wl.has_value() && !wl_entry.spat_wl->empty()) {
-                    int64_seq bc1_bits, bc2_bits;
-                    bc1_bits.sequence_to_bits(hits[first_idx].seq);
-                    bc2_bits.sequence_to_bits(hits[second_idx].seq);
-                    if (!wl_entry.spat_wl->check(bc1_bits, bc2_bits)) {
-                        if (verbose) {
-                            log_verbose("JOINT_BARCODE_PAIR_REJECTED: " +
-                                hits[first_idx].seq + "+" + hits[second_idx].seq +
-                                " not in valid pairs mask");
-                        }
-                        return false;
-                    }
-                }
-            }
+        if (conflicting_identity) {
+            if (ambiguous) *ambiguous = true;
+            if (verbose) log_verbose("JOINT_BARCODE_AMBIGUOUS: multiple barcode or adjacent UMI identities");
+            return false;
         }
+        if (accepted_hits.empty()) {
+            if (rejected_pair) *rejected_pair = mask_rejected_candidate;
+            return false;
+        }
+        hits = std::move(accepted_hits);
 
         // Convert hits back to original coordinates and apply corrections
         auto to_original = [read_len, reverse](std::pair<int, int> p) -> std::pair<int, int> {
@@ -3113,6 +3203,24 @@ private:
         };
 
         auto& id_index = sig_elements.get<sig_id_tag>();
+        if (adjacent_umi_length > 0) {
+            const int stop = hits[order[0]].start - 1;
+            const auto position = to_original({stop - adjacent_umi_length + 1, stop});
+            auto found = id_index.find(adjacent_umi_id);
+            if (found == id_index.end() ||
+                (read.is_fastq && position.second > static_cast<int>(read.qual.size()))) return false;
+            id_index.modify(found, [&](seq_element& elem) {
+                elem.original_seq = elem.seq;
+                elem.position = position;
+                elem.seq = read.seq.substr(static_cast<size_t>(position.first - 1),
+                                           static_cast<size_t>(adjacent_umi_length));
+                if (read.is_fastq) {
+                    elem.qual = read.qual.substr(static_cast<size_t>(position.first - 1),
+                                                 static_cast<size_t>(adjacent_umi_length));
+                }
+                elem.element_pass = true;
+            });
+        }
         for (size_t mi = 0; mi < members.size(); ++mi) {
             const auto& m = members[mi];
             const auto& h = hits[mi];
@@ -3186,6 +3294,7 @@ private:
         bool strict_joint_mode = (joint_bc_mode == "strict");
         bool all_barcodes_passed = true;
         bool any_barcode_passed = false;
+        bool joint_identity_rejected = false;
 
         auto& id_index = sig_elements.get<sig_id_tag>();
         for (size_t i = 0; i < barcode_entries.size();) {
@@ -3206,13 +3315,51 @@ private:
                     ++j;
                 }
 
-                if (group.size() >= 2 &&
-                    try_process_joint_barcode_group(group, layout, read, group_info, verbose)) {
-                    any_barcode_passed = true;
-                    i = j;
-                    continue;
+                bool ambiguous = false;
+                bool rejected_pair = false;
+                bool exact_group = group.size() >= 2 &&
+                    try_process_joint_barcode_group(group, layout, read, group_info, verbose,
+                                                    &ambiguous, &rejected_pair);
+                std::vector<bool> resolved(group.size(), exact_group);
+                if (!exact_group && !ambiguous && !rejected_pair) {
+                    // Default mode can retain independently resolved components.
+                    // A failed component is not a corrected barcode and must not
+                    // be written into an apparently complete molecular identity.
+                    for (size_t member = 0; member < group.size(); ++member) {
+                        seq_element elem = group[member].get();
+                        resolved[member] = elem.seq &&
+                            process_single_barcode(elem, layout, read, gen_mut, mode, verbose);
+                    }
                 }
-                // Joint group failed — fall through to process individually
+                if (!ambiguous && !rejected_pair && group.size() >= 2 &&
+                    std::all_of(resolved.begin(), resolved.end(), [](bool value) { return value; })) {
+                    // Check the full resolved pair before output filtering: a
+                    // suppressed component cannot hide a known mask violation.
+                    std::vector<int64_seq> identities;
+                    identities.reserve(group.size());
+                    for (const auto& ref : group) identities.emplace_back(*ref.get().seq);
+                    rejected_pair = !joint_barcode_pair_allowed(group, layout, identities);
+                }
+                const bool rejected = ambiguous || rejected_pair;
+                size_t retained = 0;
+                for (size_t member = 0; member < group.size(); ++member) {
+                    const auto& elem = group[member].get();
+                    if (rejected || !resolved[member] || !elem.write.value_or(true)) {
+                        edit_elem(elem.class_id, [](seq_element& failed) {
+                            failed.element_pass = false;
+                            failed.write = false;
+                        });
+                    } else {
+                        ++retained;
+                    }
+                }
+                if (retained != group.size() || group.size() < 2) {
+                    all_barcodes_passed = false;
+                }
+                joint_identity_rejected = joint_identity_rejected || rejected;
+                any_barcode_passed = any_barcode_passed || retained > 0;
+                i = std::max(i + 1, j);
+                continue;
             }
 
             // Process as a single barcode
@@ -3232,6 +3379,7 @@ private:
             ++i;
         }
 
+        if (joint_identity_rejected) return false;
         if (!has_multiple_barcodes) {
             return all_barcodes_passed;
         }
@@ -3479,7 +3627,7 @@ private:
         return count;
     }
     
-    void log_verbose(const std::string& message) {
+    void log_verbose(const std::string& message) const {
         #pragma omp critical
         {
             std::ostringstream oss;
@@ -3520,7 +3668,8 @@ public:
  * misalignment regions or are truncated on the edges of reads.
  * Aligned elements in the read are masked to prevent re-alignment or overlapping.
  */
-   void sigalign_static(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose) {
+   void sigalign_static(const read_streaming::sequence &read, const ReadLayout& layout, bool verbose,
+                        std::vector<seq_element>* additional_hits = nullptr) {
     aligner_tools aligner;
     auto& type_index = layout.by_type();
     auto static_range = type_index.equal_range("static");
@@ -3661,6 +3810,7 @@ public:
         }
 
         // Use the entire mutable sequence as target
+        static_alignments candidates;
         auto result = aligner.align_static_elements(it->seq,
                                                     mutable_seq,
                                                     verbose,
@@ -3668,7 +3818,26 @@ public:
                                                     it->masked_seq,
                                                     verbose,
                                                     expected_start,
-                                                    expected_end);
+                                                    expected_end,
+                                                    additional_hits ? &candidates : nullptr);
+        if (additional_hits && candidates.success) {
+            for (const auto& pos : candidates.positions) {
+                if (pos.first < 1 || pos.second < pos.first ||
+                    pos.second > static_cast<int>(read_length)) continue;
+                // Alternative tracebacks at the primary locus are not extra
+                // molecules. Keep legacy coordinates/metadata there.
+                if (result.success && std::any_of(result.positions.begin(), result.positions.end(),
+                    [&](const auto& primary_pos) {
+                        return pos.first <= primary_pos.second && primary_pos.first <= pos.second;
+                    })) continue;
+                additional_hits->emplace_back(it->class_id, it->global_class,
+                    candidates.edit_distance, pos, "static", it->order, it->direction,
+                    true, std::nullopt, read.seq.substr(pos.first - 1, pos.second - pos.first + 1));
+                if (verbose) log_verbose("CONCAT_CANDIDATE " + it->class_id + " " +
+                    std::to_string(pos.first) + ":" + std::to_string(pos.second) +
+                    " edits=" + std::to_string(candidates.edit_distance));
+            }
+        }
             if (result.success) {
                 // Positions returned are relative to the full read
                 for (const auto& pos : result.positions) {
@@ -3687,7 +3856,7 @@ public:
                     // Extract N-masked regions if query contains N's
                     std::string n_extracted = aligner.extract_n_masked_regions(result, it->seq);
 
-                    add_element(seq_element(
+                    seq_element primary(
                         it->class_id,
                         it->global_class,
                         result.edit_distance,
@@ -3700,7 +3869,9 @@ public:
                         n_extracted.empty() ? full_aligned_seq : n_extracted,
                         std::nullopt,
                         n_extracted.empty() ? std::nullopt : std::optional<std::string>(full_aligned_seq)
-                    ));
+                    );
+                    primary.query_complete = result.query_complete;
+                    add_element(std::move(primary));
 
                     // Mask the aligned region so that it is not re-aligned
                     std::fill(mutable_seq.begin() + adj_start - 1,
@@ -3710,6 +3881,299 @@ public:
                 continue;
             }
         }
+    }
+
+    // Group occurrences, not alignment scores. This runs before variables are
+    // instantiated, and never changes the legacy signature on an unresolved
+    // read. In particular, an ordinary F/R duplet stays on its existing path.
+    std::vector<static_segment> group_static_candidates(
+        const ReadLayout& layout, const std::vector<seq_element>& additional_hits,
+        bool verbose = false, int min_read_length = 0) const {
+        if (additional_hits.empty()) return {};
+
+        auto is_anchor = [&](const seq_element& elem) {
+            if (elem.type != "static" || !elem.element_pass.value_or(false) ||
+                elem.global_class == "start" || elem.global_class == "stop" ||
+                elem.global_class == "poly_tail") return false;
+            const auto found = layout.by_id().find(elem.class_id);
+            if (found == layout.by_id().end() || !elem.edit_distance) return false;
+            // Reject spans incompatible with a full-query alignment. This is
+            // necessary but not sufficient to rule out SSW clipping; exact
+            // query coverage is checked separately before a primary can root
+            // a repeated orientation.
+            const int span = elem.position.second - elem.position.first + 1;
+            return std::abs(span - static_cast<int>(found->seq.size())) <= *elem.edit_distance;
+        };
+        // Most unused LOC results are an alternative to a failed/positional
+        // primary, not a repeat. Avoid building grouping indices for them.
+        bool repeated_anchor = false;
+        for (size_t index = 0; index < additional_hits.size() && !repeated_anchor; ++index) {
+            const auto& hit = additional_hits[index];
+            if (!is_anchor(hit)) continue;
+            auto same_id = by_id().equal_range(hit.class_id);
+            auto separate = [&](const seq_element& other) {
+                return other.class_id == hit.class_id && is_anchor(other) &&
+                    (other.position.second < hit.position.first || hit.position.second < other.position.first);
+            };
+            for (auto it = same_id.first; it != same_id.second; ++it) repeated_anchor = repeated_anchor || separate(*it);
+            for (size_t other = 0; other < index && !repeated_anchor; ++other) repeated_anchor = separate(additional_hits[other]);
+        }
+        if (!repeated_anchor) return {};
+        const int read_length_floor = std::max(1, min_read_length >= 0
+            ? min_read_length : calc_total_static_len(layout));
+
+        std::map<std::string, std::vector<const seq_element*>> hits;
+        for (const auto& elem : sig_elements) {
+            if (is_anchor(elem)) hits[elem.class_id].push_back(&elem);
+        }
+        for (const auto& elem : additional_hits) {
+            if (is_anchor(elem)) hits[elem.class_id].push_back(&elem);
+        }
+        for (auto& entry : hits) {
+            auto& positions = entry.second;
+            std::stable_sort(positions.begin(), positions.end(), [](const auto* a, const auto* b) {
+                return a->position < b->position;
+            });
+            std::vector<const seq_element*> distinct;
+            int cluster_end = -1;
+            for (const auto* hit : positions) {
+                if (distinct.empty() || hit->position.first > cluster_end) {
+                    distinct.push_back(hit);
+                } else if (hit->edit_distance.value_or(INT_MAX) <
+                           distinct.back()->edit_distance.value_or(INT_MAX)) {
+                    distinct.back() = hit;
+                }
+                cluster_end = std::max(cluster_end, hit->position.second);
+            }
+            positions = std::move(distinct);
+        }
+
+        std::vector<static_segment> segments;
+        std::map<std::string, bool> incomplete_directions;
+        std::map<std::string, std::vector<std::pair<std::string, std::string>>> anchor_patterns;
+        for (const std::string direction : {"forward", "reverse"}) {
+            std::vector<const ReadElement*> anchors;
+            int first_read = INT_MAX, last_read = -1;
+            for (const auto& elem : layout.by_order()) {
+                if (elem.direction != direction) continue;
+                if (elem.type == "variable" && elem.global_class == "read") {
+                    first_read = std::min(first_read, elem.order);
+                    last_read = std::max(last_read, elem.order);
+                }
+                if (elem.type == "static" && elem.global_class != "start" &&
+                    elem.global_class != "stop" && elem.global_class != "poly_tail") {
+                    anchors.push_back(&elem);
+                }
+            }
+            // A single adapter or a homopolymer is insufficient evidence for
+            // a new molecule. Require real layout anchors around the cDNA.
+            if (anchors.size() < 2 || first_read == INT_MAX || first_read != last_read ||
+                anchors.front()->order >= first_read || anchors.back()->order <= last_read) continue;
+            bool unbounded_variables = false;
+            for (const auto& elem : layout.by_order()) {
+                if (elem.direction == direction && elem.type == "variable" &&
+                    (elem.order < anchors.front()->order || elem.order > anchors.back()->order)) {
+                    unbounded_variables = true;
+                }
+            }
+            if (unbounded_variables) continue;
+            auto& pattern = anchor_patterns[direction];
+            for (const auto* anchor : anchors) {
+                pattern.emplace_back(seq_utils::remove_rc(anchor->class_id),
+                    direction == "reverse" ? seq_utils::revcomp(anchor->seq) : anchor->seq);
+            }
+            std::sort(pattern.begin(), pattern.end());
+
+            std::vector<int> min_gaps(anchors.size(), 0);
+            for (size_t index = 1; index < anchors.size(); ++index) {
+                for (const auto& elem : layout.by_order()) {
+                    if (elem.direction != direction || elem.type != "variable" ||
+                        elem.order <= anchors[index - 1]->order || elem.order >= anchors[index]->order) continue;
+                    int length = elem.expected_length.value_or(0);
+                    if (!elem.length_candidates.empty()) {
+                        length = *std::min_element(elem.length_candidates.begin(), elem.length_candidates.end());
+                    }
+                    // A necessarily too-short cDNA cannot lend support to a
+                    // cut of an otherwise valid parent. This is an optimistic
+                    // bound (poly-tails are not charged here); normal extraction
+                    // and filtering still decide whether the child passes.
+                    min_gaps[index] += std::max(elem.global_class == "read" ? read_length_floor : 0, length);
+                }
+            }
+            const auto& heads = hits[anchors.front()->class_id];
+            bool incomplete = false;
+            for (size_t head = 0; head < heads.size(); ++head) {
+                const int limit = head + 1 < heads.size() ? heads[head + 1]->position.first : sequence_length + 1;
+                std::vector<const seq_element*> chain{heads[head]};
+                bool ambiguous = false;
+                for (size_t index = 1; index < anchors.size(); ++index) {
+                    const seq_element* next = nullptr;
+                    bool tied = false;
+                    for (const auto* hit : hits[anchors[index]->class_id]) {
+                        if (hit->position.first <= chain.back()->position.second + min_gaps[index] ||
+                            hit->position.second >= limit) continue;
+                        if (!next || *hit->edit_distance < *next->edit_distance) {
+                            next = hit;
+                            tied = false;
+                        } else if (*hit->edit_distance == *next->edit_distance) {
+                            tied = true;
+                        }
+                    }
+                    if (!next) break;
+                    chain.push_back(next);
+                    ambiguous = ambiguous || tied;
+                }
+                if (chain.size() != anchors.size()) {
+                    incomplete = true;
+                    continue;
+                }
+                static_segment segment{{chain.front()->position.first, chain.back()->position.second}, direction, {}};
+                segment.ambiguous = ambiguous;
+                for (const auto* hit : chain) {
+                    segment.elements.push_back(*hit);
+                    segment.edit_distance += *hit->edit_distance;
+                }
+                for (const auto& elem : sig_elements) {
+                    if (elem.global_class == "poly_tail" && elem.direction == direction &&
+                        elem.position.first >= segment.position.first && elem.position.second <= segment.position.second) {
+                        segment.elements.push_back(elem);
+                    }
+                }
+                segments.push_back(std::move(segment));
+            }
+            incomplete_directions[direction] = incomplete;
+        }
+        // Let complete, stronger chains outvote incidental opposite-strand
+        // matches in their interval. Equal-strength conflicting evidence is
+        // unresolved, not a reason to invent a cut. Custom asymmetric layouts
+        // cannot compare raw edit sums across different anchor sets.
+        const bool comparable_orientations = anchor_patterns["forward"] == anchor_patterns["reverse"];
+        std::sort(segments.begin(), segments.end(), [](const auto& a, const auto& b) {
+            return std::tie(a.edit_distance, a.position) < std::tie(b.edit_distance, b.position);
+        });
+        std::vector<static_segment> selected;
+        std::map<std::string, size_t> direction_counts;
+        for (auto& segment : segments) {
+            bool overlaps_better = false;
+            for (const auto& other : selected) {
+                if (segment.position.first <= other.position.second && other.position.first <= segment.position.second) {
+                    if (segment.edit_distance == other.edit_distance ||
+                        (segment.direction != other.direction && !comparable_orientations)) {
+                        if (verbose) log_verbose("CONCAT_UNRESOLVED equal-strength/incomparable overlapping chains");
+                        return {};
+                    }
+                    overlaps_better = true;
+                }
+            }
+            if (overlaps_better) continue;
+            if (segment.ambiguous || incomplete_directions[segment.direction]) {
+                if (verbose) log_verbose("CONCAT_UNRESOLVED ambiguous/incomplete anchor chain: " + segment.direction);
+                return {};
+            }
+            ++direction_counts[segment.direction];
+            selected.push_back(std::move(segment));
+        }
+        if (direction_counts["forward"] < 2 && direction_counts["reverse"] < 2) return {};
+        // A repeat must extend an accepted full-query primary, not consist
+        // entirely of LOC alternatives whose legacy SSW validation failed.
+        // Otherwise weak repeated motifs can replace a valid opposite strand.
+        for (const auto& entry : direction_counts) {
+            if (entry.second < 2) continue;
+            bool supported = false;
+            for (const auto& primary : sig_elements) {
+                if (primary.direction != entry.first || !primary.query_complete || !is_anchor(primary)) continue;
+                for (const auto& segment : selected) {
+                    if (segment.direction != entry.first) continue;
+                    for (const auto& hit : segment.elements) {
+                        if (hit.class_id == primary.class_id &&
+                            hit.position.first <= primary.position.second &&
+                            primary.position.first <= hit.position.second) supported = true;
+                    }
+                }
+            }
+            if (!supported) {
+                if (verbose) log_verbose("CONCAT_UNRESOLVED repeat without primary support: " + entry.first);
+                return {};
+            }
+        }
+        std::sort(selected.begin(), selected.end(), [](const auto& a, const auto& b) { return a.position < b.position; });
+        // Clipped/one-sided primaries cannot justify a cut, but they can still
+        // support legacy extraction. Do not abandon their intervals. Coverage
+        // is strand-independent so incidental opposite hits inside (or across
+        // touching) accepted children do not veto otherwise resolved groups.
+        for (const auto& primary : sig_elements) {
+            if (primary.type != "static" || !primary.element_pass.value_or(false) ||
+                primary.global_class == "start" || primary.global_class == "stop" ||
+                primary.global_class == "poly_tail" || layout.by_id().find(primary.class_id) == layout.by_id().end() ||
+                primary.position.first < 1 || primary.position.second < primary.position.first ||
+                primary.position.second > sequence_length) continue;
+            int uncovered = primary.position.first;
+            for (const auto& segment : selected) {
+                if (segment.position.second < uncovered) continue;
+                if (segment.position.first > uncovered) break;
+                uncovered = segment.position.second + 1;
+                if (uncovered > primary.position.second) break;
+            }
+            if (uncovered <= primary.position.second) {
+                if (verbose) log_verbose("CONCAT_UNRESOLVED uncovered primary: " + primary.class_id);
+                return {};
+            }
+        }
+        if (verbose) {
+            log_verbose("CONCAT_GROUPS " + std::to_string(selected.size()) + " (reused static alignments)");
+            for (const auto& segment : selected) {
+                log_verbose("CONCAT_SEGMENT " + segment.direction + " " +
+                    std::to_string(segment.position.first) + ":" + std::to_string(segment.position.second) +
+                    " edits=" + std::to_string(segment.edit_distance));
+            }
+        }
+        return selected;
+    }
+
+    // Materialize only an accepted occurrence. No child adapter search is
+    // performed; the only possible alignment here is a local traceback for
+    // an indel-containing N-masked capture whose LOC result has no path.
+    bool assign_static_segment(const static_segment& segment, const ReadLayout& layout,
+                               const read_streaming::sequence& read) {
+        from_concatemer = true;
+        const int offset = segment.position.first - 1;
+        aligner_tools aligner;
+        for (auto elem : segment.elements) {
+            elem.position.first -= offset;
+            elem.position.second -= offset;
+            const auto layout_it = layout.by_id().find(elem.class_id);
+            if (layout_it != layout.by_id().end() && layout_it->seq.find('N') != std::string::npos &&
+                !elem.original_seq) {
+                static_alignments capture;
+                capture.seq = read.seq.substr(elem.position.first - 1, elem.position.second - elem.position.first + 1);
+                if (elem.edit_distance.value_or(-1) != 0) {
+                    const EdlibEqualityPair equalities[] = {
+                        {'A','a'}, {'C','c'}, {'T','t'}, {'G','g'},
+                        {'A','x'}, {'C','x'}, {'T','x'}, {'G','x'},
+                        {'N','A'}, {'N','C'}, {'N','T'}, {'N','G'}, {'N','x'}};
+                    auto result = edlibAlign(layout_it->seq.c_str(), layout_it->seq.size(),
+                        capture.seq.c_str(), capture.seq.size(),
+                        edlibNewAlignConfig(elem.edit_distance.value_or(-1), EDLIB_MODE_NW,
+                                            EDLIB_TASK_PATH, equalities, 13));
+                    if (result.status == EDLIB_STATUS_OK && result.editDistance >= 0 && result.alignment) {
+                        char* cigar = edlibAlignmentToCigar(result.alignment, result.alignmentLength, EDLIB_CIGAR_STANDARD);
+                        if (cigar) { capture.cigar = cigar; free(cigar); }
+                    }
+                    edlibFreeAlignResult(result);
+                    if (capture.cigar.empty()) return false;
+                }
+                elem.original_seq = capture.seq;
+                elem.seq = aligner.extract_n_masked_regions(capture, layout_it->seq);
+            }
+            add_element(std::move(elem));
+        }
+        for (const auto& elem : layout.by_type()) {
+            if (elem.type != "static" || (elem.global_class != "start" && elem.global_class != "stop")) continue;
+            const int boundary = elem.global_class == "start" ? 0 : sequence_length + 1;
+            add_element(seq_element(elem.class_id, elem.global_class, std::nullopt, {boundary, boundary},
+                                    "static", elem.order, elem.direction));
+        }
+        return true;
     }
 
 /**
@@ -4078,25 +4542,46 @@ public:
                 // process the read
                 {
                     SigString sig(read.id, read.seq.length(),"undefined", layout.sequencing_type);
-                    sig.sigalign_static(read, layout, verbose);
-                    sig.sigalign_variable(read, layout, verbose);
-                    sig.sigalign_filter(read, layout, gen_mut.value_or(2), verbose, mode, joint_bc_mode, min_read_length);
-
-                    // Keep for debug if needed
-                    if (write_debug) {
-                        thread_debug.push_back(sig);
-                    }
-                    // Serialize directly to thread buffer--mod this to pigz_write?
-                    if (sig.read_type != "filtered" && sig.read_type != "skipped") {
-                        passed_count.fetch_add(1, std::memory_order_relaxed);
-                        const size_t records_written =
-                            sig.to_fastqa_append(thread_buffers[tid], rc_umi);
-                        if (records_written > 0) {
-                            demultiplexed_count.fetch_add(
-                                1, std::memory_order_relaxed);
-                            records_written_count.fetch_add(
-                                records_written, std::memory_order_relaxed);
+                    std::vector<seq_element> additional_hits;
+                    sig.sigalign_static(read, layout, verbose, &additional_hits);
+                    auto segments = sig.group_static_candidates(layout, additional_hits, verbose, min_read_length);
+                    bool parent_passed = false;
+                    size_t parent_records = 0;
+                    auto process_molecule = [&](SigString& molecule, const read_streaming::sequence& molecule_read) {
+                        molecule.sigalign_variable(molecule_read, layout, verbose);
+                        molecule.sigalign_filter(molecule_read, layout, gen_mut.value_or(2), verbose,
+                                                 mode, joint_bc_mode, min_read_length);
+                        if (write_debug) thread_debug.push_back(molecule);
+                        if (molecule.read_type != "filtered" && molecule.read_type != "skipped") {
+                            parent_passed = true;
+                            parent_records += molecule.to_fastqa_append(thread_buffers[tid], rc_umi);
                         }
+                    };
+                    if (segments.empty()) {
+                        process_molecule(sig, read);
+                    } else {
+                        for (size_t index = 0; index < segments.size(); ++index) {
+                            const auto& segment = segments[index];
+                            const int offset = segment.position.first - 1;
+                            const int length = segment.position.second - offset;
+                            read_streaming::sequence molecule_read{
+                                read.id + "/seg" + std::to_string(index + 1), read.comment,
+                                read.seq.substr(offset, length),
+                                read.is_fastq ? read.qual.substr(offset, length) : "", read.is_fastq};
+                            SigString molecule(molecule_read.id, length, "undefined", layout.sequencing_type);
+                            if (!molecule.assign_static_segment(segment, layout, molecule_read)) {
+                                if (verbose) molecule.log_verbose("CONCAT_UNRESOLVED masked-capture traceback");
+                                continue;
+                            }
+                            process_molecule(molecule, molecule_read);
+                        }
+                    }
+                    // Success remains parent-scoped; emitted records count
+                    // molecules. Filtering/counter side effects occur once.
+                    if (parent_passed) passed_count.fetch_add(1, std::memory_order_relaxed);
+                    if (parent_records > 0) {
+                        demultiplexed_count.fetch_add(1, std::memory_order_relaxed);
+                        records_written_count.fetch_add(parent_records, std::memory_order_relaxed);
                     }
                 }  // sig destroyed here
             }
@@ -4333,7 +4818,7 @@ public:
             }
             // Append final tag: direction abbreviated as F or R
             std::string dir = (direction == "forward") ? "F" : "R";
-            std::string concat = read_type == "concatenate" ? ":C" : "";
+            std::string concat = (from_concatemer || read_type == "concatenate") ? ":C" : "";
             std::string combined_info = "";
             if (read_type == "filtered") {
                 combined_info += ":filtered";
@@ -4479,7 +4964,7 @@ public:
             }
             
             bool is_fastq = !read_qual.empty();
-            bool is_concatenate = (read_type == "concatenate");
+            bool is_concatenate = from_concatemer || (read_type == "concatenate");
             bool is_forward = (dir == "forward");
             
             // Append directly to buffer - no intermediate string
@@ -4635,7 +5120,7 @@ public:
                 }
             }
             bool is_fastq = !read_qual.empty();
-            bool is_concatenate = (read_type == "concatenate");
+            bool is_concatenate = from_concatemer || (read_type == "concatenate");
             bool is_forward = (dir == "forward");
             std::stringstream ss;
             //generating modified sequence id
@@ -4697,7 +5182,7 @@ public:
                 // If the overall read type is "reverse", skip forward elements.
                 if (read_type == "reverse" && read_mintype != "reverse")
                     continue;
-                if(read_type == "concatenate"){
+                if(from_concatemer || read_type == "concatenate"){
                     read_mintype = read_mintype + "_concatenate";
                 }
                 // If read_type is "concatenate", include both.

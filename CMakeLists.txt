@@ -99,7 +99,7 @@ target_link_libraries(rad_lib INTERFACE
 # --------------------------------------------------------------------------
 # Executables
 # --------------------------------------------------------------------------
-add_executable(rad src/main.cpp)
+add_executable(rad src/main.cpp src/spatial.cpp)
 add_executable(rad_config src/config_tools.cpp)
 add_executable(generate_whitelist src/whitelist_generator.cpp)
 add_executable(discover_layout src/discover_layout.cpp)
