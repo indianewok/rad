@@ -251,6 +251,16 @@ public:
     std::string sequencing_type;
     std::unordered_map<std::string, ReferencePositions> position_map;
 
+    // Optional concatemer HMM (`--concat-hmm`, default off). concat_params holds the
+    // calibrated hmm_* columns of *_position_map.csv (empty: none); concat_model is
+    // only built when the flag is on and is shared read-only by all threads.
+    concat_hmm::Params concat_params;
+    std::shared_ptr<const concat_hmm::Model> concat_model;
+    // --concat-hmm-abstain=legacy: reads the HMM abstains on (abstain flag, unexplained
+    // opposite-strand evidence, construct count capped) take the existing path instead of
+    // being dropped (default: dropped, no record).
+    bool concat_abstain_legacy = false;
+
     //A bunch of access-based methods for the multi-index container
     auto& by_id() { return layout.get<id_tag>(); }
     auto& by_length() { return layout.get<length_tag>(); }
@@ -268,6 +278,60 @@ public:
     const auto& by_direction() const { return layout.get<direction_tag>(); }
     const auto& by_global_class() const { return layout.get<global_class_tag>(); }
     const auto& by_dir_order() const { return layout.get<dir_order_tag>(); }
+
+    // Thin adapter ReadLayout -> concat_hmm::LayoutSpec (same fields the HMM's own
+    // CSV parser reads from a generated layout cache).
+    concat_hmm::LayoutSpec to_concat_layout_spec() const {
+        concat_hmm::LayoutSpec spec;
+        spec.name = "rad_read_layout";
+        spec.mode = sequencing_type;
+        spec.bulk = (sequencing_type == "bulk");
+        for (const auto& e : by_order()) {
+            concat_hmm::LayoutElement x;
+            x.id = e.class_id;
+            x.seq = e.seq;
+            x.is_static = (e.type == "static");
+            x.klass = e.global_class.empty() ? e.class_id : e.global_class;
+            if (x.klass == "poly_t" || x.klass == "poly_a") x.klass = "poly_tail";
+            x.direction = (e.direction.rfind("reverse", 0) == 0) ? 'R' : 'F';
+            x.order = e.order;
+            x.length_candidates = e.length_candidates;
+            if (x.length_candidates.empty() && e.expected_length && *e.expected_length > 0)
+                x.length_candidates = {*e.expected_length};
+            if (e.misalignment_threshold) x.max_edits = std::get<0>(*e.misalignment_threshold);
+            spec.elements.push_back(std::move(x));
+        }
+        return spec;
+    }
+
+    // Builds the shared model from the layout and concat_params (layout priors when
+    // empty). On failure the model stays unset and every read takes the existing path.
+    bool build_concat_model(bool verbose) {
+        try {
+            const concat_hmm::LayoutSpec spec = to_concat_layout_spec();
+            const concat_hmm::Params* p = concat_params.empty() ? nullptr : &concat_params;
+            auto model = std::make_shared<concat_hmm::Model>(concat_hmm::Model::build(spec, p));
+            std::cout << "[concat_hmm] Model built: " << model->tpl.size() << " templates, "
+                      << model->A << " anchors, params="
+                      << (p ? "position-map hmm_* columns" : "layout priors")
+                      << (!model->param_warnings.empty()
+                              ? " (invalid hmm_* cells: every read uses the existing path; remove the hmm_* columns to recalibrate)"
+                              : model->guard_failed ? " (calibration guard FAILED: every read uses the existing path)" : "")
+                      << "\n";
+            for (const auto& w : model->param_warnings) std::cerr << "[concat_hmm] WARNING: " << w << "\n";
+            if (p && concat_params.topology != 0 && concat_params.topology != model->topo_hash)
+                std::cout << "[concat_hmm] WARNING: hmm_* columns were calibrated on a different layout topology; "
+                             "structural tables fall back to priors\n";
+            if (verbose) std::cout << model->describe();
+            concat_model = std::move(model);
+            return true;
+        } catch (const std::exception& ex) {
+            std::cerr << "[concat_hmm] WARNING: cannot build the HMM for this layout (" << ex.what()
+                      << "); --concat-hmm disabled, every read uses the existing path\n";
+            concat_model.reset();
+            return false;
+        }
+    }
 
     static std::optional<std::string> get_optional_csv_string(const csv::CSVRow& row, const std::string& field) {
         try {
@@ -1114,10 +1178,29 @@ public:
         if(which_file == "pos_map" || which_file == "both") {
             // Alignment and threshold information
             std::ofstream align_file(path_prefix + "_position_map.csv");
+            // Concat-HMM calibration (hmm_* columns) is appended only when present, so
+            // maps without it are written exactly as before; older RAD binaries read
+            // columns by name and ignore the extra ones.
+            std::map<std::string, std::map<std::string, std::string>> hmm_cells;
+            std::vector<std::string> hmm_cols;
+            if (!concat_params.empty()) {
+                hmm_cells = concat_hmm::params_to_columns(concat_params);
+                for (const auto& row : hmm_cells)
+                    for (const auto& col : row.second)
+                        if (std::find(hmm_cols.begin(), hmm_cols.end(), col.first) == hmm_cols.end())
+                            hmm_cols.push_back(col.first);
+                std::sort(hmm_cols.begin(), hmm_cols.end());
+                for (const auto& row : hmm_cells)
+                    if (by_id().find(row.first) == by_id().end())
+                        std::cerr << "[concat_hmm] WARNING: hmm_* row '" << row.first
+                                  << "' has no layout element; not written\n";
+            }
             align_file << "id,primary_start,primary_stop,secondary_start,secondary_stop,"
                 << "misalign_lower,misalign_mean,misalign_upper,"
                 << "align_start,var_start,align_stop,var_stop,"
-                << "misalign_start,mvar_start,misalign_stop,mvar_stop\n";
+                << "misalign_start,mvar_start,misalign_stop,mvar_stop";
+            for (const auto& col : hmm_cols) align_file << "," << col;
+            align_file << "\n";
             
             for (const auto& element : by_order()) {
                 align_file << element.class_id;
@@ -1163,6 +1246,15 @@ public:
                     align_file << ",,,";  // Three commas for threshold fields
                     align_file << ",,,,";  // Four commas for aligned positions
                     align_file << ",,,,";  // Four commas for misaligned positions
+                }
+                if (!hmm_cols.empty()) {
+                    const auto row_it = hmm_cells.find(element.class_id);
+                    for (const auto& col : hmm_cols) {
+                        align_file << ",";
+                        if (row_it == hmm_cells.end()) continue;
+                        const auto cell_it = row_it->second.find(col);
+                        if (cell_it != row_it->second.end()) align_file << cell_it->second;
+                    }
                 }
                 align_file << "\n";
             }
@@ -1362,6 +1454,11 @@ public:
         fmt.delimiter(',').quote('"').header_row(0)
             .variable_columns(VariableColumnPolicy::KEEP);
         CSVReader reader(map_csv, fmt);
+        // Optional concat-HMM calibration columns (hmm_*); absent in older maps.
+        std::vector<std::string> hmm_cols;
+        for (const auto& name : reader.get_col_names())
+            if (name.rfind("hmm_", 0) == 0) hmm_cols.push_back(name);
+        std::map<std::string, std::map<std::string, std::string>> hmm_cells;
         // iterate rows
         for (auto &row : reader) {
             std::string id = row["id"].get<std::string>();
@@ -1372,6 +1469,16 @@ public:
                     std::cout << "[pos_map] skipping unknown id: " << id << "\n";
                 }
                 continue;
+            }
+            for (const auto& col : hmm_cols) {
+                try {
+                    auto field = row[col];
+                    if (field.is_null()) continue;
+                    std::string cell = field.get<std::string>();
+                    if (!cell.empty()) hmm_cells[id][col] = std::move(cell);
+                } catch (...) {
+                    // short row: no value for this column
+                }
             }
 
             // only proceed if we have a non-empty primary_start
@@ -1447,6 +1554,17 @@ public:
                                 << " -> misalignment threshold: "
                                 << lower << "|" << mean << "|" << upper << "\n";
                 }
+            }
+        }
+        if (!hmm_cells.empty()) {
+            try {
+                concat_params = concat_hmm::params_from_columns(to_concat_layout_spec(), hmm_cells);
+                if (verbose)
+                    std::cout << "[pos_map] concat-HMM calibration loaded (" << hmm_cols.size()
+                              << " hmm_* columns" << (concat_params.guard_failed ? ", guard failed" : "") << ")\n";
+            } catch (const std::exception& ex) {
+                std::cerr << "[pos_map] WARNING: ignoring unreadable hmm_* columns: " << ex.what() << "\n";
+                concat_params = concat_hmm::Params{};
             }
         }
     }
@@ -2527,6 +2645,89 @@ private:
 };
 
 /**
+ * @brief Concat-HMM self-calibration (`--concat-hmm`): feeds reads to concat_hmm::Calibrator
+ * objects and stores the finalized parameters on the layout (written as hmm_* columns of
+ * *_position_map.csv). Each chunk is split into a fixed strided partition, one Calibrator per
+ * worker, merged in worker order, so the parameters do not depend on scheduling.
+ */
+class concat_hmm_calibration {
+public:
+    concat_hmm_calibration(const ReadLayout& layout, int num_threads)
+        : prior_(concat_hmm::Model::build(layout.to_concat_layout_spec())),
+          master_(prior_),
+          nthreads_(std::max(1, std::min(num_threads, 16))) {}
+
+    void add_chunk(const std::vector<read_streaming::sequence>& chunk, size_t max_reads) {
+        std::lock_guard<std::mutex> lock(mu_);
+        const size_t room = max_reads > added_ ? max_reads - added_ : 0;
+        const size_t n = std::min(chunk.size(), room);
+        if (n == 0) return;
+        const int workers = static_cast<int>(std::max<size_t>(1, std::min<size_t>(nthreads_, n / 1000)));
+        std::vector<concat_hmm::Calibrator> cals;
+        cals.reserve(workers);
+        for (int w = 0; w < workers; ++w) cals.emplace_back(prior_);
+        auto work = [&](int w) {
+            for (size_t r = static_cast<size_t>(w); r < n; r += static_cast<size_t>(workers))
+                cals[w].add_read(chunk[r].seq.data(), static_cast<int>(chunk[r].seq.size()));
+        };
+        if (workers == 1) {
+            work(0);
+        } else {
+            std::vector<std::thread> pool;
+            for (int w = 0; w < workers; ++w) pool.emplace_back(work, w);
+            for (auto& t : pool) t.join();
+        }
+        for (const auto& c : cals) master_.merge(c);
+        added_ += n;
+    }
+
+    // Finalizes (hard-EM + calibration guard), prints the report and stores the parameters.
+    bool finish(ReadLayout& layout) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (master_.n_reads() == 0) {
+            std::cerr << "[concat_hmm] WARNING: no reads for calibration; layout priors will be used\n";
+            return false;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        concat_hmm::Params params = master_.finalize();
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::cout << "[concat_hmm] Calibration on " << master_.n_reads() << " reads (EM " << secs << " s):\n"
+                  << master_.report();
+        if (!master_.layout_matches())
+            std::cout << "[concat_hmm] WARNING: calibration guard failed (the layout does not match these reads); "
+                         "the HMM is disabled and every read uses the existing path\n";
+        layout.concat_params = std::move(params);
+        return master_.layout_matches();
+    }
+
+    // Cached runs whose position map has no hmm_* columns: calibrate from the FASTQ head
+    // without redoing the misalignment step.
+    static bool calibrate_from_fastq(const std::string& fastq_path, ReadLayout& layout, int num_threads,
+                                     size_t max_reads = 50000) {
+        try {
+            concat_hmm_calibration cal(layout, num_threads);
+            using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
+            ChunkFunc feed = [&](const std::vector<read_streaming::sequence>& chunk, const std::string&) {
+                cal.add_chunk(chunk, max_reads);
+            };
+            chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(max_reads);
+            streamer.process_chunks(fastq_path, feed, 1, static_cast<int64_t>(max_reads));
+            return cal.finish(layout);
+        } catch (const std::exception& ex) {
+            std::cerr << "[concat_hmm] WARNING: calibration failed (" << ex.what() << ")\n";
+            return false;
+        }
+    }
+
+private:
+    concat_hmm::Model prior_;
+    concat_hmm::Calibrator master_;
+    int nthreads_;
+    size_t added_ = 0;
+    std::mutex mu_;
+};
+
+/**
  * @brief This class contains all of the setup for the misalignment threshold, as well as the masked adapters.
  * @brief contains structures for perfect matches, misalignment statistics, and position statistics.
  * @struct perfect_match
@@ -2691,9 +2892,20 @@ public:
     }
 
     void generate_misalignment_data(
-        const std::string& fastq_path, ReadLayout& layout, int num_threads = 1, size_t max_reads = 50000
+        const std::string& fastq_path, ReadLayout& layout, int num_threads = 1, size_t max_reads = 50000,
+        bool calibrate_concat_hmm = false
     ) {
         prune_similar_reverse_adapters(layout);
+
+        // --concat-hmm: calibrate the HMM in the same pass, on the same chunk reads.
+        std::unique_ptr<concat_hmm_calibration> hmm_cal;
+        if (calibrate_concat_hmm) {
+            try {
+                hmm_cal = std::make_unique<concat_hmm_calibration>(layout, num_threads);
+            } catch (const std::exception& ex) {
+                std::cerr << "[concat_hmm] WARNING: no HMM for this layout (" << ex.what() << ")\n";
+            }
+        }
 
         using ChunkFunc = std::function<bool(const std::vector<read_streaming::sequence>&, const std::string&)>;
         chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(max_reads);
@@ -2717,6 +2929,7 @@ public:
                 misalignment_stats,
                 total_reads_processed
             );
+            if (hmm_cal) hmm_cal->add_chunk(chunk, max_reads);
             // Print progress and current misalignment thresholds.
             #pragma omp critical
             {
@@ -2764,6 +2977,7 @@ public:
         };
 
         streamer.process_chunks(fastq_path, process_func, num_threads, max_reads);
+        if (hmm_cal) hmm_cal->finish(layout);
         
         // Write final results
         write_perfect_matches();

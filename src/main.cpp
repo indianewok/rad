@@ -80,6 +80,41 @@ static void usage_demux(const char *prog) {
       << "                                    dropped (default: the layout's "
          "combined element length;\n"
       << "                                    0 keeps every read with any cDNA)\n"
+      << "      --concat-hmm                  segment each read with the concatemer "
+         "HMM first (default: off).\n"
+      << "                                    Confident single constructs get "
+         "windowed single-strand\n"
+      << "                                    static alignment; confident "
+         "concatemers are cut into\n"
+      << "                                    /segN children. Uncertain reads "
+         "(abstain, unexplained\n"
+      << "                                    opposite-strand adapter, construct "
+         "count capped) and\n"
+      << "                                    10x 5' D reads (two barcode units, "
+         "one construct) are\n"
+      << "                                    dropped; an uncertain junction of a "
+         "concatemer keeps only\n"
+      << "                                    the piece with the complete barcode "
+         "unit; single-primer-end\n"
+      << "                                    pieces are trimmed and kept; one F + one R "
+         "construct are\n"
+      << "                                    named -F-CT / -R-CT. k=0 and barcode-less (T) "
+         "reads, and every\n"
+      << "                                    read of a run whose calibration guard "
+         "failed, take the\n"
+      << "                                    existing path. --min-read-length then\n"
+      << "                                    counts the cDNA without the poly "
+         "tail (existing path:\n"
+      << "                                    with it). Calibrated with the "
+         "misalignment step (hmm_*\n"
+      << "                                    columns of *_position_map.csv); "
+         "cached maps without them\n"
+      << "                                    are calibrated from the first "
+         "50000 reads\n"
+      << "      --concat-hmm-abstain=MODE     reads the HMM is unsure about: "
+         "drop (default) or\n"
+      << "                                    legacy (existing path, as before "
+         "this option)\n"
       << "  -M, --whitelist-mutation          mutation space for whitelist "
          "(default: 2)\n"
       << "  -m, --generated-mutation          mutation space for generated "
@@ -153,6 +188,10 @@ static void usage_prep(const char *prog) {
       << "  -n, --max-reads                   max reads for misalignment "
          "sampling (default: 50000)\n"
       << "  -t, --threads                     number of threads (default: 1)\n"
+      << "      --concat-hmm                  also calibrate the concatemer HMM "
+         "(writes hmm_* columns\n"
+      << "                                    to the position map; for rad demux "
+         "--concat-hmm)\n"
       << "  -v, --verbose                     verbose mode\n"
       << "  -D, --max-verbose                 trace layout construction and "
          "position assignments\n"
@@ -231,6 +270,7 @@ int cmd_prep(int argc, char *argv[]) {
   std::string layout_key, fastq_path, output_base;
   bool verbose = false, max_verbose = false;
   bool do_read_layout = false, do_position_map = false;
+  bool concat_hmm_enabled = false;
   int nthreads = 1;
   size_t max_reads = 50000;
 
@@ -245,6 +285,7 @@ int cmd_prep(int argc, char *argv[]) {
                               {"help", no_argument, nullptr, 'h'},
                               {"read-layout", no_argument, nullptr, 1},
                               {"position-map", no_argument, nullptr, 2},
+                              {"concat-hmm", no_argument, nullptr, 3},
                               {nullptr, 0, nullptr, 0}};
 
   int c;
@@ -280,6 +321,9 @@ int cmd_prep(int argc, char *argv[]) {
       break;
     case 2:
       do_position_map = true;
+      break;
+    case 3:
+      concat_hmm_enabled = true;
       break;
     default:
       usage_prep(argv[0]);
@@ -373,7 +417,7 @@ int cmd_prep(int argc, char *argv[]) {
             << "\n[prep] Computing misalignment statistics from FASTQ...\n";
       Misalignment_Setup mis(read_layout);
       mis.generate_misalignment_data(fastq_path, read_layout, nthreads,
-                                     max_reads);
+                                     max_reads, concat_hmm_enabled);
 
       // Generate position mapping
       if (verbose)
@@ -1249,6 +1293,66 @@ static bool write_demux_run_log(
       << "total_wall_time_seconds=" << total_wall_time_seconds << "\n"
       << "memory_scope=rad_process_only\n";
 
+  if (stats.concat_hmm_enabled) {
+    const size_t existing = stats.hmm_legacy_abstain + stats.hmm_legacy_k0 +
+                            stats.hmm_legacy_artifact + stats.hmm_legacy_guard +
+                            stats.hmm_legacy_too_many;
+    const double denom = stats.hmm_reads > 0 ? static_cast<double>(stats.hmm_reads) : 1.0;
+    static const char *status_names[4] = {"full", "partial", "truncated", "missing"};
+    out << "concat_hmm=enabled\n"
+        << "concat_hmm_reads=" << stats.hmm_reads << "\n"
+        << "concat_hmm_reads_single=" << stats.hmm_single << "\n"
+        << "concat_hmm_reads_split=" << stats.hmm_split << "\n"
+        << "concat_hmm_split_children=" << stats.hmm_children << "\n"
+        << "concat_hmm_split_children_full_search=" << stats.hmm_children_full_search << "\n"
+        << "concat_hmm_same_molecule_junctions=" << stats.hmm_same_molecule << "\n"
+        << "concat_hmm_reads_existing_path=" << existing << "\n"
+        << "concat_hmm_reads_existing_abstain=" << stats.hmm_legacy_abstain << "\n"
+        << "concat_hmm_reads_existing_k0=" << stats.hmm_legacy_k0 << "\n"
+        << "concat_hmm_reads_existing_artifact=" << stats.hmm_legacy_artifact << "\n"
+        << "concat_hmm_reads_existing_guard_failed=" << stats.hmm_legacy_guard << "\n"
+        << "concat_hmm_reads_existing_too_many=" << stats.hmm_legacy_too_many << "\n"
+        << "concat_hmm_abstain_rate_percent="
+        << 100.0 * static_cast<double>(stats.hmm_legacy_abstain + stats.hmm_drop_abstain) / denom << "\n"
+        << "concat_hmm_abstain_policy=" << (stats.hmm_abstain_legacy ? "legacy" : "drop") << "\n"
+        << "concat_hmm_reads_dropped="
+        << stats.hmm_drop_abstain + stats.hmm_drop_too_many + stats.hmm_drop_d_reads + stats.hmm_drop_unresolved << "\n"
+        << "concat_hmm_reads_dropped_abstain=" << stats.hmm_drop_abstain << "\n"
+        << "concat_hmm_reads_dropped_too_many=" << stats.hmm_drop_too_many << "\n"
+        << "concat_hmm_reads_dropped_d=" << stats.hmm_drop_d_reads << "\n"
+        << "concat_hmm_split_children_dropped_d=" << stats.hmm_drop_d_children << "\n"
+        << "concat_hmm_fold_read_from_child_start=" << stats.hmm_fold_read_start << "\n"
+        << "concat_hmm_fold_read_to_child_end=" << stats.hmm_fold_read_end << "\n"
+        << "concat_hmm_full_search_barcodes_rejected=" << stats.hmm_partner_rejected << "\n"
+        << "concat_hmm_retry_barcodes_from_partner=" << stats.hmm_retry_from_partner << "\n"
+        // POLICY_ROUND.md round 3
+        << "concat_hmm_reads_dropped_unresolved=" << stats.hmm_drop_unresolved << "\n"
+        << "concat_hmm_junctions_abstained=" << stats.hmm_junctions_abstained << "\n"
+        << "concat_hmm_pieces_suppressed=" << stats.hmm_pieces_suppressed << "\n"
+        << "concat_hmm_artifact_reads_piece_rule=" << stats.hmm_art_reads << "\n"
+        << "concat_hmm_pieces_full_search=" << stats.hmm_pieces << "\n"
+        << "concat_hmm_trim_keep_forward=" << stats.hmm_trim_keep_F << "\n"
+        << "concat_hmm_trim_keep_reverse=" << stats.hmm_trim_keep_R << "\n"
+        << "concat_hmm_both_directions_dropped=" << stats.hmm_both_pass_dropped << "\n"
+        << "concat_hmm_full_search_clipped_hits_evidence_only=" << stats.hmm_clip_hits << "\n"
+        << "concat_hmm_two_units_clipped_adapter_dropped=" << stats.hmm_two_unit_clip_dropped << "\n"
+        << "concat_hmm_duplets_named_ct=" << stats.hmm_duplet_named << "\n"
+        << "concat_hmm_cuts_both_adapters=" << stats.hmm_cut_kind[0] << "\n"
+        << "concat_hmm_cuts_one_adapter=" << stats.hmm_cut_kind[1] << "\n"
+        << "concat_hmm_cuts_layout_geometry=" << stats.hmm_cut_kind[2] << "\n"
+        << "concat_hmm_cuts_midpoint=" << stats.hmm_cut_kind[3] << "\n"
+        << "concat_hmm_cuts_fold_back=" << stats.hmm_cut_kind[4] << "\n"
+        << "concat_hmm_cuts_strand_flip=" << stats.hmm_cut_kind[5] << "\n";
+    for (int s = 0; s < 4; ++s)
+      out << "concat_hmm_check_" << status_names[s] << "_windows=" << stats.hmm_win[s]
+          << "\nconcat_hmm_check_" << status_names[s] << "_confirmed=" << stats.hmm_win_ok[s] << "\n";
+    out << "concat_hmm_check_full_confirmed_by_missing_rules=" << stats.hmm_full_as_missing << "\n"
+        << "concat_hmm_check_degraded_confirmed_as_fragment=" << stats.hmm_fragment_ok << "\n"
+        << "concat_hmm_spacer_offset_retries=" << stats.hmm_spacer_retry << "\n"
+        << "concat_hmm_spacer_offset_retries_confirmed=" << stats.hmm_spacer_retry_ok << "\n"
+        << "concat_hmm_spacer_read_end_confirmed=" << stats.hmm_read_end_ok << "\n";
+  }
+
   if (current_rss) {
     out << "final_rss_gib=" << *current_rss << "\n";
   } else {
@@ -1502,6 +1606,8 @@ int cmd_demux(int argc, char *argv[]) {
   std::optional<size_t> scan_chunk;      // scan-wl chunk size (default: --chunk-size)
   std::optional<int> scan_threads;       // scan-wl threads (default: --threads)
   int min_read_length = -1;    // min cDNA length to keep (-1 = layout static length)
+  bool concat_hmm_enabled = false; // --concat-hmm: HMM segmentation before static alignment
+  bool concat_hmm_abstain_legacy = false; // --concat-hmm-abstain=legacy: abstained reads take the existing path
 
   const char *optstring = "l:q:k:g:c:R:M:m:n:z:o:d:F:wbAt:vDh";
   struct option longopts[] = {
@@ -1532,6 +1638,8 @@ int cmd_demux(int argc, char *argv[]) {
       {"min-read-length", required_argument, nullptr, 9},
       {"af-bcs", no_argument, nullptr, 10},
       {"hs-bcs", no_argument, nullptr, 11},
+      {"concat-hmm", no_argument, nullptr, 12},
+      {"concat-hmm-abstain", required_argument, nullptr, 13},
       {"threads", required_argument, nullptr, 't'},
       {"verbose", no_argument, nullptr, 'v'},
       {"max-verbose", no_argument, nullptr, 'D'},
@@ -1632,6 +1740,19 @@ int cmd_demux(int argc, char *argv[]) {
       break;
     case 11:
       hs_bcs = true;
+      break;
+    case 12:
+      concat_hmm_enabled = true;
+      break;
+    case 13:
+      if (std::string(optarg) == "legacy") {
+        concat_hmm_abstain_legacy = true;
+      } else if (std::string(optarg) == "drop") {
+        concat_hmm_abstain_legacy = false;
+      } else {
+        std::cerr << "[ERROR] --concat-hmm-abstain must be 'drop' or 'legacy' (got '" << optarg << "')\n";
+        return 1;
+      }
       break;
     case 't':
       nthreads = std::stoi(optarg);
@@ -1918,7 +2039,8 @@ int cmd_demux(int argc, char *argv[]) {
       if (verbose)
         std::cout << "[misalignment_stats] Computing misalignment...\n";
       Misalignment_Setup mis(read_layout);
-      mis.generate_misalignment_data(fastq_path, read_layout, nthreads);
+      mis.generate_misalignment_data(fastq_path, read_layout, nthreads, 50000,
+                                     concat_hmm_enabled);
       auto mis_time = std::chrono::steady_clock::now() - main_start;
       std::cout << "[main] Misalignment time: "
                 << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1936,6 +2058,22 @@ int cmd_demux(int argc, char *argv[]) {
     // here too so the output directory stands on its own for later runs.
     if (imported_companion_map)
       read_layout.write_to_csv(outbase.string(), "both");
+
+    // --concat-hmm: parameters come from the misalignment pass above or from the
+    // cached map's hmm_* columns; a cached map without them is calibrated from the
+    // FASTQ head (no misalignment rerun) and rewritten with the columns.
+    if (concat_hmm_enabled) {
+      if (read_layout.concat_params.empty()) {
+        std::cout << "[concat_hmm] No hmm_* columns in the position map; "
+                     "calibrating from the first 50000 reads\n";
+        concat_hmm_calibration::calibrate_from_fastq(fastq_path, read_layout,
+                                                     nthreads, 50000);
+        if (!read_layout.concat_params.empty())
+          read_layout.write_to_csv(outbase.string(), "pos_map");
+      }
+      read_layout.build_concat_model(max_verbose);
+      read_layout.concat_abstain_legacy = concat_hmm_abstain_legacy;
+    }
 
     memory_utils::get_rss();
 

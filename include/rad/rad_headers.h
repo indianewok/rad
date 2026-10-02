@@ -28,6 +28,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -78,6 +79,7 @@
 // ————————————————————————————————————————————————————————————————
 //  rad headers
 // ————————————————————————————————————————————————————————————————
+#include "concat_hmm.hpp"   // STL-only concatemer HMM; used only with --concat-hmm
 #include "misc_utils.hpp"
 #include "io_streaming.hpp"
 #include "barcode_correction.hpp"
