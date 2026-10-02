@@ -77,6 +77,8 @@ struct static_alignments {
     int edit_distance = -1;
     bool success = false;
     bool query_complete = false;
+    int query_clip_left = 0;
+    int query_clip_right = 0;
     std::string seq;
     std::string cigar; 
     int score = 0;
@@ -533,13 +535,52 @@ public:
             )) {
                 alignment.positions.push_back({ssw_start, ssw_end});
                 alignment.edit_distance = compute_edit_distance(sswAlign.cigar_string.c_str());
-                alignment.success = alignment.edit_distance < max_edit_distance + 1 ? true : false;
                 // RAD passes the adapter as SSW's reference, not its query.
                 // Read-span/edit-distance consistency cannot detect all clipping.
                 alignment.query_complete = sswAlign.ref_begin == 0 &&
                     sswAlign.ref_end == static_cast<int>(query.size()) - 1;
+                alignment.query_clip_left = sswAlign.ref_begin;
+                alignment.query_clip_right = static_cast<int>(query.size()) - 1 - sswAlign.ref_end;
+                // Missing adapter bases are explainable by truncation only near
+                // the corresponding physical read end. An internal local hit
+                // must not get free adapter-end clipping and become a trimming
+                // boundary. Full-query matches are already checked by Edlib;
+                // Allow a few noisy terminal bases independently of the edit
+                // budget, so permissive calibration cannot widen this window.
+                constexpr int read_end_slack = 3;
+                const bool clipping_at_read_ends =
+                    (sswAlign.ref_begin == 0 || sswAlign.query_begin <= read_end_slack) &&
+                    (sswAlign.ref_end == static_cast<int>(query.size()) - 1 ||
+                     static_cast<int>(target.size()) - 1 - sswAlign.query_end <= read_end_slack);
+                alignment.success = alignment.edit_distance <= max_edit_distance &&
+                    clipping_at_read_ends;
                 alignment.cigar = sswAlign.cigar_string;
                 alignment.seq = target.substr(ssw_start - 1, ssw_end - ssw_start + 1);
+                if (!clipping_at_read_ends) {
+                    // An internal local match may still represent an adapter
+                    // with genuine end deletions. Verify the entire adapter
+                    // against this same interval, charging all missing bases
+                    // to the existing edit budget. Keeping the interval avoids
+                    // consuming adjacent UMI/barcode bases merely to complete
+                    // a local alignment with a different endpoint.
+                    auto verified = edlibAlign(query_to_use.c_str(), query_to_use.size(),
+                        alignment.seq.c_str(), alignment.seq.size(),
+                        edlibNewAlignConfig(max_edit_distance, EDLIB_MODE_NW,
+                                            EDLIB_TASK_PATH, customEqualities, numEq));
+                    if (verified.status == EDLIB_STATUS_OK && verified.editDistance >= 0 &&
+                        verified.alignment) {
+                        char* cigar = edlibAlignmentToCigar(verified.alignment,
+                            verified.alignmentLength, EDLIB_CIGAR_EXTENDED);
+                        if (cigar) {
+                            alignment.edit_distance = verified.editDistance;
+                            alignment.query_complete = true;
+                            alignment.cigar = cigar;
+                            alignment.success = true;
+                            free(cigar);
+                        }
+                    }
+                    edlibFreeAlignResult(verified);
+                }
             }
         }
     return alignment;
@@ -3686,6 +3727,10 @@ public:
     // Make a mutable copy of the read to mask aligned regions
     std::string mutable_seq = read.seq;
     size_t read_length = read.seq.length();
+    // A counterpart may be aligned later in layout order. Retain only local
+    // candidates that already met SSW's score/shape and local-edit checks;
+    // deferred validation never performs another alignment or widens a budget.
+    std::vector<std::pair<const ReadElement*, static_alignments>> clipped_pending;
 
     for (auto it = static_range.first; it != static_range.second; ++it) {
         if(verbose){
@@ -3820,6 +3865,11 @@ public:
                                                     expected_start,
                                                     expected_end,
                                                     additional_hits ? &candidates : nullptr);
+        if (!result.success && result.edit_distance >= 0 &&
+            result.edit_distance <= max_distance && result.positions.size() == 1 &&
+            ((result.query_clip_left > 0) != (result.query_clip_right > 0))) {
+            clipped_pending.emplace_back(&*it, result);
+        }
         if (additional_hits && candidates.success) {
             for (const auto& pos : candidates.positions) {
                 if (pos.first < 1 || pos.second < pos.first ||
@@ -3881,6 +3931,72 @@ public:
                 continue;
             }
         }
+    // A clipped end can face a verified molecule junction just as it can face
+    // the physical read end. The represented end must remain intact. Require
+    // an exact full-query reverse-complement counterpart of this same layout
+    // class within the existing three-base slack; partial hits cannot support
+    // each other. This is legacy extraction evidence, never a new split anchor.
+    for (const auto& pending : clipped_pending) {
+        const auto& element = *pending.first;
+        const auto& result = pending.second;
+        if (!has_exact_molecular_boundary(result, element, layout, read,
+                                          additional_hits)) continue;
+        seq_element primary(element.class_id, element.global_class,
+            result.edit_distance, result.positions.front(), "static", element.order,
+            element.direction, true, std::nullopt, result.seq);
+        primary.query_complete = false;
+        add_element(std::move(primary));
+        if (verbose) log_verbose("MOLECULAR_END_CLIP " + element.class_id + " " +
+            std::to_string(result.positions.front().first) + ":" +
+            std::to_string(result.positions.front().second) + " local_edits=" +
+            std::to_string(result.edit_distance));
+    }
+    }
+
+    bool has_exact_molecular_boundary(const static_alignments& partial,
+        const ReadElement& element, const ReadLayout& layout,
+        const read_streaming::sequence& read,
+        const std::vector<seq_element>* additional_hits = nullptr) const {
+        if (partial.query_complete || partial.positions.size() != 1 ||
+            ((partial.query_clip_left > 0) == (partial.query_clip_right > 0)) ||
+            element.seq.find_first_not_of("ACGTacgt") != std::string::npos) return false;
+        // Derive the outward edge from layout roles, not primer names. A
+        // missing end toward a barcode, UMI or insert remains unsupported.
+        auto outward_edge = [&](const ReadElement& adapter) {
+            bool payload_left = false, payload_right = false;
+            for (const auto& item : layout.by_order()) {
+                if (item.direction != adapter.direction || item.type != "variable") continue;
+                payload_left = payload_left || item.order < adapter.order;
+                payload_right = payload_right || item.order > adapter.order;
+            }
+            return payload_right && !payload_left ? -1 : payload_left && !payload_right ? 1 : 0;
+        };
+        const int missing_edge = partial.query_clip_left > 0 ? -1 : 1;
+        if (outward_edge(element) != missing_edge) return false;
+        const auto pos = partial.positions.front();
+        if (pos.first < 1 || pos.second < pos.first || pos.second > static_cast<int>(read.seq.size()) ||
+            read.seq.compare(pos.first - 1, pos.second - pos.first + 1, partial.seq) != 0) return false;
+        const std::string counterpart = seq_utils::revcomp(element.seq);
+        auto supports = [&](const seq_element& hit) {
+            if (hit.type != "static" || !hit.element_pass.value_or(false) ||
+                !hit.query_complete || hit.edit_distance.value_or(-1) != 0 ||
+                hit.global_class != element.global_class ||
+                !((element.direction == "forward" && hit.direction == "reverse") ||
+                  (element.direction == "reverse" && hit.direction == "forward"))) return false;
+            const auto definition = layout.by_id().find(hit.class_id);
+            if (definition == layout.by_id().end() || definition->seq != counterpart ||
+                outward_edge(*definition) != -missing_edge ||
+                hit.position.first < 1 || hit.position.second > static_cast<int>(read.seq.size()) ||
+                hit.position.second - hit.position.first + 1 != static_cast<int>(counterpart.size()) ||
+                read.seq.compare(hit.position.first - 1, counterpart.size(), counterpart) != 0) return false;
+            const int gap = partial.query_clip_left > 0
+                ? pos.first - hit.position.second - 1
+                : hit.position.first - pos.second - 1;
+            return gap >= 0 && gap <= 3;
+        };
+        for (const auto& hit : sig_elements) if (supports(hit)) return true;
+        if (additional_hits) for (const auto& hit : *additional_hits) if (supports(hit)) return true;
+        return false;
     }
 
     // Group occurrences, not alignment scores. This runs before variables are
