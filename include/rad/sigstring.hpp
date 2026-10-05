@@ -5814,9 +5814,9 @@ public:
     // passes each molecule to process_molecule. Returns false when the caller must run the default path
     // (guard failed, k = 0, or an abstain with --concat-hmm-abstain=legacy); true when handled, possibly
     // without a record.
-    template <class molecule_fn>
+    template <class mol_fn>
     static bool concat_hmm_route(const read_streaming::sequence& read, const ReadLayout& layout,
-                                 const concat_layout_info& info, molecule_fn&& process_molecule, bool verbose) {
+                                 const concat_layout_info& info, mol_fn&& process_molecule, bool verbose) {
         thread_local concat_hmm::Scratch scratch;
         thread_local concat_hmm::Result res;
         concat_hmm_counters& ctr = *info.ctr;

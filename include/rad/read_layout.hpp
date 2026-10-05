@@ -4,8 +4,8 @@
 // Adapter edit-distance limits and the misalignment calibration sample.
 namespace adapter_thresholds {
 
-constexpr std::size_t fallback_error_numerator = 3;
-constexpr std::size_t fallback_error_denominator = 10;
+constexpr std::size_t fallback_error_num = 3;
+constexpr std::size_t fallback_error_denom = 10;
 
 /**
  * Return the shared fallback edit-distance limit for an uncalibrated adapter.
@@ -15,9 +15,9 @@ constexpr std::size_t fallback_error_denominator = 10;
  */
 constexpr int fallback_max_edit_distance(std::size_t adapter_length) {
     const auto rounded_up =
-        (adapter_length * fallback_error_numerator +
-         fallback_error_denominator - 1) /
-        fallback_error_denominator;
+        (adapter_length * fallback_error_num +
+         fallback_error_denom - 1) /
+        fallback_error_denom;
     return std::max(1, static_cast<int>(rounded_up));
 }
 
@@ -32,14 +32,14 @@ constexpr double misalign_lower_chance_share = 0.05;
 
 // Chance hits an element needs for a calibrated threshold; below this,
 // update_read_layout uses fallback_max_edit_distance.
-constexpr std::size_t min_misalignment_observations = 100;
+constexpr std::size_t min_misal_obs = 100;
 
 // Misalignment calibration sample: the first block (rad prep: -n), then
-// further blocks until every element has min_misalignment_observations chance
-// hits, up to calibration_max_reads. Whole blocks keep the sample independent
+// further blocks until every element has min_misal_obs chance
+// hits, up to cal_max_reads. Whole blocks keep the sample independent
 // of the thread count.
-constexpr std::size_t calibration_block_reads = 50000;
-constexpr std::size_t calibration_max_reads = 1000000;
+constexpr std::size_t cal_block_reads = 50000;
+constexpr std::size_t cal_max_reads = 1000000;
 
 }  // namespace adapter_thresholds
 
@@ -2688,9 +2688,9 @@ private:
  * @brief Concat-HMM calibration (hmm_* columns). Workers get a fixed strided partition of each chunk
  * and are merged in worker order, so the result does not depend on scheduling.
  */
-class concat_hmm_calibration {
+class concat_hmm_cal {
 public:
-    concat_hmm_calibration(const ReadLayout& layout, int num_threads)
+    concat_hmm_cal(const ReadLayout& layout, int num_threads)
         : prior_(concat_hmm::Model::build(layout.to_concat_layout_spec())),
           master_(prior_),
           nthreads_(std::max(1, std::min(num_threads, 16))) {}
@@ -2743,7 +2743,7 @@ public:
     static bool calibrate_from_fastq(const std::string& fastq_path, ReadLayout& layout, int num_threads,
                                      size_t max_reads = 50000) {
         try {
-            concat_hmm_calibration cal(layout, num_threads);
+            concat_hmm_cal cal(layout, num_threads);
             using ChunkFunc = std::function<void(const std::vector<read_streaming::sequence>&, const std::string&)>;
             ChunkFunc feed = [&](const std::vector<read_streaming::sequence>& chunk, const std::string&) {
                 cal.add_chunk(chunk, max_reads);
@@ -3019,16 +3019,16 @@ public:
      */
     void generate_misalignment_data(
         const std::string& fastq_path, ReadLayout& layout, int num_threads = 1,
-        size_t min_reads = adapter_thresholds::calibration_block_reads,
+        size_t min_reads = adapter_thresholds::cal_block_reads,
         bool calibrate_concat_hmm = false
     ) {
         prune_similar_reverse_adapters(layout);
 
         // --concat-hmm: calibrate the HMM in the same pass, on the first min_reads reads.
-        std::unique_ptr<concat_hmm_calibration> hmm_cal;
+        std::unique_ptr<concat_hmm_cal> hmm_cal;
         if (calibrate_concat_hmm) {
             try {
-                hmm_cal = std::make_unique<concat_hmm_calibration>(layout, num_threads);
+                hmm_cal = std::make_unique<concat_hmm_cal>(layout, num_threads);
             } catch (const std::exception& ex) {
                 std::cerr << "[concat_hmm] WARNING: no HMM for this layout (" << ex.what() << ")\n";
             }
@@ -3083,9 +3083,9 @@ public:
             return n;
         };
 
-        const size_t block = adapter_thresholds::calibration_block_reads;
-        const size_t cap = std::max(adapter_thresholds::calibration_max_reads, min_reads);
-        const size_t need = adapter_thresholds::min_misalignment_observations;
+        const size_t block = adapter_thresholds::cal_block_reads;
+        const size_t cap = std::max(adapter_thresholds::cal_max_reads, min_reads);
+        const size_t need = adapter_thresholds::min_misal_obs;
         file_streaming files(fastq_path, 4);
         read_streaming reader(files);
         size_t target = min_reads;
@@ -3102,7 +3102,7 @@ public:
                 while (chunk.size() < want) {
                     auto rec = reader.next_sequence();
                     if (!rec) { end_of_input = true; break; }
-                    if (!keep_perfect_matches) { rec->qual = std::string(); rec->comment = std::string(); }
+                    if (!keep_perf_matches) { rec->qual = std::string(); rec->comment = std::string(); }
                     chunk.push_back(std::move(*rec));
                 }
                 if (!chunk.empty()) {
@@ -3135,7 +3135,7 @@ public:
         if (hmm_cal) hmm_cal->finish(layout);
         
         // Write final results
-        write_perfect_matches(keep_perfect_matches);
+        write_perfect_matches(keep_perf_matches);
         update_read_layout(layout, adapter_stats, misalignment_stats);
         layout.generate_position_mapping();
     }
@@ -3146,8 +3146,8 @@ private:
     std::vector<std::pair<std::string, std::string>> forward_adapters; /// vector of forward adapters, stored as `pair:[class_id, seq]`
     std::vector<std::pair<std::string, std::string>> reverse_adapters; /// vector of reverse adapters, stored as `pair:[class_id, seq]`
     // Debug only: keep perfect reads for write_perfect_matches (large memory).
-    static constexpr bool keep_perfect_matches = false;
-    std::vector<perfect_match> perfect_matches; /// vector of perfect matches (only with keep_perfect_matches)
+    static constexpr bool keep_perf_matches = false;
+    std::vector<perfect_match> perfect_matches; /// vector of perfect matches (only with keep_perf_matches)
 
     double alignment_distance_fraction(const std::string& lhs, const std::string& rhs) const {
         if (lhs.empty() && rhs.empty()) return 0.0;
@@ -3242,7 +3242,7 @@ private:
                 );
                 #pragma omp critical
                 {
-                    if (keep_perfect_matches) perfect_matches.push_back({read, "forward"});
+                    if (keep_perf_matches) perfect_matches.push_back({read, "forward"});
                     #pragma omp atomic
                     forward_count++;
                 }
@@ -3254,7 +3254,7 @@ private:
                 );
                 #pragma omp critical
                 {
-                    if (keep_perfect_matches) perfect_matches.push_back({read, "reverse"});
+                    if (keep_perf_matches) perfect_matches.push_back({read, "reverse"});
                     #pragma omp atomic
                     reverse_count++;
                 }
@@ -3616,7 +3616,7 @@ private:
                 const int fallback_threshold =
                     adapter_thresholds::fallback_max_edit_distance(seq.length());
                 const bool use_fallback_threshold =
-                    chance.n_chance < adapter_thresholds::min_misalignment_observations ||
+                    chance.n_chance < adapter_thresholds::min_misal_obs ||
                     !std::isfinite(mean) ||
                     mean < 1.0;
                 if (use_fallback_threshold) {

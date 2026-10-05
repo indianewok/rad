@@ -2078,7 +2078,7 @@ int cmd_demux(int argc, char *argv[]) {
         std::cout << "[misalignment_stats] Computing misalignment...\n";
       Misalignment_Setup mis(read_layout);
       mis.generate_misalignment_data(fastq_path, read_layout, nthreads,
-                                     adapter_thresholds::calibration_block_reads,
+                                     adapter_thresholds::cal_block_reads,
                                      concat_hmm_enabled);
       auto mis_time = std::chrono::steady_clock::now() - main_start;
       std::cout << "[main] Misalignment time: "
@@ -2105,7 +2105,7 @@ int cmd_demux(int argc, char *argv[]) {
       if (read_layout.concat_params.empty()) {
         std::cout << "[concat_hmm] No hmm_* columns in the position map; "
                      "calibrating from the first 50000 reads\n";
-        concat_hmm_calibration::calibrate_from_fastq(fastq_path, read_layout,
+        concat_hmm_cal::calibrate_from_fastq(fastq_path, read_layout,
                                                      nthreads, 50000);
         if (!read_layout.concat_params.empty())
           read_layout.write_to_csv(outbase.string(), "pos_map");
