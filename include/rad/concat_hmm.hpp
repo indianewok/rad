@@ -127,21 +127,28 @@ struct CheckRegion {
     float conf;
 };
 // Segment flags
-enum : uint8_t {
+enum : uint16_t {
     SEG_PARTIAL_LEFT = 1,     // opening element of the construct not observed
     SEG_PARTIAL_RIGHT = 2,    // closing element not observed
     SEG_LOWCONF = 4,          // low confidence (posterior < 0.9, or cut placed without junction evidence)
     SEG_SAME_MOLECULE_R = 8,  // the junction to the right is a fold-back (same molecule read twice)
-    SEG_DOUBLE_BC = 16,       // 'D' geometry: two barcode-side units facing outward, one construct
+    SEG_DOUBLE_BC = 16,       // 'D' geometry: two barcode-side units facing outward, one construct, and the D strand rule
+                              // found no clear cDNA direction (strand 'D': RAD writes nothing)
     SEG_ARTIFACT = 32,        // artifact template (barcode-less T, or a single-primer end)
     SEG_UNANCHORED_R = 64,    // cut to the right placed by geometry / duration MAP (no junction adapter)
-    SEG_EMPTY = 128           // (near) zero-length insert (empty bead oligo / primer dimer)
+    SEG_EMPTY = 128,          // (near) zero-length insert (empty bead oligo / primer dimer)
+    // D strand rule: a D geometry decided by the cDNA strand table
+    SEG_D_KEPT = 256,         // plain F / R construct: the barcode unit at the cDNA 5' end is kept, the other unit removed; the
+                              // segment edge on the removed side (end for F, start for R) is that unit's inner anchor, and the
+                              // read element ends there
+    SEG_D_SPLIT = 512         // plain F / R construct: one half of a D geometry whose cDNA changes strand (two cDNAs tail to
+                              // tail), split at the strand change (cut kind CUT_STRAND_FLIP)
 };
 struct Segment {
     int start, end;  // 0-based half-open
     char strand;     // 'F','R','T' (barcode-less artifact), 'D' (double barcode unit), '?' (single-primer end
                      // whose barcode-side partner anchor was not seen: no strand evidence)
-    uint8_t flags;
+    uint16_t flags;
     float conf;
 };
 // Result flags
@@ -171,11 +178,13 @@ struct Result {
     std::vector<int> cut_lo, cut_hi;
     // per cut (size k-1): how the cut was placed (POLICY_ROUND.md round 3, cut hierarchy): 0 both junction adapters
     // (midpoint between them), 1 one adapter (its junction-facing edge), 2 layout geometry (barcode-block edge /
-    // fixed tails), 5 cDNA strand flip (FR_RF junction with no adapter: calibrated 6-mer strand table), 3 duration-MAP
-    // midpoint (nothing located: low confidence), 4 fold-back centre (same molecule read twice)
+    // fixed tails), 5 cDNA strand flip (FR_RF junction with no adapter: calibrated 6-mer strand table; or a D geometry
+    // whose cDNA changes strand: D strand rule, 9-mer table), 3 duration-MAP midpoint (nothing located: low
+    // confidence), 4 fold-back centre (same molecule read twice)
     std::vector<uint8_t> cut_kind;
     // per cut: the score behind the placement: fold-back Jaccard (CUT_FOLDBACK), strand-flip margin in units of the
-    // calibrated mean score (CUT_STRAND_FLIP), 0 otherwise
+    // calibrated mean score (CUT_STRAND_FLIP at an FR_RF junction) or the weaker arm's evidence in those units
+    // (CUT_STRAND_FLIP inside a D geometry), 0 otherwise
     std::vector<float> cut_aux;
 #ifdef CONCAT_HMM_STAGE_TIMERS
     uint64_t stage_ns[4] = {0, 0, 0, 0};  // stage0, gate, stage2 (Myers/events), stage3 (decode+output)
@@ -266,24 +275,41 @@ constexpr int STRAND_MIN_CDNA = 60;    // calibration: minimum cDNA length count
 constexpr int FLIP_ARM_MIN = 30;       // strand-flip cut: each arm at least this long (bp)
 constexpr float FLIP_MARGIN = 0.30f;   // strand-flip cut: both arm means must exceed this fraction of the calibrated mean sense score
                                        // (a path junction between an F and an R construct: the junction exists, only its place is open)
-constexpr float FLIP_MARGIN_D = 0.50f; // ... a D-shaped construct (two barcode units, nothing at the junction): a flip here SPLITS one
-                                       //     construct into two molecules, so the margin is stricter (10x 5' training cDNA, with the two
-                                       //     guards below: 36.5% of two-molecule inserts pass, 0.39% of single-strand inserts; 93% of the
-                                       //     passing two-molecule cuts lie within 25 bp of the junction)
 constexpr float FLIP_DISTINCT_MIN = 0.5f; // strand-flip cut: distinct STRAND_K-mers / k-mer positions of each arm (low-complexity guard:
                                           //     a microsatellite or homopolymer arm repeats one k-mer and carries no strand information)
 constexpr int FLIP_EVIDENCE_MIN = 40;  // strand-flip cut: each arm's score sum >= this many mean sense scores (strand_mu units), so a
                                        //     30-60 bp arm needs a mean well above the margin (short arms are noisy; 10x 5' training
                                        //     cDNA: single-strand false fires at the D margin 0.76% -> 0.39%, two-molecule 36.8% -> 36.5%)
-constexpr float FLIP_LR_D = 40.f;      // D construct: likelihood ratio (two molecules : one) of a flip passing the D test above. The
-                                       //     decode's p_single is the prior of one construct; the split posterior
-                                       //     LR (1 - p_single) / (LR (1 - p_single) + p_single) must reach tau_junction, i.e.
-                                       //     p_single <= LR / (LR + 9) = 0.82. A confidently decoded D (p_single >= 0.99) is never
-                                       //     overturned: in 10x 5' data a D-shaped read with no junction element is a true D read
-                                       //     (one molecule, the same barcode on both units) ~300 times more often than two molecules,
-                                       //     and the flip's evidence saturates (real cDNA: composition drift inside one cDNA gives
-                                       //     margins > 1). LR 40 = the two-molecule pass rate (36.5%) over the single-strand pass rate
-                                       //     scaled to the truth5p D stratum (1.8% at the old test, 2.4x the training singletons).
+// D strand rule. A D geometry (10x 5': forw_primer barcode umi tso |
+// cDNA | rc_tso rc_umi rc_barcode rc_forw_primer, nothing at the junction) is decided by the cDNA strand sense, read with a
+// second strand table of STRAND_D_K-mers learned in the same calibration pass from the same cDNA as the 6-mer table and
+// cached as counts (hmm_strand_d). The 6-mer table stays as it is for the FR_RF strand-flip cut.
+constexpr int STRAND_D_K = 9;          // hard-coded: chosen by measurement on 13,241 10x 5' D reads against minimap2 (6-mers: at a
+                                       //     0.5% false-flip rate on closed single-strand reads 73% of the one-cDNA reads and 45% of the
+                                       //     two-cDNA reads are decided; 8-mers 95% / 85%; 9-mers 98% / 93%); a per-library choice of k
+                                       //     needs a truth set, not available in the calibration pass
+constexpr int STRAND_D_N = 1 << (2 * STRAND_D_K);  // 262,144 entries (1 MiB of float log-odds in the model, 1 MiB of counts per calibrator)
+constexpr double STRAND_D_MIN_KMERS = 2.0e6;  // calibration: the D table is written only from at least this many counted k-mers (about 8
+                                              //     per entry; hard-coded: smaller samples decided fewer reads in the measurement)
+constexpr float D_EVIDENCE_MIN = 16.f; // D strand rule: the evidence (a score sum in units of the calibrated mean sense score, i.e. in
+                                       //     "average sense positions") an arm pair needs for a strand change (in either order) and the
+                                       //     whole cDNA needs for one direction. Hard-coded. First measured as the 99.5th percentile of
+                                       //     the weaker-arm evidence S on 50,611 held-out closed single-strand reads (14.0; in-sample
+                                       //     12.6). The percentile depends on the closed-read definition: on
+                                       //     22,589 strictly closed reads outside the calibration
+                                       //     head (HMM k = 1, F or R, every check FULL, both anchors found by edlib within 150 bp of the
+                                       //     read ends at <= 2 edits, poly_a removed, cDNA >= 100 bp) the 99.5th percentile of S is 9.4
+                                       //     and of S' (the mirrored evidence) 11.9; E = 16 sits between the 99.8th and the 99.9th
+                                       //     percentile of S there (S >= 16 in 0.18%, S' >= 16 in 0.27% of these reads; the set holds
+                                       //     real strand changes, so these are upper bounds). On the truth set S >= 16 in 8 of 10,044
+                                       //     one-cDNA reads (0.08%) and S' >= 16 in 11 (0.11%). A calibrated value would need a second
+                                       //     pass over the stored calibration cDNA, and the 0.2-0.5% real two-cDNA reads among the
+                                       //     closed calibration reads sit at that percentile, so the quantile level would be a constant
+                                       //     in its place. The one-direction test (|T| >= D_EVIDENCE_MIN)
+                                       //     reuses the value: on 10,044 one-cDNA 10x 5' reads with mapping truth the sign of T is
+                                       //     wrong in 1 of 19 reads at |T| in (16, 24], 0 of 32 in (24, 32], 1 of 96 in (32, 48] and 0 of
+                                       //     9,875 above 48; no value of a separate threshold removes both
+                                       //     errors for less than 1.5% of the kept records, so none was added.
 
 inline int poly_bin(int len) {
     static const int ub[7] = {14, 17, 21, 26, 33, 42, 55};
@@ -769,6 +795,11 @@ struct Model {
     std::vector<float> strand_lo;
     float strand_mu = 0.f;                 // mean per-position sense score on the calibration cDNA (margin unit)
     bool has_strand() const { return strand_lo.size() == (size_t)detail::STRAND_N && strand_mu > 0.f; }
+    // D strand table (D strand rule): the same log-odds per STRAND_D_K-mer, from the counts cached in the hmm_strand_d
+    // column of the read row (Model::finalize). Empty when not calibrated: D geometries then get SEG_DOUBLE_BC.
+    std::vector<float> strand_d_lo;
+    float strand_d_mu = 0.f;
+    bool has_strand_d() const { return strand_d_lo.size() == (size_t)detail::STRAND_D_N && strand_d_mu > 0.f; }
     int zone5 = 150, zone3 = 120;
     float fast_p = 0.995f;
     int min_interior = 60, min_terminal = 60;
@@ -821,6 +852,8 @@ struct Scratch {
     std::vector<float> cpost, spost;
     std::vector<float> caux, saux;          // per path junction / per output segment: cut score (fold Jaccard, flip margin)
     std::vector<uint8_t> skind;             // per output segment: kind of the split inside its construct (fold-back / strand flip; 0 none)
+    std::vector<int> scut;                  // per output segment: the cut on its right (its construct's junction; a kept-left D construct
+                                            // (SEG_D_KEPT, 'F') ends at the removed unit's inner anchor, but its cut stays at the junction)
     std::vector<int> slot_ev;               // construct slot -> path event (scratch)
     std::vector<std::pair<int, int>> force; // facing-anchor rescue: (closing inner event, opening inner event) junctions forced on the next Viterbi
     std::vector<int> onp;                   // per event: index on the decoded path (-1: off the path)
@@ -2006,6 +2039,28 @@ inline void Model::finalize() {
                 strand_lo.resize((size_t)STRAND_N);
                 for (int i = 0; i < STRAND_N; ++i) strand_lo[i] = (float)it->second[i + 1];
             }
+        }
+    }
+    // D strand table: STRAND_D_N counts (validated by apply_params) -> log-odds of each k-mer against its reverse
+    // complement with one pseudocount, and the count-weighted mean sense score (the unit of D_EVIDENCE_MIN). A table
+    // whose mean is not above 0.01 nats carries no strand information and is not used.
+    strand_d_lo.clear();
+    strand_d_mu = 0.f;
+    {
+        auto it = par.find("strand_d");
+        if (it != par.end() && it->second.size() == (size_t)STRAND_D_N) {
+            const std::vector<double>& c = it->second;
+            std::vector<float> lo((size_t)STRAND_D_N);
+            double num = 0, tot = 0;
+            for (int kk = 0; kk < STRAND_D_N; ++kk) {
+                int rk = 0;
+                for (int x = 0, v = kk; x < STRAND_D_K; ++x, v >>= 2) rk = (rk << 2) | (3 - (v & 3));
+                const double l = std::log((c[(size_t)kk] + 1.0) / (c[(size_t)rk] + 1.0));
+                lo[(size_t)kk] = (float)l;
+                num += c[(size_t)kk] * l;
+                tot += c[(size_t)kk];
+            }
+            if (tot > 0 && num / tot > 0.01) { strand_d_lo.swap(lo); strand_d_mu = (float)(num / tot); }
         }
     }
     finalized = true;
@@ -4092,12 +4147,90 @@ inline bool strand_flip_cut(const Model& M, const char* s, int lo, int hi, Scrat
     return distinct_frac(lo, cut) >= FLIP_DISTINCT_MIN && distinct_frac(cut, hi) >= FLIP_DISTINCT_MIN;
 }
 
-// Posterior that a D-shaped construct holds two molecules, given a flip that passed the D test: the decode's p_single
-// is the prior of one construct (the D template against the F + R alternative with every junction element lost; the
-// two are indistinguishable without the strand table), FLIP_LR_D the flip's likelihood ratio.
-inline float flip_posterior(float p_single) {
-    const float two = FLIP_LR_D * std::max(0.f, 1.f - p_single), one = std::max(0.f, p_single);
-    return two + one > 0.f ? two / (two + one) : 0.f;
+// Per-position score of s[i, i + STRAND_D_K) on the D strand table (0 for k-mers with N).
+inline float strand_d_score_at(const Model& M, const char* s, int i) {
+    uint32_t v = 0;
+    for (int x = 0; x < STRAND_D_K; ++x) {
+        const unsigned char ch = (unsigned char)s[i + x];
+        if ((ch | 0x20) == 'n') return 0.f;
+        v = (v << 2) | code2(ch);
+    }
+    return M.strand_d_lo[v];
+}
+
+// Low-complexity guard of the D strand rule: distinct STRAND_K-mers / k-mer positions of s[a, b) (the same measure as
+// the arm guard of strand_flip_cut; a microsatellite or homopolymer stretch repeats one k-mer and is no strand evidence).
+inline float distinct_kmer_frac(const char* s, int a, int b, Scratch& W) {
+    std::vector<uint8_t>& seen = W.flip_seen;
+    seen.assign((size_t)STRAND_N, 0);
+    uint32_t v = 0;
+    int valid = 0, pos = 0, d = 0;
+    for (int i = a; i < b; ++i) {
+        const unsigned char ch = (unsigned char)s[i];
+        v = ((v << 2) | code2(ch)) & (uint32_t)(STRAND_N - 1);
+        valid = (ch | 0x20) == 'n' ? 0 : valid + 1;
+        if (valid >= STRAND_K) { ++pos; if (!seen[v]) { seen[v] = 1; ++d; } }
+    }
+    return pos ? (float)d / (float)pos : 0.f;
+}
+
+// D strand rule. s[lo, hi) is the cDNA between the inner anchors of the two barcode units of a
+// D geometry (10x 5': tso ... rc_tso). Per-position scores come from the D strand table, in units of its calibrated
+// mean sense score mu ("average sense positions"):
+//   T = (sum of all scores) / mu, the evidence of one direction (sense as read: T > 0; antisense: T < 0);
+//   c = argmax over cuts (each arm >= FLIP_ARM_MIN bp) of (left sum - right sum), S = min(left sum, -right sum) / mu, the
+//       evidence of the weaker arm for "sense on the left, antisense on the right": two cDNAs tail to tail, the strand
+//       change the two outward-pointing barcode units predict (each unit at its cDNA's 5' end);
+//   c' = argmin of the same difference, S' = min(-left sum, right sum) / mu, the evidence of the weaker arm for
+//       "antisense on the left, sense on the right": two cDNAs head to head (neither unit at its cDNA's 5' end), or a
+//       third arm. Measured on a 10x 5' truth set: 6 of 1,800 two-cDNA reads (0.3%) and 5 of 7,767 kept one-cDNA
+//       records (0.06%) have S' >= D_EVIDENCE_MIN.
+//   DRULE_UNCLEAR    S' >= D_EVIDENCE_MIN: no record (a kept record would hold both molecules; a split would still hold a
+//                    strand change in one half)
+//   DRULE_TWO        S >= D_EVIDENCE_MIN and both arms pass the low-complexity guard: two cDNAs tail to tail, cut = lo + c
+//   DRULE_ONE_LEFT   S <= 0 (no arm pair with flip evidence) and T >= D_EVIDENCE_MIN: one cDNA, sense from the left unit
+//   DRULE_ONE_RIGHT  S <= 0 and -T >= D_EVIDENCE_MIN: one cDNA, sense from the right unit (antisense as read)
+//   DRULE_UNCLEAR    otherwise, or no D table
+// O(hi - lo). Measured against minimap2 on 13,241 10x 5' D reads: the kept
+// unit is the one at the cDNA 5' end in 99.98% of the one-cDNA reads, 0.08% of them are split, 0.12% of the D reads
+// are two cDNAs written as one record (two cDNAs on one strand, which no strand rule can see), 97% of the splits lie
+// within 60 bp of the mapping breakpoint.
+enum : int { DRULE_UNCLEAR = 0, DRULE_ONE_LEFT = 1, DRULE_ONE_RIGHT = 2, DRULE_TWO = 3 };
+inline int d_strand_rule(const Model& M, const char* s, int lo, int hi, Scratch& W, int& cut, float& evidence) {
+    cut = -1;
+    evidence = 0.f;
+    if (!M.has_strand_d()) return DRULE_UNCLEAR;
+    const int n = hi - lo;
+    if (n < STRAND_D_K) return DRULE_UNCLEAR;
+    std::vector<float>& ps = W.flip_ps;
+    ps.assign((size_t)n + 1, 0.f);
+    for (int i = 0; i < n; ++i) ps[i + 1] = ps[i] + (i + STRAND_D_K <= n ? strand_d_score_at(M, s, lo + i) : 0.f);
+    const float mu = std::max(M.strand_d_mu, 1e-6f), total = ps[n];
+    float S = -1e30f, Sp = -1e30f;
+    int best = -1, bestp = -1;
+    if (n >= 2 * FLIP_ARM_MIN + STRAND_D_K) {
+        float bestv = -1e30f, bestpv = 1e30f;
+        for (int c = FLIP_ARM_MIN; c <= n - FLIP_ARM_MIN; ++c) {
+            const float v = 2.f * ps[c] - total;
+            if (v > bestv) { bestv = v; best = c; }
+            if (v < bestpv) { bestpv = v; bestp = c; }
+        }
+        S = std::min(ps[best], -(total - ps[best])) / mu;
+        Sp = std::min(-ps[bestp], total - ps[bestp]) / mu;
+    }
+    if (Sp >= D_EVIDENCE_MIN) return DRULE_UNCLEAR;  // head to head (antisense left, sense right), or a third arm: no record
+    if (S >= D_EVIDENCE_MIN && distinct_kmer_frac(s, lo, lo + best, W) >= FLIP_DISTINCT_MIN &&
+        distinct_kmer_frac(s, lo + best, hi, W) >= FLIP_DISTINCT_MIN) {
+        cut = lo + best;
+        evidence = S;
+        return DRULE_TWO;
+    }
+    const float T = total / mu;
+    if (S <= 0.f && std::fabs(T) >= D_EVIDENCE_MIN && distinct_kmer_frac(s, lo, hi, W) >= FLIP_DISTINCT_MIN) {
+        evidence = std::fabs(T);
+        return T > 0.f ? DRULE_ONE_LEFT : DRULE_ONE_RIGHT;
+    }
+    return DRULE_UNCLEAR;
 }
 
 // Cut between a construct whose last path slot is sa (event A) and the next one whose first slot is sb (event B).
@@ -4363,7 +4496,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
     std::vector<int>& ca = W.ca;
     std::vector<int>& cb = W.cb;
     ckind.clear(); ca.clear(); cb.clear();
-    W.jlo.clear(); W.jhi.clear(); W.cweak.clear(); W.segj.clear(); W.cgap.clear(); W.caux.clear(); W.saux.clear(); W.skind.clear();
+    W.jlo.clear(); W.jhi.clear(); W.cweak.clear(); W.segj.clear(); W.cgap.clear(); W.caux.clear(); W.saux.clear(); W.skind.clear(); W.scut.clear();
     for (int c = 0; c + 1 < nc; ++c) {
         const int xa = cstart[c + 1] - 1, xb = cstart[c + 1];
         const int sa = W.path_st[xa], sb = W.path_st[xb];
@@ -4478,7 +4611,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         const bool has_close = (M.st_flags[slast] & SF_CLOSE) != 0;
         Segment sg;
         sg.strand = T.strand;
-        sg.flags = (uint8_t)((has_open ? 0 : SEG_PARTIAL_LEFT) | (has_close ? 0 : SEG_PARTIAL_RIGHT) | (T.art && !T.dtpl ? SEG_ARTIFACT : 0));
+        sg.flags = (uint16_t)((has_open ? 0 : SEG_PARTIAL_LEFT) | (has_close ? 0 : SEG_PARTIAL_RIGHT) | (T.art && !T.dtpl ? SEG_ARTIFACT : 0));
         int cs_slack = 0, ce_slack = 0;  // construct bounds defaulted to the read ends (see expected_window)
         if (c > 0) sg.start = bcut[c - 1];
         else {
@@ -4533,10 +4666,16 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             if (!partner) sg.strand = '?';
         }
         // D construct (and single-primer ends: both terminal anchors are the barcode-side primer):
-        // fold-back -> two constructs; otherwise one construct (D: SEG_DOUBLE_BC)
+        // fold-back -> two constructs; otherwise the D strand rule (D geometry): one construct of the kept unit
+        // (SEG_D_KEPT), two constructs split at the cDNA strand change (SEG_D_SPLIT), or SEG_DOUBLE_BC (no clear direction)
         int fold_cut = -1;
-        float fold_aux = 0.f, flip_conf = -1.f;  // flip_conf >= 0: posterior of a strand-flip split of a single D construct
+        float fold_aux = 0.f, flip_conf = -1.f;  // flip_conf >= 0: a D geometry split by the D strand rule (its cut posterior)
         uint8_t in_kind = CUT_FOLDBACK;  // kind of a split made inside this construct (fold-back centre or strand flip)
+        int d_keep = DRULE_UNCLEAR;      // D strand rule: DRULE_ONE_LEFT / DRULE_ONE_RIGHT when one unit is kept
+        const int cut_right = sg.end;    // the cut to the next construct (bcut[c]; the read-end bound for the last one). A kept-left D
+                                         // construct trims sg.end to the removed unit's inner anchor below; the cut, and so the next
+                                         // construct's window, stays at the junction (the removed unit lies between the two and belongs
+                                         // to neither)
         if (M.tpl_fold[t]) {
             int a = sg.start, b = sg.end;
             int rl = FOLD_REACH_OPEN, rr = FOLD_REACH_OPEN;  // an arm bounded by an observed inner anchor is closed
@@ -4551,28 +4690,51 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             // reverse complement of the right arm); the barcode units and their geometry take no part
             int ctr;
             float fj, fid;
-            int fc; float mg;
             if (M.opt.foldback_split && b - a >= 2 * FOLD_ARM_MIN && fold_decision(seq, a, b, W, ctr, fj, fid, rl, rr)) { fold_cut = ctr; fold_aux = fj; }
-            else if (T.dtpl && nc == 1 && M.has_strand() && strand_flip_cut(M, seq, a, b, W, fc, mg, FLIP_MARGIN_D) &&
-                     flip_posterior(R.p_single) >= M.opt.tau_junction) {
-                // policy 10 on the D geometry: the cDNA strand sense flips inside the insert, so these are two molecules
-                // (F then R) whose junction lost every element; cut at the flip. One molecule (a true D) keeps one sense.
-                // The flip overturns the decode only when the decode left room for the F + R alternative: the split's
-                // posterior flip_posterior(p_single) must reach tau_junction (a confident D, p_single >= 0.99, stays
-                // one construct: it is a true D read far more often than two molecules, see FLIP_LR_D). In a
-                // multi-construct read (nc > 1) p_single is P(k = 1) of the whole read and is no prior for this
-                // construct, so the flip never overturns a D construct there (policies 4 / 9: the D shape is one
-                // construct; rf_dropout: the margin alone had split 12 D constructs inside concatemers more than 50 bp
-                // from every true junction, against one correct split on truth5p).
-                fold_cut = fc; fold_aux = mg; in_kind = CUT_STRAND_FLIP;
-                flip_conf = flip_posterior(R.p_single);
-            } else if (T.dtpl) {
-                sg.flags |= SEG_DOUBLE_BC;
-                // insert-length evidence: a D insert beyond what one cDNA explains (the calibrated one-insert length
-                // density's p99) where two inserts are more likely (an FR_RF junction with every junction element lost,
-                // or an undetected fold-back) -> uncertain (RAD keeps its own handling of D molecules either way)
-                const int X = b - a;
-                if (X > M.ins1_p99 && gap_score_ins(M, 2, X) > gap_score_ins(M, 1, X)) sg.flags |= SEG_LOWCONF;
+            else if (T.dtpl) {
+                // D strand rule: the cDNA between the two units' inner anchors is read with the
+                // D strand table (d_strand_rule). One direction: the unit at the cDNA 5' end is kept and the other unit
+                // removed (the segment ends at the removed unit's inner anchor: the read element never enters it). A strand
+                // change: two cDNAs tail to tail, split at the change (two plain constructs, as a fold-back split). No clear
+                // direction, or no D table: SEG_DOUBLE_BC (RAD writes nothing). The decode's p_single takes no part: the
+                // D template and the F + R alternative with every junction element lost have the same shape, and the
+                // strand table is the evidence that separates them (whole reads and D children alike).
+                // The rule's span: the inner anchor's observed edge, or, for an unobserved inner anchor (tso / rc_tso),
+                // the layout offset from the observed outer one (spacers plus the anchor's nominal length), so that the
+                // removed unit's barcode block is never part of the kept construct.
+                int lo = a, hi = b;
+                int ins_el = -1;
+                for (int x = 0; x < (int)T.el.size(); ++x) if (T.el[x].kind == EK_INSERT) { ins_el = x; break; }
+                if (ins_el >= 0) {
+                    int oL = -1, oR = -1;
+                    for (int o = 0; o < nobs; ++o) {
+                        if (ostart[o] < 0) continue;
+                        if (T.obs[o] < ins_el) oL = o; else if (oR < 0) oR = o;
+                    }
+                    if (oL >= 0) lo = oend[oL] + (int)std::lround(T.pnom[ins_el] - T.pnom[T.obs[oL] + 1]);
+                    if (oR >= 0) hi = ostart[oR] - (int)std::lround(T.pnom[T.obs[oR]] - T.pnom[ins_el + 1]);
+                    lo = std::max(a, std::min(lo, L));
+                    hi = std::min(b, std::max(hi, 0));
+                }
+                int dc = -1;
+                float dev = 0.f;
+                const int rule = hi > lo ? d_strand_rule(M, seq, lo, hi, W, dc, dev) : (int)DRULE_UNCLEAR;
+                if (rule == DRULE_TWO) {
+                    fold_cut = dc; fold_aux = dev; in_kind = CUT_STRAND_FLIP;
+                    flip_conf = 1.f;  // decided by the rule's evidence threshold; the halves' cut posterior reaches tau_junction
+                } else if (rule == DRULE_ONE_LEFT || rule == DRULE_ONE_RIGHT) {
+                    d_keep = rule;
+                    if (rule == DRULE_ONE_LEFT) { sg.strand = 'F'; sg.end = std::max(hi, sg.start + 1); sg.flags |= SEG_PARTIAL_RIGHT; }
+                    else { sg.strand = 'R'; sg.start = std::min(lo, sg.end - 1); sg.flags |= SEG_PARTIAL_LEFT; }
+                    sg.flags = (uint16_t)((sg.flags & ~SEG_LOWCONF) | SEG_D_KEPT);
+                } else {
+                    sg.flags |= SEG_DOUBLE_BC;
+                    // insert-length evidence: a D insert beyond what one cDNA explains (the calibrated one-insert length
+                    // density's p99) where two inserts are more likely (an FR_RF junction with every junction element lost,
+                    // or an undetected fold-back) -> uncertain (RAD writes nothing for a SEG_DOUBLE_BC construct either way)
+                    const int X = b - a;
+                    if (X > M.ins1_p99 && gap_score_ins(M, 2, X) > gap_score_ins(M, 1, X)) sg.flags |= SEG_LOWCONF;
+                }
             }
         }
         const int ci = (int)R.segs.size();
@@ -4581,17 +4743,18 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             // decoded them is not carried over); the split's confidence is the construct's own (policy 9: the
             // arm similarity is the decision, no barcode-unit mirror test)
             Segment s1 = sg, s2 = sg;
+            const uint16_t dsplit = (T.dtpl && in_kind == CUT_STRAND_FLIP) ? SEG_D_SPLIT : 0;  // D strand rule: both halves marked
             s1.end = fold_cut; s1.strand = 'F';
-            s1.flags = (uint8_t)((sg.flags & ~(SEG_PARTIAL_RIGHT | SEG_SAME_MOLECULE_R | SEG_UNANCHORED_R | SEG_ARTIFACT | SEG_DOUBLE_BC)) | SEG_PARTIAL_RIGHT |
-                                 (in_kind == CUT_FOLDBACK ? SEG_SAME_MOLECULE_R : SEG_UNANCHORED_R));
-            s2.start = fold_cut; s2.strand = 'R'; s2.flags = (uint8_t)((sg.flags & ~(SEG_PARTIAL_LEFT | SEG_ARTIFACT | SEG_DOUBLE_BC)) | SEG_PARTIAL_LEFT);
-            // a strand-flip split of a single D construct carries its own posterior (flip_posterior); the halves' confidence
-            // is that posterior, which reached tau_junction, so the construct's own low-confidence mark (p_single < tau) is lifted
+            s1.flags = (uint16_t)((sg.flags & ~(SEG_PARTIAL_RIGHT | SEG_SAME_MOLECULE_R | SEG_UNANCHORED_R | SEG_ARTIFACT | SEG_DOUBLE_BC)) | SEG_PARTIAL_RIGHT |
+                                  (in_kind == CUT_FOLDBACK ? SEG_SAME_MOLECULE_R : SEG_UNANCHORED_R) | dsplit);
+            s2.start = fold_cut; s2.strand = 'R'; s2.flags = (uint16_t)((sg.flags & ~(SEG_PARTIAL_LEFT | SEG_ARTIFACT | SEG_DOUBLE_BC)) | SEG_PARTIAL_LEFT | dsplit);
+            // a D geometry split by the D strand rule carries the rule's decision as its cut posterior; the halves'
+            // confidence is that value, which reaches tau_junction, so the construct's own low-confidence mark (p_single < tau) is lifted
             const float fpost = flip_conf >= 0.f ? flip_conf : conf;
             if (flip_conf >= 0.f) {
                 s1.conf = s2.conf = fpost;
-                s1.flags = (uint8_t)(s1.flags & ~SEG_LOWCONF);
-                s2.flags = (uint8_t)(s2.flags & ~SEG_LOWCONF);
+                s1.flags = (uint16_t)(s1.flags & ~SEG_LOWCONF);
+                s2.flags = (uint16_t)(s2.flags & ~SEG_LOWCONF);
             }
             R.segs.push_back(s1);
             R.segs.push_back(s2);
@@ -4603,6 +4766,8 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             W.saux.push_back(c + 1 < nc ? W.caux[c] : 0.f);
             W.skind.push_back(in_kind);
             W.skind.push_back(0);
+            W.scut.push_back(fold_cut);
+            W.scut.push_back(cut_right);
             anyF = true; anyR = true;
         } else {
             R.segs.push_back(sg);
@@ -4610,6 +4775,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             W.segj.push_back(c + 1 < nc ? c : -1);
             W.saux.push_back(c + 1 < nc ? W.caux[c] : 0.f);
             W.skind.push_back(0);
+            W.scut.push_back(cut_right);
             if (sg.strand == 'F') anyF = true;
             else if (sg.strand == 'R') anyR = true;
             else anyO = true;
@@ -4622,6 +4788,15 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             for (int tm : M.main_tpl) (M.tpl[tm].strand == 'F' ? tF : tR) = tm;
             if (tF >= 0) emit_half_checks(R, M, seq, L, tF, ci, sg.start, fold_cut, ev, T, ostart, oend, oev, nobs, conf);
             if (tR >= 0) emit_half_checks(R, M, seq, L, tR, ci + 1, fold_cut, sg.end, ev, T, ostart, oend, oev, nobs, conf);
+            continue;
+        }
+        if (d_keep != DRULE_UNCLEAR) {
+            // D strand rule, kept unit: the main template of its strand describes the construct over the kept span; the
+            // removed unit's events lie outside it and get no window, and nothing is expected across the insert (the
+            // read element ends at the removed unit's inner anchor, the segment edge)
+            int tm = -1;
+            for (int x : M.main_tpl) if (M.tpl[x].strand == sg.strand) tm = x;
+            if (tm >= 0) emit_half_checks(R, M, seq, L, tm, ci, sg.start, sg.end, ev, T, ostart, oend, oev, nobs, conf);
             continue;
         }
         // check regions for every expected static element of the construct
@@ -4650,7 +4825,8 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
     R.cut_post.clear();
     R.cut_kind.clear();
     for (int i = 0; i + 1 < R.k; ++i) {
-        const int cut = R.segs[i].end, j = W.segj[i];
+        // the cut is the construct's junction (W.scut), which equals the segment end except for a kept-left D construct
+        const int cut = i < (int)W.scut.size() ? W.scut[i] : R.segs[i].end, j = W.segj[i];
         R.cuts.push_back(cut);
         R.cut_post.push_back(spost[i]);
         R.cut_lo.push_back(j >= 0 ? std::min(W.jlo[j], cut) : cut);
@@ -4697,11 +4873,13 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
     }
     // abstain
     bool abst = false;
-    if (R.k == 1) abst = R.p_single < M.opt.tau_single;
+    // a D geometry whose unit the D strand rule kept (SEG_D_KEPT): the alternative the decode weighed against the D
+    // template (F + R with every junction element lost) is the one the strand table decided, so p_single is no doubt here
+    if (R.k == 1) abst = R.p_single < M.opt.tau_single && !(R.segs[0].flags & SEG_D_KEPT);
     else if (R.k >= 2) {
         // splits made only by the fold-back test inside one decoded construct (user convention: a fold-back is two
-        // constructs): that construct must be confident; otherwise the decode itself must exclude k = 1. A strand-flip
-        // split of a single D construct was gated on flip_posterior(p_single), which is its cut posterior below.
+        // constructs): that construct must be confident; otherwise the decode itself must exclude k = 1. A D geometry
+        // split by the D strand rule carries the rule's decision as its cut posterior below.
         const bool flip_split = nc == 1 && R.k == 2 && !R.cut_kind.empty() && R.cut_kind[0] == CUT_STRAND_FLIP;
         abst = nc >= 2 ? R.p_single > 1.f - M.opt.tau_single : (flip_split ? false : R.p_single < M.opt.tau_single);
         for (float p : R.cut_post) abst = abst || p < M.opt.tau_junction;
@@ -5146,6 +5324,9 @@ inline Params Model::export_params() const {
     {   // cDNA strand table (policy 10), only when calibrated: [mean sense score, 4096 log-odds]
         auto it = par.find("strand");
         if (it != par.end() && it->second.size() == (size_t)STRAND_N + 1) P.cells[insert_row(*this, 'F', "read")]["hmm_strand"] = it->second;
+        // D strand table (D strand rule), only when calibrated: the STRAND_D_N k-mer counts (integers: compact in the CSV)
+        auto itd = par.find("strand_d");
+        if (itd != par.end() && itd->second.size() == (size_t)STRAND_D_N) P.cells[insert_row(*this, 'F', "read")]["hmm_strand_d"] = itd->second;
     }
     P.cells[r_start]["hmm_begin"] = get("begin");
     P.cells[r_stop]["hmm_end"] = get("end");
@@ -5242,6 +5423,12 @@ inline void Model::apply_params(const Params& P) {
         for (double x : *sv) ok = ok && std::isfinite(x);
         if (!ok) reject(insert_row(*this, 'F', "read"), "hmm_strand", "must hold a positive mean and 4096 finite log-odds");
         else par["strand"] = *sv;
+    }
+    if (auto sv = cell(insert_row(*this, 'F', "read"), "hmm_strand_d")) {  // D strand table (D strand rule): k-mer counts
+        bool ok = sv->size() == (size_t)STRAND_D_N;
+        for (double x : *sv) ok = ok && std::isfinite(x) && x >= 0;
+        if (!ok) reject(insert_row(*this, 'F', "read"), "hmm_strand_d", "must hold 262144 finite non-negative counts");
+        else par["strand_d"] = *sv;
     }
     if (auto g = cell(r_start, "hmm_glob")) {
         const std::vector<double>& G = *g;
@@ -5428,6 +5615,7 @@ public:
         M_->finalize();
         shuf_.assign(M_->NTYPE, std::vector<double>(detail::NFEAT, 0.0));
         strand_cnt_.assign(detail::STRAND_N, 0.0);
+        strand_cnt_d_.assign(detail::STRAND_D_N, 0u);
     }
     // Accumulates one read (call on every read of the calibration chunk; not only perfect matches).
     void add_read(const char* seq, int len) {
@@ -5479,6 +5667,7 @@ public:
         null_bases_ += o.null_bases_;
         nreads_ += o.nreads_;
         for (size_t i = 0; i < strand_cnt_.size() && i < o.strand_cnt_.size(); ++i) strand_cnt_[i] += o.strand_cnt_[i];
+        for (size_t i = 0; i < strand_cnt_d_.size() && i < o.strand_cnt_d_.size(); ++i) strand_cnt_d_[i] += o.strand_cnt_d_[i];
         strand_reads_ += o.strand_reads_;
         strand_bases_ += o.strand_bases_;
     }
@@ -5524,28 +5713,36 @@ private:
         if (head < 0 || tail > len) return;
         const int a = std::max(0, head + STRAND_MARGIN_BP), b = std::min(len, tail - STRAND_MARGIN_BP);
         if (b - a < STRAND_MIN_CDNA) return;
-        const uint32_t km = (uint32_t)STRAND_N - 1;
-        uint32_t v = 0;
+        // the 6-mer table (strand-flip cut) and the 9-mer D table (D strand rule) are counted from the same bases in one pass
+        const uint32_t km = (uint32_t)STRAND_N - 1, kmd = (uint32_t)STRAND_D_N - 1;
+        uint32_t v = 0, vd = 0;
         int valid = 0;
         if (st == 'F') {
             for (int i = a; i < b; ++i) {
                 const unsigned char ch = (unsigned char)seq[i];
-                v = ((v << 2) | code2(ch)) & km;
+                const uint32_t c2 = code2(ch);
+                v = ((v << 2) | c2) & km;
+                vd = ((vd << 2) | c2) & kmd;
                 valid = (ch | 0x20) == 'n' ? 0 : valid + 1;
                 if (valid >= STRAND_K) strand_cnt_[v] += 1.0;
+                if (valid >= STRAND_D_K) ++strand_cnt_d_[vd];
             }
         } else {
             for (int i = b - 1; i >= a; --i) {
                 const unsigned char ch = (unsigned char)seq[i];
-                v = ((v << 2) | (3u - code2(ch))) & km;
+                const uint32_t c2 = 3u - code2(ch);
+                v = ((v << 2) | c2) & km;
+                vd = ((vd << 2) | c2) & kmd;
                 valid = (ch | 0x20) == 'n' ? 0 : valid + 1;
                 if (valid >= STRAND_K) strand_cnt_[v] += 1.0;
+                if (valid >= STRAND_D_K) ++strand_cnt_d_[vd];
             }
         }
         ++strand_reads_;
         strand_bases_ += b - a;
     }
     std::vector<double> strand_cnt_;
+    std::vector<uint32_t> strand_cnt_d_;  // D strand table: STRAND_D_K-mer counts of the same cDNA (integers: merge order cannot change them)
     size_t strand_reads_ = 0;
     double strand_bases_ = 0;
     std::shared_ptr<Model> M_;
@@ -5827,6 +6024,33 @@ inline Params Calibrator::finalize(int max_iter, double tol) {
             rep << b;
         }
     }
+    // ---- D strand table (D strand rule) ----
+    // the STRAND_D_K-mer counts of the same cDNA, cached as counts (hmm_strand_d; Model::finalize makes the log-odds).
+    // Written when the guard passes and the sample holds STRAND_D_MIN_KMERS counted k-mers (about 8 per entry).
+    {
+        double tot = 0;
+        for (uint32_t x : strand_cnt_d_) tot += x;
+        if (matches_ && strand_reads_ >= 500 && tot >= STRAND_D_MIN_KMERS) {
+            std::vector<double> tab((size_t)STRAND_D_N);
+            double num = 0;
+            for (int kk = 0; kk < STRAND_D_N; ++kk) {
+                int rk = 0;
+                for (int x = 0, v = kk; x < STRAND_D_K; ++x, v >>= 2) rk = (rk << 2) | (3 - (v & 3));
+                const double lo = std::log((strand_cnt_d_[(size_t)kk] + 1.0) / (strand_cnt_d_[(size_t)rk] + 1.0));
+                tab[(size_t)kk] = strand_cnt_d_[(size_t)kk];
+                num += strand_cnt_d_[(size_t)kk] * lo;
+            }
+            const double mu = num / tot;
+            snprintf(b, sizeof b, "D strand table: %d-mers, %.0f k-mers, mean sense score %.4f nats/position%s\n", STRAND_D_K, tot, mu,
+                     mu > 0.01 ? "" : " (too weak: D geometries get no clear direction)");
+            rep << b;
+            if (mu > 0.01) M.par["strand_d"] = tab;
+        } else {
+            snprintf(b, sizeof b, "D strand table: not written (%s; %zu single-strand reads, %.0f k-mers; needs 500 reads and %.0f k-mers)\n",
+                     !matches_ ? "calibration guard failed" : "too few reads or k-mers", strand_reads_, tot, STRAND_D_MIN_KMERS);
+            rep << b;
+        }
+    }
     Params out;
     if (!matches_) {
         rep << "CALIBRATION GUARD FAILED: " << why << "-> falling back to layout priors\n";
@@ -5909,6 +6133,7 @@ inline std::string debug_read(const Model& M, const char* seq, int len, Scratch&
                << (i < R.cut_aux.size() && R.cut_aux[i] > 0 ? (i < R.cut_kind.size() && R.cut_kind[i] == CUT_FOLDBACK ? " (arm Jaccard " : " (margin ") + std::to_string(R.cut_aux[i]) + ")" : "")
                << ", posterior " << (i < R.cut_post.size() ? R.cut_post[i] : 0.f) << "\n";
         os << "strand table: " << (M.has_strand() ? "present" : "absent") << "\n";
+        os << "D strand table (" << STRAND_D_K << "-mers, D strand rule): " << (M.has_strand_d() ? "present" : "absent") << "\n";
     }
     return os.str();
 }

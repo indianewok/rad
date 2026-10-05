@@ -301,50 +301,95 @@ namespace mutation_tools {
  * @param pattern_len: `int` length of the pattern (currently <=32 bases)
  * @param text_len: `int` length of the text (currently <=32 bases)
  * @param max_dist: maximum allowed distance
+ * @param best_end: optional out: 0-based index in the text of the last base of the best match (the column where
+ *        the minimum score occurs). The text is consumed from its first base to its last, so this is the match END.
+ * @param n_best: optional out: how many text columns reach the minimum score (1 = one best end; >= 2 = equally good ends)
  * @return `int` minimum edit distance if <= max_dist, else -1
+ * @note The edit distance is the same whether both strings are read first-to-last or last-to-first (the earlier form
+ *       of this loop); only the position bookkeeping is new. When no position is requested the loop stops at the first
+ *       exact match, as before.
  */
-    int bit_partial_match(int64_t pattern, int64_t text, int pattern_len, int text_len, int max_dist) {
+    int bit_partial_match(int64_t pattern, int64_t text, int pattern_len, int text_len, int max_dist,
+                          int* best_end = nullptr, int* n_best = nullptr) {
         if (pattern_len <= 0 || text_len <= 0 || pattern_len > 32 || text_len > 32) {
             return -1;
         }
-        
-        // Build pattern equality vectors
+
+        // Build pattern equality vectors. Bit i stands for pattern base i counted from the pattern START
+        // (sequence_to_bits puts the first base in the highest 2 bits).
         int64_t Peq[4] = {0, 0, 0, 0};
         for (int i = 0; i < pattern_len; i++) {
-            int nuc = (pattern >> (2 * i)) & 3;
+            int nuc = (pattern >> (2 * (pattern_len - 1 - i))) & 3;
             Peq[nuc] |= (1LL << i);
         }
-        
+
         int64_t pattern_mask = (1LL << pattern_len) - 1;
         int64_t Pv = pattern_mask;
         int64_t Mv = 0;
         int score = pattern_len;
         // Track minimum across all positions
         int min_score = pattern_len;
-        
+        const bool keep_position = best_end != nullptr || n_best != nullptr;
+
+        if (!keep_position) {
+            // the loop of every whitelist scan: unchanged apart from the orientation
+            for (int j = 0; j < text_len; j++) {
+                int text_nuc = (text >> (2 * (text_len - 1 - j))) & 3;
+                int64_t Eq = Peq[text_nuc] & pattern_mask;
+
+                int64_t Xv = Eq | Mv;
+                int64_t Xh = (((Eq & Pv) + Pv) ^ Pv) | Eq;
+                int64_t Ph = Mv | ~(Xh | Pv);
+                int64_t Mh = Pv & Xh;
+
+                Ph &= pattern_mask;
+                Mh &= pattern_mask;
+
+                if (Ph & (1LL << (pattern_len - 1))) score++;
+                if (Mh & (1LL << (pattern_len - 1))) score--;
+                // Key difference from full matching
+                min_score = std::min(min_score, score);
+                // Perfect match found
+                if (min_score == 0) return 0;
+
+                Ph <<= 1;
+                Pv = ((Mh << 1) | ~(Xv | Ph)) & pattern_mask;
+                Mv = Ph & Xv;
+            }
+            return (min_score <= max_dist) ? min_score : -1;
+        }
+
+        // the same recurrence, run once for a chosen barcode, keeping where the minimum occurs
+        int min_end = -1;
+        int min_count = 0;
         for (int j = 0; j < text_len; j++) {
-            int text_nuc = (text >> (2 * j)) & 3;
+            int text_nuc = (text >> (2 * (text_len - 1 - j))) & 3;
             int64_t Eq = Peq[text_nuc] & pattern_mask;
-            
+
             int64_t Xv = Eq | Mv;
             int64_t Xh = (((Eq & Pv) + Pv) ^ Pv) | Eq;
             int64_t Ph = Mv | ~(Xh | Pv);
             int64_t Mh = Pv & Xh;
-            
+
             Ph &= pattern_mask;
             Mh &= pattern_mask;
-            
+
             if (Ph & (1LL << (pattern_len - 1))) score++;
             if (Mh & (1LL << (pattern_len - 1))) score--;
-            // Key difference from full matching
-            min_score = std::min(min_score, score);  
-            // Perfect match found
-            if (min_score == 0) return 0; 
-            
+            if (score < min_score) {
+                min_score = score;
+                min_end = j;
+                min_count = 1;
+            } else if (score == min_score && min_end >= 0) {
+                ++min_count;
+            }
+
             Ph <<= 1;
             Pv = ((Mh << 1) | ~(Xv | Ph)) & pattern_mask;
             Mv = Ph & Xv;
         }
+        if (best_end) *best_end = min_end;
+        if (n_best) *n_best = min_count;
         return (min_score <= max_dist) ? min_score : -1;
     }
 
@@ -364,7 +409,7 @@ namespace mutation_tools {
             if (target.bits.empty()){
                 continue;
             }
-            
+
             int dist;
             if (query.length <= target.length) {
                 // Query is shorter or equal, search query in target
@@ -373,7 +418,7 @@ namespace mutation_tools {
                 // Target is shorter, search target in query
                 dist = bit_partial_match(target.bits[0], query.bits[0], target.length, query.length, max_dist);
             }
-            
+
             if(dist >= 0){
                 results[dist].insert(target);
             }
@@ -419,19 +464,22 @@ namespace mutation_tools {
  * * @param query The query sequence as an `int64_seq`
  * @param target The target sequence as an `int64_seq`
  * @param max_dist Maximum allowed edit distance
+ * @param best_end optional out: end of the best match, 0-based, in the LONGER of the two sequences (the Myers text)
+ * @param n_best optional out: number of end positions that reach the minimum
  * @return `int` minimum edit distance if <= max_dist, else -1
  */
-    int int64_lvdist(const int64_seq &query, const int64_seq &target, int max_dist) {
+    int int64_lvdist(const int64_seq &query, const int64_seq &target, int max_dist,
+                     int* best_end = nullptr, int* n_best = nullptr) {
         if (query.bits.empty() || target.bits.empty()){
             return -1;
         }
-        
+
         if (query.length <= target.length) {
             // Query is shorter or equal, search query in target
-            return bit_partial_match(query.bits[0], target.bits[0], query.length, target.length, max_dist);
+            return bit_partial_match(query.bits[0], target.bits[0], query.length, target.length, max_dist, best_end, n_best);
         } else {
             // Target is shorter, search target in query
-            return bit_partial_match(target.bits[0], query.bits[0], target.length, query.length, max_dist);
+            return bit_partial_match(target.bits[0], query.bits[0], target.length, query.length, max_dist, best_end, n_best);
         }
     }
 
@@ -2108,6 +2156,163 @@ class whitelist {
             auto g = global_seeds.query(query);
             r.insert(r.end(), g.begin(), g.end());
             return r;
+        }
+
+/**
+ * @brief Part table of the true whitelist: a filter in front of the exhaustive scan
+ *
+ * Each barcode is cut into PARTS = 3 parts (the partitions of seed_idx). A barcode within max_dist <= PARTS - 1 = 2
+ * edits of an infix of a longer window has at least one part exact in the window: an alignment with at most 2 edits
+ * touches at most 2 parts, and a part that no edit touches is copied base for base into consecutive window bases. The
+ * table maps the key of a part (its first key_len <= KEY_MAX bases, 2-bit packed; a prefix of an exact part is exact
+ * too) to the barcodes that hold it, one table set for each barcode length. For a window, scan() looks up the keys
+ * at every window position, runs the same comparison (mutation_tools::int64_lvdist) on the barcodes found, and reports
+ * each barcode once: the match set is the one of the loop over every unique entry. A group of barcodes at least as
+ * long as the window is compared in full (int64_lvdist then searches the window inside the barcode, where the part
+ * argument does not hold). Entries that int64_lvdist can never match (no bases, more than 32 bases, more than one
+ * 2-bit chunk) are left out. Built once after the whitelist is loaded; read-only afterwards (scan() is const and
+ * keeps no state between calls).
+ */
+        struct part_idx {
+            static constexpr int PARTS = 3;    // parts for each barcode: lossless for max_dist <= PARTS - 1
+            static constexpr int KEY_MAX = 8;  // bases of a part in its key: bounds a table at 4^8 slots for each part
+
+            struct group {
+                int m = 0;                                     // barcode length of the group
+                std::vector<const barcode_entry*> entries;     // the barcodes of this length
+                int part_start[PARTS] = {0, 0, 0};
+                int key_len[PARTS] = {0, 0, 0};
+                std::vector<uint32_t> offset[PARTS];           // rows offset[k][key] .. offset[k][key + 1) of list[k]
+                std::vector<uint32_t> list[PARTS];             // indices into entries
+            };
+            std::vector<group> groups;
+            size_t n_entries = 0;                              // unique entries at build time
+            bool ready = false;
+
+            /// int64_lvdist can give a distance for this entry (otherwise it returns -1 for every window)
+            static bool comparable(const barcode_entry* e) noexcept {
+                return e && e->barcode.length > 0 && e->barcode.length <= 32 && e->barcode.bits.size() == 1;
+            }
+
+            /// bases [start, start + key_len) of a len-base sequence whose first base is in the highest 2 bits
+            static uint32_t key_of(int64_t bits, int len, int start, int key_len) noexcept {
+                const int shift = 2 * (len - start - key_len);
+                const uint64_t mask = (uint64_t(1) << (2 * key_len)) - 1;
+                return static_cast<uint32_t>((static_cast<uint64_t>(bits) >> shift) & mask);
+            }
+
+            void build(const std::vector<const barcode_entry*>& entries, bool verbose) {
+                groups.clear();
+                n_entries = entries.size();
+                ready = false;
+                std::map<int, size_t> by_len;
+                for (const auto* e : entries) {
+                    if (!comparable(e)) continue;
+                    const int m = e->barcode.length;
+                    auto it = by_len.find(m);
+                    if (it == by_len.end()) {
+                        it = by_len.emplace(m, groups.size()).first;
+                        groups.emplace_back();
+                        groups.back().m = m;
+                    }
+                    groups[it->second].entries.push_back(e);
+                }
+                for (auto& g : groups) {
+                    if (g.m < PARTS) {   // no 3 non-empty parts: the full loop stays
+                        groups.clear();
+                        if (verbose) std::cout << "[part_idx] Skipping build: barcode length < " << PARTS << "\n";
+                        return;
+                    }
+                    const auto windows = seed_idx::partitions(static_cast<size_t>(g.m));
+                    for (int k = 0; k < PARTS; ++k) {
+                        g.part_start[k] = static_cast<int>(windows[k].first);
+                        g.key_len[k] = std::min<int>(static_cast<int>(windows[k].second - windows[k].first), KEY_MAX);
+                        const size_t slots = size_t(1) << (2 * g.key_len[k]);
+                        std::vector<uint32_t> count(slots + 1, 0);
+                        for (const auto* e : g.entries) {
+                            ++count[key_of(e->barcode.bits[0], g.m, g.part_start[k], g.key_len[k]) + 1];
+                        }
+                        for (size_t s = 0; s < slots; ++s) count[s + 1] += count[s];
+                        std::vector<uint32_t> fill(count.begin(), count.end() - 1);
+                        g.list[k].assign(g.entries.size(), 0);
+                        for (uint32_t i = 0; i < g.entries.size(); ++i) {
+                            const uint32_t key = key_of(g.entries[i]->barcode.bits[0], g.m, g.part_start[k], g.key_len[k]);
+                            g.list[k][fill[key]++] = i;
+                        }
+                        g.offset[k] = std::move(count);
+                    }
+                }
+                ready = !groups.empty();
+                if (verbose) {
+                    std::cout << "[part_idx] Built table: " << n_entries << " barcodes, " << groups.size()
+                              << " length group(s)";
+                    for (const auto& g : groups) {
+                        std::cout << " [len=" << g.m << ": " << g.entries.size() << " barcodes, keys "
+                                  << g.key_len[0] << "/" << g.key_len[1] << "/" << g.key_len[2] << "]";
+                    }
+                    std::cout << ", " << (bytes() / 1024) << " KiB\n";
+                }
+            }
+
+            /// scan() gives the match set of the loop over every unique entry for this cap and this list size
+            bool covers(int max_dist, size_t unique_size) const noexcept {
+                return ready && max_dist <= PARTS - 1 && unique_size == n_entries;
+            }
+
+            size_t bytes() const noexcept {
+                size_t b = sizeof(*this) + groups.capacity() * sizeof(group);
+                for (const auto& g : groups) {
+                    b += g.entries.capacity() * sizeof(const barcode_entry*);
+                    for (int k = 0; k < PARTS; ++k) {
+                        b += (g.offset[k].capacity() + g.list[k].capacity()) * sizeof(uint32_t);
+                    }
+                }
+                return b;
+            }
+
+            /// The matches of `win` against every entry: the pairs (barcode, distance) that the loop
+            /// `for (entry : get_unique_entries()) int64_lvdist(win, entry->barcode, max_dist) >= 0` gives, in any order.
+            void scan(const int64_seq& win, int max_dist, std::vector<std::pair<int64_seq, int>>& match) const {
+                const int n = win.length;
+                const bool packed = win.length > 0 && win.length <= 32 && win.bits.size() == 1;
+                std::vector<const barcode_entry*> hit;   // entries already reported (a candidate can come up twice)
+                for (const group& g : groups) {
+                    if (!packed || n <= g.m) {   // the window is not longer than the barcode: compare every entry
+                        for (const auto* e : g.entries) {
+                            const int res = mutation_tools::int64_lvdist(win, e->barcode, max_dist);
+                            if (res >= 0) match.emplace_back(e->barcode, res);
+                        }
+                        continue;
+                    }
+                    const uint64_t text = static_cast<uint64_t>(win.bits[0]);
+                    hit.clear();
+                    for (int k = 0; k < PARTS; ++k) {
+                        const int kl = g.key_len[k];
+                        const uint64_t mask = (uint64_t(1) << (2 * kl)) - 1;
+                        const uint32_t* off = g.offset[k].data();
+                        const uint32_t* rows = g.list[k].data();
+                        for (int j = 0; j + kl <= n; ++j) {
+                            const uint32_t key = static_cast<uint32_t>((text >> (2 * (n - j - kl))) & mask);
+                            for (uint32_t r = off[key], end = off[key + 1]; r < end; ++r) {
+                                const barcode_entry* e = g.entries[rows[r]];
+                                if (std::find(hit.begin(), hit.end(), e) != hit.end()) continue;
+                                const int res = mutation_tools::int64_lvdist(win, e->barcode, max_dist);
+                                if (res >= 0) {
+                                    hit.push_back(e);
+                                    match.emplace_back(e->barcode, res);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        part_idx true_parts;
+
+        /// Build the part table of the true whitelist (call once, after the last change to true_bcs)
+        void build_part_idx(bool verbose) {
+            true_parts.build(true_bcs.get_unique_entries(), verbose);
         }
 
         template<class F> decltype(auto) with_wl(std::string_view src, F&& f) {

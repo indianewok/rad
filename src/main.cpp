@@ -79,7 +79,15 @@ static void usage_demux(const char *prog) {
          "shorter inserts are\n"
       << "                                    dropped (default: the layout's "
          "combined element length;\n"
-      << "                                    0 keeps every read with any cDNA)\n"
+      << "                                    0 keeps every read with any cDNA). "
+         "The length counted\n"
+      << "                                    is the cDNA as written: the read "
+         "element without the\n"
+      << "                                    poly tail and without any other "
+         "element that overlaps\n"
+      << "                                    it. Same definition on every route: "
+         "existing path,\n"
+      << "                                    --concat-hmm, pieces of split reads\n"
       << "      --concat-hmm                  segment each read with the concatemer "
          "HMM first (default: off).\n"
       << "                                    Confident single constructs get "
@@ -102,10 +110,10 @@ static void usage_demux(const char *prog) {
          "reads, and every\n"
       << "                                    read of a run whose calibration guard "
          "failed, take the\n"
-      << "                                    existing path. --min-read-length then\n"
-      << "                                    counts the cDNA without the poly "
-         "tail (existing path:\n"
-      << "                                    with it). Calibrated with the "
+      << "                                    existing path. --min-read-length counts\n"
+      << "                                    the cDNA without the poly tail on "
+         "both paths.\n"
+      << "                                    Calibrated with the "
          "misalignment step (hmm_*\n"
       << "                                    columns of *_position_map.csv); "
          "cached maps without them\n"
@@ -185,8 +193,12 @@ static void usage_prep(const char *prog) {
          "--position-map)\n"
       << "  -o, --output                      output base path (saves "
          "_layout.csv, _position_map.csv)\n"
-      << "  -n, --max-reads                   max reads for misalignment "
-         "sampling (default: 50000)\n"
+      << "  -n, --max-reads                   first calibration block in reads "
+         "(default: 50000); more\n"
+      << "                                    blocks of 50000 reads follow until "
+         "every adapter has\n"
+      << "                                    100 chance hits (limit: "
+         "max(1000000, -n) reads)\n"
       << "  -t, --threads                     number of threads (default: 1)\n"
       << "      --concat-hmm                  also calibrate the concatemer HMM "
          "(writes hmm_* columns\n"
@@ -302,6 +314,10 @@ int cmd_prep(int argc, char *argv[]) {
       break;
     case 'n':
       max_reads = std::stoull(optarg);
+      if (max_reads == 0) {
+        std::cerr << "Error: -n/--max-reads must be at least 1\n";
+        return 1;
+      }
       break;
     case 't':
       nthreads = std::stoi(optarg);
@@ -1293,6 +1309,24 @@ static bool write_demux_run_log(
       << "total_wall_time_seconds=" << total_wall_time_seconds << "\n"
       << "memory_scope=rad_process_only\n";
 
+  // Barcode position from the whitelist match: single-barcode
+  // corrections by outcome. Printed when there was at least one (all counts stay 0 on joint-barcode layouts).
+  const size_t bc_pos_total = stats.bc_pos_moved + stats.bc_pos_in_place + stats.bc_pos_window +
+                              stats.bc_pos_unknown + stats.bc_pos_tie + stats.bc_pos_clipped +
+                              stats.bc_pos_out_of_read;
+  if (bc_pos_total > 0) {
+    out << "barcode_position_corrections=" << bc_pos_total << "\n"
+        << "barcode_position_moved=" << stats.bc_pos_moved << "\n"
+        << "barcode_position_moved_forward=" << stats.bc_pos_moved_forward << "\n"
+        << "barcode_position_moved_reverse=" << stats.bc_pos_moved_reverse << "\n"
+        << "barcode_position_located_in_place=" << stats.bc_pos_in_place << "\n"
+        << "barcode_position_window_match=" << stats.bc_pos_window << "\n"
+        << "barcode_position_unknown=" << stats.bc_pos_unknown << "\n"
+        << "barcode_position_ambiguous=" << stats.bc_pos_tie << "\n"
+        << "barcode_position_clipped_at_window_edge=" << stats.bc_pos_clipped << "\n"
+        << "barcode_position_out_of_read=" << stats.bc_pos_out_of_read << "\n";
+  }
+
   if (stats.concat_hmm_enabled) {
     const size_t existing = stats.hmm_legacy_abstain + stats.hmm_legacy_k0 +
                             stats.hmm_legacy_artifact + stats.hmm_legacy_guard +
@@ -1321,6 +1355,11 @@ static bool write_demux_run_log(
         << "concat_hmm_reads_dropped_too_many=" << stats.hmm_drop_too_many << "\n"
         << "concat_hmm_reads_dropped_d=" << stats.hmm_drop_d_reads << "\n"
         << "concat_hmm_split_children_dropped_d=" << stats.hmm_drop_d_children << "\n"
+        // D strand rule: D constructs (reads and children) by outcome
+        << "concat_hmm_d_kept_left_unit=" << stats.hmm_d_kept_left << "\n"
+        << "concat_hmm_d_kept_right_unit=" << stats.hmm_d_kept_right << "\n"
+        << "concat_hmm_d_split_strand_change=" << stats.hmm_d_split << "\n"
+        << "concat_hmm_d_no_record=" << stats.hmm_drop_d_reads + stats.hmm_drop_d_children << "\n"
         << "concat_hmm_fold_read_from_child_start=" << stats.hmm_fold_read_start << "\n"
         << "concat_hmm_fold_read_to_child_end=" << stats.hmm_fold_read_end << "\n"
         << "concat_hmm_full_search_barcodes_rejected=" << stats.hmm_partner_rejected << "\n"
@@ -2039,7 +2078,10 @@ int cmd_demux(int argc, char *argv[]) {
       if (verbose)
         std::cout << "[misalignment_stats] Computing misalignment...\n";
       Misalignment_Setup mis(read_layout);
-      mis.generate_misalignment_data(fastq_path, read_layout, nthreads, 50000,
+      // first block 50,000 reads; more blocks until every adapter has enough
+      // chance hits (adapter_thresholds::kCalibrationBlockReads / kCalibrationMaxReads)
+      mis.generate_misalignment_data(fastq_path, read_layout, nthreads,
+                                     adapter_thresholds::kCalibrationBlockReads,
                                      concat_hmm_enabled);
       auto mis_time = std::chrono::steady_clock::now() - main_start;
       std::cout << "[main] Misalignment time: "

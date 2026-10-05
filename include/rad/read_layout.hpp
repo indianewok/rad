@@ -1867,6 +1867,12 @@ public:
             }
         }
 
+        // The part table of each true whitelist for the exhaustive scan (whitelist::wl_entry::part_idx). true_bcs is
+        // not changed after this point, so the table stays valid and read-only for the whole run.
+        for (auto & [pool_key, E] : wl_map.lists) {
+            E.build_part_idx(verbose);
+        }
+
         auto t3 = high_resolution_clock::now();
         double total_s = duration<double>(t3 - t0).count();
         std::cout << "[load_wl] finished loading all whitelists in "
@@ -2766,6 +2772,7 @@ public:
         size_t total_reads_seen;
         bool is_stable;
         std::pair<size_t, size_t> dir_counts;
+        std::vector<size_t> ed_hist;  // accrued values per edit distance (index = edit distance)
 
     /**
      * @brief nested structure for storing position statistics
@@ -2822,6 +2829,11 @@ public:
     void update_stats(int new_edit_distance, size_t total_reads, size_t forward_count, size_t reverse_count) {
             double old_mean = mean;
             count++;
+            if (new_edit_distance >= 0) {
+                if (ed_hist.size() <= static_cast<size_t>(new_edit_distance))
+                    ed_hist.resize(static_cast<size_t>(new_edit_distance) + 1, 0);
+                ed_hist[static_cast<size_t>(new_edit_distance)]++;
+            }
             total_reads_seen = total_reads;
             mean = mean + (new_edit_distance - mean) / count;
             sum_squares += (new_edit_distance - old_mean) * (new_edit_distance - mean);
@@ -2866,11 +2878,102 @@ public:
         }
     };
 
+    /**
+     * @brief statistics of the chance hits among the accrued misalignment edit distances of one static element
+     *
+     * The accrued values of a static element are the whole-read best edit distances of that element in reads
+     * that hold an exact copy of every static element of the other direction. On libraries with concatemers
+     * these values form two groups: true copies of the element at low edit distance (the read holds both
+     * directions) and chance hits in a main group around one third of the element length. The misalignment
+     * thresholds are statistics of the chance hits only.
+     *
+     * Split rule (no new number): M = the mode of the histogram (ties: the largest edit distance); an exact
+     * copy cannot be a chance hit, so when M is 0 the mode over edit distances >= 1 is used. v = the edit
+     * distance with the lowest count in [0, M] (ties: the largest). A low group exists when a bin below v is
+     * higher than bin v; the chance hits are then the values above v. Otherwise there is no gap and every
+     * value is a chance hit.
+     *
+     * lower = the largest edit distance at which the cumulative share of chance hits is <= chance_share
+     * (adapter_thresholds::kMisalignLowerChanceShare).
+     */
+    struct chance_hit_stats {
+        size_t n_all = 0;              // accrued values
+        size_t n_low = 0;              // values in the low group (true copies), removed
+        size_t n_chance = 0;           // values in the chance-hit group
+        int mode = -1;                 // main peak used for the split
+        int split = -1;                // last edit distance of the low group; -1 when there is no low group
+        double mean = 0.0;             // mean of the chance hits
+        double sd = 0.0;               // sample standard deviation of the chance hits
+        int lower = -1;                // largest edit distance with a cumulative chance-hit share <= chance_share
+        double share_at_lower = 0.0;   // cumulative chance-hit share at lower
+        double share_above_lower = 0.0;// cumulative chance-hit share at lower + 1
+    };
+
+    static chance_hit_stats chance_hits_from_histogram(const std::vector<size_t>& hist, double chance_share) {
+        chance_hit_stats r;
+        for (size_t c : hist) r.n_all += c;
+        if (hist.empty() || r.n_all == 0) return r;
+        const int last = static_cast<int>(hist.size()) - 1;
+        auto argmax_from = [&](int from) {
+            int m = -1;
+            size_t best = 0;
+            for (int d = from; d <= last; ++d)
+                if (hist[d] > 0 && hist[d] >= best) { best = hist[d]; m = d; }
+            return m;
+        };
+        int mode = argmax_from(0);
+        if (mode == 0) {
+            const int m1 = argmax_from(1);
+            if (m1 > 0) mode = m1;
+        }
+        r.mode = mode;
+        int v = 0;
+        size_t vmin = hist[0];
+        for (int d = 0; d <= mode; ++d)
+            if (hist[d] <= vmin) { vmin = hist[d]; v = d; }
+        size_t below_max = 0;
+        for (int d = 0; d < v; ++d) below_max = std::max(below_max, hist[d]);
+        const int first = (below_max > vmin) ? v + 1 : 0;   // first edit distance of the chance-hit group
+        r.split = first - 1;
+        double sum = 0.0;
+        for (int d = 0; d <= last; ++d) {
+            if (d < first) { r.n_low += hist[d]; continue; }
+            r.n_chance += hist[d];
+            sum += static_cast<double>(d) * static_cast<double>(hist[d]);
+        }
+        if (r.n_chance == 0) return r;
+        r.mean = sum / static_cast<double>(r.n_chance);
+        double ss = 0.0;
+        for (int d = first; d <= last; ++d) {
+            const double diff = static_cast<double>(d) - r.mean;
+            ss += diff * diff * static_cast<double>(hist[d]);
+        }
+        r.sd = r.n_chance > 1 ? std::sqrt(ss / static_cast<double>(r.n_chance - 1)) : 0.0;
+        auto share_at = [&](int d) {
+            size_t cum = 0;
+            for (int e = first; e <= std::min(d, last); ++e) cum += hist[e];
+            return static_cast<double>(cum) / static_cast<double>(r.n_chance);
+        };
+        r.lower = -1;
+        for (int d = 0; d <= last; ++d) {
+            if (share_at(d) <= chance_share) r.lower = d;
+            else break;
+        }
+        if (r.lower < 0) r.lower = 0;   // chance hits at edit distance 0 above the limit: nothing but exact copies
+        r.share_at_lower = share_at(r.lower);
+        r.share_above_lower = share_at(r.lower + 1);
+        return r;
+    }
+
 /**
  * @brief Constructor that initializes the Misalignment_Setup with a given ReadLayout
  * @param layout ReadLayout object
+ * @param misalign_lower_chance_share accepted cumulative share of chance hits at misalign_lower (default
+ *        adapter_thresholds::kMisalignLowerChanceShare)
  */
-    Misalignment_Setup(const ReadLayout& layout) {
+    Misalignment_Setup(const ReadLayout& layout,
+                       double misalign_lower_chance_share = adapter_thresholds::kMisalignLowerChanceShare)
+        : misalign_lower_chance_share_(misalign_lower_chance_share) {
         // Extract static adapters (non poly-tail, non start/stop)
         // guards against empty seq -- need to update for static indexing
         for (const auto& elem : layout.by_type()) {
@@ -2891,13 +2994,29 @@ public:
         }
     }
 
+    /**
+     * @brief Accrue the misalignment null on a calibration sample from the FASTQ head and update the layout
+     *
+     * Calibration sample (adapter_thresholds): the first min_reads reads, then
+     * further blocks of kCalibrationBlockReads reads from the same stream until every static element has
+     * kMinMisalignmentObservations chance hits. The pass stops at the end of the input, at
+     * max(kCalibrationMaxReads, min_reads) reads, or early when the projected number of reads (reads so
+     * far x kMinMisalignmentObservations / chance hits of the slowest element) exceeds that bound. Reads
+     * enter only as whole blocks in file order, so the sample does not depend on the thread count.
+     * Before this rule the pass read exactly min_reads reads: its early stop (stable means) returned a
+     * value that chunk_streaming::process_chunks ignores.
+     *
+     * @param min_reads first block: 50,000 for rad demux, -n for rad prep
+     * @param calibrate_concat_hmm also calibrate the concat-HMM, on the first min_reads reads only
+     */
     void generate_misalignment_data(
-        const std::string& fastq_path, ReadLayout& layout, int num_threads = 1, size_t max_reads = 50000,
+        const std::string& fastq_path, ReadLayout& layout, int num_threads = 1,
+        size_t min_reads = adapter_thresholds::kCalibrationBlockReads,
         bool calibrate_concat_hmm = false
     ) {
         prune_similar_reverse_adapters(layout);
 
-        // --concat-hmm: calibrate the HMM in the same pass, on the same chunk reads.
+        // --concat-hmm: calibrate the HMM in the same pass, on the first min_reads reads.
         std::unique_ptr<concat_hmm_calibration> hmm_cal;
         if (calibrate_concat_hmm) {
             try {
@@ -2907,19 +3026,14 @@ public:
             }
         }
 
-        using ChunkFunc = std::function<bool(const std::vector<read_streaming::sequence>&, const std::string&)>;
-        chunk_streaming<read_streaming::sequence, ChunkFunc> streamer(max_reads);
-        
         size_t forward_count = 0;
         size_t reverse_count = 0;
         size_t total_reads_processed = 0;
-        constexpr size_t kMinPerfectMatches = 10;
-        
+
         //collecting statistics of both adapter stats and misalignment stats
         std::unordered_map<std::string, static_alignment_stats> adapter_stats;
         std::unordered_map<std::string, static_alignment_stats> misalignment_stats;
-        ChunkFunc process_func = [&](const std::vector<read_streaming::sequence>& chunk, const std::string& file) -> bool {
-            #pragma omp atomic
+        auto process_block = [&](const std::vector<read_streaming::sequence>& chunk) {
             total_reads_processed += chunk.size();
             process_misalignment_chunk(
                 chunk,
@@ -2929,67 +3043,105 @@ public:
                 misalignment_stats,
                 total_reads_processed
             );
-            if (hmm_cal) hmm_cal->add_chunk(chunk, max_reads);
+            if (hmm_cal) hmm_cal->add_chunk(chunk, min_reads);
             // Print progress and current misalignment thresholds.
-            #pragma omp critical
-            {
-                std::cout << 
-                "\r[misalignment_stats] Processed " << total_reads_processed << 
-                " total reads - Forward perfect: " <<  forward_count  << 
-                ", Reverse perfect: " << reverse_count << "\n";
+            std::cout <<
+            "\r[misalignment_stats] Processed " << total_reads_processed <<
+            " total reads - Forward perfect: " <<  forward_count  <<
+            ", Reverse perfect: " << reverse_count << "\n";
 
-                for (const auto& [adapter_id, stats] : adapter_stats) {
-                    std::cout << 
-                    "[misalignment_stats] " << adapter_id << 
-                    " misalignment mean: " <<  misalignment_stats[adapter_id].mean  << 
-                    " (total times detected properly = " << stats.count << "," << 
-                    " misaligned forward: " << misalignment_stats[adapter_id].dir_counts.first << 
-                    ", misaligned reverse: " << misalignment_stats[adapter_id].dir_counts.second << 
-                    ")" << 
-                    (stats.is_stable ? " [STABLE]" : "") << 
-                    "\n";
-                }
+            for (const auto& [adapter_id, stats] : adapter_stats) {
+                std::cout <<
+                "[misalignment_stats] " << adapter_id <<
+                " misalignment mean: " <<  misalignment_stats[adapter_id].mean  <<
+                " (total times detected properly = " << stats.count << "," <<
+                " misaligned forward: " << misalignment_stats[adapter_id].dir_counts.first <<
+                ", misaligned reverse: " << misalignment_stats[adapter_id].dir_counts.second <<
+                ")" <<
+                (stats.is_stable ? " [STABLE]" : "") <<
+                "\n";
             }
-            // Determine if processing should stop.
-            bool has_min_perfect = (forward_count >= kMinPerfectMatches) || (reverse_count >= kMinPerfectMatches);
-            bool reached_read_limit = total_reads_processed >= max_reads;
-
-            bool all_stable = false;
-            #pragma omp critical(adapter_stats_read)
-            {
-                if (!misalignment_stats.empty()) {
-                    all_stable = std::all_of(
-                        misalignment_stats.begin(),
-                        misalignment_stats.end(),
-                        [](const auto& pair) { 
-                            return pair.second.is_stable; 
-                        }
-                    );
-                }
-            }
-            if (!has_min_perfect && !reached_read_limit) {
-                return true;  // Need more data before considering stopping conditions.
-            }
-            if (all_stable || reached_read_limit) {
-                return false;  // Signal to stop processing
-            }
-            return true;  // Continue processing
         };
 
-        streamer.process_chunks(fastq_path, process_func, num_threads, max_reads);
+        // chance hits of every element that a perfect read of the other direction feeds
+        auto chance_counts = [&]() {
+            std::vector<std::pair<std::string, size_t>> n;
+            for (const auto* adapters : {&forward_adapters, &reverse_adapters})
+                for (const auto& [id, seq] : *adapters) {
+                    auto it = misalignment_stats.find(id);
+                    n.emplace_back(id, it == misalignment_stats.end() ? size_t{0}
+                        : chance_hits_from_histogram(it->second.ed_hist, misalign_lower_chance_share_).n_chance);
+                }
+            return n;
+        };
+
+        const size_t block = adapter_thresholds::kCalibrationBlockReads;
+        const size_t cap = std::max(adapter_thresholds::kCalibrationMaxReads, min_reads);
+        const size_t need = adapter_thresholds::kMinMisalignmentObservations;
+        file_streaming files(fastq_path, 4);
+        read_streaming reader(files);
+        size_t target = min_reads;
+        size_t blocks = 0;
+        bool end_of_input = false;
+        std::string stop_reason;
+        std::vector<std::pair<std::string, size_t>> n_chance;
+        while (true) {
+            // Read up to the target in pieces of at most one block, so memory holds one block of reads at most
+            // (also for a large rad prep -n). Only the sequence is kept: the calibration reads nothing else.
+            while (total_reads_processed < target && !end_of_input) {
+                std::vector<read_streaming::sequence> chunk;
+                const size_t want = std::min(block, target - total_reads_processed);
+                chunk.reserve(want);
+                while (chunk.size() < want) {
+                    auto rec = reader.next_sequence();
+                    if (!rec) { end_of_input = true; break; }
+                    if (!kKeepPerfectMatches) { rec->qual = std::string(); rec->comment = std::string(); }
+                    chunk.push_back(std::move(*rec));
+                }
+                if (!chunk.empty()) {
+                    process_block(chunk);
+                    ++blocks;
+                }
+            }
+            n_chance = chance_counts();
+            if (n_chance.empty()) { stop_reason = "no static element to calibrate"; break; }
+            size_t slowest = std::numeric_limits<size_t>::max();
+            for (const auto& [id, n] : n_chance) slowest = std::min(slowest, n);
+            if (slowest >= need) { stop_reason = "every element has enough chance hits"; break; }
+            if (end_of_input) { stop_reason = "end of input"; break; }
+            if (total_reads_processed >= cap) { stop_reason = "read limit reached"; break; }
+            const double projected = slowest == 0 ? std::numeric_limits<double>::infinity()
+                : static_cast<double>(total_reads_processed) * static_cast<double>(need) / static_cast<double>(slowest);
+            if (projected > static_cast<double>(cap)) {
+                stop_reason = slowest == 0 ? "an element has no chance hits"
+                                           : "projected sample above the read limit";
+                break;
+            }
+            target = std::min(total_reads_processed + block, cap);
+        }
+        std::cout << "[misalignment_stats] Calibration sample: " << total_reads_processed << " reads in "
+                  << blocks << " block(s); stop: " << stop_reason << " (need " << need
+                  << " chance hits per element, read limit " << cap << "); chance hits:";
+        for (const auto& [id, n] : n_chance) std::cout << " " << id << "=" << n;
+        std::cout << "\n";
+
         if (hmm_cal) hmm_cal->finish(layout);
         
         // Write final results
-        write_perfect_matches();
+        write_perfect_matches(kKeepPerfectMatches);
         update_read_layout(layout, adapter_stats, misalignment_stats);
         layout.generate_position_mapping();
     }
 
 private:
+    double misalign_lower_chance_share_; /// accepted cumulative share of chance hits at misalign_lower
     std::unordered_map<std::string, std::vector<consensus_matrix>> consensus_matrices;
     std::vector<std::pair<std::string, std::string>> forward_adapters; /// vector of forward adapters, stored as `pair:[class_id, seq]`
     std::vector<std::pair<std::string, std::string>> reverse_adapters; /// vector of reverse adapters, stored as `pair:[class_id, seq]`
-    std::vector<perfect_match> perfect_matches; /// vector of perfect matches
+    // Debug only: keep a copy of every perfect read and write it to ~/Desktop (write_perfect_matches).
+    // Off: nothing reads the copies, and the calibration sample can now reach kCalibrationMaxReads reads.
+    static constexpr bool kKeepPerfectMatches = false;
+    std::vector<perfect_match> perfect_matches; /// vector of perfect matches (only with kKeepPerfectMatches)
 
     double alignment_distance_fraction(const std::string& lhs, const std::string& rhs) const {
         if (lhs.empty() && rhs.empty()) return 0.0;
@@ -3084,7 +3236,7 @@ private:
                 );
                 #pragma omp critical
                 {
-                    perfect_matches.push_back({read, "forward"});
+                    if (kKeepPerfectMatches) perfect_matches.push_back({read, "forward"});
                     #pragma omp atomic
                     forward_count++;
                 }
@@ -3096,7 +3248,7 @@ private:
                 );
                 #pragma omp critical
                 {
-                    perfect_matches.push_back({read, "reverse"});
+                    if (kKeepPerfectMatches) perfect_matches.push_back({read, "reverse"});
                     #pragma omp atomic
                     reverse_count++;
                 }
@@ -3311,11 +3463,13 @@ private:
  * @brief generate a masked adapter sequence based on consensus matrices and misalignment statistics
  * @param adapter_id the ID of the adapter
  * @param adapter_seq the original adapter sequence
- * @param stats the misalignment statistics for the adapter
+ * @param misalign_mean mean of the misalignment edit distances used for the thresholds (chance hits, or the fallback)
+ * @param misalign_sd standard deviation of the same values
  * @return the masked adapter sequence
  */
-    std::string generate_masked_adapter(const std::string& adapter_id, const std::string adapter_seq, const static_alignment_stats& stats) {
-    int threshold = static_cast<int>(std::floor(stats.mean - stats.get_sd()));
+    std::string generate_masked_adapter(const std::string& adapter_id, const std::string adapter_seq,
+                                        double misalign_mean, double misalign_sd) {
+    int threshold = static_cast<int>(std::floor(misalign_mean - misalign_sd));
     // Define max consecutive N's allowed as (threshold - 1), with a minimum of 1.
     int max_consecutive_N = (threshold > 1 ? threshold - 1 : 1);
     int max_total_N = 12;
@@ -3433,8 +3587,6 @@ private:
                 }
 
                 std::string seq = it->seq;
-                std::string masked = generate_masked_adapter(adapter_id, seq, stats);
-                double sd = stats.get_sd();
 
                 AlignmentPositions align_pos = stats.position_stats.calculate();
                 AlignmentPositions misalign_pos = misalignment_stats[adapter_id].position_stats.calculate();
@@ -3446,19 +3598,57 @@ private:
                     continue;
                 }
 
+                // The thresholds are statistics of the misalignment edit distances of this element
+                // (misalignment_stats), restricted to the chance hits. Before: the sd came from
+                // adapter_stats, which holds no edit distances (sd was always 0, so misalign_lower was
+                // the mean of the null), and the mean included the true copies that concatemer reads hold.
                 auto& misalignment = misalignment_stats[adapter_id];
-                double mean = misalignment.mean;
-                constexpr size_t kMinMisalignmentObservations = 100;
+                const chance_hit_stats chance =
+                    chance_hits_from_histogram(misalignment.ed_hist, misalign_lower_chance_share_);
+                const double mean_all = misalignment.mean;
+                const double sd_all = misalignment.get_sd();
+                double mean = chance.mean;
+                double sd = chance.sd;
+                int lower = chance.lower;
                 const int fallback_threshold =
                     adapter_thresholds::fallback_max_edit_distance(seq.length());
                 const bool use_fallback_threshold =
-                    misalignment.count < kMinMisalignmentObservations ||
+                    chance.n_chance < adapter_thresholds::kMinMisalignmentObservations ||
                     !std::isfinite(mean) ||
                     mean < 1.0;
                 if (use_fallback_threshold) {
                     mean = static_cast<double>(fallback_threshold);
                     sd = 0.0;
+                    lower = fallback_threshold;
                 }
+                // the masking generator reads the same statistics as the thresholds
+                std::string masked = generate_masked_adapter(adapter_id, seq, mean, sd);
+
+                std::tuple<int, int, int> threshold =
+                    use_fallback_threshold
+                        ? std::make_tuple(
+                              fallback_threshold,
+                              fallback_threshold,
+                              fallback_threshold)
+                        : std::make_tuple(
+                              lower,
+                              static_cast<int>(std::floor(mean)),
+                              static_cast<int>(std::round(mean + sd)));
+
+                std::ostringstream hist_text;
+                for (size_t d = 0; d < misalignment.ed_hist.size(); ++d) {
+                    if (misalignment.ed_hist[d] == 0) continue;
+                    if (hist_text.tellp() > 0) hist_text << " ";
+                    hist_text << d << ":" << misalignment.ed_hist[d];
+                }
+                auto pct = [](double x) { return std::round(x * 1000.0) / 10.0; };
+                std::ostringstream low_text;
+                if (chance.split >= 0)
+                    low_text << "ED <= " << chance.split << ": " << chance.n_low << " ("
+                             << pct(static_cast<double>(chance.n_low) / static_cast<double>(std::max<size_t>(1, chance.n_all)))
+                             << "%)";
+                else
+                    low_text << "none (no gap below the mode)";
 
                 double misal_start = 0.0;
                 double misal_stop = 0.0;
@@ -3475,14 +3665,23 @@ private:
                 << "| Metric                       | Value                |\n"
                 << "+------------------------------+----------------------+\n"
                 << "| original seq                 | " << seq << "\n"
+                << "| masked seq                   | " << masked << "\n"
+                << "| misalignment observations    | " << misalignment.count << "\n"
+                << "| misalignment ED histogram    | " << hist_text.str() << "\n"
+                << "| true-copy group (removed)    | " << low_text.str() << "\n"
+                << "| chance hits (mode ED)        | " << chance.n_chance << " (" << chance.mode << ")\n"
                 << "| misalignment mean            | " << mean << "\n"
                 << "| misalignment sd              | " << sd << "\n"
-                << "| misalignment observations    | " << misalignment.count << "\n"
+                << "| mean / sd of all values      | " << mean_all << " / " << sd_all << "\n"
+                << "| chance share <= lower, +1    | " << pct(chance.share_at_lower) << "% / "
+                << pct(chance.share_above_lower) << "% (limit " << pct(misalign_lower_chance_share_) << "%)\n"
                 << "| threshold source             | "
                 << (use_fallback_threshold
                         ? "fallback ceil(0.30 * adapter length)"
-                        : "observed misalignment distribution")
+                        : "chance hits of the misalignment distribution")
                 << "\n"
+                << "| misalign lower / mean / upper| " << std::get<0>(threshold) << " / "
+                << std::get<1>(threshold) << " / " << std::get<2>(threshold) << "\n"
                 << "| perfect adapter count        | " << adapter_stats[adapter_id].count << "\n"
                 << "| forward count                | " << adapter_stats[adapter_id].dir_counts.first << "\n"
                 << "| reverse count                | " << adapter_stats[adapter_id].dir_counts.second << "\n"
@@ -3491,18 +3690,6 @@ private:
                 << "| misaligned start pos (mean)  | " << misalign_pos.start_stats.first << "\n"
                 << "| misaligned stop pos (mean)   | " << misalign_pos.stop_stats.first << "\n"
                 << "+------------------------------+----------------------+\n";
-
-                std::tuple<int, int, int> threshold =
-                    use_fallback_threshold
-                        ? std::make_tuple(
-                              fallback_threshold,
-                              fallback_threshold,
-                              fallback_threshold)
-                        : std::make_tuple(
-                              static_cast<int>(std::round(mean - sd)),
-                              static_cast<int>(std::floor(mean)),
-                              static_cast<int>(std::round(mean + sd)));
-                
 
                 by_id_index.modify(it, [&](ReadElement& elem) {
                     elem.masked_seq = masked;

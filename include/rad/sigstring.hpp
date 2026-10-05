@@ -844,6 +844,52 @@ public:
  */
 namespace barcode_correction {
     /**
+     * @brief Where the whitelist lookup placed the barcode inside the expanded window of `correct_barcode`
+     * Indices are 0-based in the ORIENTED window (layout direction:
+     * primer side first, UMI side last; the window of a reverse element is reverse-complemented first).
+     *
+     * kind: `unknown`  the lookup gives no position (a mutation alias of a shifted k-mer);
+     *       `window`   the match was decided on the layout window itself (exact or alias match of the window 16-mer,
+     *                  seed shortlist): the barcode position stays where the layout put it;
+     *       `located`  one best end is known: an exact copy of the corrected barcode at one place in the window, or the
+     *                  end column of the Myers match of the corrected barcode in the window (`bit_partial_match`);
+     *       `tie`      two or more equally good ends (a second exact copy, or an edit at the barcode's last base);
+     *       `clipped`  the Myers match ends at the last column of the window with at least one edit: the barcode may
+     *                  continue beyond the window, so its end is not known.
+     * shift: for `located`, the located end minus the end of the layout window (positive = toward the UMI).
+     * Nothing moves unless kind == located and shift != 0.
+     */
+    struct bc_position {
+        enum kind_t : uint8_t { unknown = 0, window = 1, located = 2, tie = 3, clipped = 4 };
+        kind_t kind = unknown;
+        int end = -1;    // oriented index of the last barcode base in the expanded window (kind located / tie)
+        int n_end = 0;   // number of equally good ends (located: 1; tie: >= 2)
+        int shift = 0;   // kind located: end - end of the layout window
+
+        void set_from_match(int match_end, int match_n_end) {
+            end = match_end;
+            n_end = match_n_end;
+            kind = (match_n_end == 1 && match_end >= 0) ? located : tie;
+        }
+    };
+
+    /// Half-width of the expanded window around the layout barcode position that correct_barcode searches.
+    /// Hard-coded (today's value; also the edit distance of the global-list checks that share it).
+    constexpr int expanded_window_pad = 4;
+
+    /// bc_position of the barcode a check chose: the Myers match of `winner` in `query` evaluated once more, this time
+    /// keeping the column of its minimum (one 16-in-24 pass per corrected barcode; the whitelist scans themselves are
+    /// unchanged). Only when the query is the longer sequence (the expanded window), because the match end is
+    /// reported in the longer sequence.
+    inline void locate_winner(bc_position* pos, const int64_seq& query, const int64_seq& winner, int max_dist) {
+        if (!pos || query.length <= winner.length) return;
+        int match_end = -1, match_n = 0;
+        if (mutation_tools::int64_lvdist(query, winner, max_dist, &match_end, &match_n) >= 0) {
+            pos->set_from_match(match_end, match_n);
+        }
+    }
+
+    /**
      * @brief Check if a candidate barcode passes quality checks based on counts from the whitelist
      * @param candidate ``int64_seq`` Candidate barcode sequence
      * @param wl ``const whitelist::wl_entry*`` Pointer to the whitelist entry
@@ -926,9 +972,10 @@ namespace barcode_correction {
  * @param wl ``const whitelist::wl_entry*`` Pointer to the whitelist entry
  * @return ``std::pair<std::optional<int64_seq>, std::optional<int>> Pair containing the resolved barcode (if any) and its edit distance
  */
-    std::pair<std::optional<int64_seq>, std::optional<int>> 
+    std::pair<std::optional<int64_seq>, std::optional<int>>
     resolve_multiple_hits_simple(const int64_seq& query, const std::unordered_set<int64_seq>& candidates,
-        int max_dist, bool verbose, const std::string& wl_type, const whitelist::wl_entry* wl = nullptr
+        int max_dist, bool verbose, const std::string& wl_type, const whitelist::wl_entry* wl = nullptr,
+        bc_position* pos = nullptr
     ) {
         auto sorted = mutation_tools::int64_lvdist(query, candidates, max_dist);
         if (sorted.empty()) return {std::nullopt, std::nullopt};
@@ -954,6 +1001,7 @@ namespace barcode_correction {
             if (valid_candidates.size() == 1) {
                 if (verbose) std::cout << "Winner: unique candidate at distance " << edit_dist << "\n";
                 if(passes_quality_check(valid_candidates[0], wl, wl_type, "offensive", verbose)) {
+                    locate_winner(pos, query, valid_candidates[0], max_dist);
                     return {valid_candidates[0], edit_dist};
                 } else {
                     if (verbose) std::cout << "Quality check failed for candidate, rejecting\n";
@@ -989,9 +1037,10 @@ namespace barcode_correction {
  * If no suitable match is found or if quality checks fail, the function returns std::nullopt.
  */
     std::optional<int64_seq> check_against_wl(const int64_seq& bc, const std::unordered_set<int64_seq>& candidates,
-        const std::string& whitelist_type, int max_dist, bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr
+        const std::string& whitelist_type, int max_dist, bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr,
+        bc_position* pos = nullptr
     ) {
-        
+
 
         // Early exit if whitelist is empty or no candidates match
 
@@ -1041,6 +1090,7 @@ namespace barcode_correction {
                             std::cout << oss.str();
                         }
                     }
+                    locate_winner(pos, bc, putative_candidate, max_dist);
                     return putative_candidate;
                 } else {
                     if (verbose) {
@@ -1058,7 +1108,7 @@ namespace barcode_correction {
             }
         } else if (matched.size() > 1) {
             // Multiple candidates case - use enhanced resolution
-            auto [resolved, min_dist] = resolve_multiple_hits_simple(bc, matched, max_dist, verbose, whitelist_type, wl);
+            auto [resolved, min_dist] = resolve_multiple_hits_simple(bc, matched, max_dist, verbose, whitelist_type, wl, pos);
             if (resolved.has_value()) {
                 if (passes_quality_check(resolved.value(), wl, whitelist_type, mode, verbose)) {
                     if (verbose) {
@@ -1106,8 +1156,16 @@ namespace barcode_correction {
  * If no matches are found or if quality checks fail, the function returns std::nullopt.
  */ 
     std::optional<int64_seq> exhaustive_check_against_wl(const int64_seq& bc, const std::string& whitelist_type,
-        int max_dist,bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr
+        int max_dist,bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr,
+        bc_position* pos = nullptr
     ) {
+        // Filter in front of the comparison: with the true whitelist and a cap
+        // that its part table covers, only the barcodes that share a part with the window are compared. The match set
+        // is the one of the loop over every entry below, which every other case keeps.
+        const whitelist::wl_entry::part_idx* parts = nullptr;
+        if (whitelist_type == "true" && wl->true_parts.covers(max_dist, wl->true_bcs.unique_val_size())) {
+            parts = &wl->true_parts;
+        }
         auto matches = wl->with_wl(whitelist_type, [&](const auto& typed_wl) {
             std::vector<std::pair<int64_seq, int>> match;
             if (verbose) {
@@ -1118,6 +1176,11 @@ namespace barcode_correction {
                         << " (checking " << typed_wl.size() << " sequences)\n";
                     std::cout << oss.str();
                 }
+            }
+
+            if (parts) {
+                parts->scan(bc, max_dist, match);
+                return match;
             }
 
             auto unique_entries = typed_wl.get_unique_entries();
@@ -1156,18 +1219,18 @@ namespace barcode_correction {
         
         if (matches.size() == 1) {
             auto [candidate, distance] = matches[0];
-            
+
             if (verbose) {
                 #pragma omp critical
                 {
                     std::ostringstream oss;
-                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_CANDIDATE::" 
+                    oss << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_CANDIDATE::"
                                                     : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_CANDIDATE::")
                         << candidate.bits_to_sequence() << "\n";
                     std::cout << oss.str();
                 }
             }
-            
+
             // Quality check
             if (passes_quality_check(candidate, wl, whitelist_type, mode, verbose)) {
                 if (verbose) {
@@ -1175,12 +1238,13 @@ namespace barcode_correction {
                     {
                         std::ostringstream oss;
                         oss << "LVDIST::" << distance << "\n"
-                            << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_MATCHED" 
+                            << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_CHECK_MATCHED"
                                                         : "EXHAUSTIVE_GLOBAL_MUTATION_CHECK_MATCHED")
                             << "\n";
                         std::cout << oss.str();
                     }
                 }
+                locate_winner(pos, bc, candidate, max_dist);
                 return candidate;
             } else {
                 if (verbose) {
@@ -1229,11 +1293,12 @@ namespace barcode_correction {
                         {
                             std::ostringstream oss;
                             oss << "LVDIST::" << best_distance << "\n"
-                                << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_MATCHED_RESOLVED" 
+                                << (whitelist_type == "true" ? "EXHAUSTIVE_MUTATION_MULTIPLE_MATCHED_RESOLVED"
                                                             : "EXHAUSTIVE_GLOBAL_MUTATION_MULTIPLE_MATCHED_RESOLVED") << "\n";
                             std::cout << oss.str();
                         }
                     }
+                    locate_winner(pos, bc, best_candidate, max_dist);
                     return best_candidate;
                 } else {
                     if (verbose) {
@@ -1283,9 +1348,14 @@ namespace barcode_correction {
  * to find matches through k-mer mutations using an exhaustive search approach.
  */
     std::optional<int64_seq> kmer_fuzzy_search(const int64_seq& original_barcode, const std::string& expanded_seq, int bc_len,
-        const std::string& mode, const whitelist::wl_entry& wl, bool verbose, int max_dist
+        const std::string& mode, const whitelist::wl_entry& wl, bool verbose, int max_dist,
+        bc_position* pos = nullptr
     ) {
-    
+    // Position bookkeeping (bc_position): a direct k-mer hit carries no position here (the exact copy is found by
+    // correct_barcode from the k-mer offsets); a seed-shortlist hit is a match of the window itself; the exhaustive
+    // step keeps the end column of its Myers match.
+    if (pos) *pos = bc_position{};
+
     if (verbose) {
         #pragma omp critical
         {
@@ -1406,6 +1476,7 @@ namespace barcode_correction {
                                   << seed_result.value().bits_to_sequence() << "\n";
                     }
                 }
+                if (pos) pos->kind = bc_position::window;
                 return seed_result;
             }
         }
@@ -1413,7 +1484,7 @@ namespace barcode_correction {
 
     int64_seq exp_bc;
     exp_bc.sequence_to_bits(expanded_seq);
-    auto true_result = exhaustive_check_against_wl(exp_bc, "true", 2, verbose, mode, &wl);
+    auto true_result = exhaustive_check_against_wl(exp_bc, "true", 2, verbose, mode, &wl, pos);
     if (true_result.has_value()) {
         if (verbose) {
             #pragma omp critical
@@ -1433,31 +1504,35 @@ namespace barcode_correction {
     return std::nullopt;
 }
 /**
- * @brief Correct a barcode sequence using the provided layout and read information
+ * @brief Whitelist lookup of a barcode (the body of correct_barcode): the layout window, its mutation aliases, the
+ * k-mers of the expanded window and the mutations of the window, against the global and true whitelists
  * @param elem ``const seq_element&`` Sequence element containing barcode information
  * @param layout ``const ReadLayout&`` Read layout containing whitelist mappings
  * @param full_read ``const read_streaming::sequence&`` Full read sequence
+ * @param expanded_seq ``const std::string&`` the read around the layout window (+- expanded_window_pad), already
+ *        reverse-complemented for a reverse element (see correct_barcode)
  * @param verbose ``bool`` Whether to print verbose output
  * @param mut_dist ``int`` Maximum allowed edit distance for mutation checks
  * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive")
+ * @param pos optional out: where the lookup placed the barcode (bc_position); `window` for every match decided on
+ *        the layout window itself, the Myers match end for the exhaustive and mutation steps
  * @return ``std::optional<int64_seq>`` Corrected barcode sequence if found, otherwise std::nullopt
  */
-    std::optional<int64_seq> correct_barcode(const seq_element& elem,  const ReadLayout& layout, 
-        const read_streaming::sequence& full_read,  bool verbose, int mut_dist, std::string mode) {
+    std::optional<int64_seq> correct_barcode_lookup(const seq_element& elem,  const ReadLayout& layout,
+        const read_streaming::sequence& full_read, const std::string& expanded_seq, bool verbose, int mut_dist, std::string mode,
+        bc_position* pos = nullptr) {
         // pick the right whitelist
         auto key = seq_utils::remove_rc(elem.class_id);
         auto wl_it = layout.wl_map.maps.find(key);
         if (wl_it == layout.wl_map.maps.end()) return std::nullopt;
         auto &wl = wl_it->second.get();
-        int max_dist = 4;
+        int max_dist = expanded_window_pad;
         // extract and reverse‐complement the raw string
         // encoded barcode and reverse complement
         std::string raw = elem.seq.value();
-        std::string expanded_seq = seq_utils::substr_w_padding(full_read.seq, elem.position.first, elem.position.second, max_dist);
 
         if (elem.direction == "reverse") {
             raw = seq_utils::revcomp(raw);
-            expanded_seq = seq_utils::revcomp(expanded_seq);
         }
 
         int64_seq bc, rc_bc, exp_bc, exp_rcbc;
@@ -1504,6 +1579,7 @@ namespace barcode_correction {
                         << ")\n";
                 }
             }
+            if (pos) pos->kind = bc_position::window;
             return bc_true_identity ? bc : rc_bc;
         }
 
@@ -1530,6 +1606,7 @@ namespace barcode_correction {
                             std::cout << oss.str();
                         }
                     }
+                    if (pos) pos->kind = bc_position::window;
                     return candidate;
                 } else {
                     if (verbose) {
@@ -1556,6 +1633,7 @@ namespace barcode_correction {
                                 std::cout << oss.str();
                             }
                         }
+                        if (pos) pos->kind = bc_position::window;
                         return resolved;
                     } else {
                         if (verbose) {
@@ -1617,6 +1695,7 @@ namespace barcode_correction {
                             std::cout << oss.str();
                         }
                     }
+                    if (pos) pos->kind = bc_position::window;
                     return candidate;
                 } else {
                     if (verbose) {
@@ -1643,6 +1722,7 @@ namespace barcode_correction {
                                 std::cout << oss.str();
                             }
                         }
+                        if (pos) pos->kind = bc_position::window;
                         return resolved;
                     } else {
                         if (verbose) {
@@ -1684,7 +1764,7 @@ namespace barcode_correction {
         // generate mutations
         // === k-mer fuzzy search ===
 
-      auto kmer_fuzzy_result = kmer_fuzzy_search(bc, expanded_seq, bc_len, mode, wl, verbose, 3);
+      auto kmer_fuzzy_result = kmer_fuzzy_search(bc, expanded_seq, bc_len, mode, wl, verbose, 3, pos);
       if (verbose) {
             #pragma omp critical
             {
@@ -1700,13 +1780,14 @@ namespace barcode_correction {
         }
         
         auto muts = mutation_tools::generate_mutated_barcodes(bc, mut_dist);
+        if (pos) *pos = bc_position{};  // the checks below keep the Myers end of their match in the expanded window
         if(mode == "defensive"){
-            auto global_result = check_against_wl(exp_bc, muts, "global", max_dist, verbose, mode, &wl);
+            auto global_result = check_against_wl(exp_bc, muts, "global", max_dist, verbose, mode, &wl, pos);
             if(global_result.has_value()){
                 return(global_result);
             }
 
-            auto true_result = check_against_wl(exp_bc, muts, "true", 2, verbose, mode, &wl);
+            auto true_result = check_against_wl(exp_bc, muts, "true", 2, verbose, mode, &wl, pos);
             if(true_result.has_value()){
                 return(true_result);
             }
@@ -1715,7 +1796,7 @@ namespace barcode_correction {
         // IF OFFENSIVE: Check against true first, and then global
         
         if(mode == "offensive") {
-            auto true_result = check_against_wl(exp_bc, muts, "true", 2, verbose, mode, &wl);
+            auto true_result = check_against_wl(exp_bc, muts, "true", 2, verbose, mode, &wl, pos);
             if (true_result.has_value()) {
                 if (verbose) {
                     #pragma omp critical
@@ -1727,7 +1808,7 @@ namespace barcode_correction {
                 return true_result;
             }
 
-            auto global_result = check_against_wl(exp_bc, muts, "global", max_dist, verbose, mode, &wl);
+            auto global_result = check_against_wl(exp_bc, muts, "global", max_dist, verbose, mode, &wl, pos);
             if (global_result.has_value()) {
                 if (verbose) {
                     #pragma omp critical
@@ -1752,7 +1833,93 @@ namespace barcode_correction {
         }
         return std::nullopt;
     }
+
+/**
+ * @brief Correct a barcode sequence using the provided layout and read information
+ * @param elem ``const seq_element&`` Sequence element containing barcode information
+ * @param layout ``const ReadLayout&`` Read layout containing whitelist mappings
+ * @param full_read ``const read_streaming::sequence&`` Full read sequence
+ * @param verbose ``bool`` Whether to print verbose output
+ * @param mut_dist ``int`` Maximum allowed edit distance for mutation checks
+ * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive")
+ * @param pos optional out: where the corrected barcode lies in the expanded window (bc_position), with `shift` = its
+ *        end minus the end of the layout window when one position is known. Without it the lookup runs as before.
+ * @return ``std::optional<int64_seq>`` Corrected barcode sequence if found, otherwise std::nullopt
+ *
+ * The expanded window is the read from `expanded_window_pad` bases before the layout window to as many after it,
+ * reverse-complemented for a reverse element, so that the primer side comes first and the UMI side last. The lookup
+ * (correct_barcode_lookup) is unchanged. With `pos`, the position comes from what the lookup already computed:
+ *   1. an exact copy of the corrected barcode among the window k-mers (the k-mers kmer_fuzzy_search builds, compared by
+ *      their 2-bit code: integer comparisons, no lookup); one copy -> located there, two or more -> tie;
+ *   2. otherwise the end column of the Myers match of the corrected barcode in the window (exhaustive and mutation
+ *      steps, bit_partial_match); one best end -> located, several -> tie; an end at the window's last column ->
+ *      clipped (the barcode may continue beyond the window);
+ *   3. otherwise `window` (the match was decided on the layout window itself) or `unknown` (a mutation alias of a
+ *      shifted k-mer: no position).
+ */
+    std::optional<int64_seq> correct_barcode(const seq_element& elem,  const ReadLayout& layout,
+        const read_streaming::sequence& full_read,  bool verbose, int mut_dist, std::string mode,
+        bc_position* pos = nullptr) {
+        const int read_len = static_cast<int>(full_read.seq.size());
+        const int win_lo = std::max(1, elem.position.first - expanded_window_pad);
+        const int win_hi = std::min(read_len, elem.position.second + expanded_window_pad);
+        std::string expanded_seq = seq_utils::substr_w_padding(full_read.seq, elem.position.first, elem.position.second, expanded_window_pad);
+        const bool reverse = elem.direction == "reverse";
+        if (reverse) {
+            expanded_seq = seq_utils::revcomp(expanded_seq);
+        }
+        if (pos) *pos = bc_position{};
+
+        auto result = correct_barcode_lookup(elem, layout, full_read, expanded_seq, verbose, mut_dist, mode, pos);
+        if (!pos || !result.has_value()) return result;
+
+        // 1. exact copies of the corrected barcode in the oriented window (k-mer offsets)
+        int64_seq exp_bc;
+        exp_bc.sequence_to_bits(expanded_seq);
+        const int W = exp_bc.length;
+        const int L = result->length;
+        if (exp_bc.is_valid() && result->is_valid() && L >= 1 && L <= 32 && W <= 32 && W >= L) {
+            const int64_t mask = (L == 32) ? ~int64_t{0} : ((int64_t{1} << (2 * L)) - 1);
+            const int64_t wanted = result->bits[0] & mask;
+            int copies = 0, copy_end = -1;
+            for (int i = 0; i + L <= W; ++i) {
+                const int64_t kmer = (exp_bc.bits[0] >> (2 * (W - L - i))) & mask;
+                if (kmer == wanted) {
+                    ++copies;
+                    copy_end = i + L - 1;
+                }
+            }
+            if (copies >= 1) {
+                pos->set_from_match(copy_end, copies);
+            } else if (pos->kind == bc_position::located && pos->end == W - 1) {
+                // 2. an inexact Myers match that ends at the window's last column: the barcode may run on beyond the
+                // window (it lies more than expanded_window_pad bases from the layout window), so the end is not known
+                pos->kind = bc_position::clipped;
+            }
+        }
+        // 2. / 3. are what the lookup left in pos
+        if (pos->kind == bc_position::located) {
+            const int window_first = reverse ? (win_hi - elem.position.second) : (elem.position.first - win_lo);
+            const int window_last = window_first + (elem.position.second - elem.position.first);
+            pos->shift = pos->end - window_last;
+        }
+        return result;
+    }
 };
+
+/**
+ * @brief Run counters of the barcode position taken from the whitelist match:
+ * single-barcode corrections by what the lookup said about the
+ * barcode's place in the expanded window. Reset by sigalign, copied into sigalign_run_stats at its end.
+ */
+namespace barcode_position_stats {
+inline std::atomic<size_t> moved{0}, moved_forward{0}, moved_reverse{0}, in_place{0}, window{0}, unknown{0}, tie{0},
+    clipped{0}, out_of_read{0};
+inline void reset() {
+    for (auto* c : {&moved, &moved_forward, &moved_reverse, &in_place, &window, &unknown, &tie, &clipped, &out_of_read})
+        c->store(0);
+}
+}  // namespace barcode_position_stats
 
 struct sigalign_run_stats {
     size_t total_reads = 0;
@@ -1764,6 +1931,9 @@ struct sigalign_run_stats {
     double process_time_seconds = 0.0;
     double output_staging_time_seconds = 0.0;
     double overhead_time_seconds = 0.0;
+    // barcode position from the whitelist match (barcode_position_stats): single-barcode corrections by outcome
+    size_t bc_pos_moved = 0, bc_pos_moved_forward = 0, bc_pos_moved_reverse = 0, bc_pos_in_place = 0, bc_pos_window = 0,
+           bc_pos_unknown = 0, bc_pos_tie = 0, bc_pos_clipped = 0, bc_pos_out_of_read = 0;
     // --concat-hmm branch counts (reported only when enabled)
     bool concat_hmm_enabled = false;
     size_t hmm_reads = 0, hmm_single = 0, hmm_split = 0, hmm_children = 0, hmm_children_full_search = 0,
@@ -1773,6 +1943,7 @@ struct sigalign_run_stats {
     size_t hmm_spacer_retry = 0, hmm_spacer_retry_ok = 0, hmm_fragment_ok = 0, hmm_read_end_ok = 0;
     bool hmm_abstain_legacy = false;
     size_t hmm_drop_abstain = 0, hmm_drop_too_many = 0, hmm_drop_d_reads = 0, hmm_drop_d_children = 0;
+    size_t hmm_d_kept_left = 0, hmm_d_kept_right = 0, hmm_d_split = 0;  // D strand rule outcomes (reads and children)
     size_t hmm_fold_read_start = 0, hmm_fold_read_end = 0, hmm_partner_rejected = 0, hmm_retry_from_partner = 0;
     // POLICY_ROUND.md round 3
     size_t hmm_art_reads = 0, hmm_pieces = 0, hmm_trim_keep_F = 0, hmm_trim_keep_R = 0;  // P7
@@ -1851,7 +2022,10 @@ struct concat_hmm_counters {
     std::atomic<size_t> read_end_ok{0};         // barcode-side adapters confirmed because their partner ran off the read end
     // policies (POLICY_ROUND.md): reads / children written without any record
     std::atomic<size_t> drop_abstain{0}, drop_too_many{0};  // P1: abstained / k-capped reads (default policy)
-    std::atomic<size_t> drop_d_reads{0}, drop_d_children{0};  // P4: 10x 5'-like D constructs (two barcode units, one construct)
+    std::atomic<size_t> drop_d_reads{0}, drop_d_children{0};  // 10x 5'-like D constructs (two barcode units) with no clear cDNA direction
+    // D strand rule (concat_hmm::SEG_D_KEPT / SEG_D_SPLIT): D constructs (whole reads and children)
+    // kept at the unit at the cDNA 5' end (left = forward, right = reverse), or split at the cDNA strand change
+    std::atomic<size_t> d_kept_left{0}, d_kept_right{0}, d_split{0};
     std::atomic<size_t> fold_read_start{0}, fold_read_end{0};  // P3: read elements placed at a fold-back child boundary
     std::atomic<size_t> partner_rejected{0};    // P5: barcode blocks of full-search children rejected (partner not at the spacer offset)
     std::atomic<size_t> retry_from_partner{0};  // P6: retry-only outer barcode-side primers re-anchored at the partner (barcode / UMI moved)
@@ -2904,10 +3078,12 @@ private:
     }
 
 /**
- * @brief Filter out reads that are shorter than the summative expected length of adapters
- * @param elems vector of references to `seq_element` objects
+ * @brief Filter out reads whose cDNA is shorter than --min-read-length
+ * @param elems vector of references to `seq_element` objects, after mask_and_trim_elements: the read
+ *        element's seq is the cDNA as written (poly tail and other overlapping elements removed)
  * @param layout `ReadLayout` object containing layout elements
- * @return true if read length meets or exceeds total expected adapter length, false otherwise
+ * @param min_read_length the limit; -1 = the summative expected length of the layout's elements
+ * @return true if the cDNA length meets or exceeds the limit, false otherwise
  */
     bool filter_short_reads(const std::vector<std::reference_wrapper<const seq_element>>& elems,
                             const ReadLayout& layout, int min_read_length = -1) const {
@@ -3153,21 +3329,27 @@ private:
             return false;
         }
 
-        // Length filtering
+        // Sort elements by order
+        std::sort(elements.begin(), elements.end(), [](const auto& a, const auto& b) {
+            return a.get().order < b.get().order;
+        });
+
+        // Mask overlapping elements and trim reads
+        mask_and_trim_elements(elements, read, verbose);
+
+        // Length test (--min-read-length) on the cDNA as it is written: the read
+        // element after every element of this direction that overlaps it (poly
+        // tail, adapter, barcode, UMI) is masked and removed. The test runs after
+        // the trim so that it counts the same thing on every route: the existing
+        // path, the --concat-hmm windows and the pieces of split reads. Before,
+        // it ran on the untrimmed read window, which holds the poly tail when
+        // the poly reference failed the order check of map_positions.
         if (!filter_short_reads(elements, layout, min_read_length)) {
             filtered_because += direction + "_FILTERED_READ_LENGTH";
             set_info(filtered_because);
             return false;
         }
-        
-        // Sort elements by order
-        std::sort(elements.begin(), elements.end(), [](const auto& a, const auto& b) {
-            return a.get().order < b.get().order;
-        });
-        
-        // Mask overlapping elements and trim reads
-        mask_and_trim_elements(elements, read, verbose);
-        
+
         // Validate positions and check for overlaps
         return validate_element_positions(elements, direction, filtered_because, verbose);
     }
@@ -3895,7 +4077,7 @@ private:
                 continue;
             }
             seq_element elem = *it;
-            bool barcode_passed = process_single_barcode(elem, layout, read, gen_mut, mode, verbose);
+            bool barcode_passed = process_single_barcode(elem, layout, read, gen_mut, mode, verbose, /*locate=*/true);
             if (!barcode_passed) {
                 all_barcodes_passed = false;
                 mark_element_failed(elem.class_id);
@@ -3927,15 +4109,17 @@ private:
  * @return true if barcode correction is successful, false otherwise
  */
     bool process_single_barcode(const seq_element& elem, const ReadLayout& layout, const read_streaming::sequence& read,
-        int gen_mut, const std::string& mode, bool verbose
+        int gen_mut, const std::string& mode, bool verbose, bool locate = false
     ) {
 
         if (verbose) {
             log_verbose("Processing barcode: " + elem.seq.value());
         }
-        
+
+        // locate: a single (not joint) barcode also takes its position from the whitelist match
+        barcode_correction::bc_position pos;
         auto correction_result = barcode_correction::correct_barcode(
-            elem, layout, read, verbose, gen_mut, mode
+            elem, layout, read, verbose, gen_mut, mode, locate ? &pos : nullptr
         );
 
         // Apply correction and update element
@@ -3944,7 +4128,103 @@ private:
         }
 
         apply_barcode_correction(elem, correction_result.value(), layout, verbose);
+        if (locate) {
+            move_barcode_position(elem, pos, layout, read, verbose);
+        }
         return true;
+    }
+
+/**
+ * @brief Move a single barcode to where the whitelist match found it, and the elements chained to it by the position
+ * map (the UMI) with it
+ * @param elem the barcode element as it was before correction (layout position)
+ * @param pos what correct_barcode found out about its place in the expanded window
+ * @param layout the read layout (position map rules of the chained elements)
+ * @param read the read (the chained elements' sequence and quality are extracted again)
+ *
+ * Nothing moves unless the position is `located` with a shift other than 0. A chained element is a variable element
+ * of the same direction whose primary start and primary stop both reference this barcode (10x: umi =
+ * barcode|stop+1 .. barcode|stop+10; rc_umi = rc_barcode|start-10 .. rc_barcode|start-1); it follows by the same
+ * rule from the moved barcode position. The read element never moves (its sequence was extracted and masked before
+ * correction). The barcode's sequence, its CR tag and its corrected flag are those of apply_barcode_correction. When
+ * a new position leaves the read, nothing moves. Every outcome is counted in barcode_position_stats.
+ */
+    void move_barcode_position(const seq_element& elem, const barcode_correction::bc_position& pos,
+        const ReadLayout& layout, const read_streaming::sequence& read, bool verbose
+    ) {
+        using bc_position = barcode_correction::bc_position;
+        namespace st = barcode_position_stats;
+        auto kept = [&](std::atomic<size_t>& counter, const std::string& why) {
+            counter.fetch_add(1, std::memory_order_relaxed);
+            if (verbose) log_verbose("Barcode position kept: " + elem.class_id + " (" + why + ")");
+        };
+        switch (pos.kind) {
+            case bc_position::unknown: kept(st::unknown, "position unknown"); return;
+            case bc_position::window: kept(st::window, "window match"); return;
+            case bc_position::tie: kept(st::tie, "ambiguous: " + std::to_string(pos.n_end) + " equally good ends"); return;
+            case bc_position::clipped: kept(st::clipped, "match clipped at the window edge"); return;
+            case bc_position::located: break;
+        }
+        if (pos.shift == 0) {
+            kept(st::in_place, "located in place");
+            return;
+        }
+
+        const bool reverse = elem.direction == "reverse";
+        // read coordinates: on the reverse strand the UMI side is at lower coordinates
+        const int delta = reverse ? -pos.shift : pos.shift;
+        const int read_len = static_cast<int>(read.seq.size());
+        const std::pair<int, int> bc_pos{elem.position.first + delta, elem.position.second + delta};
+        if (bc_pos.first < 1 || bc_pos.second > read_len) {
+            kept(st::out_of_read, "new position outside the read");
+            return;
+        }
+
+        auto& id_index = sig_elements.get<sig_id_tag>();
+        auto bc_it = id_index.find(elem.class_id);
+        if (bc_it == id_index.end()) return;
+
+        struct chained_move { std::string id; std::pair<int, int> position; };
+        std::vector<chained_move> chained;
+        auto& type_index = layout.by_type();
+        auto variable_range = type_index.equal_range("variable");
+        for (auto lit = variable_range.first; lit != variable_range.second; ++lit) {
+            if (!lit->ref_pos || lit->direction != elem.direction) continue;
+            const auto& rp = *lit->ref_pos;
+            if (rp.primary_start.ref_id != elem.class_id || rp.primary_stop.ref_id != elem.class_id) continue;
+            auto it = id_index.find(lit->class_id);
+            if (it == id_index.end() || it->type != "variable") continue;
+            if (it->position.first < 1 || it->position.second < it->position.first) continue;  // not placed
+            const int start = (rp.primary_start.is_start ? bc_pos.first : bc_pos.second) + rp.primary_start.offset;
+            const int stop = (rp.primary_stop.is_start ? bc_pos.first : bc_pos.second) + rp.primary_stop.offset;
+            if (start < 1 || stop > read_len || stop < start) {
+                kept(st::out_of_read, "new position outside the read");
+                return;
+            }
+            chained.push_back({lit->class_id, {start, stop}});
+        }
+
+        id_index.modify(bc_it, [&](seq_element& e) { e.position = bc_pos; });
+        for (const auto& m : chained) {
+            id_index.modify(id_index.find(m.id), [&](seq_element& e) {
+                e.position = m.position;
+                const size_t off = static_cast<size_t>(m.position.first - 1);
+                const size_t len = static_cast<size_t>(m.position.second - m.position.first + 1);
+                e.seq = read.seq.substr(off, len);
+                if (e.qual.has_value() && read.is_fastq && read.qual.size() >= off + len) {
+                    e.qual = read.qual.substr(off, len);
+                }
+            });
+        }
+        st::moved.fetch_add(1, std::memory_order_relaxed);
+        (reverse ? st::moved_reverse : st::moved_forward).fetch_add(1, std::memory_order_relaxed);
+
+        if (verbose) {
+            log_verbose("Barcode position moved: " + elem.class_id + " " + std::to_string(elem.position.first) + "-" +
+                        std::to_string(elem.position.second) + " -> " + std::to_string(bc_pos.first) + "-" +
+                        std::to_string(bc_pos.second) + " (shift " + std::to_string(pos.shift) + ", " +
+                        std::to_string(chained.size()) + " chained element(s) moved)");
+        }
     }
 
 /**
@@ -5771,12 +6051,16 @@ public:
     //       inner partner anchor at the layout spacer offset (P5).
     // Policies (benchmarks/concat_hmm/final/POLICY_ROUND.md): reads the HMM abstains on (abstain
     // flag, unexplained opposite-strand evidence, k capped) are dropped, i.e. written without any
-    // record (P1; --concat-hmm-abstain=legacy sends them to the existing path instead), and so are
-    // D constructs, single (k = 1) or children of a split read (P4). A construct next to a
-    // fold-back cut may start / end its read element at that cut (P3). A barcode-side primer
-    // accepted only by the spacer-offset retry places the barcode from its partner anchor (P6;
-    // only the barcode block's outer adapter, so the inner adapter bounding the cDNA keeps its
-    // own alignment).
+    // record (P1; --concat-hmm-abstain=legacy sends them to the existing path instead). A D
+    // construct (two barcode units facing outward), single (k = 1) or a child of a split read, is
+    // decided by the HMM's D strand rule: one cDNA direction ->
+    // a plain construct of the unit at the cDNA 5' end (SEG_D_KEPT; the piece ends at the removed
+    // unit's inner anchor and the read element may end there), a strand change -> two plain
+    // constructs split at the change (SEG_D_SPLIT, legacy duplet names), no clear direction ->
+    // no record (P4, SEG_DOUBLE_BC). A construct next to a fold-back cut may start / end its read
+    // element at that cut (P3). A barcode-side primer accepted only by the spacer-offset retry
+    // places the barcode from its partner anchor (P6; only the barcode block's outer adapter, so
+    // the inner adapter bounding the cDNA keeps its own alignment).
     // Returns false (the caller then runs the existing path unchanged) when the calibration
     // guard failed (for every read of the run), k = 0, or the single construct is a T /
     // single-primer-end artifact (RAD keeps its own handling); true otherwise (handled, possibly
@@ -5820,8 +6104,9 @@ public:
             else if (res.k == 1) { drop = "abstain"; ctr.drop_abstain.fetch_add(1, std::memory_order_relaxed); }
             else junction_abstain = true;
         } else if (res.k == 1 && (res.segs[0].flags & concat_hmm::SEG_DOUBLE_BC)) {
-            // P4: one construct with two barcode units facing outward (10x 5' D): the genuine unit cannot be
-            // resolved, so write nothing rather than one or two guessed records
+            // one construct with two barcode units facing outward (10x 5' D) whose cDNA has no clear strand
+            // direction (D strand rule: unclear): the genuine unit cannot be resolved, so write nothing rather than
+            // one or two guessed records (a resolved D geometry arrives as a plain F / R construct, SEG_D_KEPT / SEG_D_SPLIT)
             drop = "d";
             ctr.drop_d_reads.fetch_add(1, std::memory_order_relaxed);
         }
@@ -5891,25 +6176,29 @@ public:
             // child window: from cut_lo of the cut on its left to cut_hi of the cut on its right (equal to the cuts except
             // where an anchor-derived barcode-block edge lies on the far side of a cut); the first / last child extends to
             // the read end; a single construct is the whole read
-            const int start = c == 0 ? 0 : (win ? res.cut_lo[c - 1] : res.cuts[c - 1]);
-            const int end = c + 1 == res.k ? len : (win ? res.cut_hi[c] : res.cuts[c]);
+            int start = c == 0 ? 0 : (win ? res.cut_lo[c - 1] : res.cuts[c - 1]);
+            int end = c + 1 == res.k ? len : (win ? res.cut_hi[c] : res.cuts[c]);
+            // D strand rule, kept unit (SEG_D_KEPT): the piece ends at the removed unit's inner anchor (the segment
+            // edge on that side), so the removed unit's barcode block and adapters are never inside the piece
+            const bool d_kept = (res.segs[c].flags & concat_hmm::SEG_D_KEPT) != 0;
+            const bool d_left = d_kept && res.segs[c].strand == 'F';  // the left unit (forward) is kept; else the right one (reverse)
+            if (d_kept) { if (d_left) end = std::min(end, res.segs[c].end); else start = std::max(start, res.segs[c].start); }
             if (end <= start) continue;
-            if (res.segs[c].flags & concat_hmm::SEG_DOUBLE_BC) {  // P4: a D child is written without any record
+            if (res.segs[c].flags & concat_hmm::SEG_DOUBLE_BC) {  // a D child without a clear cDNA direction is written without any record
                 ctr.drop_d_children.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
+            const bool piece_of_read = split || d_kept;  // the molecule is a window of the parent read, not the whole read
             piece_t p;
             p.c = c; p.start = start; p.end = end;
             p.plain = concat_plain_construct(res.segs[c]);
             p.strand = res.segs[c].strand;
             p.rs = read_streaming::sequence{split ? read.id + "/seg" + std::to_string(c + 1) : read.id, read.comment,
-                                            split ? read.seq.substr(start, end - start) : read.seq,
-                                            read.is_fastq ? (split ? read.qual.substr(start, end - start) : read.qual) : "", read.is_fastq};
+                                            piece_of_read ? read.seq.substr(start, end - start) : read.seq,
+                                            read.is_fastq ? (piece_of_read ? read.qual.substr(start, end - start) : read.qual) : "", read.is_fastq};
             p.sig = SigString(p.rs.id, end - start, "undefined", layout.sequencing_type);
-            if (split) {
-                p.sig.mark_concatemer();
-                p.sig.set_parent_frame(start, end);  // P10: debug sigstrings in parent coordinates
-            }
+            if (split) p.sig.mark_concatemer();
+            if (piece_of_read) p.sig.set_parent_frame(start, end);  // debug sigstrings in parent coordinates
             {
 #ifdef RAD_STAGE_TIMERS
                 rad_stage_timers::scope t_static(rad_stage_timers::windowed_static_ns);
@@ -5926,8 +6215,18 @@ public:
                     };
                     const bool fold_start = c > 0 && ((res.segs[c - 1].flags & concat_hmm::SEG_SAME_MOLECULE_R) || cut_edge(c - 1));
                     const bool fold_end = c + 1 < res.k && ((res.segs[c].flags & concat_hmm::SEG_SAME_MOLECULE_R) || cut_edge(c));
-                    if (fold_start || fold_end)
-                        p.sig.set_fold_edges(fold_start, fold_end, res.segs[c].strand == 'F' ? "forward" : "reverse");
+                    // D strand rule, kept unit: the piece edge at the removed unit's inner anchor has no layout reference
+                    // left (no window is searched beyond it), so the read element may end (start) there, as at a P7 trim
+                    if (fold_start || fold_end || d_kept)
+                        p.sig.set_fold_edges(fold_start || (d_kept && !d_left), fold_end || d_left,
+                                             res.segs[c].strand == 'F' ? "forward" : "reverse", !d_kept);
+                    if (d_kept) {
+                        p.sig.set_hmm_note(d_left ? "D_KEEP_L" : "D_KEEP_R");
+                        (d_left ? ctr.d_kept_left : ctr.d_kept_right).fetch_add(1, std::memory_order_relaxed);
+                    } else if (res.segs[c].flags & concat_hmm::SEG_D_SPLIT) {
+                        p.sig.set_hmm_note("D_SPLIT");
+                        if (res.segs[c].strand == 'F') ctr.d_split.fetch_add(1, std::memory_order_relaxed);  // once per D construct
+                    }
                     const static_restriction r = restriction_for(c, start, end);
                     p.sig.sigalign_static(p.rs, layout, verbose, nullptr, &r);
                 } else {
@@ -6117,6 +6416,8 @@ public:
     std::atomic<long long> total_process_time_ms{0};
     std::atomic<long long> total_queue_time_ms{0};
     std::mutex metrics_mu;
+
+    barcode_position_stats::reset();
 
     // --concat-hmm: the model is set on the layout only when the flag is on.
     concat_hmm_counters hmm_ctr;
@@ -6545,6 +6846,9 @@ public:
         run_stats.hmm_drop_too_many = hmm_ctr.drop_too_many;
         run_stats.hmm_drop_d_reads = hmm_ctr.drop_d_reads;
         run_stats.hmm_drop_d_children = hmm_ctr.drop_d_children;
+        run_stats.hmm_d_kept_left = hmm_ctr.d_kept_left;
+        run_stats.hmm_d_kept_right = hmm_ctr.d_kept_right;
+        run_stats.hmm_d_split = hmm_ctr.d_split;
         run_stats.hmm_fold_read_start = hmm_ctr.fold_read_start;
         run_stats.hmm_fold_read_end = hmm_ctr.fold_read_end;
         run_stats.hmm_partner_rejected = hmm_ctr.partner_rejected;
@@ -6566,6 +6870,15 @@ public:
             run_stats.hmm_win_ok[s] = hmm_ctr.win_ok[s];
         }
     }
+    run_stats.bc_pos_moved = barcode_position_stats::moved;
+    run_stats.bc_pos_moved_forward = barcode_position_stats::moved_forward;
+    run_stats.bc_pos_moved_reverse = barcode_position_stats::moved_reverse;
+    run_stats.bc_pos_in_place = barcode_position_stats::in_place;
+    run_stats.bc_pos_window = barcode_position_stats::window;
+    run_stats.bc_pos_unknown = barcode_position_stats::unknown;
+    run_stats.bc_pos_tie = barcode_position_stats::tie;
+    run_stats.bc_pos_clipped = barcode_position_stats::clipped;
+    run_stats.bc_pos_out_of_read = barcode_position_stats::out_of_read;
     return run_stats;
 }
 
