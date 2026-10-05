@@ -301,13 +301,10 @@ namespace mutation_tools {
  * @param pattern_len: `int` length of the pattern (currently <=32 bases)
  * @param text_len: `int` length of the text (currently <=32 bases)
  * @param max_dist: maximum allowed distance
- * @param best_end: optional out: 0-based index in the text of the last base of the best match (the column where
- *        the minimum score occurs). The text is consumed from its first base to its last, so this is the match END.
- * @param n_best: optional out: how many text columns reach the minimum score (1 = one best end; >= 2 = equally good ends)
+ * @param best_end: optional out: 0-based text index of the last base of the best match (the column of the minimum score)
+ * @param n_best: optional out: number of text columns that reach the minimum score
  * @return `int` minimum edit distance if <= max_dist, else -1
- * @note The edit distance is the same whether both strings are read first-to-last or last-to-first (the earlier form
- *       of this loop); only the position bookkeeping is new. When no position is requested the loop stops at the first
- *       exact match, as before.
+ * @note Without best_end and n_best the loop stops at the first exact match.
  */
     int bit_partial_match(int64_t pattern, int64_t text, int pattern_len, int text_len, int max_dist,
                           int* best_end = nullptr, int* n_best = nullptr) {
@@ -332,7 +329,7 @@ namespace mutation_tools {
         const bool keep_position = best_end != nullptr || n_best != nullptr;
 
         if (!keep_position) {
-            // the loop of every whitelist scan: unchanged apart from the orientation
+            // whitelist scans: no position bookkeeping
             for (int j = 0; j < text_len; j++) {
                 int text_nuc = (text >> (2 * (text_len - 1 - j))) & 3;
                 int64_t Eq = Peq[text_nuc] & pattern_mask;
@@ -2159,19 +2156,13 @@ class whitelist {
         }
 
 /**
- * @brief Part table of the true whitelist: a filter in front of the exhaustive scan
+ * @brief Part table of the true whitelist: a lossless filter in front of the exhaustive scan
  *
- * Each barcode is cut into PARTS = 3 parts (the partitions of seed_idx). A barcode within max_dist <= PARTS - 1 = 2
- * edits of an infix of a longer window has at least one part exact in the window: an alignment with at most 2 edits
- * touches at most 2 parts, and a part that no edit touches is copied base for base into consecutive window bases. The
- * table maps the key of a part (its first key_len <= KEY_MAX bases, 2-bit packed; a prefix of an exact part is exact
- * too) to the barcodes that hold it, one table set for each barcode length. For a window, scan() looks up the keys
- * at every window position, runs the same comparison (mutation_tools::int64_lvdist) on the barcodes found, and reports
- * each barcode once: the match set is the one of the loop over every unique entry. A group of barcodes at least as
- * long as the window is compared in full (int64_lvdist then searches the window inside the barcode, where the part
- * argument does not hold). Entries that int64_lvdist can never match (no bases, more than 32 bases, more than one
- * 2-bit chunk) are left out. Built once after the whitelist is loaded; read-only afterwards (scan() is const and
- * keeps no state between calls).
+ * Each barcode is cut into PARTS parts (seed_idx::partitions). An alignment with at most PARTS - 1 edits leaves at
+ * least one part unchanged, so a barcode within max_dist <= PARTS - 1 edits of an infix of a longer window has one
+ * part that occurs exactly in the window. The table maps the key of each part (its first key_len bases) to the
+ * barcodes that hold it, one group for each barcode length. scan() gives the same match set as int64_lvdist over
+ * every unique entry. Built once after the whitelist is loaded; read-only afterwards.
  */
         struct part_idx {
             static constexpr int PARTS = 3;    // parts for each barcode: lossless for max_dist <= PARTS - 1
@@ -2218,7 +2209,7 @@ class whitelist {
                     groups[it->second].entries.push_back(e);
                 }
                 for (auto& g : groups) {
-                    if (g.m < PARTS) {   // no 3 non-empty parts: the full loop stays
+                    if (g.m < PARTS) {   // fewer bases than parts: use the full loop
                         groups.clear();
                         if (verbose) std::cout << "[part_idx] Skipping build: barcode length < " << PARTS << "\n";
                         return;

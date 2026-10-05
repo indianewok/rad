@@ -1355,7 +1355,7 @@ static bool write_demux_run_log(
         << "concat_hmm_reads_dropped_too_many=" << stats.hmm_drop_too_many << "\n"
         << "concat_hmm_reads_dropped_d=" << stats.hmm_drop_d_reads << "\n"
         << "concat_hmm_split_children_dropped_d=" << stats.hmm_drop_d_children << "\n"
-        // D strand rule: D constructs (reads and children) by outcome
+        // D constructs (reads and children) by outcome
         << "concat_hmm_d_kept_left_unit=" << stats.hmm_d_kept_left << "\n"
         << "concat_hmm_d_kept_right_unit=" << stats.hmm_d_kept_right << "\n"
         << "concat_hmm_d_split_strand_change=" << stats.hmm_d_split << "\n"
@@ -1364,7 +1364,6 @@ static bool write_demux_run_log(
         << "concat_hmm_fold_read_to_child_end=" << stats.hmm_fold_read_end << "\n"
         << "concat_hmm_full_search_barcodes_rejected=" << stats.hmm_partner_rejected << "\n"
         << "concat_hmm_retry_barcodes_from_partner=" << stats.hmm_retry_from_partner << "\n"
-        // POLICY_ROUND.md round 3
         << "concat_hmm_reads_dropped_unresolved=" << stats.hmm_drop_unresolved << "\n"
         << "concat_hmm_junctions_abstained=" << stats.hmm_junctions_abstained << "\n"
         << "concat_hmm_pieces_suppressed=" << stats.hmm_pieces_suppressed << "\n"
@@ -2078,10 +2077,8 @@ int cmd_demux(int argc, char *argv[]) {
       if (verbose)
         std::cout << "[misalignment_stats] Computing misalignment...\n";
       Misalignment_Setup mis(read_layout);
-      // first block 50,000 reads; more blocks until every adapter has enough
-      // chance hits (adapter_thresholds::kCalibrationBlockReads / kCalibrationMaxReads)
       mis.generate_misalignment_data(fastq_path, read_layout, nthreads,
-                                     adapter_thresholds::kCalibrationBlockReads,
+                                     adapter_thresholds::calibration_block_reads,
                                      concat_hmm_enabled);
       auto mis_time = std::chrono::steady_clock::now() - main_start;
       std::cout << "[main] Misalignment time: "

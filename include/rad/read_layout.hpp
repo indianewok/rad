@@ -1,6 +1,48 @@
 #pragma once
 #include "rad_headers.h"
 
+// Adapter edit-distance limits and the misalignment calibration sample.
+namespace adapter_thresholds {
+
+constexpr std::size_t fallback_error_numerator = 3;
+constexpr std::size_t fallback_error_denominator = 10;
+
+/**
+ * Return the shared fallback edit-distance limit for an uncalibrated adapter.
+ *
+ * Keep this integer-only so layout preparation and read processing cannot
+ * drift because of different rounding rules or duplicated constants.
+ */
+constexpr int fallback_max_edit_distance(std::size_t adapter_length) {
+    const auto rounded_up =
+        (adapter_length * fallback_error_numerator +
+         fallback_error_denominator - 1) /
+        fallback_error_denominator;
+    return std::max(1, static_cast<int>(rounded_up));
+}
+
+static_assert(fallback_max_edit_distance(22) == 7,
+              "22 nt adapters must allow seven fallback edits");
+static_assert(fallback_max_edit_distance(23) == 7,
+              "23 nt adapters must allow seven fallback edits");
+
+// misalign_lower = largest edit distance with at most this share of the
+// element's chance hits (the null) at or below it.
+constexpr double misalign_lower_chance_share = 0.05;
+
+// Chance hits an element needs for a calibrated threshold; below this,
+// update_read_layout uses fallback_max_edit_distance.
+constexpr std::size_t min_misalignment_observations = 100;
+
+// Misalignment calibration sample: the first block (rad prep: -n), then
+// further blocks until every element has min_misalignment_observations chance
+// hits, up to calibration_max_reads. Whole blocks keep the sample independent
+// of the thread count.
+constexpr std::size_t calibration_block_reads = 50000;
+constexpr std::size_t calibration_max_reads = 1000000;
+
+}  // namespace adapter_thresholds
+
 /**
  * @brief Represents a position in the ReadLayout. Each string from position strings is processed in this manner.
  * @param ref_id Reference element ID this position is based on
@@ -251,14 +293,10 @@ public:
     std::string sequencing_type;
     std::unordered_map<std::string, ReferencePositions> position_map;
 
-    // Optional concatemer HMM (`--concat-hmm`, default off). concat_params holds the
-    // calibrated hmm_* columns of *_position_map.csv (empty: none); concat_model is
-    // only built when the flag is on and is shared read-only by all threads.
+    // --concat-hmm: calibrated hmm_* parameters and the shared read-only model.
     concat_hmm::Params concat_params;
     std::shared_ptr<const concat_hmm::Model> concat_model;
-    // --concat-hmm-abstain=legacy: reads the HMM abstains on (abstain flag, unexplained
-    // opposite-strand evidence, construct count capped) take the existing path instead of
-    // being dropped (default: dropped, no record).
+    // --concat-hmm-abstain=legacy: abstained reads take the default path instead of being dropped.
     bool concat_abstain_legacy = false;
 
     //A bunch of access-based methods for the multi-index container
@@ -279,15 +317,14 @@ public:
     const auto& by_global_class() const { return layout.get<global_class_tag>(); }
     const auto& by_dir_order() const { return layout.get<dir_order_tag>(); }
 
-    // Thin adapter ReadLayout -> concat_hmm::LayoutSpec (same fields the HMM's own
-    // CSV parser reads from a generated layout cache).
-    concat_hmm::LayoutSpec to_concat_layout_spec() const {
-        concat_hmm::LayoutSpec spec;
+    // ReadLayout -> concat_hmm::layout_spec.
+    concat_hmm::layout_spec to_concat_layout_spec() const {
+        concat_hmm::layout_spec spec;
         spec.name = "rad_read_layout";
         spec.mode = sequencing_type;
         spec.bulk = (sequencing_type == "bulk");
         for (const auto& e : by_order()) {
-            concat_hmm::LayoutElement x;
+            concat_hmm::layout_element x;
             x.id = e.class_id;
             x.seq = e.seq;
             x.is_static = (e.type == "static");
@@ -304,11 +341,10 @@ public:
         return spec;
     }
 
-    // Builds the shared model from the layout and concat_params (layout priors when
-    // empty). On failure the model stays unset and every read takes the existing path.
+    // On failure the model stays unset and every read takes the default path.
     bool build_concat_model(bool verbose) {
         try {
-            const concat_hmm::LayoutSpec spec = to_concat_layout_spec();
+            const concat_hmm::layout_spec spec = to_concat_layout_spec();
             const concat_hmm::Params* p = concat_params.empty() ? nullptr : &concat_params;
             auto model = std::make_shared<concat_hmm::Model>(concat_hmm::Model::build(spec, p));
             std::cout << "[concat_hmm] Model built: " << model->tpl.size() << " templates, "
@@ -1178,9 +1214,8 @@ public:
         if(which_file == "pos_map" || which_file == "both") {
             // Alignment and threshold information
             std::ofstream align_file(path_prefix + "_position_map.csv");
-            // Concat-HMM calibration (hmm_* columns) is appended only when present, so
-            // maps without it are written exactly as before; older RAD binaries read
-            // columns by name and ignore the extra ones.
+            // Concat-HMM calibration (hmm_* columns) is appended only when present.
+            // Readers find columns by name and ignore extra ones.
             std::map<std::string, std::map<std::string, std::string>> hmm_cells;
             std::vector<std::string> hmm_cols;
             if (!concat_params.empty()) {
@@ -1454,7 +1489,7 @@ public:
         fmt.delimiter(',').quote('"').header_row(0)
             .variable_columns(VariableColumnPolicy::KEEP);
         CSVReader reader(map_csv, fmt);
-        // Optional concat-HMM calibration columns (hmm_*); absent in older maps.
+        // Optional concat-HMM calibration columns (hmm_*).
         std::vector<std::string> hmm_cols;
         for (const auto& name : reader.get_col_names())
             if (name.rfind("hmm_", 0) == 0) hmm_cols.push_back(name);
@@ -1867,8 +1902,7 @@ public:
             }
         }
 
-        // The part table of each true whitelist for the exhaustive scan (whitelist::wl_entry::part_idx). true_bcs is
-        // not changed after this point, so the table stays valid and read-only for the whole run.
+        // Part tables for the exhaustive scan; true_bcs must not change after this point.
         for (auto & [pool_key, E] : wl_map.lists) {
             E.build_part_idx(verbose);
         }
@@ -2651,10 +2685,8 @@ private:
 };
 
 /**
- * @brief Concat-HMM self-calibration (`--concat-hmm`): feeds reads to concat_hmm::Calibrator
- * objects and stores the finalized parameters on the layout (written as hmm_* columns of
- * *_position_map.csv). Each chunk is split into a fixed strided partition, one Calibrator per
- * worker, merged in worker order, so the parameters do not depend on scheduling.
+ * @brief Concat-HMM calibration (hmm_* columns). Workers get a fixed strided partition of each chunk
+ * and are merged in worker order, so the result does not depend on scheduling.
  */
 class concat_hmm_calibration {
 public:
@@ -2879,22 +2911,8 @@ public:
     };
 
     /**
-     * @brief statistics of the chance hits among the accrued misalignment edit distances of one static element
-     *
-     * The accrued values of a static element are the whole-read best edit distances of that element in reads
-     * that hold an exact copy of every static element of the other direction. On libraries with concatemers
-     * these values form two groups: true copies of the element at low edit distance (the read holds both
-     * directions) and chance hits in a main group around one third of the element length. The misalignment
-     * thresholds are statistics of the chance hits only.
-     *
-     * Split rule (no new number): M = the mode of the histogram (ties: the largest edit distance); an exact
-     * copy cannot be a chance hit, so when M is 0 the mode over edit distances >= 1 is used. v = the edit
-     * distance with the lowest count in [0, M] (ties: the largest). A low group exists when a bin below v is
-     * higher than bin v; the chance hits are then the values above v. Otherwise there is no gap and every
-     * value is a chance hit.
-     *
-     * lower = the largest edit distance at which the cumulative share of chance hits is <= chance_share
-     * (adapter_thresholds::kMisalignLowerChanceShare).
+     * @brief Chance hits of one element's misalignment edit distances. Values at or below the lowest bin
+     * under the mode (v) are true copies when a higher bin lies below v; all other values are chance hits.
      */
     struct chance_hit_stats {
         size_t n_all = 0;              // accrued values
@@ -2969,10 +2987,10 @@ public:
  * @brief Constructor that initializes the Misalignment_Setup with a given ReadLayout
  * @param layout ReadLayout object
  * @param misalign_lower_chance_share accepted cumulative share of chance hits at misalign_lower (default
- *        adapter_thresholds::kMisalignLowerChanceShare)
+ *        adapter_thresholds::misalign_lower_chance_share)
  */
     Misalignment_Setup(const ReadLayout& layout,
-                       double misalign_lower_chance_share = adapter_thresholds::kMisalignLowerChanceShare)
+                       double misalign_lower_chance_share = adapter_thresholds::misalign_lower_chance_share)
         : misalign_lower_chance_share_(misalign_lower_chance_share) {
         // Extract static adapters (non poly-tail, non start/stop)
         // guards against empty seq -- need to update for static indexing
@@ -2995,23 +3013,13 @@ public:
     }
 
     /**
-     * @brief Accrue the misalignment null on a calibration sample from the FASTQ head and update the layout
-     *
-     * Calibration sample (adapter_thresholds): the first min_reads reads, then
-     * further blocks of kCalibrationBlockReads reads from the same stream until every static element has
-     * kMinMisalignmentObservations chance hits. The pass stops at the end of the input, at
-     * max(kCalibrationMaxReads, min_reads) reads, or early when the projected number of reads (reads so
-     * far x kMinMisalignmentObservations / chance hits of the slowest element) exceeds that bound. Reads
-     * enter only as whole blocks in file order, so the sample does not depend on the thread count.
-     * Before this rule the pass read exactly min_reads reads: its early stop (stable means) returned a
-     * value that chunk_streaming::process_chunks ignores.
-     *
-     * @param min_reads first block: 50,000 for rad demux, -n for rad prep
+     * @brief Accrue the misalignment null from the FASTQ head (sample rule: adapter_thresholds) and update the layout.
+     * @param min_reads size of the first block (rad prep: -n)
      * @param calibrate_concat_hmm also calibrate the concat-HMM, on the first min_reads reads only
      */
     void generate_misalignment_data(
         const std::string& fastq_path, ReadLayout& layout, int num_threads = 1,
-        size_t min_reads = adapter_thresholds::kCalibrationBlockReads,
+        size_t min_reads = adapter_thresholds::calibration_block_reads,
         bool calibrate_concat_hmm = false
     ) {
         prune_similar_reverse_adapters(layout);
@@ -3075,9 +3083,9 @@ public:
             return n;
         };
 
-        const size_t block = adapter_thresholds::kCalibrationBlockReads;
-        const size_t cap = std::max(adapter_thresholds::kCalibrationMaxReads, min_reads);
-        const size_t need = adapter_thresholds::kMinMisalignmentObservations;
+        const size_t block = adapter_thresholds::calibration_block_reads;
+        const size_t cap = std::max(adapter_thresholds::calibration_max_reads, min_reads);
+        const size_t need = adapter_thresholds::min_misalignment_observations;
         file_streaming files(fastq_path, 4);
         read_streaming reader(files);
         size_t target = min_reads;
@@ -3086,8 +3094,7 @@ public:
         std::string stop_reason;
         std::vector<std::pair<std::string, size_t>> n_chance;
         while (true) {
-            // Read up to the target in pieces of at most one block, so memory holds one block of reads at most
-            // (also for a large rad prep -n). Only the sequence is kept: the calibration reads nothing else.
+            // At most one block in memory; only the sequence is kept.
             while (total_reads_processed < target && !end_of_input) {
                 std::vector<read_streaming::sequence> chunk;
                 const size_t want = std::min(block, target - total_reads_processed);
@@ -3095,7 +3102,7 @@ public:
                 while (chunk.size() < want) {
                     auto rec = reader.next_sequence();
                     if (!rec) { end_of_input = true; break; }
-                    if (!kKeepPerfectMatches) { rec->qual = std::string(); rec->comment = std::string(); }
+                    if (!keep_perfect_matches) { rec->qual = std::string(); rec->comment = std::string(); }
                     chunk.push_back(std::move(*rec));
                 }
                 if (!chunk.empty()) {
@@ -3128,7 +3135,7 @@ public:
         if (hmm_cal) hmm_cal->finish(layout);
         
         // Write final results
-        write_perfect_matches(kKeepPerfectMatches);
+        write_perfect_matches(keep_perfect_matches);
         update_read_layout(layout, adapter_stats, misalignment_stats);
         layout.generate_position_mapping();
     }
@@ -3138,10 +3145,9 @@ private:
     std::unordered_map<std::string, std::vector<consensus_matrix>> consensus_matrices;
     std::vector<std::pair<std::string, std::string>> forward_adapters; /// vector of forward adapters, stored as `pair:[class_id, seq]`
     std::vector<std::pair<std::string, std::string>> reverse_adapters; /// vector of reverse adapters, stored as `pair:[class_id, seq]`
-    // Debug only: keep a copy of every perfect read and write it to ~/Desktop (write_perfect_matches).
-    // Off: nothing reads the copies, and the calibration sample can now reach kCalibrationMaxReads reads.
-    static constexpr bool kKeepPerfectMatches = false;
-    std::vector<perfect_match> perfect_matches; /// vector of perfect matches (only with kKeepPerfectMatches)
+    // Debug only: keep perfect reads for write_perfect_matches (large memory).
+    static constexpr bool keep_perfect_matches = false;
+    std::vector<perfect_match> perfect_matches; /// vector of perfect matches (only with keep_perfect_matches)
 
     double alignment_distance_fraction(const std::string& lhs, const std::string& rhs) const {
         if (lhs.empty() && rhs.empty()) return 0.0;
@@ -3236,7 +3242,7 @@ private:
                 );
                 #pragma omp critical
                 {
-                    if (kKeepPerfectMatches) perfect_matches.push_back({read, "forward"});
+                    if (keep_perfect_matches) perfect_matches.push_back({read, "forward"});
                     #pragma omp atomic
                     forward_count++;
                 }
@@ -3248,7 +3254,7 @@ private:
                 );
                 #pragma omp critical
                 {
-                    if (kKeepPerfectMatches) perfect_matches.push_back({read, "reverse"});
+                    if (keep_perfect_matches) perfect_matches.push_back({read, "reverse"});
                     #pragma omp atomic
                     reverse_count++;
                 }
@@ -3598,10 +3604,7 @@ private:
                     continue;
                 }
 
-                // The thresholds are statistics of the misalignment edit distances of this element
-                // (misalignment_stats), restricted to the chance hits. Before: the sd came from
-                // adapter_stats, which holds no edit distances (sd was always 0, so misalign_lower was
-                // the mean of the null), and the mean included the true copies that concatemer reads hold.
+                // thresholds from the chance hits only
                 auto& misalignment = misalignment_stats[adapter_id];
                 const chance_hit_stats chance =
                     chance_hits_from_histogram(misalignment.ed_hist, misalign_lower_chance_share_);
@@ -3613,7 +3616,7 @@ private:
                 const int fallback_threshold =
                     adapter_thresholds::fallback_max_edit_distance(seq.length());
                 const bool use_fallback_threshold =
-                    chance.n_chance < adapter_thresholds::kMinMisalignmentObservations ||
+                    chance.n_chance < adapter_thresholds::min_misalignment_observations ||
                     !std::isfinite(mean) ||
                     mean < 1.0;
                 if (use_fallback_threshold) {

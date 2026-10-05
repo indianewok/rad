@@ -83,7 +83,6 @@
 #include "misc_utils.hpp"
 #include "io_streaming.hpp"
 #include "barcode_correction.hpp"
-#include "adapter_thresholds.hpp"
 #include "read_layout.hpp"
 #include "sigstring.hpp"
 #include "whitelist_generator.hpp"

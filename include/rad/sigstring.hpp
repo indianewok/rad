@@ -398,14 +398,8 @@ public:
                 expected_end = target.size();
         }
 
-        // Optional search window [search_lo, search_hi] (1-based, inclusive; --concat-hmm
-        // check regions). Positions stay in target coordinates. The defaults search the
-        // whole target exactly as before. allow_ssw=false: Edlib only (no SSW fallback).
-        // target_at_read_start / target_at_read_end: the target's first / last base is the
-        // PHYSICAL end of the sequenced read. Both are true for a whole read (always with the
-        // flag off); a --concat-hmm piece cut out of a split read passes false for an edge
-        // that is an HMM cut, so the SSW read-end clipping rule below never takes a cut for a
-        // read end.
+        // Search window [search_lo, search_hi], 1-based inclusive; positions stay in target coordinates.
+        // target_at_read_start / _end: false when that target edge is an HMM cut, not a physical read end.
         const bool windowed = search_lo > 1 || search_hi >= 0;
         const int win_off = windowed ? std::max(0, search_lo - 1) : 0;
         const int win_end = (search_hi < 0 || search_hi > static_cast<int>(target.size()))
@@ -490,8 +484,6 @@ public:
             }
         }
         if (!allow_ssw) {
-            // Edlib only (HMM FULL check): several candidates in the window -> the one
-            // nearest the window centre.
             if (!candidates.empty()) {
                 const double centre = win_off + 1 + (win_len - 1) / 2.0;
                 auto dist = [centre](const std::pair<int,int>& c) {
@@ -581,39 +573,23 @@ public:
                 alignment.query_clip_right = static_cast<int>(query.size()) - 1 - sswAlign.ref_end;
                 alignment.ref_begin = sswAlign.ref_begin;
                 alignment.ref_end = sswAlign.ref_end;
-                // Missing adapter bases are explainable by truncation only near
-                // the corresponding physical read end. An internal local hit
-                // must not get free adapter-end clipping and become a trimming
-                // boundary. Full-query matches are already checked by Edlib;
-                // Allow a few noisy terminal bases independently of the edit
-                // budget, so permissive calibration cannot widen this window.
+                // Clipped adapter bases are free only within read_end_slack of a physical read end.
                 constexpr int read_end_slack = 3;
-                // Distances are taken in target coordinates (win_off is 0 without a search
-                // window) and count only against a target edge that is a physical read end.
                 const bool clipping_at_read_ends =
                     (sswAlign.ref_begin == 0 ||
                      (target_at_read_start && win_off + sswAlign.query_begin <= read_end_slack)) &&
                     (sswAlign.ref_end == static_cast<int>(query.size()) - 1 ||
                      (target_at_read_end &&
                       static_cast<int>(target.size()) - 1 - (win_off + sswAlign.query_end) <= read_end_slack));
-                // --concat-hmm windowed calls (align_static_in_windows, MISSING rules) keep the
-                // window's own clipped-hit rule, applied by the caller to query_clip_left /
-                // query_clip_right (ref_begin / ref_end): there the HMM names the window and a
-                // window edge is never treated as a read end. Whole-target calls (windowed is
-                // false: always with the flag off) use the read-end rule and the re-verification
-                // below.
+                // Windowed calls: the caller applies its own clipped-hit rule.
                 const bool read_end_rule = !windowed;
                 alignment.success = alignment.edit_distance <= max_edit_distance &&
                     (clipping_at_read_ends || !read_end_rule);
                 alignment.cigar = sswAlign.cigar_string;
                 alignment.seq = target.substr(ssw_start - 1, ssw_end - ssw_start + 1);
                 if (read_end_rule && !clipping_at_read_ends) {
-                    // An internal local match may still represent an adapter
-                    // with genuine end deletions. Verify the entire adapter
-                    // against this same interval, charging all missing bases
-                    // to the existing edit budget. Keeping the interval avoids
-                    // consuming adjacent UMI/barcode bases merely to complete
-                    // a local alignment with a different endpoint.
+                    // Internal hit: verify the whole adapter on the same interval, missing bases
+                    // charged to the same edit budget (the interval must not grow into a barcode/UMI).
                     auto verified = edlibAlign(query_to_use.c_str(), query_to_use.size(),
                         alignment.seq.c_str(), alignment.seq.size(),
                         edlibNewAlignConfig(max_edit_distance, EDLIB_MODE_NW,
@@ -740,11 +716,8 @@ public:
     }
 
 /**
- * @brief Read-end anchored alignment of a truncated adapter (--concat-hmm TRUNCATED_AT_READ_END).
- * at_3prime: the largest adapter prefix adapter[0:t) whose Edlib HW alignment on the last t+4 bases
- * has ED <= max(1, t/6) and ends <= 2 bp from the read end; otherwise the largest suffix
- * adapter[m-t:m) starting <= 2 bp from the read start. Only t >= min_keep is accepted.
- * Positions are 1-based in target coordinates; query_complete only for t == m.
+ * @brief Longest adapter prefix ending at the read end (at_3prime) or suffix starting at the read start.
+ * @return 1-based positions in target coordinates
  */
     static_alignments align_read_end_fragment(const std::string& adapter, const std::string& target,
                                               bool at_3prime, int max_keep = -1, int min_keep = 9) const {
@@ -791,11 +764,9 @@ public:
     }
 
 /**
- * @brief Degraded / truncated adapter confirmed as a fragment (--concat-hmm PARTIAL or TRUNCATED
- * windows): a prefix adapter[0:t) (prefix=true) or suffix adapter[m-t:m) with an Edlib HW hit of
- * ED <= max(1, t/8) (strict: exact below 20 nt, else 1 edit) inside the 1-based inclusive window
- * [lo, hi], for t from min(m-1, max_keep) down to min_keep, keeping the best t - 3*ED.
- * Positions are 1-based in target coordinates; query_complete is false.
+ * @brief Best adapter prefix (prefix=true) or suffix fragment inside the 1-based inclusive window [lo, hi],
+ * scored t - 3*ED.
+ * @return 1-based positions in target coordinates; query_complete is false
  */
     static_alignments align_adapter_fragment(const std::string& adapter, const std::string& target, int lo, int hi,
                                              bool prefix, int min_keep = 12, int max_keep = -1, bool strict = false) const {
@@ -809,16 +780,15 @@ public:
             {'A','a'}, {'C','c'}, {'T','t'}, {'G','g'},
             {'A','x'}, {'C','x'}, {'T','x'}, {'G','x'},
             {'N','A'}, {'N','C'}, {'N','T'}, {'N','G'}, {'N','x'}};
-        // every t passing ED <= max(1, t/8); keep the best t - 3*ED (ties: longer), as the HMM scores pieces
         int best_sc = -(1 << 30);
         for (int t = std::min({m - 1, span, max_keep > 0 ? max_keep : m - 1}); t >= min_keep; --t) {
-            const int k = strict ? (t >= 20 ? 1 : 0) : std::max(1, t / 8);  // strict: exact below 20 nt
-            if (t <= best_sc) break;  // even an exact match of t bp cannot beat the best any more
+            const int k = strict ? (t >= 20 ? 1 : 0) : std::max(1, t / 8);
+            if (t <= best_sc) break;  // no shorter t can beat the best score
             const char* q = adapter.c_str() + (prefix ? 0 : m - t);
             EdlibAlignResult r = edlibAlign(q, t, target.c_str() + off, span,
                                             edlibNewAlignConfig(k, EDLIB_MODE_HW, EDLIB_TASK_LOC, eq, 13));
             if (r.status == EDLIB_STATUS_OK && r.editDistance >= 0 && r.numLocations > 0 && t - 3 * r.editDistance > best_sc) {
-                int best = 0;  // prefix: leftmost start (inward edge); suffix: rightmost end
+                int best = 0;  // the hit at the inward edge
                 for (int i = 1; i < r.numLocations; ++i)
                     if (prefix ? r.startLocations[i] < r.startLocations[best] : r.endLocations[i] > r.endLocations[best]) best = i;
                 const int s0 = off + r.startLocations[best], e0 = off + r.endLocations[best];
@@ -844,27 +814,15 @@ public:
  */
 namespace barcode_correction {
     /**
-     * @brief Where the whitelist lookup placed the barcode inside the expanded window of `correct_barcode`
-     * Indices are 0-based in the ORIENTED window (layout direction:
-     * primer side first, UMI side last; the window of a reverse element is reverse-complemented first).
-     *
-     * kind: `unknown`  the lookup gives no position (a mutation alias of a shifted k-mer);
-     *       `window`   the match was decided on the layout window itself (exact or alias match of the window 16-mer,
-     *                  seed shortlist): the barcode position stays where the layout put it;
-     *       `located`  one best end is known: an exact copy of the corrected barcode at one place in the window, or the
-     *                  end column of the Myers match of the corrected barcode in the window (`bit_partial_match`);
-     *       `tie`      two or more equally good ends (a second exact copy, or an edit at the barcode's last base);
-     *       `clipped`  the Myers match ends at the last column of the window with at least one edit: the barcode may
-     *                  continue beyond the window, so its end is not known.
-     * shift: for `located`, the located end minus the end of the layout window (positive = toward the UMI).
-     * Nothing moves unless kind == located and shift != 0.
+     * @brief Where the whitelist lookup placed the barcode in the expanded window of `correct_barcode`.
+     * Indices are 0-based in the oriented window: primer side first, UMI side last.
      */
     struct bc_position {
         enum kind_t : uint8_t { unknown = 0, window = 1, located = 2, tie = 3, clipped = 4 };
         kind_t kind = unknown;
-        int end = -1;    // oriented index of the last barcode base in the expanded window (kind located / tie)
-        int n_end = 0;   // number of equally good ends (located: 1; tie: >= 2)
-        int shift = 0;   // kind located: end - end of the layout window
+        int end = -1;    // index of the last barcode base
+        int n_end = 0;   // number of equally good ends
+        int shift = 0;   // located: end minus the layout window end (positive = toward the UMI)
 
         void set_from_match(int match_end, int match_n_end) {
             end = match_end;
@@ -873,14 +831,10 @@ namespace barcode_correction {
         }
     };
 
-    /// Half-width of the expanded window around the layout barcode position that correct_barcode searches.
-    /// Hard-coded (today's value; also the edit distance of the global-list checks that share it).
+    /// Half-width of the expanded barcode window; also the edit distance of the global-list checks.
     constexpr int expanded_window_pad = 4;
 
-    /// bc_position of the barcode a check chose: the Myers match of `winner` in `query` evaluated once more, this time
-    /// keeping the column of its minimum (one 16-in-24 pass per corrected barcode; the whitelist scans themselves are
-    /// unchanged). Only when the query is the longer sequence (the expanded window), because the match end is
-    /// reported in the longer sequence.
+    /// The match end is reported in the longer sequence, so only a query longer than `winner` gives a position.
     inline void locate_winner(bc_position* pos, const int64_seq& query, const int64_seq& winner, int max_dist) {
         if (!pos || query.length <= winner.length) return;
         int match_end = -1, match_n = 0;
@@ -1159,9 +1113,7 @@ namespace barcode_correction {
         int max_dist,bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr,
         bc_position* pos = nullptr
     ) {
-        // Filter in front of the comparison: with the true whitelist and a cap
-        // that its part table covers, only the barcodes that share a part with the window are compared. The match set
-        // is the one of the loop over every entry below, which every other case keeps.
+        // Part-table prefilter: gives the same match set as the full loop below.
         const whitelist::wl_entry::part_idx* parts = nullptr;
         if (whitelist_type == "true" && wl->true_parts.covers(max_dist, wl->true_bcs.unique_val_size())) {
             parts = &wl->true_parts;
@@ -1351,9 +1303,7 @@ namespace barcode_correction {
         const std::string& mode, const whitelist::wl_entry& wl, bool verbose, int max_dist,
         bc_position* pos = nullptr
     ) {
-    // Position bookkeeping (bc_position): a direct k-mer hit carries no position here (the exact copy is found by
-    // correct_barcode from the k-mer offsets); a seed-shortlist hit is a match of the window itself; the exhaustive
-    // step keeps the end column of its Myers match.
+    // A direct k-mer hit sets no position here: correct_barcode finds it from the k-mer offsets.
     if (pos) *pos = bc_position{};
 
     if (verbose) {
@@ -1504,18 +1454,15 @@ namespace barcode_correction {
     return std::nullopt;
 }
 /**
- * @brief Whitelist lookup of a barcode (the body of correct_barcode): the layout window, its mutation aliases, the
- * k-mers of the expanded window and the mutations of the window, against the global and true whitelists
+ * @brief Whitelist lookup of a barcode (the body of correct_barcode)
  * @param elem ``const seq_element&`` Sequence element containing barcode information
  * @param layout ``const ReadLayout&`` Read layout containing whitelist mappings
  * @param full_read ``const read_streaming::sequence&`` Full read sequence
- * @param expanded_seq ``const std::string&`` the read around the layout window (+- expanded_window_pad), already
- *        reverse-complemented for a reverse element (see correct_barcode)
+ * @param expanded_seq ``const std::string&`` oriented expanded window (see correct_barcode)
  * @param verbose ``bool`` Whether to print verbose output
  * @param mut_dist ``int`` Maximum allowed edit distance for mutation checks
  * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive")
- * @param pos optional out: where the lookup placed the barcode (bc_position); `window` for every match decided on
- *        the layout window itself, the Myers match end for the exhaustive and mutation steps
+ * @param pos optional out: where the lookup placed the barcode
  * @return ``std::optional<int64_seq>`` Corrected barcode sequence if found, otherwise std::nullopt
  */
     std::optional<int64_seq> correct_barcode_lookup(const seq_element& elem,  const ReadLayout& layout,
@@ -1780,7 +1727,7 @@ namespace barcode_correction {
         }
         
         auto muts = mutation_tools::generate_mutated_barcodes(bc, mut_dist);
-        if (pos) *pos = bc_position{};  // the checks below keep the Myers end of their match in the expanded window
+        if (pos) *pos = bc_position{};
         if(mode == "defensive"){
             auto global_result = check_against_wl(exp_bc, muts, "global", max_dist, verbose, mode, &wl, pos);
             if(global_result.has_value()){
@@ -1842,20 +1789,8 @@ namespace barcode_correction {
  * @param verbose ``bool`` Whether to print verbose output
  * @param mut_dist ``int`` Maximum allowed edit distance for mutation checks
  * @param mode ``std::string`` Barcode correction mode ("defensive" or "offensive")
- * @param pos optional out: where the corrected barcode lies in the expanded window (bc_position), with `shift` = its
- *        end minus the end of the layout window when one position is known. Without it the lookup runs as before.
+ * @param pos optional out: where the corrected barcode lies in the oriented expanded window
  * @return ``std::optional<int64_seq>`` Corrected barcode sequence if found, otherwise std::nullopt
- *
- * The expanded window is the read from `expanded_window_pad` bases before the layout window to as many after it,
- * reverse-complemented for a reverse element, so that the primer side comes first and the UMI side last. The lookup
- * (correct_barcode_lookup) is unchanged. With `pos`, the position comes from what the lookup already computed:
- *   1. an exact copy of the corrected barcode among the window k-mers (the k-mers kmer_fuzzy_search builds, compared by
- *      their 2-bit code: integer comparisons, no lookup); one copy -> located there, two or more -> tie;
- *   2. otherwise the end column of the Myers match of the corrected barcode in the window (exhaustive and mutation
- *      steps, bit_partial_match); one best end -> located, several -> tie; an end at the window's last column ->
- *      clipped (the barcode may continue beyond the window);
- *   3. otherwise `window` (the match was decided on the layout window itself) or `unknown` (a mutation alias of a
- *      shifted k-mer: no position).
  */
     std::optional<int64_seq> correct_barcode(const seq_element& elem,  const ReadLayout& layout,
         const read_streaming::sequence& full_read,  bool verbose, int mut_dist, std::string mode,
@@ -1873,7 +1808,7 @@ namespace barcode_correction {
         auto result = correct_barcode_lookup(elem, layout, full_read, expanded_seq, verbose, mut_dist, mode, pos);
         if (!pos || !result.has_value()) return result;
 
-        // 1. exact copies of the corrected barcode in the oriented window (k-mer offsets)
+        // an exact copy of the barcode in the window overrides the lookup's position
         int64_seq exp_bc;
         exp_bc.sequence_to_bits(expanded_seq);
         const int W = exp_bc.length;
@@ -1892,12 +1827,10 @@ namespace barcode_correction {
             if (copies >= 1) {
                 pos->set_from_match(copy_end, copies);
             } else if (pos->kind == bc_position::located && pos->end == W - 1) {
-                // 2. an inexact Myers match that ends at the window's last column: the barcode may run on beyond the
-                // window (it lies more than expanded_window_pad bases from the layout window), so the end is not known
+                // inexact match at the window's last column: the barcode may continue past it
                 pos->kind = bc_position::clipped;
             }
         }
-        // 2. / 3. are what the lookup left in pos
         if (pos->kind == bc_position::located) {
             const int window_first = reverse ? (win_hi - elem.position.second) : (elem.position.first - win_lo);
             const int window_last = window_first + (elem.position.second - elem.position.first);
@@ -1907,11 +1840,7 @@ namespace barcode_correction {
     }
 };
 
-/**
- * @brief Run counters of the barcode position taken from the whitelist match:
- * single-barcode corrections by what the lookup said about the
- * barcode's place in the expanded window. Reset by sigalign, copied into sigalign_run_stats at its end.
- */
+// Run counters of single-barcode position outcomes; reset by sigalign.
 namespace barcode_position_stats {
 inline std::atomic<size_t> moved{0}, moved_forward{0}, moved_reverse{0}, in_place{0}, window{0}, unknown{0}, tie{0},
     clipped{0}, out_of_read{0};
@@ -1931,10 +1860,8 @@ struct sigalign_run_stats {
     double process_time_seconds = 0.0;
     double output_staging_time_seconds = 0.0;
     double overhead_time_seconds = 0.0;
-    // barcode position from the whitelist match (barcode_position_stats): single-barcode corrections by outcome
     size_t bc_pos_moved = 0, bc_pos_moved_forward = 0, bc_pos_moved_reverse = 0, bc_pos_in_place = 0, bc_pos_window = 0,
            bc_pos_unknown = 0, bc_pos_tie = 0, bc_pos_clipped = 0, bc_pos_out_of_read = 0;
-    // --concat-hmm branch counts (reported only when enabled)
     bool concat_hmm_enabled = false;
     size_t hmm_reads = 0, hmm_single = 0, hmm_split = 0, hmm_children = 0, hmm_children_full_search = 0,
            hmm_same_molecule = 0;
@@ -1943,23 +1870,21 @@ struct sigalign_run_stats {
     size_t hmm_spacer_retry = 0, hmm_spacer_retry_ok = 0, hmm_fragment_ok = 0, hmm_read_end_ok = 0;
     bool hmm_abstain_legacy = false;
     size_t hmm_drop_abstain = 0, hmm_drop_too_many = 0, hmm_drop_d_reads = 0, hmm_drop_d_children = 0;
-    size_t hmm_d_kept_left = 0, hmm_d_kept_right = 0, hmm_d_split = 0;  // D strand rule outcomes (reads and children)
+    size_t hmm_d_kept_left = 0, hmm_d_kept_right = 0, hmm_d_split = 0;
     size_t hmm_fold_read_start = 0, hmm_fold_read_end = 0, hmm_partner_rejected = 0, hmm_retry_from_partner = 0;
-    // POLICY_ROUND.md round 3
-    size_t hmm_art_reads = 0, hmm_pieces = 0, hmm_trim_keep_F = 0, hmm_trim_keep_R = 0;  // P7
-    size_t hmm_both_pass_dropped = 0, hmm_duplet_named = 0;                               // P7 safety, P8
-    size_t hmm_clip_hits = 0, hmm_two_unit_clip_dropped = 0;  // REBASE.md 3.1: clipped full-search hits kept as piece-rule evidence
-    size_t hmm_junctions_abstained = 0, hmm_pieces_suppressed = 0, hmm_drop_unresolved = 0;  // P11
-    size_t hmm_cut_kind[6] = {0, 0, 0, 0, 0, 0};                                            // P9 / P12: cuts by placement
+    size_t hmm_art_reads = 0, hmm_pieces = 0, hmm_trim_keep_F = 0, hmm_trim_keep_R = 0;
+    size_t hmm_both_pass_dropped = 0, hmm_duplet_named = 0;
+    size_t hmm_clip_hits = 0, hmm_two_unit_clip_dropped = 0;
+    size_t hmm_junctions_abstained = 0, hmm_pieces_suppressed = 0, hmm_drop_unresolved = 0;
+    size_t hmm_cut_kind[6] = {0, 0, 0, 0, 0, 0};
     size_t hmm_win[4] = {0, 0, 0, 0}, hmm_win_ok[4] = {0, 0, 0, 0};  // per concat_hmm::Status
 };
 
 #ifdef RAD_STAGE_TIMERS
-// Compile-time-only per-stage timers (-DRAD_STAGE_TIMERS) for benchmarking; not in normal builds.
 namespace rad_stage_timers {
 inline std::atomic<unsigned long long> read_ns{0}, hmm_ns{0}, windowed_static_ns{0}, legacy_static_ns{0}, reads{0};
 inline std::atomic<unsigned long long> variable_ns{0}, filter_ns{0}, molecules{0}, molecules_passed{0};
-// filter time per molecule outcome: [path: 0 = --concat-hmm route, 1 = existing path][0 passed, 1 barcode correction failed, 2 other]
+// [0 HMM route, 1 default path][0 passed, 1 barcode correction failed, 2 other]
 inline std::atomic<unsigned long long> fb_ns[2][3]{}, fb_n[2][3]{};
 struct scope {
     std::atomic<unsigned long long>& acc;
@@ -1983,15 +1908,11 @@ struct static_segment {
     bool ambiguous = false;
 };
 
-// ---------------------------------------------------------------------------
-// --concat-hmm (default off): HMM-guided static alignment. Per read, or per child
-// of a split read, concat_hmm::segment() names the strand, the static elements
-// expected there and a window + expected status for each (its check regions);
-// sigalign_static then aligns only those elements, only inside their windows.
-// ---------------------------------------------------------------------------
+// --concat-hmm: concat_hmm::segment() names the strand and the expected static elements of each
+// read or child, with a window and status for each; sigalign_static aligns only inside these windows.
 struct static_check_window {
     std::string class_id;
-    int lo = 1, hi = 0;  // 1-based inclusive window in the (child) read
+    int lo = 1, hi = 0;  // 1-based inclusive, child coordinates
     concat_hmm::Status status = concat_hmm::Status::MISSING_EXPECTED;
     int retained_from = -1, retained_to = -1, edits = -1;
 };
@@ -1999,89 +1920,79 @@ struct static_check_window {
 // Layout facts used by the windowed aligners, built once per run.
 struct concat_elem_info {
     int m = 0;                   // adapter length
-    bool left_outward = false;   // no payload variable before it (its 5' edge faces a boundary)
+    bool left_outward = false;   // no payload variable before it
     bool right_outward = false;  // no payload variable after it
-    int k_full = 4;              // FULL: Edlib k (anchor grade, <= 4)
-    int k_missing = 5;           // MISSING_EXPECTED: full-length cap (<= 5, +1 only with layout support)
-    std::string poly_id;         // same-strand poly tail joined to it by fixed-length spacers only
+    int k_full = 4;
+    int k_missing = 5;
+    std::string poly_id;         // poly tail joined by fixed-length spacers only
     int poly_gap_lo = 0, poly_gap_hi = -1;
-    bool poly_after = true;      // the poly tail follows the adapter (else precedes it)
-    std::string partner_id;      // same-strand adapter joined to it by fixed-length spacers only (10x 5' forw_primer <26> tso)
+    bool poly_after = true;
+    std::string partner_id;      // adapter joined by fixed-length spacers only
     int partner_gap_lo = 0, partner_gap_hi = -1;
-    bool partner_after = true;   // the partner follows the adapter (else precedes it)
-    bool bc_outer = false;       // opens a barcode block that partner_id closes (10x 5' forw_primer, rc_forw_primer; P6)
+    bool partner_after = true;
+    bool bc_outer = false;       // opens a barcode block that partner_id closes
 };
 
 struct concat_hmm_counters {
     std::atomic<size_t> reads{0}, single{0}, split{0}, children{0}, children_full_search{0}, same_molecule{0};
     std::atomic<size_t> legacy_guard{0}, legacy_k0{0}, legacy_abstain{0}, legacy_artifact{0}, legacy_too_many{0};
-    std::atomic<size_t> win[4]{}, win_ok[4]{};  // check windows per expected status / confirmed by alignment
-    std::atomic<size_t> full_as_missing{0};     // FULL not confirmed at k_full, accepted by the MISSING rules
-    std::atomic<size_t> spacer_retry{0}, spacer_retry_ok{0};  // barcode-side retries at the spacer offset of a confirmed partner
-    std::atomic<size_t> fragment_ok{0};         // degraded closers / openers confirmed as a prefix / suffix fragment
-    std::atomic<size_t> read_end_ok{0};         // barcode-side adapters confirmed because their partner ran off the read end
-    // policies (POLICY_ROUND.md): reads / children written without any record
-    std::atomic<size_t> drop_abstain{0}, drop_too_many{0};  // P1: abstained / k-capped reads (default policy)
-    std::atomic<size_t> drop_d_reads{0}, drop_d_children{0};  // 10x 5'-like D constructs (two barcode units) with no clear cDNA direction
-    // D strand rule (concat_hmm::SEG_D_KEPT / SEG_D_SPLIT): D constructs (whole reads and children)
-    // kept at the unit at the cDNA 5' end (left = forward, right = reverse), or split at the cDNA strand change
+    std::atomic<size_t> win[4]{}, win_ok[4]{};  // per concat_hmm::Status
+    std::atomic<size_t> full_as_missing{0};
+    std::atomic<size_t> spacer_retry{0}, spacer_retry_ok{0};
+    std::atomic<size_t> fragment_ok{0};
+    std::atomic<size_t> read_end_ok{0};
+    std::atomic<size_t> drop_abstain{0}, drop_too_many{0};
+    std::atomic<size_t> drop_d_reads{0}, drop_d_children{0};
     std::atomic<size_t> d_kept_left{0}, d_kept_right{0}, d_split{0};
-    std::atomic<size_t> fold_read_start{0}, fold_read_end{0};  // P3: read elements placed at a fold-back child boundary
-    std::atomic<size_t> partner_rejected{0};    // P5: barcode blocks of full-search children rejected (partner not at the spacer offset)
-    std::atomic<size_t> retry_from_partner{0};  // P6: retry-only outer barcode-side primers re-anchored at the partner (barcode / UMI moved)
-    // POLICY_ROUND.md round 3: P7 trim-and-keep, P8 naming, P11 junction-level abstain, P9 / P12 cut placement
-    std::atomic<size_t> art_reads{0};           // k = 1 T / single-primer-end reads handled by the piece rule (no longer the existing path)
-    std::atomic<size_t> pieces{0};              // non-plain pieces examined (k = 1 reads + children)
-    std::atomic<size_t> trim_keep_F{0}, trim_keep_R{0};  // P7: bare barcode-adjacent primer trimmed, piece kept as F / R
-    std::atomic<size_t> both_pass_dropped{0};   // a piece with two barcode units whose both directions passed: no record (never double-count)
-    // REBASE.md 3.1 (production clipping rule inside full-search pieces)
-    std::atomic<size_t> clip_hits{0};           // SSW hits within the local edit budget that the production rule did not accept: evidence only
-    std::atomic<size_t> two_unit_clip_dropped{0};  // a piece with two barcode units (the other strand's complete) whose record would hold such a hit inside its read element: no record
-    std::atomic<size_t> duplet_named{0};        // P8: reads whose one F + one R pieces were named <id>-F-CT / <id>-R-CT
-    std::atomic<size_t> junctions_abstained{0}; // P11: junctions not located confidently (no split there: one piece kept)
-    std::atomic<size_t> pieces_suppressed{0};   // P11: pieces next to such a junction written without a record
-    std::atomic<size_t> drop_unresolved{0};     // P11: reads where no piece next to an abstained junction had a barcode unit (nothing resolvable)
-    std::atomic<size_t> cut_kind[6]{};          // cuts by placement (concat_hmm CUT_*: both adapters, one adapter, geometry, midpoint, fold-back, strand flip)
+    std::atomic<size_t> fold_read_start{0}, fold_read_end{0};
+    std::atomic<size_t> partner_rejected{0};
+    std::atomic<size_t> retry_from_partner{0};
+    std::atomic<size_t> art_reads{0};
+    std::atomic<size_t> pieces{0};
+    std::atomic<size_t> trim_keep_F{0}, trim_keep_R{0};
+    std::atomic<size_t> both_pass_dropped{0};
+    std::atomic<size_t> clip_hits{0};
+    std::atomic<size_t> two_unit_clip_dropped{0};
+    std::atomic<size_t> duplet_named{0};
+    std::atomic<size_t> junctions_abstained{0};
+    std::atomic<size_t> pieces_suppressed{0};
+    std::atomic<size_t> drop_unresolved{0};
+    std::atomic<size_t> cut_kind[6]{};          // per concat_hmm CUT_* kind
 };
 
-// A barcode block of the layout (P5): barcode / UMI spacers between an outer adapter (no payload on its far side,
-// e.g. 10x 5' forw_primer, rc_forw_primer; VisiumHD forw_primer, rc_forw_primer) and the inner element joined to it by
-// fixed-length spacers only (10x 5' tso / rc_tso; a poly tail where the layout has no inner adapter, VisiumHD).
+// Barcode / UMI spacers between an outer adapter (no payload on its far side, e.g. 10x 5' forw_primer) and the
+// inner element joined to it by fixed-length spacers only (10x 5' tso; a poly tail on VisiumHD).
 struct concat_bc_block {
-    std::string outer_id, inner_id;      // class_ids (same strand)
-    bool inner_after = true;             // the inner element follows the outer one in read coordinates
-    int gap_lo = 0, gap_hi = -1;         // layout spacer length between them (sum of length candidates)
-    std::vector<std::string> barcode_ids;  // barcode-class variables inside the block
+    std::string outer_id, inner_id;
+    bool inner_after = true;
+    int gap_lo = 0, gap_hi = -1;         // layout spacer length between them
+    std::vector<std::string> barcode_ids;
 };
 
 struct concat_layout_info {
-    std::vector<concat_bc_block> bc_blocks;  // P5: barcode blocks with an outer adapter
-    std::unordered_map<std::string, concat_elem_info> elems;  // static (non-poly) elements by class_id
-    std::unordered_map<std::string, const ReadElement*> layout_by_id;  // static elements of the layout by class_id
-    std::vector<std::string> id_F, id_R;  // HMM spec element index -> RAD class_id on the F / R strand
+    std::vector<concat_bc_block> bc_blocks;
+    std::unordered_map<std::string, concat_elem_info> elems;
+    std::unordered_map<std::string, const ReadElement*> layout_by_id;
+    std::vector<std::string> id_F, id_R;  // HMM spec element index -> RAD class_id per strand
     int seen_pad = 6;
     concat_hmm_counters* ctr = nullptr;
 };
 
 struct static_restriction {
-    std::string direction;                     // the only strand aligned ("forward" / "reverse")
-    std::vector<static_check_window> windows;  // elements named by the HMM, with windows
+    std::string direction;
+    std::vector<static_check_window> windows;
     const concat_layout_info* info = nullptr;
-    bool read_start = true, read_end = true;   // the (child) read starts / ends at a physical read end, not at a cut
+    bool read_start = true, read_end = true;   // false at an HMM cut
 };
 
-// --concat-hmm: where a non-plain piece lies in its parent read (a whole k = 1 read: offset 0, the
-// read itself). Given to RAD's full static search inside the piece (sigalign_static without a
-// restriction), so that the SSW clipping rule and the junction exception judge "read end" and
-// "junction" on the parent read (an edge at an HMM cut is not a physical read end; the exact
-// counterpart of a clipped adapter may lie across the cut), and the refused hits are kept as evidence.
+// --concat-hmm: a piece's place in its parent read. Read ends and junction counterparts are judged
+// on the parent read, because a piece edge at an HMM cut is not a physical read end.
 struct static_piece_frame {
-    const std::string* parent_seq = nullptr;  // the whole sequenced read
+    const std::string* parent_seq = nullptr;
     int offset = 0;                           // 0-based start of the piece in the parent read
 };
 
-// A construct the layout describes directly: a main F / R template, not a barcode-less (T),
-// double-barcode (D) or single-primer-end artifact.
+// A main F / R template, not a T, D or single-primer-end artifact.
 inline bool concat_plain_construct(const concat_hmm::Segment& s) {
     return (s.strand == 'F' || s.strand == 'R') && !(s.flags & concat_hmm::SEG_ARTIFACT);
 }
@@ -2117,7 +2028,7 @@ inline concat_layout_info build_concat_layout_info(const ReadLayout& layout, con
             x.right_outward = !var_after;
             x.k_full = std::max(1, std::min(4, x.m * 4 / 22));
             x.k_missing = std::max(1, std::min(5, x.m * 5 / 22));
-            // walk outward over fixed-length variables (barcodes, UMIs) to the first poly tail or adapter
+            // walk outward over fixed-length variables to the first poly tail or adapter
             auto link = [&](int step, bool want_poly) {
                 int lo_sum = 0, hi_sum = 0;
                 for (int j = static_cast<int>(i) + step; j >= 0 && j < static_cast<int>(v.size()); j += step) {
@@ -2131,7 +2042,7 @@ inline concat_layout_info build_concat_layout_info(const ReadLayout& layout, con
                         return true;
                     }
                     if (o.type == "static" && !o.seq.empty() && o.global_class != "start" && o.global_class != "stop") {
-                        if (want_poly || j == static_cast<int>(i) + step) return false;  // an adjacent adapter is not a spacer partner
+                        if (want_poly || j == static_cast<int>(i) + step) return false;
                         x.partner_id = o.class_id;
                         x.partner_gap_lo = lo_sum;
                         x.partner_gap_hi = hi_sum;
@@ -2149,8 +2060,6 @@ inline concat_layout_info build_concat_layout_info(const ReadLayout& layout, con
             if (!link(+1, false)) link(-1, false);
             info.elems[e.class_id] = x;
             info.layout_by_id[e.class_id] = &e;
-            // P5: a barcode block opened by an outer adapter (no payload on its far side) and closed by the element
-            // joined to it by fixed-length spacers (an adapter, else a poly tail)
             const bool adapter_partner = !x.partner_id.empty();
             const std::string& inner = adapter_partner ? x.partner_id : x.poly_id;
             const bool after = adapter_partner ? x.partner_after : x.poly_after;
@@ -2166,14 +2075,13 @@ inline concat_layout_info build_concat_layout_info(const ReadLayout& layout, con
                     if (v[j]->type == "variable" && v[j]->global_class == "barcode") b.barcode_ids.push_back(v[j]->class_id);
                 }
                 if (!b.barcode_ids.empty()) {
-                    if (adapter_partner) info.elems[e.class_id].bc_outer = true;  // P6: only this adapter is re-anchored
+                    if (adapter_partner) info.elems[e.class_id].bc_outer = true;
                     info.bc_blocks.push_back(std::move(b));
                 }
             }
         }
     }
-    // HMM element index -> RAD class_id per strand (explicit reverse rows map to themselves;
-    // a forward-only row used for the R strand maps to its reverse-complement counterpart)
+    // a forward-only row maps to its reverse-complement counterpart on the R strand
     const auto& els = model.spec.elements;
     info.id_F.assign(els.size(), "");
     info.id_R.assign(els.size(), "");
@@ -2193,30 +2101,29 @@ inline concat_layout_info build_concat_layout_info(const ReadLayout& layout, con
     return info;
 }
 
-// --concat-hmm P7 / P9 (POLICY_ROUND.md, round 2). State of one layout barcode block (concat_bc_block) in a piece
-// after RAD's full static search; positions are 1-based inclusive in piece coordinates, -1 when absent.
+// --concat-hmm: a barcode block in a piece after the full static search. Positions are 1-based inclusive
+// in piece coordinates, -1 when absent.
 struct concat_bc_state {
     const concat_bc_block* block = nullptr;
-    std::string dir;                 // strand of the block (direction of its outer adapter)
-    int outer_s = -1, outer_e = -1;  // outer adapter (10x 5' forw_primer / rc_forw_primer)
-    int inner_s = -1, inner_e = -1;  // inner anchor (10x 5' tso / rc_tso; a poly tail on VisiumHD)
-    bool paired = false;             // inner aligned at the layout spacer offset from the outer (+-4 bp)
-    bool outer_clipped = false;      // the outer adapter is a clipped hit the production rule did not accept (evidence, not an element)
-    bool strict() const { return outer_s > 0 && inner_s > 0 && paired; }       // complete unit: outer + partner at the offset
-    bool usable() const { return inner_s > 0 && (outer_s <= 0 || paired); }    // P5 keeps its barcode
-    bool bare() const { return outer_s > 0 && !paired; }                       // a bare barcode-adjacent primer
+    std::string dir;
+    int outer_s = -1, outer_e = -1;
+    int inner_s = -1, inner_e = -1;
+    bool paired = false;             // inner at the layout spacer offset from the outer (+-4 bp)
+    bool outer_clipped = false;      // outer is a refused clipped hit: evidence, not an element
+    bool strict() const { return outer_s > 0 && inner_s > 0 && paired; }
+    bool usable() const { return inner_s > 0 && (outer_s <= 0 || paired); }
+    bool bare() const { return outer_s > 0 && !paired; }
     int rank() const { return strict() ? 3 : usable() ? 2 : bare() ? 1 : 0; }
 };
 
-// What the router does with a non-plain piece (a T / single-primer-end whole read or child; POLICY_ROUND.md round 3, P7).
+// What the router does with a T / single-primer-end piece.
 struct concat_piece_plan {
     enum kind_t { NORMAL, TRIM } kind = NORMAL;
-    std::string dir;                // the strand of the piece's (only) usable barcode unit ("forward" / "reverse"; empty: none or two)
-    int trim_lo = 0, trim_hi = 0;   // TRIM: the kept piece [trim_lo, trim_hi), 0-based in piece coordinates
-    bool no_double_count = false;   // NORMAL with two usable units: a "concatenate" outcome writes nothing
-    uint8_t clip_check = 0;         // NORMAL with two usable units, a refused (clipped) adapter hit and a complete unit on the other
-                                    // strand: no record whose read element holds the hit (bit0 forward records, bit1 reverse records)
-    const char* note = "";          // written to the debug sigstring trailer (HMM=...)
+    std::string dir;                // strand of the only usable barcode unit; empty: none or two
+    int trim_lo = 0, trim_hi = 0;   // TRIM: kept range, 0-based half-open, piece coordinates
+    bool no_double_count = false;
+    uint8_t clip_check = 0;         // see SigString::hmm_clip_check
+    const char* note = "";
 };
 
 /**
@@ -2241,26 +2148,21 @@ class SigString {
     std::string read_type;
     std::string additional_info;
     bool from_concatemer = false;
-    // --concat-hmm only (POLICY_ROUND.md); the defaults leave every existing path unchanged
-    uint8_t hmm_fold_edges = 0;   // P3: bit0 the child starts at a fold-back cut, bit1 it ends at one
-    uint8_t hmm_fold_used = 0;    // P3: the read element was placed at that child boundary (bit0 start, bit1 end)
-    std::string hmm_fold_dir;     // P3: strand of the child's construct ("forward" / "reverse")
-    std::vector<std::string> hmm_reject_barcodes;  // P5: barcode elements whose partner anchor was not confirmed
+    // --concat-hmm only; the defaults are inert on every other path
+    uint8_t hmm_fold_edges = 0;   // bit0 child starts at a fold-back cut, bit1 ends at one
+    uint8_t hmm_fold_used = 0;
+    std::string hmm_fold_dir;
+    std::vector<std::string> hmm_reject_barcodes;
     struct hmm_weak_ref { std::string id; std::pair<int, int> aligned, anchored; };
-    std::vector<hmm_weak_ref> hmm_weak_refs;  // P6: retry-only outer primers: aligned position, partner-anchored position
-    std::string hmm_note;         // P7 / P11: what the piece rule did with this molecule (debug sigstring trailer, HMM=...)
-    bool hmm_no_double_count = false;  // P7 safety: two barcode units: a "concatenate" outcome (both directions pass) writes nothing
-    // REBASE.md 3.1. RAD's full static search inside a non-plain piece: SSW hits that pass the local shape and edit
-    // checks but not the production clipping rule (missing adapter bases away from a physical read end, not
-    // re-verified end to end, no exact junction counterpart). They are never static elements: nothing is masked,
-    // extracted or placed from them. The piece rule reads them as evidence only (a bare barcode-side primer for
-    // P7 / P5; an adapter inside a piece with two barcode units), from the alignment the search already made.
+    std::vector<hmm_weak_ref> hmm_weak_refs;
+    std::string hmm_note;
+    bool hmm_no_double_count = false;
+    // SSW hits refused by the read-end clipping rule in a piece's full search: evidence only, never elements.
     struct hmm_clip_hit { std::string id; std::pair<int, int> pos; bool block_adapter = false; };
     std::vector<hmm_clip_hit> hmm_clip_hits;
-    uint8_t hmm_clip_check = 0;        // two barcode units, the other strand's complete: a record whose read element holds such a hit (outside
-                                       // the barcode blocks) is not written (bit0 forward records, bit1 reverse records)
-    bool hmm_edge_is_fold = true;      // set_fold_edges: P3 fold-back cut (true) or a P7 trimmed bare primer (false)
-    int hmm_parent_off = -1, hmm_parent_end = -1;  // P10: this molecule is read[parent_off, parent_end) of its parent (reporting only)
+    uint8_t hmm_clip_check = 0;        // do not write a record whose read element holds a clip hit (bit0 fwd, bit1 rev)
+    bool hmm_edge_is_fold = true;
+    int hmm_parent_off = -1, hmm_parent_end = -1;  // window in the parent read, 0-based half-open (reporting only)
 
 public:
     SigString(
@@ -2327,8 +2229,8 @@ public:
     void set_length(int length) { sequence_length = length; }
     void set_type(const std::string& type) { read_type = type; }
     void set_info(const std::string& info) { additional_info = info; }
-    void mark_concatemer() { from_concatemer = true; }  // child of a split read (-CT records)
-    // --concat-hmm P3: this child begins (ends) at a fold-back cut; its construct strand
+    void mark_concatemer() { from_concatemer = true; }
+    // --concat-hmm: the read element may start (end) at the child boundary
     void set_fold_edges(bool at_start, bool at_end, const std::string& dir, bool fold = true) {
         hmm_fold_edges = static_cast<uint8_t>((at_start ? 1 : 0) | (at_end ? 2 : 0));
         hmm_fold_dir = dir;
@@ -2336,9 +2238,7 @@ public:
     }
     uint8_t fold_boundary_used() const { return hmm_fold_used; }
     bool fold_edge_is_fold() const { return hmm_edge_is_fold; }
-    // --concat-hmm P10 (reporting only): the molecule's window in its parent read, 0-based half-open. to_sigstring()
-    // then prints element positions in parent coordinates and the virtual boundaries as seg_start / seg_stop. The
-    // mapping frame (seq_start / seq_stop, map_positions, FASTQ records) is untouched.
+    // --concat-hmm: debug sigstrings print in parent coordinates; the mapping frame and FASTQ records do not change.
     void set_parent_frame(int off, int end) { hmm_parent_off = off; hmm_parent_end = end; }
     int parent_offset() const { return hmm_parent_off; }
 
@@ -2412,9 +2312,8 @@ private:
     }
 
 /**
- * @brief --concat-hmm P3 helper for map_positions (POLICY_ROUND.md); inert unless the HMM route set hmm_fold_edges.
- * The read element of the child's construct strand, with neither of its references on that side placed, starts (ends)
- * at the child boundary, i.e. next to the strand's virtual start (stop) element. Returns -1 otherwise.
+ * @brief --concat-hmm: child-boundary position for a read element whose references on that side are not placed.
+ * @return the position next to the virtual start (stop) element, or -1
  */
     static bool hmm_ref_placed(const std::vector<const seq_element*>& ordered, const std::string& id) {
         if (id.empty()) return false;
@@ -2745,9 +2644,7 @@ private:
         }
     }
     
-    // --concat-hmm P3: a child that begins at a fold-back cut and has neither start reference of its read element
-    // (10x 5' FR_RF fold: the reverse half starts inside the cDNA, without rc_rev_primer / poly_t) lets the read
-    // element start at the child boundary. Nothing else ever takes this branch (hmm_fold_edges is 0).
+    // --concat-hmm: at a fold-back cut with no start reference, the read element starts at the child boundary.
     if (start_pos <= 0 && (hmm_fold_edges & 1))
         start_pos = hmm_fold_boundary(ref_pos.primary_start.ref_id, ref_pos.secondary_start.ref_id, ordered_elements, *var_it, true);
 
@@ -2991,7 +2888,7 @@ private:
         }
     }    
     
-    // --concat-hmm P3, mirror: a child that ends at a fold-back cut (its read element may end at the child end)
+    // --concat-hmm: mirror for the child end
     if (stop_pos <= 0 && (hmm_fold_edges & 2))
         stop_pos = hmm_fold_boundary(ref_pos.primary_stop.ref_id, ref_pos.secondary_stop.ref_id, ordered_elements, *var_it, false);
 
@@ -3079,11 +2976,10 @@ private:
 
 /**
  * @brief Filter out reads whose cDNA is shorter than --min-read-length
- * @param elems vector of references to `seq_element` objects, after mask_and_trim_elements: the read
- *        element's seq is the cDNA as written (poly tail and other overlapping elements removed)
+ * @param elems elements after mask_and_trim_elements (the read element holds the written cDNA)
  * @param layout `ReadLayout` object containing layout elements
- * @param min_read_length the limit; -1 = the summative expected length of the layout's elements
- * @return true if the cDNA length meets or exceeds the limit, false otherwise
+ * @param min_read_length the limit; -1 = the summed expected length of the layout's elements
+ * @return true if the cDNA length meets the limit
  */
     bool filter_short_reads(const std::vector<std::reference_wrapper<const seq_element>>& elems,
                             const ReadLayout& layout, int min_read_length = -1) const {
@@ -3337,13 +3233,7 @@ private:
         // Mask overlapping elements and trim reads
         mask_and_trim_elements(elements, read, verbose);
 
-        // Length test (--min-read-length) on the cDNA as it is written: the read
-        // element after every element of this direction that overlaps it (poly
-        // tail, adapter, barcode, UMI) is masked and removed. The test runs after
-        // the trim so that it counts the same thing on every route: the existing
-        // path, the --concat-hmm windows and the pieces of split reads. Before,
-        // it ran on the untrimmed read window, which holds the poly tail when
-        // the poly reference failed the order check of map_positions.
+        // After the trim, so the length test counts the written cDNA on every route.
         if (!filter_short_reads(elements, layout, min_read_length)) {
             filtered_because += direction + "_FILTERED_READ_LENGTH";
             set_info(filtered_because);
@@ -4116,7 +4006,6 @@ private:
             log_verbose("Processing barcode: " + elem.seq.value());
         }
 
-        // locate: a single (not joint) barcode also takes its position from the whitelist match
         barcode_correction::bc_position pos;
         auto correction_result = barcode_correction::correct_barcode(
             elem, layout, read, verbose, gen_mut, mode, locate ? &pos : nullptr
@@ -4135,19 +4024,10 @@ private:
     }
 
 /**
- * @brief Move a single barcode to where the whitelist match found it, and the elements chained to it by the position
- * map (the UMI) with it
- * @param elem the barcode element as it was before correction (layout position)
- * @param pos what correct_barcode found out about its place in the expanded window
- * @param layout the read layout (position map rules of the chained elements)
- * @param read the read (the chained elements' sequence and quality are extracted again)
- *
- * Nothing moves unless the position is `located` with a shift other than 0. A chained element is a variable element
- * of the same direction whose primary start and primary stop both reference this barcode (10x: umi =
- * barcode|stop+1 .. barcode|stop+10; rc_umi = rc_barcode|start-10 .. rc_barcode|start-1); it follows by the same
- * rule from the moved barcode position. The read element never moves (its sequence was extracted and masked before
- * correction). The barcode's sequence, its CR tag and its corrected flag are those of apply_barcode_correction. When
- * a new position leaves the read, nothing moves. Every outcome is counted in barcode_position_stats.
+ * @brief Move a single barcode to where the whitelist match found it, with the elements whose primary start and
+ * stop both reference it (the UMI). The read element never moves: it was extracted and masked before correction.
+ * @param elem the barcode element before correction (layout position)
+ * @param pos where correct_barcode located the barcode
  */
     void move_barcode_position(const seq_element& elem, const barcode_correction::bc_position& pos,
         const ReadLayout& layout, const read_streaming::sequence& read, bool verbose
@@ -4171,7 +4051,7 @@ private:
         }
 
         const bool reverse = elem.direction == "reverse";
-        // read coordinates: on the reverse strand the UMI side is at lower coordinates
+        // reverse strand: the UMI side is at lower read coordinates
         const int delta = reverse ? -pos.shift : pos.shift;
         const int read_len = static_cast<int>(read.seq.size());
         const std::pair<int, int> bc_pos{elem.position.first + delta, elem.position.second + delta};
@@ -4493,23 +4373,18 @@ public:
     int max_distance = -1;
     // Make a mutable copy of the read to mask aligned regions
     std::string mutable_seq = read.seq;
-    std::vector<const ReadElement*> deferred_polys;  // --concat-hmm only
-    std::vector<std::pair<const ReadElement*, static_check_window>> spacer_retries;  // --concat-hmm only
+    std::vector<const ReadElement*> deferred_polys;
+    std::vector<std::pair<const ReadElement*, static_check_window>> spacer_retries;
     size_t read_length = read.seq.length();
-    // A counterpart may be aligned later in layout order. Retain only local
-    // candidates that already met SSW's score/shape and local-edit checks;
-    // deferred validation never performs another alignment or widens a budget.
+    // Clipped hits wait for a counterpart that may align later; no new alignment, no wider budget.
     std::vector<std::pair<const ReadElement*, static_alignments>> clipped_pending;
-    // --concat-hmm piece of a split read: an edge at an HMM cut is not a physical read end.
-    // Without a piece frame (always with the flag off) the read is the whole sequenced read.
+    // A piece edge at an HMM cut is not a physical read end.
     const bool at_read_start = !piece || piece->offset == 0;
     const bool at_read_end = !piece || !piece->parent_seq ||
         piece->offset + read_length >= piece->parent_seq->size();
 
     for (auto it = static_range.first; it != static_range.second; ++it) {
-        // --concat-hmm: one strand, only the elements the HMM named, only in their windows.
-        // start/stop stay virtual boundaries for both strands (below). Poly tails go last so a
-        // run cannot swallow (mask) the edge of an adapter the HMM placed next to it.
+        // --concat-hmm: poly tails go last so a run cannot mask the edge of an adapter next to it.
         if (restrict_to && it->global_class != "start" && it->global_class != "stop") {
             if (it->direction == restrict_to->direction) {
                 if (it->global_class == "poly_tail") deferred_polys.push_back(&*it);
@@ -4656,9 +4531,7 @@ public:
             ((result.query_clip_left > 0) != (result.query_clip_right > 0))) {
             clipped_pending.emplace_back(&*it, result);
         }
-        // --concat-hmm full search inside a non-plain piece (the only caller that gives a piece
-        // frame): the hit the clipping rule just refused stays available to the piece rule as
-        // evidence. It is not an element, nothing is masked, no further alignment is made.
+        // --concat-hmm piece: keep the refused hit as evidence only (not an element, not masked).
         if (piece && !result.success && result.edit_distance >= 0 &&
             result.edit_distance <= max_distance && result.positions.size() == 1) {
             hmm_clip_hits.push_back({it->class_id, result.positions.front(), false});
@@ -4729,15 +4602,8 @@ public:
                 continue;
             }
         }
-    // A clipped end can face a verified molecule junction just as it can face
-    // the physical read end. The represented end must remain intact. Require
-    // an exact full-query reverse-complement counterpart of this same layout
-    // class within the existing three-base slack; partial hits cannot support
-    // each other. This is legacy extraction evidence, never a new split anchor.
-    // (--concat-hmm: only the whole-target search fills clipped_pending; windowed
-    // alignment, restrict_to, never gets here. Inside a piece of a split read the
-    // counterpart may lie across the HMM cut: the same exact-copy test is then
-    // made on the parent read. The element stays inside the piece.)
+    // A clipped end may face a molecule junction: accept it only next to an exact full-length
+    // reverse-complement counterpart (extraction evidence only, never a split anchor).
     for (const auto& pending : clipped_pending) {
         const auto& element = *pending.first;
         const auto& result = pending.second;
@@ -4748,7 +4614,7 @@ public:
             element.direction, true, std::nullopt, result.seq);
         primary.query_complete = false;
         add_element(std::move(primary));
-        if (piece)  // --concat-hmm: accepted here, so no longer evidence only
+        if (piece)
             hmm_clip_hits.erase(std::remove_if(hmm_clip_hits.begin(), hmm_clip_hits.end(),
                 [&](const hmm_clip_hit& h) { return h.id == element.class_id; }), hmm_clip_hits.end());
         if (verbose) log_verbose("MOLECULAR_END_CLIP " + element.class_id + " " +
@@ -4770,8 +4636,7 @@ public:
         if (partial.query_complete || partial.positions.size() != 1 ||
             ((partial.query_clip_left > 0) == (partial.query_clip_right > 0)) ||
             element.seq.find_first_not_of("ACGTacgt") != std::string::npos) return false;
-        // Derive the outward edge from layout roles, not primer names. A
-        // missing end toward a barcode, UMI or insert remains unsupported.
+        // Only a missing end that faces away from all payload can be supported.
         auto outward_edge = [&](const ReadElement& adapter) {
             bool payload_left = false, payload_right = false;
             for (const auto& item : layout.by_order()) {
@@ -4806,11 +4671,7 @@ public:
         };
         for (const auto& hit : sig_elements) if (supports(hit)) return true;
         if (additional_hits) for (const auto& hit : *additional_hits) if (supports(hit)) return true;
-        // --concat-hmm piece of a split read: the counterpart of an adapter clipped at an HMM
-        // cut lies in the neighbouring piece and is never aligned in this one. The evidence is
-        // the same and is read off the parent read: an exact full-length copy of the
-        // counterpart, of a layout element with the opposite outward edge, 0-3 bases beyond
-        // the clipped end and reaching past this piece's edge.
+        // --concat-hmm piece: the counterpart may lie across the HMM cut, so test the parent read.
         if (piece && piece->parent_seq) {
             bool defined = false;
             for (const auto& item : layout.by_order()) {
@@ -4825,36 +4686,21 @@ public:
             const std::string& parent = *piece->parent_seq;
             const long len = static_cast<long>(counterpart.size());
             const long piece_lo = piece->offset;
-            const long piece_hi = piece_lo + static_cast<long>(read.seq.size());  // exclusive
+            const long piece_hi = piece_lo + static_cast<long>(read.seq.size());
             for (int gap = 0; defined && gap <= 3; ++gap) {
                 const long start = partial.query_clip_left > 0
                     ? piece_lo + (pos.first - 1) - gap - len
                     : piece_lo + pos.second + gap;
                 if (start < 0 || start + len > static_cast<long>(parent.size())) continue;
-                if (start >= piece_lo && start + len <= piece_hi) continue;  // inside the piece: judged above
+                if (start >= piece_lo && start + len <= piece_hi) continue;  // already tested above
                 if (parent.compare(static_cast<size_t>(start), counterpart.size(), counterpart) == 0) return true;
             }
         }
         return false;
     }
 
-    // --concat-hmm: aligns one static element of the HMM's strand inside the windows the HMM
-    // named for it (one per construct), with the aligner its expected status calls for
-    // (benchmarks/concat_hmm/partial_adapters/rad_ssw/RAD_SSW_AUDIT.md section 8):
-    //   FULL       Edlib k <= 4, no SSW; not confirmed -> MISSING_EXPECTED rules
-    //   PARTIAL    retained piece (>= 12 nt) whose missing edge faces a boundary -> Edlib of the
-    //              piece; otherwise MISSING_EXPECTED rules
-    //   TRUNCATED  read-end anchored prefix (3' end) / suffix (5' start), retained >= 9; only for
-    //              an adapter whose outward edge is that read end
-    //   MISSING    Edlib, then SSW, inside the window; full-length ED <= min(misalign_lower, 5),
-    //              one more edit only with layout support (poly tail at the spacer offset);
-    //              clipped SSW hits only >= 16 nt at <= 1 edit per 8 nt with the clipped edge outward
-    //   Then, for a window still unconfirmed: a degraded adapter that the HMM saw over its whole length
-    //   (PARTIAL 0..m) is tried as a prefix (closer) / suffix (opener) fragment whose lost part faces
-    //   outward (t >= 12, ED <= max(1, t/8)); a MISSING / PARTIAL window at the adapter's outward read
-    //   end gets the read-end fragment test; a barcode-side adapter (joined to a poly tail or another
-    //   adapter by fixed-length barcodes / UMIs) is queued for retry_at_spacer_offset.
-    //   poly tails: RAD's poly scan, keeping only runs that overlap the element's windows
+    // --concat-hmm: align one static element inside each HMM window for it, with the aligner its expected
+    // status calls for. Unconfirmed barcode-side adapters are queued for retry_at_spacer_offset.
     void align_static_in_windows(const ReadElement& elem, const read_streaming::sequence& read,
                                  std::string& mutable_seq, const static_restriction& rs,
                                  aligner_tools& aligner, bool verbose,
@@ -4867,7 +4713,6 @@ public:
             auto result = aligner.find_poly_tails(elem.seq, read.seq, 14);
             if (!result.success) return;
             for (auto positions : result.positions) {
-                // never overlap an adapter aligned above (masked 'X'); drop runs left < 12 bp
                 while (positions.first <= positions.second && mutable_seq[positions.first - 1] == 'X') ++positions.first;
                 while (positions.second >= positions.first && mutable_seq[positions.second - 1] == 'X') --positions.second;
                 if (positions.second - positions.first + 1 < 12) continue;
@@ -4903,14 +4748,8 @@ public:
             }
             return false;
         };
-        // Barcode-side safe zone at a junction (benchmarks/concat_hmm/final/FIXES_5P.md, fix 4): in a child whose
-        // barcode side faces a cut, a barcode-adjacent primer joined by fixed-length barcodes / UMIs to a partner adapter
-        // (10x 5' forw_primer <barcode umi> tso, rc_tso <umi barcode> rc_forw_primer) may not reach into that barcode
-        // block. When the HMM reported the partner FULL in this construct, every search of the primer is clamped to end
-        // at most 4 bp past the block edge the partner implies (forw_primer end <= tso.start - block + 4; rc_forw_primer
-        // start >= rc_tso.end + block - 4). Unclamped Edlib / SSW searches at fused junctions "find" phantom primers
-        // running into barcodes that start with the primer's AGATC(GG) prefix. At a physical read end the clamp is not
-        // applied (a real primer next to a block shortened by a deletion must stay acceptable there).
+        // At a cut (not a physical read end), the primer may reach at most 4 bp into the barcode block that a
+        // FULL partner implies.
         auto clamp_to_partner = [&](static_check_window& wc) {
             if (info.partner_id.empty() || (info.partner_after ? rs.read_start : rs.read_end)) return;
             int best = -1, bd = INT_MAX;
@@ -4931,7 +4770,7 @@ public:
             clamp_to_partner(w);
             const int st = static_cast<int>(w.status);
             if (ctr) ctr->win[st].fetch_add(1, std::memory_order_relaxed);
-            if (w.hi < w.lo) {  // no room left outside the barcode block
+            if (w.hi < w.lo) {
                 if (retry && w.status != Status::TRUNCATED_AT_READ_END && (!info.poly_id.empty() || !info.partner_id.empty()))
                     retry->push_back({&elem, w0});
                 continue;
@@ -4949,7 +4788,6 @@ public:
                 const int rt = w.retained_to < 0 ? m : std::min(m, w.retained_to);
                 whole_degraded = rf == 0 && rt == m;
                 const bool faces_boundary = (rf == 0 || info.left_outward) && (rt == m || info.right_outward);
-                // retained piece >= 10 nt (<= 1 edit up to 15 nt) whose lost edge faces outward
                 if (rt - rf >= 10 && rt - rf < m && faces_boundary) {
                     const int a = std::max(0, rf - 2), b = std::min(m, rt + 2);
                     hit = aligner.align_static_elements(elem.seq.substr(a, b - a), mutable_seq, verbose,
@@ -4960,7 +4798,7 @@ public:
                         is_fragment = true;
                     }
                 }
-                if (!hit.success) {  // short prefix / suffix at the adapter's outward read end
+                if (!hit.success) {
                     const bool at3 = w.hi >= read_length - 6;
                     const bool at5 = !at3 && w.lo <= 7;
                     if ((at3 && rf == 0 && info.right_outward) || (at5 && rt == m && info.left_outward)) {
@@ -4973,7 +4811,7 @@ public:
                 const bool at3 = w.hi >= read_length - 6;
                 const bool at5 = !at3 && w.lo <= 7;
                 if ((at3 && info.right_outward) || (at5 && info.left_outward)) {
-                    // a retained length seen in sequence bounds the search; a geometric one (edits -1) does not
+                    // only a retained length seen in sequence (edits >= 0) bounds the search
                     const int keep = (w.edits >= 0 && w.retained_from >= 0 && w.retained_to > w.retained_from)
                         ? w.retained_to - w.retained_from + 4 : -1;
                     hit = aligner.align_read_end_fragment(elem.seq, mutable_seq, at3, keep);
@@ -4992,9 +4830,7 @@ public:
                     const int len = hit.positions.front().second - hit.positions.front().first + 1;
                     const bool lclip = hit.ref_begin > 0;
                     const bool rclip = hit.ref_end >= 0 && hit.ref_end < m - 1;
-                    // where the HMM saw a degraded adapter (PARTIAL), an internal piece (both edges clipped) is allowed,
-                    // down to 12 nt at <= 1 edit (or >= 16 nt at <= 1 edit per 6 nt); elsewhere >= 16 nt at <= 1 edit
-                    // per 8 nt with the clipped edge outward
+                    // outside PARTIAL windows a clipped edge must face outward
                     const bool seen = w.status == Status::PARTIAL;
                     const int ed = hit.edit_distance;
                     const bool long_enough = seen ? ((len >= 12 && ed <= 1) || (len >= 16 && ed * 6 <= len))
@@ -5005,8 +4841,7 @@ public:
                 if (hit.success && w.status == Status::FULL && ctr)
                     ctr->full_as_missing.fetch_add(1, std::memory_order_relaxed);
                 if (!hit.success && w.status == Status::PARTIAL && info.right_outward != info.left_outward) {
-                    // the adapter's inward part (prefix of a closer / suffix of an opener) is retained: search
-                    // the longest such fragment (t <= retained + 2; >= 12 nt for a whole-length degraded hit)
+                    // the inward part is retained: prefix of a closer, suffix of an opener
                     const bool prefix = info.right_outward;
                     const int rf = std::max(0, w.retained_from);
                     const int rt = w.retained_to < 0 ? m : std::min(m, w.retained_to);
@@ -5026,8 +4861,6 @@ public:
                     }
                 }
             }
-            // A truncated adapter the read-end rule did not confirm (e.g. its piece ends a few bases before
-            // the read end): the inward-retained fragment inside the window.
             if (!hit.success && w.status == Status::TRUNCATED_AT_READ_END && info.right_outward != info.left_outward) {
                 const bool prefix = info.right_outward;
                 const int rf = std::max(0, w.retained_from), rt = w.retained_to < 0 ? m : std::min(m, w.retained_to);
@@ -5036,8 +4869,7 @@ public:
                 is_fragment = hit.success;
                 if (hit.success && ctr) ctr->fragment_ok.fetch_add(1, std::memory_order_relaxed);
             }
-            // Where the HMM saw adapter sequence (PARTIAL / TRUNCATED), a piece that kept the outward edge and lost
-            // the inward one (internal deletion, flank fusion): exact below 20 nt, >= 12 nt.
+            // a fragment that kept the outward edge and lost the inward one
             if (!hit.success && (w.status == Status::PARTIAL || w.status == Status::TRUNCATED_AT_READ_END) &&
                 info.right_outward != info.left_outward) {
                 hit = aligner.align_adapter_fragment(elem.seq, mutable_seq, w.lo, w.hi, !info.right_outward, 12, m - 1, true);
@@ -5071,15 +4903,9 @@ public:
         }
     }
 
-    // --concat-hmm: a barcode-side adapter (joined to a poly tail or another adapter by fixed-length
-    // barcodes / UMIs) that its window rules did not confirm gets one more Edlib search at RAD's own
-    // threshold (misalign_lower), placed and accepted only at the layout spacer offset (+-4; +-8 where
-    // the HMM saw degraded adapter sequence, i.e. a PARTIAL window with edits) from a partner RAD
-    // already aligned in this (child) read, within the HMM window widened by the adapter length.
-    // Failing that: a joint search of the adapter and its adapter partner; failing that, when the
-    // partner adapter cannot fit before the physical read end (it ran off the read), the adapter
-    // alone at one edit above the anchor grade, with its spacer block ending inside the read.
-    // Runs after every other element (including poly tails) of the strand.
+    // --concat-hmm: retry an unconfirmed barcode-side adapter at the layout spacer offset from an aligned
+    // partner, then jointly with its adapter partner, then alone when the partner ran off the read end.
+    // Runs after every other element of the strand.
     void retry_at_spacer_offset(const ReadElement& elem, const static_check_window& w, const read_streaming::sequence& read,
                                 std::string& mutable_seq, const static_restriction& rs, aligner_tools& aligner, bool verbose) {
         if (!rs.info) return;
@@ -5091,12 +4917,10 @@ public:
         const int m = info.m;
         const int k = elem.misalignment_threshold ? std::get<0>(*elem.misalignment_threshold)
                                                   : adapter_thresholds::fallback_max_edit_distance(elem.seq.length());
-        const bool seen = w.status == concat_hmm::Status::PARTIAL && w.edits >= 0;  // HMM saw adapter sequence here
+        const bool seen = w.status == concat_hmm::Status::PARTIAL && w.edits >= 0;
         const int tol = seen ? 8 : 4;
-        // construct-local: the HMM window widened by the adapter length (the partner-implied position may
-        // correct a misplaced HMM window by up to 60 bp)
         const int wlo = w.lo - m, whi = w.hi + m, plo_lim = w.lo - 60, phi_lim = w.hi + 60;
-        {   // already aligned here (e.g. by the joint search of its partner)
+        {   // already aligned here, e.g. by its partner's joint search
             auto range = by_id().equal_range(elem.class_id);
             for (auto it = range.first; it != range.second; ++it)
                 if (it->position.first <= whi && wlo <= it->position.second) return;
@@ -5122,12 +4946,11 @@ public:
             auto range = by_id().equal_range(pid);
             std::vector<std::pair<int, int>> partners;
             for (auto it = range.first; it != range.second; ++it) partners.push_back(it->position);
-            // at a junction an adapter partner fixes the barcode block: at most 4 bp into it (FIXES_5P.md, fix 4)
             const bool junction_side = after ? !rs.read_start : !rs.read_end;
             const int tin = pid == info.partner_id && junction_side ? std::min(tol, 4) : tol;
             for (const auto& pp : partners) {
-                const int ps = pp.first, pe = pp.second;  // 1-based inclusive
-                int lo, hi, edge_lo, edge_hi;             // search window; accepted adapter end (after) / start (before)
+                const int ps = pp.first, pe = pp.second;
+                int lo, hi, edge_lo, edge_hi;             // edge: accepted adapter end (after) / start (before)
                 if (after) { edge_hi = ps - 1 - glo + tin; edge_lo = ps - 1 - ghi - tol; lo = edge_lo - m + 1 - k; hi = edge_hi; }
                 else { edge_lo = pe + 1 + glo - tin; edge_hi = pe + 1 + ghi + tol; lo = edge_lo; hi = edge_hi + m - 1 + k; }
                 lo = std::max({lo, 1, plo_lim});
@@ -5140,8 +4963,6 @@ public:
                 if (he < hs || (after ? (he < edge_lo || he > edge_hi) : (hs < edge_lo || hs > edge_hi))) continue;
                 record(elem, hit, hs, he, "partner=" + pid);
                 if (ctr) ctr->spacer_retry_ok.fetch_add(1, std::memory_order_relaxed);
-                // P6: barcode / UMI from the partner anchor, for the block's outer adapter only (an inner adapter, 10x 5'
-                // tso / rc_tso, keeps its own alignment as the read element's reference)
                 if (pid == info.partner_id && info.bc_outer)
                     mark_weak_primer(elem.class_id, hs, he, ps, pe, glo, ghi, after);
                 return true;
@@ -5150,10 +4971,6 @@ public:
         };
         if (try_partner(info.poly_id, info.poly_gap_lo, info.poly_gap_hi, info.poly_after)) return;
         if (try_partner(info.partner_id, info.partner_gap_lo, info.partner_gap_hi, info.partner_after)) return;
-        // Neither confirmed: a joint search of the adapter and its adapter partner (both at RAD's own
-        // thresholds), accepted only as a pair at the layout spacer offset (+-4), inside the HMM
-        // windows (the partner must be named by the HMM in this construct). Two adapters at the right
-        // spacing are the layout's own evidence (10x 5' forw_primer <barcode umi> tso).
         if (info.partner_id.empty() || by_id().count(info.partner_id)) return;
         auto try_joint = [&]() -> bool {
             const ReadElement* pel = nullptr;
@@ -5177,8 +4994,8 @@ public:
             const bool after = info.partner_after;
             const int glo = info.partner_gap_lo, ghi = info.partner_gap_hi;
             const bool junction_side = after ? !rs.read_start : !rs.read_end;
-            const int tin = junction_side ? std::min(tol, 4) : tol;  // at a junction: at most 4 bp into the barcode block
-            int edge_lo, edge_hi, plo, phi;  // accepted partner start (after) / end (before); partner search window
+            const int tin = junction_side ? std::min(tol, 4) : tol;
+            int edge_lo, edge_hi, plo, phi;  // edge: accepted partner start (after) / end (before)
             if (after) { edge_lo = he + 1 + glo - tin; edge_hi = he + 1 + ghi + tol; plo = edge_lo; phi = edge_hi + mp - 1 + kp; }
             else { edge_hi = hs - 1 - glo + tin; edge_lo = hs - 1 - ghi - tol; plo = edge_lo - mp + 1 - kp; phi = edge_hi; }
             plo = std::max(1, plo);
@@ -5196,24 +5013,18 @@ public:
             record(elem, he_hit, hs, he, "joint with " + info.partner_id);
             record(*pel, hp, ps, pe, "joint with " + elem.class_id);
             if (ctr) ctr->spacer_retry_ok.fetch_add(2, std::memory_order_relaxed);
-            // P6: only when the retried adapter is the block's outer one; a joint search started by the inner adapter
-            // (10x 5' tso / rc_tso) re-anchors neither: the inner adapter keeps its own alignment as the read element's
-            // reference and the outer one its own end as the barcode's
             if (info.bc_outer) mark_weak_primer(elem.class_id, hs, he, ps, pe, glo, ghi, after);
             return true;
         };
         if (try_joint()) return;
-        // The partner adapter ran off the physical read end (10x 5': rc_tso <umi barcode> and the read ends
-        // inside rc_forw_primer): it cannot fit before the read end even at the smallest spacer gap, and the
-        // spacer block lies inside the read. Accept the adapter alone, Edlib full length, at one edit above
-        // its anchor grade (13-mer: ED <= 3; random rate ~1% in this ~18-position window).
+        // The partner ran off the physical read end: accept the adapter alone at one edit above its anchor grade.
         const bool after = info.partner_after;
         if (after ? !rs.read_end : !rs.read_start) return;
         const auto pinfo_it = rs.info->elems.find(info.partner_id);
         if (pinfo_it == rs.info->elems.end()) return;
         const int mp = pinfo_it->second.m, glo = info.partner_gap_lo, t0 = 4;
         const int kr = std::min(k, std::max(1, std::min(4, m * 4 / 22)) + 1);
-        int edge_lo, edge_hi, lo, hi;  // accepted adapter end (after) / start (before); search window
+        int edge_lo, edge_hi, lo, hi;  // edge: accepted adapter end (after) / start (before)
         if (after) { edge_lo = n - mp - glo + t0 + 1; edge_hi = n - glo; lo = edge_lo - m + 1 - kr; hi = edge_hi; }
         else { edge_lo = glo + 1; edge_hi = mp + glo - t0; lo = edge_lo; hi = edge_hi + m - 1 + kr; }
         lo = std::max({lo, 1, wlo});
@@ -5231,18 +5042,8 @@ public:
         }
     }
 
-    // --concat-hmm P6: a barcode-side primer accepted only by retry_at_spacer_offset at the offset of its adapter partner
-    // (a weak hit, up to misalign_lower edits; [start, end] 1-based) keeps its alignment as a static element, but the
-    // variables placed from it (barcode, UMI) are placed from the partner anchor instead: sigalign_variable hands
-    // map_positions a copy of the primer laid at the layout spacer offset from the partner (partner [ps, pe], spacer
-    // gap [glo, ghi]; 10x 5': forw_primer end = tso.start - 27, rc_forw_primer start = rc_tso.end + 27), so a primer
-    // end a few bp inside the barcode block cannot shift the barcode or the UMI. Differences of 1-2 bp stay with the
-    // primer end: that is the end uncertainty of a short partner alignment (13-mer tso at ED 1) plus a UMI indel, and
-    // there the primer end was the closer one on the 10x 5' truth sets (POLICY_ROUND.md, P6 audit).
-    // Only the outer adapter of a barcode block (concat_elem_info::bc_outer) is re-anchored. The inner adapter (10x 5'
-    // tso / rc_tso) is retried with the outer one as its partner too, but re-anchoring it would move the read element's
-    // reference (tso|stop+1, rc_tso|start-1) and so the cDNA edge, not the barcode; its own alignment was the closer edge
-    // on the 10x 5' truth sets (POLICY_ROUND.md, P6 inner-adapter fix).
+    // --concat-hmm: the barcode and UMI of a retry-only outer primer are placed from the partner anchor (the primer
+    // laid at the layout spacer offset). Only an outer adapter: moving the inner one would move the cDNA edge.
     void mark_weak_primer(const std::string& class_id, int start, int end, int ps, int pe, int glo, int ghi, bool partner_after) {
         constexpr int min_shift = 3;
         int a = start, b = end;
@@ -5253,10 +5054,7 @@ public:
     }
     size_t weak_primer_count() const { return hmm_weak_refs.size(); }
 
-    // REBASE.md 3.1. The outer adapter of a barcode block as the piece rule sees it: the aligned elements, then the
-    // clipped hit the production rule refused in this piece's full search (clipped = true). The second kind exists
-    // only as evidence that the primer is there (bare primer: P7 trims at it, P5 rejects its block); barcodes and
-    // UMIs are never placed from it because it is not a static element.
+    // Outer-adapter hits of a block: aligned elements, then refused clip hits (clipped = true, evidence only).
     template <class Fn>  // fn(position, clipped)
     void concat_hmm_each_outer_hit(const concat_bc_block& b, Fn&& fn) const {
         auto orng = by_id().equal_range(b.outer_id);
@@ -5265,19 +5063,14 @@ public:
         for (const auto& h : hmm_clip_hits)
             if (h.id == b.outer_id) fn(h.pos, true);
     }
-    // Marks the hits that belong to a barcode block (outer / inner adapter); returns the number of hits.
     size_t concat_hmm_classify_clip_hits(const concat_layout_info& info) {
         for (auto& h : hmm_clip_hits)
             for (const auto& b : info.bc_blocks) h.block_adapter = h.block_adapter || h.id == b.outer_id || h.id == b.inner_id;
         return hmm_clip_hits.size();
     }
     void mark_hmm_clip_check(uint8_t dirs) { hmm_clip_check = dirs; }
-    // REBASE.md 3.1. A piece with two barcode units has no layout reference that separates their constructs. An
-    // adapter hit the production rule refused is not a boundary, so the read element of the direction that passes
-    // runs over it. With a complete barcode unit of the other strand in the piece (outer adapter and inner partner
-    // at the layout spacer offset), that hit inside the read element marks a second construct boundary there: the
-    // record would join two constructs. True when this molecule would write such a record (called after
-    // sigalign_filter; the element positions are final).
+    // True when a written record's read element holds a refused clip hit, i.e. it would join two constructs.
+    // Call after sigalign_filter, when the element positions are final.
     bool hmm_clip_hit_in_written_read() const {
         if (!hmm_clip_check || read_type == "filtered" || read_type == "skipped") return false;
         for (const auto& e : sig_elements) {
@@ -5290,12 +5083,8 @@ public:
         return false;
     }
 
-    // --concat-hmm P5: after RAD's full static search of a barcode-less (T) or single-primer-end child of a split read,
-    // a barcode block keeps its barcode only when its outer adapter (10x 5' forw_primer / rc_forw_primer) is absent or
-    // its inner partner (tso / rc_tso; a poly tail where the layout has no inner adapter) is aligned at the layout
-    // spacer offset from it (+-4 bp). Otherwise the block's barcodes are invalidated after variable extraction
-    // (concat_hmm_apply_barcode_rejections) and that direction fails as it does for any read without a barcode.
-    // Returns the number of rejected blocks.
+    // --concat-hmm: a block keeps its barcode only when its outer adapter is absent or its inner partner is at the
+    // layout spacer offset (+-4 bp). Returns the number of rejected blocks.
     int concat_hmm_partner_rule(const concat_layout_info& info) {
         constexpr int tol = 4;
         int rejected = 0;
@@ -5322,14 +5111,11 @@ public:
             edit_elem(id, [](seq_element& x) { x.position = {-1, -1}; x.element_pass = false; });
     }
 
-    // --concat-hmm P7 / P9 (POLICY_ROUND.md, round 2): the piece rule for T / single-primer-end / D-labelled pieces.
     void set_hmm_note(const std::string& n) { hmm_note = n; }
     const std::string& hmm_note_str() const { return hmm_note; }
     void mark_hmm_no_double_count() { hmm_no_double_count = true; }
     bool hmm_no_double_count_set() const { return hmm_no_double_count; }
 
-    // State of every layout barcode block in this piece after the full static search (P5 geometry: the inner
-    // partner pairs with the outer adapter at the layout spacer offset +-4 bp).
     std::vector<concat_bc_state> concat_hmm_block_states(const concat_layout_info& info) const {
         constexpr int tol = 4;
         std::vector<concat_bc_state> out;
@@ -5360,13 +5146,7 @@ public:
         return out;
     }
 
-    // Decide what to do with a non-plain piece after RAD's full static search inside it (user policy 5 / P7):
-    //   one usable barcode unit + a bare barcode-adjacent primer as the outermost adapter on the far side -> TRIM: keep
-    //   the piece in the orientation of the complete unit from just past the bare primer (the read element then runs
-    //   from the trimmed edge to the unit's inner anchor), barcode / UMI only from the complete unit; mirror-symmetric;
-    //   one usable unit without such a primer -> NORMAL in that strand; two usable units -> NORMAL, but a "concatenate"
-    //   outcome (both directions pass) writes nothing; no usable unit -> NORMAL (P5 then rejects every bare block).
-    //   D constructs never reach this rule (policy 4 drops them; policy 9 decides fold-back vs D in the header).
+    // Plan a T / single-primer-end piece: TRIM at a bare outermost primer facing the one usable unit, else NORMAL.
     concat_piece_plan concat_hmm_plan_piece(const concat_layout_info& info, int len) const {
         concat_piece_plan plan;
         const auto states = concat_hmm_block_states(info);
@@ -5376,27 +5156,23 @@ public:
             const concat_bc_state*& slot = s.dir == "reverse" ? R : F;
             if (!slot || s.rank() > slot->rank()) slot = &s;
         }
-        const bool uF = F && F->usable(), uR = R && R->usable();
-        if (uF && uR) {
+        const bool u_f = F && F->usable(), u_r = R && R->usable();
+        if (u_f && u_r) {
             plan.no_double_count = true;
             plan.note = "ART_BOTH";
-            // REBASE.md 3.1: with a refused hit of an adapter outside the barcode blocks (10x 5' rev_primer /
-            // rc_rev_primer) in the piece, a record is checked after the filter (hmm_clip_hit_in_written_read)
-            // when the unit of the other strand is complete (an inner anchor alone, 10x 5' tso / rc_tso at ED <= 4,
-            // is too often a chance hit to count as a second construct)
+            // check records only against a complete unit: an inner anchor alone is often a chance hit
             bool far_hit = false;
             for (const auto& h : hmm_clip_hits) far_hit = far_hit || !h.block_adapter;
             if (far_hit) plan.clip_check = static_cast<uint8_t>((R->strict() ? 1 : 0) | (F->strict() ? 2 : 0));
             return plan;
         }
-        if (uF || uR) {
-            const concat_bc_state* unit = uF ? F : R;
-            const concat_bc_state* other = uF ? R : F;
+        if (u_f || u_r) {
+            const concat_bc_state* unit = u_f ? F : R;
+            const concat_bc_state* other = u_f ? R : F;
             plan.dir = unit->dir;
-            // P7: a bare barcode-adjacent primer on the far side of the usable unit, outermost adapter of the piece there
             if (other && other->bare()) {
-                const bool far_right = uF && other->outer_s > unit->inner_e;   // bare rc_forw_primer right of tso
-                const bool far_left = uR && other->outer_e < unit->inner_s;    // bare forw_primer left of rc_tso
+                const bool far_right = u_f && other->outer_s > unit->inner_e;
+                const bool far_left = u_r && other->outer_e < unit->inner_s;
                 bool outermost = far_right || far_left;
                 if (outermost) {
                     for (const auto& e : sig_elements) {
@@ -5411,9 +5187,9 @@ public:
                 }
                 if (outermost) {
                     plan.kind = concat_piece_plan::TRIM;
-                    plan.trim_lo = far_left ? other->outer_e : 0;          // 0-based start just past the trimmed primer
-                    plan.trim_hi = far_right ? other->outer_s - 1 : len;   // 0-based end just before it
-                    plan.note = uF ? "P7_TRIM_F" : "P7_TRIM_R";
+                    plan.trim_lo = far_left ? other->outer_e : 0;
+                    plan.trim_hi = far_right ? other->outer_s - 1 : len;
+                    plan.note = u_f ? "P7_TRIM_F" : "P7_TRIM_R";
                     return plan;
                 }
             }
@@ -5424,8 +5200,7 @@ public:
         return plan;
     }
 
-    // The best barcode unit of this piece on the given strand (any strand when dir is empty), as concat_bc_state::rank
-    // (3 complete, 2 usable, 1 bare primer, 0 none); P11 keeps the piece with the higher rank at an abstained junction.
+    // Best concat_bc_state::rank on the given strand (any strand when dir is empty).
     int concat_hmm_unit_rank(const concat_layout_info& info, const std::string& dir) const {
         int r = 0;
         for (const auto& st : concat_hmm_block_states(info))
@@ -5433,7 +5208,6 @@ public:
         return r;
     }
 
-    // Reject every barcode block of the given strand (the other strand of a piece whose construct strand is known).
     void concat_hmm_reject_strand(const concat_layout_info& info, const std::string& dir) {
         for (const auto& b : info.bc_blocks) {
             auto lit = info.layout_by_id.find(b.outer_id);
@@ -5442,9 +5216,8 @@ public:
         }
     }
 
-    // Take over the static alignments of a parent piece that lie wholly inside [offset0, offset0 + new_len)
-    // (0-based), shifted to this molecule's coordinates, plus the layout's virtual start / stop boundaries.
-    // No new alignment is run (as assign_static_segment does for the existing path's children).
+    // Copy the parent's static alignments inside [offset0, offset0 + new_len), shifted to this molecule's
+    // coordinates, plus virtual start / stop boundaries. No new alignment is run.
     void adopt_statics_from(const SigString& src, int offset0, int new_len, const ReadLayout& layout) {
         for (const auto& e : src.sig_elements) {
             if (e.type != "static" || e.global_class == "start" || e.global_class == "stop") continue;
@@ -5462,8 +5235,7 @@ public:
         }
     }
 
-    // Records to_fastqa_append would write for this molecule, per direction (forward, reverse): a direction writes
-    // one record when it has a barcode (or the layout is bulk) and a read element with sequence.
+    // Records to_fastqa_append would write: {forward, reverse}.
     std::pair<int, int> concat_hmm_pending_records() const {
         if (read_type == "skipped" || read_type == "filtered") return {0, 0};
         std::pair<int, int> out{0, 0};
@@ -5842,12 +5614,11 @@ public:
         
         int positioned_count = 0;
 
-        // --concat-hmm P6: retry-only primers are seen by map_positions at their partner-anchored position
-        // (copies; the aligned element itself is unchanged). Empty, and so inert, on every other path.
+        // --concat-hmm: map_positions sees retry-only primers at their partner-anchored position (copies).
         std::vector<seq_element> hmm_anchored;
-        std::vector<const seq_element*> hmm_anchored_of;  // the aligned element each copy stands for
+        std::vector<const seq_element*> hmm_anchored_of;
         if (!hmm_weak_refs.empty()) {
-            hmm_anchored.reserve(hmm_weak_refs.size());  // no reallocation below: the pointers stay valid
+            hmm_anchored.reserve(hmm_weak_refs.size());  // no reallocation: pointers into it must stay valid
             for (const auto& elem : sig_elements) {
                 if (elem.type != "static") continue;
                 for (const auto& w : hmm_weak_refs) {
@@ -6039,41 +5810,19 @@ public:
  * @param write_debug flag to enable writing debug output files
  * @param mode `std::string` correction mode for barcode correction (offensive or defensive, which whitelist to check first)
  */
-    // --concat-hmm per-read router. concat_hmm::segment() runs first; a confident call takes
-    //   (a) k = 1: windowed single-strand static alignment of the read, or
-    //   (b) k >= 2: one child per construct, cut at the HMM cuts and named like the existing
-    //       /segN children (concatemer-marked), each with windowed single-strand alignment. At a
-    //       barcode-side junction whose facing barcode blocks abut or overlap, the children overlap
-    //       by a few bp (Result::cut_lo / cut_hi), so each keeps its whole barcode block
-    //       (benchmarks/concat_hmm/final/FIXES_5P.md, review round 2).
-    //       Children whose construct is a T / single-primer-end artifact get RAD's full static
-    //       search inside the child (the layout has no slot set for them); their barcodes need the
-    //       inner partner anchor at the layout spacer offset (P5).
-    // Policies (benchmarks/concat_hmm/final/POLICY_ROUND.md): reads the HMM abstains on (abstain
-    // flag, unexplained opposite-strand evidence, k capped) are dropped, i.e. written without any
-    // record (P1; --concat-hmm-abstain=legacy sends them to the existing path instead). A D
-    // construct (two barcode units facing outward), single (k = 1) or a child of a split read, is
-    // decided by the HMM's D strand rule: one cDNA direction ->
-    // a plain construct of the unit at the cDNA 5' end (SEG_D_KEPT; the piece ends at the removed
-    // unit's inner anchor and the read element may end there), a strand change -> two plain
-    // constructs split at the change (SEG_D_SPLIT, legacy duplet names), no clear direction ->
-    // no record (P4, SEG_DOUBLE_BC). A construct next to a fold-back cut may start / end its read
-    // element at that cut (P3). A barcode-side primer accepted only by the spacer-offset retry
-    // places the barcode from its partner anchor (P6; only the barcode block's outer adapter, so
-    // the inner adapter bounding the cDNA keeps its own alignment).
-    // Returns false (the caller then runs the existing path unchanged) when the calibration
-    // guard failed (for every read of the run), k = 0, or the single construct is a T /
-    // single-primer-end artifact (RAD keeps its own handling); true otherwise (handled, possibly
-    // without a record).
-    template <class MoleculeFn>
+    // --concat-hmm per-read router: segments the read with the HMM, aligns each construct in its windows and
+    // passes each molecule to process_molecule. Returns false when the caller must run the default path
+    // (guard failed, k = 0, or an abstain with --concat-hmm-abstain=legacy); true when handled, possibly
+    // without a record.
+    template <class molecule_fn>
     static bool concat_hmm_route(const read_streaming::sequence& read, const ReadLayout& layout,
-                                 const concat_layout_info& info, MoleculeFn&& process_molecule, bool verbose) {
-        thread_local concat_hmm::Scratch scratch;  // per thread, grow-only
+                                 const concat_layout_info& info, molecule_fn&& process_molecule, bool verbose) {
+        thread_local concat_hmm::Scratch scratch;
         thread_local concat_hmm::Result res;
         concat_hmm_counters& ctr = *info.ctr;
         const int len = static_cast<int>(read.seq.size());
         ctr.reads.fetch_add(1, std::memory_order_relaxed);
-        if (layout.concat_model->guard_failed) {  // layout does not match the library: HMM off
+        if (layout.concat_model->guard_failed) {
             ctr.legacy_guard.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -6084,33 +5833,27 @@ public:
             concat_hmm::segment(*layout.concat_model, read.seq.data(), len, scratch, res);
         }
         const char* legacy = nullptr;
-        const char* drop = nullptr;  // policies: the read is written without any record
-        bool junction_abstain = false;  // P11: the HMM is unsure about a junction (k >= 2): resolved per junction below
+        const char* drop = nullptr;  // written without any record
+        bool junction_abstain = false;
         const bool abstain_legacy = layout.concat_abstain_legacy;
         if (res.flags & concat_hmm::RES_GUARD_FAILED) { legacy = "guard"; ctr.legacy_guard.fetch_add(1, std::memory_order_relaxed); }
         else if (res.k <= 0) { legacy = "k0"; ctr.legacy_k0.fetch_add(1, std::memory_order_relaxed); }
         else if (res.flags & concat_hmm::RES_TOO_MANY) {
-            // P1: k capped is an abstention (dropped unless --concat-hmm-abstain=legacy)
             if (abstain_legacy) { legacy = "too_many"; ctr.legacy_too_many.fetch_add(1, std::memory_order_relaxed); }
             else { drop = "too_many"; ctr.drop_too_many.fetch_add(1, std::memory_order_relaxed); }
         } else if (res.flags & concat_hmm::RES_OPPOSITE_EVIDENCE) {
-            // P1: an unexplained opposite-strand anchor: a junction somewhere whose place is unknown (nothing resolvable)
             if (abstain_legacy) { legacy = "abstain"; ctr.legacy_abstain.fetch_add(1, std::memory_order_relaxed); }
             else { drop = "abstain"; ctr.drop_abstain.fetch_add(1, std::memory_order_relaxed); }
         } else if (res.flags & concat_hmm::RES_ABSTAIN) {
-            // P1 / P11: unsure. One construct whose singleness is in doubt: nothing is resolvable (drop). Two or more:
-            // abstain on the uncertain junction(s) only and keep the most complete piece next to each (policy 8).
+            // k >= 2: abstain only on the uncertain junctions (resolved below)
             if (abstain_legacy) { legacy = "abstain"; ctr.legacy_abstain.fetch_add(1, std::memory_order_relaxed); }
             else if (res.k == 1) { drop = "abstain"; ctr.drop_abstain.fetch_add(1, std::memory_order_relaxed); }
             else junction_abstain = true;
         } else if (res.k == 1 && (res.segs[0].flags & concat_hmm::SEG_DOUBLE_BC)) {
-            // one construct with two barcode units facing outward (10x 5' D) whose cDNA has no clear strand
-            // direction (D strand rule: unclear): the genuine unit cannot be resolved, so write nothing rather than
-            // one or two guessed records (a resolved D geometry arrives as a plain F / R construct, SEG_D_KEPT / SEG_D_SPLIT)
+            // D construct with no clear cDNA direction: write nothing rather than guess the unit
             drop = "d";
             ctr.drop_d_reads.fetch_add(1, std::memory_order_relaxed);
         }
-        // (k = 1 T / single-primer-end constructs go through the piece rule below since round 3: P7 trim-and-keep)
         if (verbose) {
             std::ostringstream oss;
             oss << "CONCAT_HMM " << read.id << " k=" << res.k << " p_single=" << res.p_single
@@ -6122,9 +5865,9 @@ public:
             std::cout << oss.str() << std::endl;
         }
         if (legacy) return false;
-        if (drop) return true;  // handled: no molecule, no record
+        if (drop) return true;
 
-        // check regions of construct c -> windows in child coordinates [child_start, child_end)
+        // check regions of construct c -> windows in child coordinates
         auto restriction_for = [&](int c, int child_start, int child_end) {
             static_restriction r;
             const char strand = res.segs[c].strand;
@@ -6143,7 +5886,7 @@ public:
                 w.hi = std::min(chk.end, child_end) - child_start;
                 if (w.hi < w.lo) {
                     if (chk.status != concat_hmm::Status::TRUNCATED_AT_READ_END) continue;
-                    w.lo = w.hi = std::max(1, std::min(child_len, w.hi));  // zero-width: read-end marker
+                    w.lo = w.hi = std::max(1, std::min(child_len, w.hi));  // read-end marker
                 }
                 w.status = chk.status;
                 w.retained_from = chk.retained_from;
@@ -6160,7 +5903,6 @@ public:
             ctr.children.fetch_add(static_cast<size_t>(res.k), std::memory_order_relaxed);
         }
         for (uint8_t kd : res.cut_kind) if (kd < 6) ctr.cut_kind[kd].fetch_add(1, std::memory_order_relaxed);
-        // ---- pieces: one per construct (D constructs excepted), statics aligned, non-plain ones planned (P7) ----
         struct piece_t {
             int c = 0, start = 0, end = 0;
             bool plain = true, trimmed = false, suppressed = false;
@@ -6173,22 +5915,19 @@ public:
         const bool win = res.cut_lo.size() == res.cuts.size() && res.cut_hi.size() == res.cuts.size();
         for (int c = 0; c < res.k; ++c) {
             if (res.segs[c].flags & concat_hmm::SEG_SAME_MOLECULE_R) ctr.same_molecule.fetch_add(1, std::memory_order_relaxed);
-            // child window: from cut_lo of the cut on its left to cut_hi of the cut on its right (equal to the cuts except
-            // where an anchor-derived barcode-block edge lies on the far side of a cut); the first / last child extends to
-            // the read end; a single construct is the whole read
+            // children may overlap at a cut (cut_lo / cut_hi) so each keeps its whole barcode block
             int start = c == 0 ? 0 : (win ? res.cut_lo[c - 1] : res.cuts[c - 1]);
             int end = c + 1 == res.k ? len : (win ? res.cut_hi[c] : res.cuts[c]);
-            // D strand rule, kept unit (SEG_D_KEPT): the piece ends at the removed unit's inner anchor (the segment
-            // edge on that side), so the removed unit's barcode block and adapters are never inside the piece
+            // D kept unit: the piece ends at the removed unit's inner anchor, so that unit is never inside it
             const bool d_kept = (res.segs[c].flags & concat_hmm::SEG_D_KEPT) != 0;
-            const bool d_left = d_kept && res.segs[c].strand == 'F';  // the left unit (forward) is kept; else the right one (reverse)
+            const bool d_left = d_kept && res.segs[c].strand == 'F';
             if (d_kept) { if (d_left) end = std::min(end, res.segs[c].end); else start = std::max(start, res.segs[c].start); }
             if (end <= start) continue;
-            if (res.segs[c].flags & concat_hmm::SEG_DOUBLE_BC) {  // a D child without a clear cDNA direction is written without any record
+            if (res.segs[c].flags & concat_hmm::SEG_DOUBLE_BC) {
                 ctr.drop_d_children.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            const bool piece_of_read = split || d_kept;  // the molecule is a window of the parent read, not the whole read
+            const bool piece_of_read = split || d_kept;
             piece_t p;
             p.c = c; p.start = start; p.end = end;
             p.plain = concat_plain_construct(res.segs[c]);
@@ -6198,25 +5937,20 @@ public:
                                             read.is_fastq ? (piece_of_read ? read.qual.substr(start, end - start) : read.qual) : "", read.is_fastq};
             p.sig = SigString(p.rs.id, end - start, "undefined", layout.sequencing_type);
             if (split) p.sig.mark_concatemer();
-            if (piece_of_read) p.sig.set_parent_frame(start, end);  // debug sigstrings in parent coordinates
+            if (piece_of_read) p.sig.set_parent_frame(start, end);
             {
 #ifdef RAD_STAGE_TIMERS
                 rad_stage_timers::scope t_static(rad_stage_timers::windowed_static_ns);
 #endif
                 if (p.plain) {
-                    // P3: a construct next to a fold-back cut may run its read element to the child boundary at the fold
-                    // when the layout's references on that side are missing (10x 5' FR_RF fold: the reverse half has no
-                    // rc_rev_primer / poly_t), so both halves of a fold-back can be written
-                    // Round 3: the same holds at a strand-flip cut (policy 10: an FR_RF junction that lost every
-                    // element, placed by the cDNA strand sense), so both molecules can be written.
+                    // at a fold-back or strand-flip cut the read element may run to the child boundary
                     auto cut_edge = [&](int j) {
                         return j >= 0 && j < static_cast<int>(res.cut_kind.size()) &&
                                (res.cut_kind[j] == concat_hmm::CUT_FOLDBACK || res.cut_kind[j] == concat_hmm::CUT_STRAND_FLIP);
                     };
                     const bool fold_start = c > 0 && ((res.segs[c - 1].flags & concat_hmm::SEG_SAME_MOLECULE_R) || cut_edge(c - 1));
                     const bool fold_end = c + 1 < res.k && ((res.segs[c].flags & concat_hmm::SEG_SAME_MOLECULE_R) || cut_edge(c));
-                    // D strand rule, kept unit: the piece edge at the removed unit's inner anchor has no layout reference
-                    // left (no window is searched beyond it), so the read element may end (start) there, as at a P7 trim
+                    // likewise at the edge of a D kept unit, where no layout reference remains
                     if (fold_start || fold_end || d_kept)
                         p.sig.set_fold_edges(fold_start || (d_kept && !d_left), fold_end || d_left,
                                              res.segs[c].strand == 'F' ? "forward" : "reverse", !d_kept);
@@ -6225,21 +5959,15 @@ public:
                         (d_left ? ctr.d_kept_left : ctr.d_kept_right).fetch_add(1, std::memory_order_relaxed);
                     } else if (res.segs[c].flags & concat_hmm::SEG_D_SPLIT) {
                         p.sig.set_hmm_note("D_SPLIT");
-                        if (res.segs[c].strand == 'F') ctr.d_split.fetch_add(1, std::memory_order_relaxed);  // once per D construct
+                        if (res.segs[c].strand == 'F') ctr.d_split.fetch_add(1, std::memory_order_relaxed);  // count once per D
                     }
                     const static_restriction r = restriction_for(c, start, end);
                     p.sig.sigalign_static(p.rs, layout, verbose, nullptr, &r);
                 } else {
-                    // T / single-primer end (whole read or child): RAD's full static search inside the piece, then the
-                    // piece rule (P7) and the partner rule (P5)
+                    // T / single-primer end: full static search in the piece, then the piece and partner rules
                     ctr.pieces.fetch_add(1, std::memory_order_relaxed);
                     if (split) ctr.children_full_search.fetch_add(1, std::memory_order_relaxed);
                     else ctr.art_reads.fetch_add(1, std::memory_order_relaxed);
-                    // A piece of a split read: its edges at HMM cuts are not physical read ends for the SSW
-                    // clipping rule, and the junction exception looks for the counterpart on the parent read.
-                    // A whole read (k = 1) is the frame [0, len): both edges are read ends and nothing lies
-                    // beyond them, i.e. the production rule unchanged. The frame also makes the search keep
-                    // the hits that rule refuses as evidence for the piece rule (REBASE.md 3.1).
                     const static_piece_frame frame{&read.seq, start};
                     p.sig.sigalign_static(p.rs, layout, verbose, nullptr, nullptr, &frame);
                     if (const size_t nclip = p.sig.concat_hmm_classify_clip_hits(info)) ctr.clip_hits.fetch_add(nclip, std::memory_order_relaxed);
@@ -6251,11 +5979,10 @@ public:
                                                      p.rs.is_fastq ? p.rs.qual.substr(tl, th - tl) : "", p.rs.is_fastq};
                         SigString sig2(rs2.id, th - tl, "undefined", layout.sequencing_type);
                         if (split) sig2.mark_concatemer();
-                        sig2.set_parent_frame(start + tl, start + th);  // a piece of the parent, also for a whole read
-                        sig2.adopt_statics_from(p.sig, tl, th - tl, layout);  // the bare primer lies outside the piece
-                        // the read element may start (end) at the trimmed edge: no layout reference remains there
+                        sig2.set_parent_frame(start + tl, start + th);
+                        sig2.adopt_statics_from(p.sig, tl, th - tl, layout);
                         sig2.set_fold_edges(tl > 0, th < end - start, plan.dir, false);
-                        sig2.concat_hmm_reject_strand(info, other);  // nothing beside the bare primer is a barcode
+                        sig2.concat_hmm_reject_strand(info, other);
                         sig2.set_hmm_note(plan.note);
                         p.sig = std::move(sig2);
                         p.rs = std::move(rs2);
@@ -6268,7 +5995,6 @@ public:
                         p.sig.set_hmm_note(plan.note);
                     }
                     p.strand = plan.dir == "forward" ? 'F' : plan.dir == "reverse" ? 'R' : '?';
-                    // P5: barcodes only with the inner partner anchor at the layout spacer offset
                     if (const int rej = p.sig.concat_hmm_partner_rule(info))
                         ctr.partner_rejected.fetch_add(static_cast<size_t>(rej), std::memory_order_relaxed);
                 }
@@ -6276,10 +6002,7 @@ public:
             if (p.sig.weak_primer_count()) ctr.retry_from_partner.fetch_add(p.sig.weak_primer_count(), std::memory_order_relaxed);
             pieces.push_back(std::move(p));
         }
-        // ---- P11: junctions the HMM could not locate confidently (posterior below tau, a duration-MAP midpoint, or the
-        // read's decomposition itself in doubt): no split is forced there. The piece with the more complete barcode
-        // unit next to such a junction is kept (tie: the higher HMM confidence, then the forward construct, as the
-        // existing path prefers); the other is written without a record. Nothing resolvable -> the read is dropped. ----
+        // At a weak junction keep only the piece with the better barcode unit (ties: HMM confidence, then forward).
         if (split && !pieces.empty()) {
             const float tau = layout.concat_model ? layout.concat_model->opt.tau_junction : 0.9f;
             bool any_weak = false;
@@ -6320,11 +6043,11 @@ public:
                 ctr.pieces_suppressed.fetch_add(nsup, std::memory_order_relaxed);
                 if (nsup == pieces.size()) {
                     ctr.drop_unresolved.fetch_add(1, std::memory_order_relaxed);
-                    return true;  // handled: no piece could be trusted (policy 1 only when nothing resolves)
+                    return true;
                 }
             }
         }
-        // ---- P8: one F + one R construct -> <id>-F-CT / <id>-R-CT, as the existing path names a duplet; otherwise /segN ----
+        // one F + one R construct: duplet names (<id>-F-CT / <id>-R-CT); otherwise /segN
         if (split && res.k == 2 && pieces.size() == 2 &&
             ((pieces[0].strand == 'F' && pieces[1].strand == 'R') || (pieces[0].strand == 'R' && pieces[1].strand == 'F'))) {
             for (auto& p : pieces) { p.sig.set_id(read.id); p.rs.id = read.id; }
@@ -6419,7 +6142,6 @@ public:
 
     barcode_position_stats::reset();
 
-    // --concat-hmm: the model is set on the layout only when the flag is on.
     concat_hmm_counters hmm_ctr;
     std::unique_ptr<concat_layout_info> hmm_info;
     if (layout.concat_model) {
@@ -6478,8 +6200,7 @@ public:
                 rad_stage_timers::reads.fetch_add(1, std::memory_order_relaxed);
 #endif
 
-                // --concat-hmm: confident HMM calls take the windowed path; everything
-                // else falls through to the existing path below, unchanged.
+                // --concat-hmm: reads the router does not handle fall through to the default path
                 if (hmm_info) {
                     bool hmm_passed = false;
                     size_t hmm_records = 0;
@@ -6489,7 +6210,7 @@ public:
                         { rad_stage_timers::scope t_var(rad_stage_timers::variable_ns);
 #endif
                         molecule.sigalign_variable(molecule_read, layout, verbose);
-                        molecule.concat_hmm_apply_barcode_rejections();  // P5 (no-op unless the partner rule fired)
+                        molecule.concat_hmm_apply_barcode_rejections();
 #ifdef RAD_STAGE_TIMERS
                         }
                         rad_stage_timers::scope t_filt(rad_stage_timers::filter_ns);
@@ -6506,13 +6227,11 @@ public:
                             rad_stage_timers::fb_n[0][oc].fetch_add(1, std::memory_order_relaxed);
                         }
 #endif
-                        // a piece with two barcode units whose both directions passed would be written twice with
-                        // two cells: never double-count (POLICY_ROUND.md round 3)
+                        // two barcode units that both pass would be written twice: never double-count
                         if (molecule.hmm_no_double_count_set() && molecule.read_type == "concatenate") {
                             molecule.set_type("skipped");
                             hmm_ctr.both_pass_dropped.fetch_add(1, std::memory_order_relaxed);
                         } else if (molecule.hmm_clip_hit_in_written_read()) {
-                            // two barcode units and a refused adapter hit inside the read element (REBASE.md 3.1)
                             molecule.set_type("skipped");
                             molecule.set_hmm_note(molecule.hmm_note_str() + "_CLIP");
                             hmm_ctr.two_unit_clip_dropped.fetch_add(1, std::memory_order_relaxed);
@@ -6920,9 +6639,7 @@ public:
                     });
             
             bool first_elem = true;
-            // --concat-hmm P10: a child / piece of a split read prints in PARENT coordinates (debug output only): every
-            // position shifted by the parent offset, the virtual boundaries as seg_start:0:<p0>:<p0> / seg_stop:0:<p1>:<p1>
-            // (rc_seg_start / rc_seg_stop on the reverse strand) with p0 / p1 the piece's window in the parent.
+            // --concat-hmm piece: print in parent coordinates (debug output only)
             const bool parent_frame = hmm_parent_off >= 0;
             for (const auto& elem_ref : sorted_elements) {
                 const auto& elem = elem_ref.get();
@@ -6956,7 +6673,7 @@ public:
             if (additional_info.length() > 2) {
                 combined_info += ":" + additional_info;
             }
-            if (!hmm_note.empty()) {  // --concat-hmm piece rule only (P7 / P9); empty on every other path
+            if (!hmm_note.empty()) {
                 combined_info += ":HMM=" + hmm_note;
             }
             ss << "<" << sequence_length << ":" << sequence_id << ":" << dir << concat <<  combined_info << ">";

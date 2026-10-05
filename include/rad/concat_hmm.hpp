@@ -1,49 +1,9 @@
-// concat_hmm.hpp -- layout-generic, self-calibrating concatemer segmenter for long reads.
-//
-// One header, C++17, STL only (no boost, no OpenMP, no RAD includes). RAD-agnostic: the model is
-// built from a plain LayoutSpec (parse_layout_csv() reads both RAD layout formats; RAD itself
-// converts its ReadLayout with a thin adapter).
-//
-// Pipeline per read (see benchmarks/concat_hmm/final/BUILD.md for the full specification):
-//   Stage 0  fused pass over the read: 2-bit codes, offset-indexed 11-mer seeds (exact + 1-mismatch
-//            neighbourhood) for EVERY static element of the layout, each seed labelled
-//            (element, offset); poly-A/T windows.  -> seed clusters (element, implied span,
-//            retained offsets) and poly runs.
-//   Stage 1  gate: clean single constructs (one template, layout-consistent positions, no
-//            opposite-strand seed, every poly explained, >= 2 construct elements, certifying
-//            evidence) finish here as k = 1 with check regions (tiny single-pattern Myers for the
-//            edit distances, read-end prefix test for truncated closers).
-//   Stage 2  windowed packed bit-parallel Myers (2 patterns per 64-bit word, read split in 2
-//            lockstep halves) around seeds / poly runs / read ends; every local minimum <= the
-//            pattern's edit budget; read-end prefixes from the final Myers column; relaxed
-//            (ED <= budget+2) opener scan right after strong closers; seed-only partial and
-//            truncated adapter events.
-//   Stage 3  event HSMM in float log-likelihood-ratio units (against "all events are noise") over
-//            templates generated from the layout (F, R, T / artifact ends / D), Viterbi with a
-//            construct-certification bit and a minimum construct length; forward-backward
-//            (k = 1 vs k >= 2 layers) for p_single and per-junction posteriors.
-//            Barcode-side junctions (benchmarks/concat_hmm/final/FIXES_5P.md): tight junctions between anchor
-//            slots may skip physically deleted barcode-adjacent primers (10x 5' fused rc_tso <umi bc | bc umi>
-//            tso); a primer laid over a facing barcode block is dropped; after the decode a lazy scan finds
-//            seedless facing partner anchors and a facing-anchor rescue forces junctions the decode left out.
-//            A junction made only by a pairing (a construct delimited by a short partner anchor facing the other
-//            construct's partner anchor or a degraded primer) needs a strong pairing near the fused geometry or a
-//            cDNA-side anchor in both constructs, and a split made only by the fold-back test needs mirrored barcode
-//            units on its two arms; otherwise the read abstains (FIXES_5P.md, review round 2).
-//   Output   k, cuts (at barcode-block edges; an unobserved barcode-adjacent primer counts as 0 bp), child
-//            windows per cut (overlapping where facing barcode blocks abut or overlap, so that each construct
-//            keeps its whole barcode block), segments (flags), check regions (FULL / PARTIAL /
-//            TRUNCATED_AT_READ_END / MISSING_EXPECTED per expected static element of every construct), strand
-//            call, flags.
-//
-// Calibration: Calibrator (hard-EM, Dirichlet-smoothed toward layout priors, shuffled null +
-// real-read opposite-strand null, calibration guard). Parameters serialise into hmm_* columns of
-// RAD's *_position_map.csv (params_to_columns / params_from_columns).
-//
-// Thread safety: Model is immutable after build() and can be shared; Scratch is per thread and
-// grow-only (no heap allocation per read in steady state).
+// concat_hmm.hpp -- layout-generic, self-calibrating concatemer segmenter for long reads (C++17, STL only).
+// Per read: stage 0 seeds and poly runs, stage 1 gate (clean single constructs), stage 2 windowed Myers events,
+// stage 3 event HSMM (Viterbi + forward-backward). Calibrated parameters live in hmm_* position-map columns.
+// Thread safety: Model is immutable after build() and shareable; Scratch is per thread.
 #pragma once
-#define CONCAT_HMM_HAS_CUT_WINDOWS 1  // Result::cut_lo / cut_hi (FIXES_5P.md, review round 2)
+#define CONCAT_HMM_HAS_CUT_WINDOWS 1  // Result::cut_lo / cut_hi
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -72,37 +32,30 @@
 
 namespace concat_hmm {
 
-// =====================================================================================
-// Public types
-// =====================================================================================
-struct LayoutElement {
-    std::string id;                      // RAD element id (forw_primer, rc_forw_primer, umi, read, poly_t, ...)
-    std::string seq;                     // static sequence ('T{12,}+' style or empty for poly / variable)
+struct layout_element {
+    std::string id;
+    std::string seq;                     // static sequence ('T{12,}+' style for poly); empty for variable elements
     bool is_static = false;
-    std::string klass;                   // RAD global_class: start, stop, poly_tail, read, barcode, umi, forw_primer, ...
+    std::string klass;
     char direction = 'F';                // 'F' or 'R'
     int order = 0;
-    std::vector<int> length_candidates;  // e.g. {15,16}
-    int max_edits = -1;                  // from misalign_lower (position map); -1 if unknown
+    std::vector<int> length_candidates;
+    int max_edits = -1;                  // from misalign_lower; -1 if unknown
 };
-struct LayoutSpec {
-    std::vector<LayoutElement> elements;
+struct layout_spec {
+    std::vector<layout_element> elements;
     bool bulk = false;
     std::string name;
     std::string mode;                    // text after "Read Layout:" (e.g. "bulk"), lower case
 };
 
-// Calibrated parameters, organised exactly as they are cached in RAD's position map:
-// element id -> hmm_* column -> numbers. Per-element tables sit on the element's own row (anchor
-// emission / null tables, poly length tables, barcode-block spacer tables on the first spacer row,
-// cDNA length on read / rc_read); global, junction, begin/end tables on seq_start / seq_stop /
-// rc_seq_start / rc_seq_stop. Structural tables are only used when `topology` (a hash of the
-// generated topology) matches the model they are applied to.
+// Calibrated parameters as cached in RAD's position map: element id -> hmm_* column -> numbers.
+// Structural tables apply only when `topology` matches the model's topology hash.
 struct Params {
     std::map<std::string, std::map<std::string, std::vector<double>>> cells;
     bool guard_failed = false;
     uint64_t topology = 0;
-    std::vector<std::string> bad_cells;  // "row/column" of hmm_* cells that did not parse as numbers (rejected by Model::build)
+    std::vector<std::string> bad_cells;  // "row/column" of hmm_* cells that did not parse as numbers
     bool empty() const { return cells.empty() && bad_cells.empty(); }
 };
 
@@ -116,76 +69,56 @@ inline const char* status_name(Status s) {
     }
 }
 
-struct CheckRegion {
+struct check_region {
     int start, end;                  // 0-based half-open window (padded)
-    int element;                     // index into LayoutSpec::elements
+    int element;                     // index into layout_spec::elements
     char strand;                     // 'F' / 'R' strand of the construct ('T' / 'D' for artifact templates)
     int construct;                   // construct index (0-based, read order)
     Status status;
     int retained_from, retained_to;  // adapter offsets present [from, to), -1 if n/a
-    int edits;                       // edit distance of the seen part (-1 unknown / n.a.)
+    int edits;                       // edit distance of the seen part, -1 if unknown
     float conf;
 };
-// Segment flags
 enum : uint16_t {
     SEG_PARTIAL_LEFT = 1,     // opening element of the construct not observed
     SEG_PARTIAL_RIGHT = 2,    // closing element not observed
-    SEG_LOWCONF = 4,          // low confidence (posterior < 0.9, or cut placed without junction evidence)
-    SEG_SAME_MOLECULE_R = 8,  // the junction to the right is a fold-back (same molecule read twice)
-    SEG_DOUBLE_BC = 16,       // 'D' geometry: two barcode-side units facing outward, one construct, and the D strand rule
-                              // found no clear cDNA direction (strand 'D': RAD writes nothing)
+    SEG_LOWCONF = 4,
+    SEG_SAME_MOLECULE_R = 8,  // the junction to the right is a fold-back
+    SEG_DOUBLE_BC = 16,       // D geometry with no clear cDNA direction (strand 'D': RAD writes nothing)
     SEG_ARTIFACT = 32,        // artifact template (barcode-less T, or a single-primer end)
-    SEG_UNANCHORED_R = 64,    // cut to the right placed by geometry / duration MAP (no junction adapter)
-    SEG_EMPTY = 128,          // (near) zero-length insert (empty bead oligo / primer dimer)
-    // D strand rule: a D geometry decided by the cDNA strand table
-    SEG_D_KEPT = 256,         // plain F / R construct: the barcode unit at the cDNA 5' end is kept, the other unit removed; the
-                              // segment edge on the removed side (end for F, start for R) is that unit's inner anchor, and the
-                              // read element ends there
-    SEG_D_SPLIT = 512         // plain F / R construct: one half of a D geometry whose cDNA changes strand (two cDNAs tail to
-                              // tail), split at the strand change (cut kind CUT_STRAND_FLIP)
+    SEG_UNANCHORED_R = 64,    // cut to the right placed without a junction adapter
+    SEG_EMPTY = 128,          // (near) zero-length insert
+    SEG_D_KEPT = 256,         // D geometry: the unit at the cDNA 5' end is kept; the segment ends at the other unit's inner anchor
+    SEG_D_SPLIT = 512         // D geometry: one half of a split at a cDNA strand change
 };
 struct Segment {
     int start, end;  // 0-based half-open
-    char strand;     // 'F','R','T' (barcode-less artifact), 'D' (double barcode unit), '?' (single-primer end
-                     // whose barcode-side partner anchor was not seen: no strand evidence)
+    char strand;     // 'F', 'R', 'T' (barcode-less artifact), 'D' (double barcode unit), '?' (no strand evidence)
     uint16_t flags;
     float conf;
 };
-// Result flags
 enum : uint32_t {
-    RES_ABSTAIN = 1,          // uncertain: p_single in the uncertain band or a junction posterior < tau
-    RES_TOO_MANY = 2,         // more than ModelOptions::k_cap constructs (k capped)
-    RES_GUARD_FAILED = 4,     // the calibration guard failed for this model (layout priors in use)
+    RES_ABSTAIN = 1,
+    RES_TOO_MANY = 2,         // more than model_options::k_cap constructs (k capped)
+    RES_GUARD_FAILED = 4,     // layout priors in use
     RES_FAST_PATH = 8,        // decided by the stage-1 gate
-    RES_OPPOSITE_EVIDENCE = 16, // unexplained opposite-strand anchor (ED <= 4) remains -> strand '?'
-    RES_RESCUED = 32            // a junction was added by the facing-anchor rescue (two facing barcode-side partner anchors)
+    RES_OPPOSITE_EVIDENCE = 16, // unexplained opposite-strand anchor -> strand '?'
+    RES_RESCUED = 32            // a junction was added by the facing-anchor rescue
 };
 struct Result {
     int k = 0;
     std::vector<int> cuts;           // size k-1
     std::vector<Segment> segs;       // size k
-    std::vector<CheckRegion> checks;
+    std::vector<check_region> checks;
     float p_single = 0.f;            // P(k == 1 | read)
     char strand_call = '?';          // 'F','R','M','?'
     uint32_t flags = 0;
     std::vector<float> cut_post;     // per-cut junction posterior (size k-1)
-    // per-cut child windows (size k-1): the construct left of cut i is handed to alignment up to cut_hi[i], the one
-    // right of it from cut_lo[i] (cut_lo[i] <= cuts[i] <= cut_hi[i]). They differ from the cut only at a barcode-side
-    // junction whose barcode-block edge comes from an anchor-grade partner anchor (10x 5' rc_tso / tso) and lies on
-    // the far side of the cut (facing blocks that abut or overlap, e.g. a fused RF_FR junction with micro-homology):
-    // the window then reaches that edge + BC_WIN_PAD, so each child keeps its whole barcode block. Children may
-    // overlap by a few bp there.
+    // per-cut child windows: the left construct ends at cut_hi[i], the right one starts at cut_lo[i]
+    // (cut_lo[i] <= cuts[i] <= cut_hi[i]; children may overlap where facing barcode blocks abut)
     std::vector<int> cut_lo, cut_hi;
-    // per cut (size k-1): how the cut was placed (POLICY_ROUND.md round 3, cut hierarchy): 0 both junction adapters
-    // (midpoint between them), 1 one adapter (its junction-facing edge), 2 layout geometry (barcode-block edge /
-    // fixed tails), 5 cDNA strand flip (FR_RF junction with no adapter: calibrated 6-mer strand table; or a D geometry
-    // whose cDNA changes strand: D strand rule, 9-mer table), 3 duration-MAP midpoint (nothing located: low
-    // confidence), 4 fold-back centre (same molecule read twice)
-    std::vector<uint8_t> cut_kind;
-    // per cut: the score behind the placement: fold-back Jaccard (CUT_FOLDBACK), strand-flip margin in units of the
-    // calibrated mean score (CUT_STRAND_FLIP at an FR_RF junction) or the weaker arm's evidence in those units
-    // (CUT_STRAND_FLIP inside a D geometry), 0 otherwise
-    std::vector<float> cut_aux;
+    std::vector<uint8_t> cut_kind;   // per cut: CUT_* value
+    std::vector<float> cut_aux;      // per cut: fold-back Jaccard or strand-flip evidence (strand_mu units), else 0
 #ifdef CONCAT_HMM_STAGE_TIMERS
     uint64_t stage_ns[4] = {0, 0, 0, 0};  // stage0, gate, stage2 (Myers/events), stage3 (decode+output)
 #endif
@@ -194,27 +127,26 @@ struct Result {
 #define CONCAT_HMM_HAS_STRAND_TABLE 1  // calibrated strand k-mer table (hmm_strand column), strand-flip cuts
 enum : uint8_t { CUT_BOTH_ADAPTERS = 0, CUT_ONE_ADAPTER = 1, CUT_GEOMETRY = 2, CUT_MIDPOINT = 3, CUT_FOLDBACK = 4, CUT_STRAND_FLIP = 5 };
 
-// Policies and switches (defaults are the evaluated configuration).
-struct ModelOptions {
-    int artifact_templates = -1;   // -1 auto (single-primer end templates when the layout has a weak outer anchor), 0 off, 1 on
-    int d_template = -1;           // -1 auto (when the barcode-side outer anchor is weak, i.e. 10x 5'-like), 0 off, 1 on
-    bool gate = true;              // stage-1 fast path
+struct model_options {
+    int artifact_templates = -1;   // -1 auto (when the layout has a weak outer anchor), 0 off, 1 on
+    int d_template = -1;           // -1 auto, 0 off, 1 on
+    bool gate = true;
     bool windowed_myers = true;    // false: whole-read Myers on the full path
-    bool posteriors = true;        // forward-backward on the full path
-    bool check_regions = true;     // emit check regions
+    bool posteriors = true;
+    bool check_regions = true;
     bool relaxed_openers = true;   // ED <= budget+2 opener scan after strong closers
-    bool foldback_split = true;    // fold-backs: split at the palindrome centre (2 constructs, SEG_SAME_MOLECULE_R)
+    bool foldback_split = true;
     int k_cap = 256;
-    int min_interior_len = -1;     // -1: layout-derived (see BUILD.md)
+    int min_interior_len = -1;     // -1: layout-derived
     int min_terminal_len = 60;
-    float tau_single = 0.99f;      // abstain when k==1 and p_single < tau_single (full path; fast-path reads never abstain)
+    float tau_single = 0.99f;      // abstain when k == 1 and p_single < tau_single (full path only)
     float tau_junction = 0.9f;     // abstain when a junction posterior < tau_junction
-    int check_pad = 25;            // padding of MISSING_EXPECTED windows (plus spacer half-range)
-    int seen_pad = 6;              // padding of windows of seen elements
+    int check_pad = 25;            // bp padding of MISSING_EXPECTED windows
+    int seen_pad = 6;              // bp padding of windows of seen elements
 };
 
-struct LayoutSpecError : std::runtime_error {
-    explicit LayoutSpecError(const std::string& m) : std::runtime_error(m) {}
+struct layout_spec_error : std::runtime_error {
+    explicit layout_spec_error(const std::string& m) : std::runtime_error(m) {}
 };
 
 namespace detail {
@@ -223,9 +155,9 @@ constexpr float NEG = -1e30f;
 constexpr float NEG_HALF = -5e29f;
 constexpr int NFEAT = 32;
 constexpr int FEAT_PREFIX = 16;    // 16..20: read-end prefix of a closing anchor (retained-length bins)
-constexpr int FEAT_SEEDPART = 21;  // 21..25: seed-chain partial (internal fragment), retained-length bins
+constexpr int FEAT_SEEDPART = 21;  // 21..25: seed-chain partial, retained-length bins
 constexpr int FEAT_TRUNC5 = 26;    // opener suffix at the read start (seeds)
-constexpr int FEAT_TRUNC3S = 27;   // closer running off the read end seen by seeds only
+constexpr int FEAT_TRUNC3S = 27;   // closer running off the read end (seeds)
 constexpr int NPOLYBIN = 8;
 constexpr int NPARTBIN = 5;
 constexpr int MAXPAT = 16;         // Myers patterns (chunks), both strands
@@ -245,71 +177,37 @@ constexpr int MAX_EVENTS = 1 << 15;
 constexpr int PACK_MAX = 57;
 constexpr int PAT_MAXLEN = 63;
 constexpr int SEED_K = 11;
-constexpr float SHORT_LLR_CAP = 8.0f;  // nats (restored at read-start / read-end geometry)
-constexpr float FORCE_BONUS = 30.0f;   // nats: junction forced by the facing-anchor rescue
-constexpr int RESCUE_GMAX = 150;       // facing-anchor rescue: gap g beyond the abutting barcode blocks, one anchor on the path
-constexpr int RESCUE_GMAX_OFF = 30;    // ... both anchors off the path
-constexpr int RESCUE_GMIN = -5;        // ... overlap of the two barcode blocks (micro-homology; SCORE.md used -6, but on this
-                                       // decoder the only g = -6 firings were isolated-tso decoys)
-constexpr int DEL_GMIN = -5;           // decoder: overlap allowed between abutting barcode blocks (deleted primers)
-constexpr int DEL_GMAX_CERT = 30;      // decoder: filler up to which facing partner anchors certify the junction
-constexpr int BC_WIN_PAD = 2;          // child windows reach an anchor-derived barcode-block edge + this (umi indels,
-                                       // anchor end differences between the HMM and RAD's own alignment)
-constexpr int FOLD_ROOM = 25;          // fold-back mirror test: a missing mirror element may lie within this of a read end
-constexpr int FOLD_SPREAD = 6;         // ... the two arms' barcode units agree in geometry within this (bp)
-constexpr float WEAK_POST = 0.5f;      // posterior cap of a pairing junction / fold-back split without enough evidence (< tau_junction)
-// POLICY_ROUND.md round 3 (user policies 9 and 10)
-constexpr int FOLD_K = 10;             // fold-back decision: Jaccard of 10-mers, left arm vs reverse complement of the right arm
-constexpr int FOLD_ARM_MIN = 40;       // ... each arm at least this long (bp)
-constexpr float FOLD_J = 0.10f;        // ... reference threshold (measured at truth junctions: fold-backs median 0.29, D / FF / RR
-                                       //     0.00, FR_RF 0.00-0.03; the tails overlap, so identity and reach are required too)
-constexpr float FOLD_J_LO = 0.06f;     // ... minimum Jaccard considered at all
-constexpr float FOLD_NW_ID = 0.65f;    // ... banded identity (1 - edits / longer segment) of the mirrored core required
-constexpr int FOLD_REACH = 40;         // ... the mirrored diagonal must reach within this of an arm's unit-side end (inner anchor seen)
-constexpr int FOLD_REACH_OPEN = 80;    // ... or within this when that end is open (the unit's inner anchor was not observed: lost unit)
-constexpr int FOLD_DIAG_MIN = 8;       // ... and carry at least this many shared k-mers
-constexpr int STRAND_K = 6;            // strand table: k-mer length (4^6 = 4096 entries)
+constexpr float SHORT_LLR_CAP = 8.0f;  // nats; LLR cap of short anchors
+constexpr float FORCE_BONUS = 30.0f;   // nats; bonus of a junction forced by the facing-anchor rescue
+constexpr int RESCUE_GMAX = 150;       // bp; rescue gap beyond the abutting barcode blocks, one anchor on the path
+constexpr int RESCUE_GMAX_OFF = 30;    // bp; same, both anchors off the path
+constexpr int RESCUE_GMIN = -5;        // bp; overlap of the two barcode blocks
+constexpr int DEL_GMIN = -5;           // bp; overlap allowed between abutting barcode blocks (deleted primers)
+constexpr int DEL_GMAX_CERT = 30;      // bp; filler up to which facing partner anchors certify the junction
+constexpr int BC_WIN_PAD = 2;          // bp; child windows reach an anchor-derived barcode-block edge + this
+constexpr int FOLD_ROOM = 25;          // fold_mirrored only
+constexpr int FOLD_SPREAD = 6;         // fold_mirrored only
+constexpr float WEAK_POST = 0.5f;      // posterior cap of a pairing junction without enough evidence
+constexpr int FOLD_K = 10;             // fold-back decision: k-mer length
+constexpr int FOLD_ARM_MIN = 40;       // bp; minimum arm length
+constexpr float FOLD_J = 0.10f;        // unused
+constexpr float FOLD_J_LO = 0.06f;     // minimum arm Jaccard
+constexpr float FOLD_NW_ID = 0.65f;    // banded identity of the mirrored core
+constexpr int FOLD_REACH = 40;         // bp; mirrored diagonal reach to an arm end bounded by an inner anchor
+constexpr int FOLD_REACH_OPEN = 80;    // bp; same, when that inner anchor was not observed
+constexpr int FOLD_DIAG_MIN = 8;       // shared k-mers on the mirrored diagonal
+constexpr int STRAND_K = 6;            // strand table k-mer length
 constexpr int STRAND_N = 4096;
 constexpr int STRAND_MARGIN_BP = 10;   // calibration: bases skipped next to the cDNA's bounding elements
 constexpr int STRAND_MIN_CDNA = 60;    // calibration: minimum cDNA length counted
-constexpr int FLIP_ARM_MIN = 30;       // strand-flip cut: each arm at least this long (bp)
-constexpr float FLIP_MARGIN = 0.30f;   // strand-flip cut: both arm means must exceed this fraction of the calibrated mean sense score
-                                       // (a path junction between an F and an R construct: the junction exists, only its place is open)
-constexpr float FLIP_DISTINCT_MIN = 0.5f; // strand-flip cut: distinct STRAND_K-mers / k-mer positions of each arm (low-complexity guard:
-                                          //     a microsatellite or homopolymer arm repeats one k-mer and carries no strand information)
-constexpr int FLIP_EVIDENCE_MIN = 40;  // strand-flip cut: each arm's score sum >= this many mean sense scores (strand_mu units), so a
-                                       //     30-60 bp arm needs a mean well above the margin (short arms are noisy; 10x 5' training
-                                       //     cDNA: single-strand false fires at the D margin 0.76% -> 0.39%, two-molecule 36.8% -> 36.5%)
-// D strand rule. A D geometry (10x 5': forw_primer barcode umi tso |
-// cDNA | rc_tso rc_umi rc_barcode rc_forw_primer, nothing at the junction) is decided by the cDNA strand sense, read with a
-// second strand table of STRAND_D_K-mers learned in the same calibration pass from the same cDNA as the 6-mer table and
-// cached as counts (hmm_strand_d). The 6-mer table stays as it is for the FR_RF strand-flip cut.
-constexpr int STRAND_D_K = 9;          // hard-coded: chosen by measurement on 13,241 10x 5' D reads against minimap2 (6-mers: at a
-                                       //     0.5% false-flip rate on closed single-strand reads 73% of the one-cDNA reads and 45% of the
-                                       //     two-cDNA reads are decided; 8-mers 95% / 85%; 9-mers 98% / 93%); a per-library choice of k
-                                       //     needs a truth set, not available in the calibration pass
-constexpr int STRAND_D_N = 1 << (2 * STRAND_D_K);  // 262,144 entries (1 MiB of float log-odds in the model, 1 MiB of counts per calibrator)
-constexpr double STRAND_D_MIN_KMERS = 2.0e6;  // calibration: the D table is written only from at least this many counted k-mers (about 8
-                                              //     per entry; hard-coded: smaller samples decided fewer reads in the measurement)
-constexpr float D_EVIDENCE_MIN = 16.f; // D strand rule: the evidence (a score sum in units of the calibrated mean sense score, i.e. in
-                                       //     "average sense positions") an arm pair needs for a strand change (in either order) and the
-                                       //     whole cDNA needs for one direction. Hard-coded. First measured as the 99.5th percentile of
-                                       //     the weaker-arm evidence S on 50,611 held-out closed single-strand reads (14.0; in-sample
-                                       //     12.6). The percentile depends on the closed-read definition: on
-                                       //     22,589 strictly closed reads outside the calibration
-                                       //     head (HMM k = 1, F or R, every check FULL, both anchors found by edlib within 150 bp of the
-                                       //     read ends at <= 2 edits, poly_a removed, cDNA >= 100 bp) the 99.5th percentile of S is 9.4
-                                       //     and of S' (the mirrored evidence) 11.9; E = 16 sits between the 99.8th and the 99.9th
-                                       //     percentile of S there (S >= 16 in 0.18%, S' >= 16 in 0.27% of these reads; the set holds
-                                       //     real strand changes, so these are upper bounds). On the truth set S >= 16 in 8 of 10,044
-                                       //     one-cDNA reads (0.08%) and S' >= 16 in 11 (0.11%). A calibrated value would need a second
-                                       //     pass over the stored calibration cDNA, and the 0.2-0.5% real two-cDNA reads among the
-                                       //     closed calibration reads sit at that percentile, so the quantile level would be a constant
-                                       //     in its place. The one-direction test (|T| >= D_EVIDENCE_MIN)
-                                       //     reuses the value: on 10,044 one-cDNA 10x 5' reads with mapping truth the sign of T is
-                                       //     wrong in 1 of 19 reads at |T| in (16, 24], 0 of 32 in (24, 32], 1 of 96 in (32, 48] and 0 of
-                                       //     9,875 above 48; no value of a separate threshold removes both
-                                       //     errors for less than 1.5% of the kept records, so none was added.
+constexpr int FLIP_ARM_MIN = 30;       // bp; strand-flip cut: minimum arm length
+constexpr float FLIP_MARGIN = 0.30f;   // strand-flip cut: minimum arm mean, as a fraction of strand_mu
+constexpr float FLIP_DISTINCT_MIN = 0.5f; // distinct k-mers / k-mer positions per arm (low-complexity guard)
+constexpr int FLIP_EVIDENCE_MIN = 40;  // strand-flip cut: minimum arm score sum, in strand_mu units
+constexpr int STRAND_D_K = 9;          // D strand table k-mer length
+constexpr int STRAND_D_N = 1 << (2 * STRAND_D_K);
+constexpr double STRAND_D_MIN_KMERS = 2.0e6;  // calibration: minimum counted k-mers to write the D table
+constexpr float D_EVIDENCE_MIN = 16.f; // D strand rule: minimum evidence, in strand_d_mu units
 
 inline int poly_bin(int len) {
     static const int ub[7] = {14, 17, 21, 26, 33, 42, 55};
@@ -393,8 +291,7 @@ inline std::string csv_quote(const std::string& s) {
     return o + "\"";
 }
 // "15-16" -> {15,16}; "22" -> {22}; "8,10" / "8;10" / "8 10" -> {8,10}; "" (or na / nan / none / null) -> {}.
-// `ok` is false on anything else: letters, a negative number ("-5"), an open or reversed range, or a
-// length above LENGTH_MAX (a barcode / UMI / linker block of more than 4 kb is not a spacer).
+// `ok` is false on anything else (letters, negatives, open or reversed ranges, lengths above LENGTH_MAX).
 constexpr int LENGTH_MAX = 4096;
 inline std::vector<int> parse_length_list(const std::string& s_in, bool* ok_out = nullptr) {
     std::vector<int> out;
@@ -436,14 +333,13 @@ inline std::string read_file(const std::string& path) {
     ss << in.rdbuf();
     return ss.str();
 }
-inline bool is_poly_elem(const LayoutElement& e) {
+inline bool is_poly_elem(const layout_element& e) {
     if (!e.is_static) return false;
     std::string k = lower(e.klass), id = lower(e.id);
     if (k == "poly_tail" || k == "poly_t" || k == "poly_a" || id == "poly_t" || id == "poly_a" || id.rfind("poly_", 0) == 0) return true;
-    // "T{12,}+" style
     return e.seq.find('{') != std::string::npos;
 }
-inline char poly_base_of(const LayoutElement& e) {
+inline char poly_base_of(const layout_element& e) {
     std::string id = lower(e.id), k = lower(e.klass);
     if (id == "poly_a" || k == "poly_a") return 'A';
     if (id == "poly_t" || k == "poly_t") return 'T';
@@ -451,9 +347,8 @@ inline char poly_base_of(const LayoutElement& e) {
         if (c == 'A' || c == 'C' || c == 'G' || c == 'T') return c;
     return 'T';
 }
-// Static sequence in model form: upper case, IUPAC ambiguity codes (RYSWKMBDHV) become the N wildcard,
-// any other character (spaces, '-', digits) is dropped.
-inline std::string static_seq_of(const LayoutElement& e) {
+// Static sequence in model form: upper case, IUPAC codes -> N, other characters dropped.
+inline std::string static_seq_of(const layout_element& e) {
     std::string s2;
     for (char c : upper(e.seq)) {
         if (c == 'A' || c == 'C' || c == 'G' || c == 'T' || c == 'N') s2 += c;
@@ -467,29 +362,27 @@ inline std::string strip_flank_n(const std::string& s) {
     while (b > a && s[b - 1] == 'N') --b;
     return s.substr(a, b - a);
 }
-// The anchor sequence the model searches for (flanking N stripped), as stored in Model::anch[].seq.
-inline std::string anchor_seq_of(const LayoutElement& e) { return strip_flank_n(static_seq_of(e)); }
+inline std::string anchor_seq_of(const layout_element& e) { return strip_flank_n(static_seq_of(e)); }
 inline int informative_bases(const std::string& s) {
     int c = 0;
     for (char x : s) c += x != 'N';
     return c;
 }
-inline bool is_insert_elem(const LayoutElement& e) {
+inline bool is_insert_elem(const layout_element& e) {
     std::string k = lower(e.klass), id = lower(e.id);
     return !e.is_static && (k == "read" || id == "read" || id == "rc_read");
 }
 constexpr int ANCHOR_MIN_INFORMATIVE = 12;
-// Checks a LayoutSpec (from parse_layout_csv or built directly, e.g. by RAD's adapter): every static
-// anchor needs >= 12 informative (non-N) bases (shorter ones match real cDNA everywhere), spacer
-// lengths must lie in [0, LENGTH_MAX], and at least one anchor must exist. Throws LayoutSpecError.
-inline void validate_spec(const LayoutSpec& L) {
+// Throws layout_spec_error unless every static anchor has >= ANCHOR_MIN_INFORMATIVE non-N bases, spacer
+// lengths lie in [0, LENGTH_MAX] and at least one anchor exists.
+inline void validate_spec(const layout_spec& L) {
     int nstatic = 0;
     for (auto& e : L.elements) {
         if (!e.is_static) {
             if (!is_insert_elem(e))
                 for (int x : e.length_candidates)
                     if (x < 0 || x > LENGTH_MAX)
-                        throw LayoutSpecError("concat_hmm: layout '" + L.name + "': element '" + e.id + "' has length candidate " + std::to_string(x) +
+                        throw layout_spec_error("concat_hmm: layout '" + L.name + "': element '" + e.id + "' has length candidate " + std::to_string(x) +
                                               " outside [0, " + std::to_string(LENGTH_MAX) + "]");
             continue;
         }
@@ -499,22 +392,18 @@ inline void validate_spec(const LayoutSpec& L) {
         const std::string a = anchor_seq_of(e);
         if (a.empty()) continue;  // static row without a sequence: not an anchor
         if (informative_bases(a) < ANCHOR_MIN_INFORMATIVE)
-            throw LayoutSpecError("concat_hmm: layout '" + L.name + "': static element '" + e.id + "' ('" + e.seq + "') has " +
+            throw layout_spec_error("concat_hmm: layout '" + L.name + "': static element '" + e.id + "' ('" + e.seq + "') has " +
                                   std::to_string(informative_bases(a)) + " informative bases (minimum " + std::to_string(ANCHOR_MIN_INFORMATIVE) + ")");
         ++nstatic;
     }
     if (nstatic == 0)
-        throw LayoutSpecError("concat_hmm: layout '" + L.name + "' has no usable static (anchor) element: the model would be empty");
+        throw layout_spec_error("concat_hmm: layout '" + L.name + "' has no usable static (anchor) element: the model would be empty");
 }
 
 }  // namespace detail
 
-// Parses both RAD layout CSV formats:
-//  * user format: optional "Read Layout[:mode]" title row, columns id,seq,expected_length,type,class,whitelist[,flags]
-//  * generated cache format: id,seq,masked_seq,expected_length,length_candidates,flags,type,class,direction,class_id,
-//    whitelist,order (with or without the title row).
-// Throws LayoutSpecError when the file is unreadable or yields no usable static element.
-inline LayoutSpec parse_layout_text(const std::string& text_in, const std::string& name = "") {
+// Parses both RAD layout CSV formats; throws layout_spec_error when no usable static element remains.
+inline layout_spec parse_layout_text(const std::string& text_in, const std::string& name = "") {
     using namespace detail;
     std::string text = text_in;
     if (text.size() >= 3 && (unsigned char)text[0] == 0xEF && (unsigned char)text[1] == 0xBB && (unsigned char)text[2] == 0xBF)
@@ -528,10 +417,9 @@ inline LayoutSpec parse_layout_text(const std::string& text_in, const std::strin
             if (!trim(ln).empty()) lines.push_back(ln);
         }
     }
-    LayoutSpec L;
+    layout_spec L;
     L.name = name;
-    if (lines.size() < 2) throw LayoutSpecError("concat_hmm: layout '" + name + "' has fewer than 2 non-empty lines");
-    // locate the header row: the first row (within the first 3) whose fields include "id" and ("seq" or "type")
+    if (lines.size() < 2) throw layout_spec_error("concat_hmm: layout '" + name + "' has fewer than 2 non-empty lines");
     size_t hdr_line = std::string::npos;
     for (size_t li = 0; li < std::min<size_t>(lines.size(), 3); ++li) {
         auto f = csv_fields(lines[li]);
@@ -549,7 +437,7 @@ inline LayoutSpec parse_layout_text(const std::string& text_in, const std::strin
         }
         if (has_id && (has_seq || has_type)) { hdr_line = li; break; }
     }
-    if (hdr_line == std::string::npos) throw LayoutSpecError("concat_hmm: layout '" + name + "': no header row with id/seq/type columns");
+    if (hdr_line == std::string::npos) throw layout_spec_error("concat_hmm: layout '" + name + "': no header row with id/seq/type columns");
     L.bulk = L.mode == "bulk";
     auto hdr = csv_fields(lines[hdr_line]);
     std::map<std::string, int> col;
@@ -563,7 +451,7 @@ inline LayoutSpec parse_layout_text(const std::string& text_in, const std::strin
     int order = 0;
     for (size_t li = hdr_line + 1; li < lines.size(); ++li) {
         auto f = csv_fields(lines[li]);
-        LayoutElement e;
+        layout_element e;
         e.id = get(f, "id");
         if (e.id.empty()) continue;
         std::string type = lower(get(f, "type"));
@@ -578,14 +466,14 @@ inline LayoutSpec parse_layout_text(const std::string& text_in, const std::strin
         order = std::max(order, e.order);
         std::string lk = lower(e.klass);
         if (lk == "poly_t" || lk == "poly_a") e.klass = "poly_tail";
-        // lengths matter for spacers (barcodes, UMIs, linkers): an unparsable value is an error there
+        // an unparsable length is an error for spacers only
         const bool spacer = !e.is_static && !is_insert_elem(e);
         bool ok1 = true, ok2 = true;
         const std::string lc = get(f, "length_candidates"), el = get(f, "expected_length");
         e.length_candidates = parse_length_list(lc, &ok1);
         if (e.length_candidates.empty()) e.length_candidates = parse_length_list(el, &ok2);
         if (spacer && (!ok1 || (e.length_candidates.empty() && !ok2)))
-            throw LayoutSpecError("concat_hmm: layout '" + name + "': element '" + e.id + "' has an unusable length ('" + (ok1 ? el : lc) +
+            throw layout_spec_error("concat_hmm: layout '" + name + "': element '" + e.id + "' has an unusable length ('" + (ok1 ? el : lc) +
                                   "'; expected e.g. 12, 15-16 or 8,10, each <= " + std::to_string(LENGTH_MAX) + ")");
         std::string ml = get(f, "misalign_lower");
         if (!ml.empty()) e.max_edits = std::atoi(ml.c_str());
@@ -594,9 +482,9 @@ inline LayoutSpec parse_layout_text(const std::string& text_in, const std::strin
     validate_spec(L);
     return L;
 }
-inline LayoutSpec parse_layout_csv(const std::string& path) {
+inline layout_spec parse_layout_csv(const std::string& path) {
     std::string t = detail::read_file(path);
-    if (t.empty()) throw LayoutSpecError("concat_hmm: cannot read layout file '" + path + "'");
+    if (t.empty()) throw layout_spec_error("concat_hmm: cannot read layout file '" + path + "'");
     return parse_layout_text(t, path);
 }
 
@@ -606,20 +494,20 @@ struct Scratch;
 
 namespace detail {
 
-enum ElemKind : uint8_t { EK_ANCHOR = 0, EK_POLY = 1, EK_SPACER = 2, EK_INSERT = 3 };
+enum elem_kind : uint8_t { EK_ANCHOR = 0, EK_POLY = 1, EK_SPACER = 2, EK_INSERT = 3 };
 
 struct TElem {
-    ElemKind kind = EK_SPACER;
+    elem_kind kind = EK_SPACER;
     int anc = -1;            // anchor id (EK_ANCHOR) or poly id (EK_POLY)
     int lmin = 0, lmax = 0;
     std::string label;       // element id (merged spacers: "a+b")
-    int spec = -1;           // LayoutSpec element index (first element of a merged spacer block)
-    int fwd_spec = -1;       // derived reverse-complement slot: LayoutSpec index of its forward counterpart
+    int spec = -1;           // layout_spec element index (first element of a merged spacer block)
+    int fwd_spec = -1;       // derived reverse-complement slot: layout_spec index of its forward counterpart
     double nominal = 0, var = 0, hr = 0;  // nominal length, variance, half-range
 };
 struct Template {
     char strand = '?';       // F, R, T (barcode-less), D (double barcode unit)
-    bool main = false;       // F or R
+    bool main = false;
     bool art = false;        // artifact / auxiliary template (T, A5, A5r, A3, A3r, D)
     bool dtpl = false;
     std::string name;
@@ -643,41 +531,41 @@ struct Pattern {             // one Myers pattern (an anchor chunk of <= 63 bp)
     int anchor = -1, off = 0, m = 0, k = 0;
     std::array<uint8_t, 65> inf{};  // inf[i]: informative (non-N) bases among used[0, i)
 };
-struct PWord {               // SWAR-packed word: A in [0,mA), guard bit, B in [mA+1, mA+1+mB)
+struct PWord {               // SWAR-packed word: A in [0,m_a), guard bit, B in [m_a+1, m_a+1+m_b)
     uint64_t peq[256];
-    int pa = -1, pb = -1, mA = 0, mB = 0, tA = 0, tB = 0, kA = 0, kB = 0;
+    int pa = -1, pb = -1, m_a = 0, m_b = 0, t_a = 0, t_b = 0, k_a = 0, k_b = 0;
     uint64_t CG = ~0ULL, HB = 0, CS = ~0ULL, T = 0, H = 0, S0 = 0, FA = ~0ULL;
 };
-struct LWord {               // single pattern, scalar
+struct LWord {
     uint64_t peq[256];
     int pat = -1, m = 0, k = 0;
 };
 struct PState { uint64_t Pv, Mv, S; };
 struct Clu { int32_t first, last, best_end, best; };
 inline void clu_reset(Clu& c) { c.first = c.last = c.best_end = -1; c.best = 1 << 30; }
-struct RawEv { int32_t end, first, last; uint8_t pat, score; };
+struct raw_ev { int32_t end, first, last; uint8_t pat, score; };
 
 enum : uint8_t { CL_S4 = 0, CL_S6 = 1, CL_S8 = 2, CL_SP = 3, CL_POLY = 4 };
 enum : uint8_t { EVF_TRUNC3 = 1, EVF_TRUNC5 = 2, EVF_SEEDPART = 4, EVF_RELAXED = 8, EVF_PREFIX = 16 };
 struct Event {
     int32_t start, end;      // implied full-element span, clamped to the read
     uint8_t type;            // anchor id, or A + poly id
-    uint8_t feat;            // emission feature
+    uint8_t feat;
     uint8_t cls;             // evidence class (CL_*)
     uint8_t fl;              // EVF_*
     int16_t rlo, rhi;        // retained element offsets [rlo, rhi) (anchors), -1 if n/a
     int16_t ed;              // edit distance of the seen part (-1 unknown)
     int16_t len;             // poly length / retained length
 };
-struct SeedCluster {
+struct seed_cluster {
     int32_t s, e;            // implied element span (may run past the read ends)
     uint8_t a, n, nx;        // anchor, seeds, exact seeds
     int16_t olo, ohi;        // min / max seed offset (element coordinates)
     bool valid() const { return nx >= 1 || n >= 2; }
 };
-struct PolyReg { int32_t s, e; uint8_t q; };  // q = poly type id
+struct poly_reg { int32_t s, e; uint8_t q; };  // q = poly type id
 
-struct DescHot {
+struct desc_hot {
     float base = 0;
     int32_t fixed = 0;
     int16_t tid = -1;
@@ -686,13 +574,11 @@ struct DescHot {
     uint8_t valid = 0;
     uint8_t pal = 0;         // cross into an opening slot across a palindromic junction class
     uint8_t spacer_only = 0; // same-construct tight descriptor spanning only spacers
-    // tight junction between two anchor slots that skips barcode-adjacent outer primers (the closing one of the
-    // previous construct: dela bp; the opening one of the next: delb bp). Those primers may be physically
-    // deleted (fused junction: 10x 5' rc_tso <umi bc | bc umi> tso), so the gap may be shorter than `fixed` by
-    // dela, delb or dela + delb; the duration table covers those regimes too.
+    // lengths of deletable barcode-adjacent primers skipped by a tight junction (closing side, opening side):
+    // the gap may be shorter than `fixed` by dela, delb or dela + delb
     int16_t dela = 0, delb = 0;
 };
-struct DescCold {
+struct desc_cold {
     std::vector<std::pair<int, bool>> pres;
     int jfrom = -1, jto = -1;
     std::string key;
@@ -710,10 +596,9 @@ struct Nbr {                 // tight neighbour relation used for windows / gate
     int dir;                 // +1: other lies after this element, -1: before
     int lo, hi;              // gap range (this.end -> other.start for dir +1; other.end -> this.start for -1)
 };
-// A barcode-adjacent outer primer joined by fixed-length spacers only (the barcode block) to an inner partner
-// anchor, from the layout: head rule = template start [prim] <block> [inner] (10x 5' forw_primer <bc umi 26> tso),
-// tail rule = template end [inner] <block> [prim] (rc_tso <umi bc 26> rc_forw_primer).
-struct BcRule { int prim, inner, block; };
+// Barcode block: a barcode-adjacent outer primer joined by spacers only to an inner partner anchor.
+// Head rule: template start [prim] <block> [inner]; tail rule: [inner] <block> [prim] template end.
+struct bc_rule { int prim, inner, block; };
 
 inline int pat_k_budget(int m) {
     int k = m < 12 ? 1 : m < 16 ? 2 : m < 20 ? 4 : m < 30 ? 6 : m < 45 ? 8 : 10;
@@ -723,12 +608,9 @@ inline int strong_ed_of(int m) { return std::max(0, std::min(10, (int)std::floor
 
 }  // namespace detail
 
-// =====================================================================================
-// Model
-// =====================================================================================
 struct Model {
-    LayoutSpec spec;
-    ModelOptions opt;
+    layout_spec spec;
+    model_options opt;
     std::vector<detail::Template> tpl;
     std::vector<detail::Anchor> anch;
     std::vector<detail::Pattern> pats;
@@ -740,31 +622,23 @@ struct Model {
     std::vector<std::vector<int>> states_by_type;
     std::vector<int> open_state, close_state;
     std::vector<int> head_fix, tail_fix;   // per state: fixed bp from construct start to slot start / slot end to construct end (-1: insert between)
-    // per state: length of the barcode block between the slot and a barcode-adjacent outer primer at the template
-    // start (bc_head) / end (bc_tail), counting the primer as absent (-1: the slot is not such an inner slot).
-    // Nominal block length for an anchor slot, the maximum for a poly slot (fuzzy run start). Used to place cuts and
-    // read-end segment bounds at barcode-block edges (an unobserved barcode-adjacent primer counts as 0 bp).
+    // per state: bp of the barcode block between the slot and the barcode-adjacent primer at the template start /
+    // end, primer counted as absent; -1 if the slot is not such an inner slot
     std::vector<int> bc_head, bc_tail;
-    // per state: the slot belongs to a barcode-side unit of its template (an inner slot with bc_head / bc_tail >= 0, or
-    // the barcode-adjacent primer at the template end joined to it by spacers). Other slots are cDNA-side evidence
-    // (10x 5' poly_a / rev_primer of F, rc_rev_primer / poly_t of R, the bare outer primer of a single-primer end)
+    // per state: the slot belongs to a barcode-side unit (an inner slot or its barcode-adjacent primer)
     std::vector<uint8_t> bc_unit;
-    std::vector<detail::BcRule> head_rules, tail_rules;  // anchor partners only (poly runs never certify)
+    std::vector<detail::bc_rule> head_rules, tail_rules;  // anchor partners only (poly runs never certify)
     std::vector<int> tight_dela, tight_delb;             // per tight table: deletable barcode-adjacent primer lengths
-    std::vector<uint8_t> inner_role;                     // per type: 1 / 2 inner anchor of a tail (rc_tso) / head (tso) rule,
-                                                         // 4 / 8 barcode-adjacent primer of a tail (rc_forw_primer) / head rule
-    std::vector<std::vector<detail::Nbr>> nbr;  // per type
+    std::vector<uint8_t> inner_role;                     // per type: 1 / 2 tail / head rule inner anchor, 4 / 8 its primer
+    std::vector<std::vector<detail::Nbr>> nbr;
     std::vector<int> main_tpl;             // indices of F and R
-    std::vector<uint8_t> tpl_fold;         // fold-back test applies (auxiliary, barcode spacer, terminal anchors reverse-complementary)
-    std::vector<std::vector<int>> tpl_mirror;  // per template, per observable slot: the slot mirroring it across the insert
-                                               // (reverse-complementary anchor at the mirrored position; -1 none). Fold-back test only
-    // engine
+    std::vector<uint8_t> tpl_fold;         // per template: fold-back test applies
+    std::vector<std::vector<int>> tpl_mirror;  // per template, per observable slot: mirrored slot across the insert, -1 none
     std::vector<detail::PWord> words, rwords;
     std::vector<detail::LWord> lwords, single, single_rev;  // long patterns; single-pattern words per anchor (first chunk) and reversed
     std::vector<int> rword_anchor_pat;
     bool words_shared = false, rwords_shared = false;
     int Wov = 0, max_close_m = 0;
-    // seeds
     int K = detail::SEED_K;
     uint64_t kmask = 0;
     std::vector<uint64_t> seed_bits, seed_hkey, seed_bloom;  // exact 4^K presence bits; label hash keys; 2^19-bit L1 pre-filter
@@ -773,30 +647,25 @@ struct Model {
     bool stage0_poly[2] = {false, false};  // detect A / T runs in stage 0
     int polyq_of_base[4] = {-1, -1, -1, -1};  // A C G T -> poly id
     bool other_poly = false;
-    // parameters
     detail::PMap par, prior;
     std::vector<std::string> pres_names;
-    std::vector<detail::DescHot> same, cross;
-    std::vector<detail::DescCold> same_c, cross_c;
+    std::vector<detail::desc_hot> same, cross;
+    std::vector<detail::desc_cold> same_c, cross_c;
     std::vector<std::string> tight_keys;
     std::vector<int> tight_lo, tight_hi;
     std::vector<std::string> tight_row;    // serialization row of each tight table ("" = global)
-    // derived tables
     std::vector<float> emit, emit_pal;     // S * NFEAT
-    std::vector<float> emit_bonus;         // S * NFEAT: uncapped - capped LLR of short anchors (paid back at terminal geometry)
+    std::vector<float> emit_bonus;         // S * NFEAT: uncapped - capped LLR of short anchors
     std::vector<std::vector<float>> tight;
     std::vector<float> ins[2];
     std::vector<float> lbegin, lend;
     float lp0 = 0, lp1 = 0;
     int ins1_p99 = 1 << 30;                // p99 of the (calibrated) one-insert length density
-    // cDNA strand table (policy 10): per 6-mer, log-odds of the k-mer on the sense strand (F construct as read, R
-    // construct reverse-complemented) against its reverse complement; learned in calibration from single-strand
-    // reads, cached in the hmm_strand column of the read row. Empty when not calibrated.
+    // cDNA strand table: per STRAND_K-mer, sense vs antisense log-odds; empty when not calibrated
     std::vector<float> strand_lo;
-    float strand_mu = 0.f;                 // mean per-position sense score on the calibration cDNA (margin unit)
+    float strand_mu = 0.f;                 // mean per-position sense score of the calibration cDNA
     bool has_strand() const { return strand_lo.size() == (size_t)detail::STRAND_N && strand_mu > 0.f; }
-    // D strand table (D strand rule): the same log-odds per STRAND_D_K-mer, from the counts cached in the hmm_strand_d
-    // column of the read row (Model::finalize). Empty when not calibrated: D geometries then get SEG_DOUBLE_BC.
+    // D strand table: per STRAND_D_K-mer log-odds from the hmm_strand_d counts; empty when not calibrated
     std::vector<float> strand_d_lo;
     float strand_d_mu = 0.f;
     bool has_strand_d() const { return strand_d_lo.size() == (size_t)detail::STRAND_D_N && strand_d_mu > 0.f; }
@@ -804,11 +673,11 @@ struct Model {
     float fast_p = 0.995f;
     int min_interior = 60, min_terminal = 60;
     bool guard_failed = false;
-    std::vector<std::string> param_warnings;  // cached hmm_* cells rejected by apply_params (prior used; guard_failed set)
+    std::vector<std::string> param_warnings;  // hmm_* cells rejected by apply_params
     uint64_t topo_hash = 0;
     bool finalized = false;
 
-    static Model build(const LayoutSpec& spec, const Params* p = nullptr, const ModelOptions& o = ModelOptions());
+    static Model build(const layout_spec& spec, const Params* p = nullptr, const model_options& o = model_options());
     void finalize();
     void apply_params(const Params& p);
     Params export_params() const;
@@ -824,14 +693,14 @@ struct Model {
 };
 
 struct Scratch {
-    std::vector<uint64_t> seeds;            // (position << 16) | seed label (64-bit: reads longer than 65,536 bp)
+    std::vector<uint64_t> seeds;            // (position << 16) | seed label
     std::vector<uint32_t> hits;
-    std::vector<detail::SeedCluster> sc;
-    std::vector<detail::PolyReg> poly;
-    std::vector<detail::RawEv> rawA, rawB, rawX, rawCh;
+    std::vector<detail::seed_cluster> sc;
+    std::vector<detail::poly_reg> poly;
+    std::vector<detail::raw_ev> raw_a, raw_b, raw_x, raw_ch;
     std::vector<std::pair<int, int>> win;
     std::string cat;                        // evidence windows concatenated (separated by non-matching bytes)
-    std::vector<int> cat_off;               // per window: offset in cat
+    std::vector<int> cat_off;
     std::vector<detail::Event> ev, ev2;
     std::vector<float> dp;
     std::vector<int32_t> bp, cs;
@@ -845,30 +714,28 @@ struct Scratch {
     std::vector<int> cidx;                  // per construct: first path index
     std::vector<uint8_t> ckind;
     std::vector<int> ca, cb, bcut;
-    std::vector<int> jlo, jhi, segj;        // per path junction: child window bounds; per output segment: its right junction (-1 fold cut)
-    std::vector<uint8_t> cweak;             // per path junction made only by a pairing: bit 1 not enough evidence (abstain), 2 strong
-                                            // pairing, 4 / 8 left / right construct partner-delimited
-    std::vector<int> cgap;                  // per path junction: gap g between the barcode-block edges (pairing junctions)
+    std::vector<int> jlo, jhi, segj;        // per path junction: child window bounds; per output segment: its right junction
+    std::vector<uint8_t> cweak;             // per pairing junction: bit 1 weak (abstain), 2 strong pairing, 4 / 8 partner-delimited
+    std::vector<int> cgap;                  // per pairing junction: gap between the barcode-block edges
     std::vector<float> cpost, spost;
-    std::vector<float> caux, saux;          // per path junction / per output segment: cut score (fold Jaccard, flip margin)
-    std::vector<uint8_t> skind;             // per output segment: kind of the split inside its construct (fold-back / strand flip; 0 none)
-    std::vector<int> scut;                  // per output segment: the cut on its right (its construct's junction; a kept-left D construct
-                                            // (SEG_D_KEPT, 'F') ends at the removed unit's inner anchor, but its cut stays at the junction)
-    std::vector<int> slot_ev;               // construct slot -> path event (scratch)
-    std::vector<std::pair<int, int>> force; // facing-anchor rescue: (closing inner event, opening inner event) junctions forced on the next Viterbi
+    std::vector<float> caux, saux;          // per path junction / per output segment: cut score
+    std::vector<uint8_t> skind;             // per output segment: kind of the split inside its construct, 0 none
+    std::vector<int> scut;                  // per output segment: the cut on its right
+    std::vector<int> slot_ev;
+    std::vector<std::pair<int, int>> force; // event pairs whose junction the next Viterbi forces
     std::vector<int> onp;                   // per event: index on the decoded path (-1: off the path)
     std::vector<uint32_t> fb_keys;
     std::vector<int32_t> fb_pos, fb_diag;
     std::vector<int> fb_hist;
-    std::vector<uint32_t> jk_a, jk_b;       // fold-back decision: 10-mer sets of the two arms (policy 9)
+    std::vector<uint32_t> jk_a, jk_b;       // fold-back decision: 10-mer sets of the two arms
     std::vector<std::pair<uint32_t, int32_t>> jp_a, jp_b;  // ... k-mers with positions (mirror reach)
     std::vector<int32_t> nw0, nw1;          // banded edit-distance rows (fold-back tie-break)
-    std::vector<float> flip_ps;             // strand-flip cut: prefix sums of per-position strand scores (policy 10)
+    std::vector<float> flip_ps;             // strand-flip cut: prefix sums of per-position strand scores
     std::vector<uint8_t> flip_seen;         // ... distinct k-mer table of one arm (low-complexity guard)
     std::string shuf;
-    float best_score = 0, null_score = 0, lZ = 0, lZ1 = 0;
+    float best_score = 0, null_score = 0, l_z = 0, l_z1 = 0;
     Scratch() {
-        ev.reserve(256); ev2.reserve(256); rawA.reserve(64); rawB.reserve(64);
+        ev.reserve(256); ev2.reserve(256); raw_a.reserve(64); raw_b.reserve(64);
         dp.reserve(4096); bp.reserve(4096); cs.reserve(4096);
         path_ev.reserve(64); path_st.reserve(64); path_cross.reserve(64);
         seeds.reserve(256); sc.reserve(64); poly.reserve(32); win.reserve(32);
@@ -877,7 +744,6 @@ struct Scratch {
 
 namespace detail {
 
-// ------------------------------------------------------------------ topology ----
 inline int add_anchor(Model& M, const std::string& seq_in, const std::string& row, int spec) {
     const std::string seq = strip_flank_n(seq_in);
     for (int i = 0; i < (int)M.anch.size(); ++i)
@@ -927,11 +793,11 @@ inline void finish_template(const Model& M, Template& T) {
     }
 }
 // Build a template's element chain from layout elements (one direction, in read order).
-inline Template chain_from_spec(Model& M, const LayoutSpec& L, const std::vector<int>& idx, char strand, const std::string& name) {
+inline Template chain_from_spec(Model& M, const layout_spec& L, const std::vector<int>& idx, char strand, const std::string& name) {
     Template T;
     T.strand = strand; T.name = name; T.main = true;
     for (int ii : idx) {
-        const LayoutElement& e = L.elements[ii];
+        const layout_element& e = L.elements[ii];
         std::string kl = lower(e.klass);
         if (kl == "start" || kl == "stop") continue;
         TElem t;
@@ -981,9 +847,7 @@ inline TElem rc_elem(Model& M, const TElem& e0) {
     t.spec = -1;
     return t;
 }
-// Map an rc'd element to the explicit reverse-direction layout element, if any.
-// Both sides are compared in model form (anchor_seq_of: IUPAC -> N, flanking N stripped), the form
-// add_anchor() stores, so N-flanked or IUPAC-coded static elements bind too.
+// Binds a slot to its layout element; sequences are compared in model form (anchor_seq_of).
 inline void bind_spec(const Model& M, TElem& t) {
     if (t.spec >= 0 || (t.kind != EK_ANCHOR && t.kind != EK_POLY)) return;
     for (int i = 0; i < (int)M.spec.elements.size(); ++i) {
@@ -1010,7 +874,6 @@ inline uint64_t fnv(uint64_t h, const std::string& s) {
 
 namespace detail {
 
-// ---------------------------------------------------------------- engine build ----
 inline void fill_peq(uint64_t* peq, const std::string& p, int off) {
     for (int i = 0; i < (int)p.size(); ++i) {
         uint64_t bit = 1ULL << (off + i);
@@ -1078,10 +941,10 @@ inline void build_patterns(Model& M) {
             for (int i = 0; i < p.m && i < 64; ++i) p.inf[i + 1] = (uint8_t)(p.inf[i] + (p.used[i] != 'N'));
         }
         if (x.nchunk == 0)
-            throw LayoutSpecError("concat_hmm: static element '" + x.row + "' yields no searchable pattern (every N-free part has < 12 informative bases)");
+            throw layout_spec_error("concat_hmm: static element '" + x.row + "' yields no searchable pattern (every N-free part has < 12 informative bases)");
     }
     if ((int)M.pats.size() > MAXPAT)
-        throw LayoutSpecError("concat_hmm: layout needs " + std::to_string(M.pats.size()) + " Myers patterns (max " + std::to_string(MAXPAT) + ")");
+        throw layout_spec_error("concat_hmm: layout needs " + std::to_string(M.pats.size()) + " Myers patterns (max " + std::to_string(MAXPAT) + ")");
 }
 inline void pack_words(const Model& M, const std::vector<int>& pids, const std::vector<int>& kk, std::vector<PWord>& out,
                        std::vector<int>* longs, bool& shared) {
@@ -1107,26 +970,26 @@ inline void pack_words(const Model& M, const std::vector<int>& pids, const std::
         }
         PWord W;
         memset(W.peq, 0, sizeof W.peq);
-        W.pa = pids[a]; W.mA = M.pats[pids[a]].m; W.kA = kk[a]; W.tA = W.mA - 1;
+        W.pa = pids[a]; W.m_a = M.pats[pids[a]].m; W.k_a = kk[a]; W.t_a = W.m_a - 1;
         fill_peq(W.peq, M.pats[pids[a]].used, 0);
         if (b >= 0) {
             used[b] = true;
-            W.pb = pids[b]; W.mB = M.pats[pids[b]].m; W.kB = kk[b];
-            fill_peq(W.peq, M.pats[pids[b]].used, W.mA + 1);
-            W.tB = W.mA + W.mB;
-            W.CG = ~(1ULL << W.mA);
-            W.CS = ~(1ULL << (W.mA + 1));
-            W.HB = (1ULL << W.tA) | (1ULL << W.tB);
-            W.S0 = ((uint64_t)W.mA << W.tA) + ((uint64_t)W.mB << W.tB);
-            W.T = ((uint64_t)(W.kA + 1) << W.tA) + ((uint64_t)(W.kB + 1) << W.tB);
-            W.H = (1ULL << (W.tB - 1)) | (1ULL << 63);
-            W.FA = (1ULL << (W.tB - W.tA)) - 1;
+            W.pb = pids[b]; W.m_b = M.pats[pids[b]].m; W.k_b = kk[b];
+            fill_peq(W.peq, M.pats[pids[b]].used, W.m_a + 1);
+            W.t_b = W.m_a + W.m_b;
+            W.CG = ~(1ULL << W.m_a);
+            W.CS = ~(1ULL << (W.m_a + 1));
+            W.HB = (1ULL << W.t_a) | (1ULL << W.t_b);
+            W.S0 = ((uint64_t)W.m_a << W.t_a) + ((uint64_t)W.m_b << W.t_b);
+            W.T = ((uint64_t)(W.k_a + 1) << W.t_a) + ((uint64_t)(W.k_b + 1) << W.t_b);
+            W.H = (1ULL << (W.t_b - 1)) | (1ULL << 63);
+            W.FA = (1ULL << (W.t_b - W.t_a)) - 1;
         } else {
-            W.tB = 64;
+            W.t_b = 64;
             W.CG = ~0ULL; W.CS = ~0ULL;
-            W.HB = 1ULL << W.tA;
-            W.S0 = (uint64_t)W.mA << W.tA;
-            W.T = (uint64_t)(W.kA + 1) << W.tA;
+            W.HB = 1ULL << W.t_a;
+            W.S0 = (uint64_t)W.m_a << W.t_a;
+            W.T = (uint64_t)(W.k_a + 1) << W.t_a;
             W.H = 1ULL << 63;
             W.FA = ~0ULL;
         }
@@ -1253,7 +1116,6 @@ inline uint16_t seed_label(const Model& M, uint64_t km) {
     return 0xFFFF;
 }
 
-// ---------------------------------------------------------------- priors ----
 inline std::vector<double> normal_mix_pmf(int lo, int hi, double sd, double tail) {
     std::vector<double> p(hi - lo + 1);
     double s2 = 3 * sd + 3, tot = 0;
@@ -1267,12 +1129,8 @@ inline std::vector<double> normal_mix_pmf(int lo, int hi, double sd, double tail
     for (auto& v : p) v = std::max(v, 1e-7);
     return p;
 }
-// Tight junction table of a descriptor that skips barcode-adjacent primers (da bp on the closing side, db bp on the
-// opening side): mixture of the regular regime (primers present, possibly unobserved) and the deletion regimes in
-// which one or both primers are physically absent, i.e. x = gap - fixed near -da, -db, -(da + db). Each deletion
-// component allows -DEL_GMIN bp of overlap (micro-homology between the facing barcode blocks; fused 10x 5' junctions
-// overlap by <= 4-5 bp) and a junction-filler tail.
-// Prior weights 0.04 per single deletion and 0.02 for both; learned per run by the EM like any tight table.
+// Adds deletion regimes to a tight table whose junction skips barcode-adjacent primers of da / db bp:
+// x = gap - fixed near -da, -db, -(da + db). Prior weights: 0.04 per single deletion, 0.02 for both.
 inline void add_deletion_regimes(std::vector<double>& p, int lo, int hi, int da, int db) {
     int dd[3] = {0, 0, 0};
     double ww[3] = {0, 0, 0};
@@ -1340,11 +1198,9 @@ inline std::vector<double> convolve_ins(const std::vector<double>& p1) {
 }
 inline std::string tkey(const Model& M, int st) { return M.tpl[M.st_tpl[st]].name + std::to_string(M.st_obs[st]); }
 
-// Read-end truncation shapes (retained-length bins <=10, 11-12, 13-15, 16-18, >=19) from the
-// training-file census (partial_adapters/census/tables/train100k_hmm_partial_params.json,
-// read_end exit offsets); used as priors for the known 10x primers, generic otherwise.
+// Read-end truncation priors per retained-length bin: known 10x primers, generic otherwise.
 inline void prefix_prior_shape(const std::string& seq, double* w) {
-    static const double tsorc[5] = {0.45, 0.36, 0.17, 0.01, 0.01};   // rev_primer (TSOrc)
+    static const double tsorc[5] = {0.45, 0.36, 0.17, 0.01, 0.01};   // rev_primer
     static const double fprc[5] = {0.64, 0.33, 0.01, 0.01, 0.01};    // rc_forw_primer
     static const double gen[5] = {0.45, 0.33, 0.18, 0.02, 0.02};
     const double* s = gen;
@@ -1356,7 +1212,7 @@ inline void prefix_prior_shape(const std::string& seq, double* w) {
 inline void make_priors(Model& M) {
     PMap& pr = M.prior;
     pr.clear();
-    pr["strand"] = {};  // cDNA strand table (policy 10): no prior; present only after calibration (hmm_strand column)
+    pr["strand"] = {};
     for (int ty = 0; ty < M.NTYPE; ++ty) {
         std::vector<double> q(NFEAT, 0.0), nl(NFEAT, 0.0);
         if (ty < M.A) {
@@ -1450,7 +1306,6 @@ inline void make_priors(Model& M) {
     pr["guard"] = {0};
 }
 
-// ---------------------------------------------------------------- descriptors ----
 inline bool palindromic(const Model& M, int t1, int t2) {
     const Template& A = M.tpl[t1];
     const Template& B = M.tpl[t2];
@@ -1462,10 +1317,10 @@ inline bool palindromic(const Model& M, int t1, int t2) {
 }
 inline void build_descriptors(Model& M) {
     const int S = M.S;
-    M.same.assign(S * S, DescHot());
-    M.cross.assign(S * S, DescHot());
-    M.same_c.assign(S * S, DescCold());
-    M.cross_c.assign(S * S, DescCold());
+    M.same.assign(S * S, desc_hot());
+    M.cross.assign(S * S, desc_hot());
+    M.same_c.assign(S * S, desc_cold());
+    M.cross_c.assign(S * S, desc_cold());
     M.tight_keys.clear(); M.tight_lo.clear(); M.tight_hi.clear(); M.tight_row.clear();
     M.tight_dela.clear(); M.tight_delb.clear();
     M.pres_names.clear();
@@ -1493,7 +1348,7 @@ inline void build_descriptors(Model& M) {
             if (e.kind == EK_POLY) has_poly = true;
         }
     };
-    auto finish = [&](DescHot& d, DescCold& c, double fixed, double var, double hr, int nins, const std::string& key,
+    auto finish = [&](desc_hot& d, desc_cold& c, double fixed, double var, double hr, int nins, const std::string& key,
                       bool poly_end, const std::string& row, int dela = 0, int delb = 0) {
         if (nins > 2) { d.valid = 0; return; }
         d.valid = 1;
@@ -1509,9 +1364,7 @@ inline void build_descriptors(Model& M) {
             d.dela = (int16_t)dela;
             d.delb = (int16_t)delb;
             M.tight_keys.push_back("tight." + key);
-            // deleted barcode-adjacent primers: the gap may be down to (dela + delb) + 6 bp shorter than `fixed`
-            // (micro-homology overlap between the two barcode blocks; the prior mass starts at DEL_GMIN, the last
-            // bp is reachable only by the facing-anchor rescue)
+            // deleted primers: the gap may be up to dela + delb - RESCUE_GMIN bp shorter than `fixed`
             M.tight_lo.push_back(std::min(-R, -(dela + delb) + RESCUE_GMIN));
             M.tight_hi.push_back(key.back() == 'x' ? R + JUNC_SPACER_MAX : R);
             M.tight_row.push_back(row);
@@ -1519,9 +1372,8 @@ inline void build_descriptors(Model& M) {
             M.tight_delb.push_back(delb);
         }
     };
-    // barcode-adjacent outer primer skipped at the end of template t after element e (closing side) / at the start
-    // of template t before element e (opening side): the skipped elements are that primer plus spacers only, so with
-    // the primer physically deleted only the barcode block remains. Returns the primer length, or 0.
+    // length of the barcode-adjacent primer skipped after element e at the template end (del_tail) / before e at
+    // the template start (del_head) when only spacers lie between; else 0
     auto del_tail = [&](int t, int e) -> int {
         const Template& T = M.tpl[t];
         const int E = (int)T.el.size();
@@ -1543,8 +1395,8 @@ inline void build_descriptors(Model& M) {
             const Template& T2 = M.tpl[t2];
             const bool poly_end = M.st_type[sp] >= M.A || M.st_type[st] >= M.A;
             if (t1 == t2 && o2 > o1) {
-                DescHot& d = M.same[sp * S + st];
-                DescCold& c = M.same_c[sp * S + st];
+                desc_hot& d = M.same[sp * S + st];
+                desc_cold& c = M.same_c[sp * S + st];
                 for (int x = o1 + 1; x < o2; ++x) c.pres.push_back({pres(int_name(t1, x)), false});
                 if (is_internal(t2, o2)) c.pres.push_back({pres(int_name(t1, o2)), true});
                 double fixed = 0, var = 0, hr = 0;
@@ -1560,8 +1412,8 @@ inline void build_descriptors(Model& M) {
                 finish(d, c, fixed, var, hr, nins, tkey(M, sp) + "-" + tkey(M, st) + "s", poly_end, row);
             }
             {
-                DescHot& d = M.cross[sp * S + st];
-                DescCold& c = M.cross_c[sp * S + st];
+                desc_hot& d = M.cross[sp * S + st];
+                desc_cold& c = M.cross_c[sp * S + st];
                 const bool pal = palindromic(M, t1, t2);
                 int nobs1 = (int)T1.obs.size();
                 for (int x = o1 + 1; x < nobs1 - 1; ++x)
@@ -1591,7 +1443,7 @@ inline void build_descriptors(Model& M) {
 }  // namespace detail
 
 // Builds the topology (and priors) from a layout; applies `p` when given; finalizes.
-inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptions& o) {
+inline Model Model::build(const layout_spec& L, const Params* p, const model_options& o) {
     using namespace detail;
     validate_spec(L);
     Model M;
@@ -1603,7 +1455,7 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
     std::stable_sort(fidx.begin(), fidx.end(), by_order);
     std::stable_sort(ridx.begin(), ridx.end(), by_order);
     Template F = chain_from_spec(M, L, fidx, 'F', "F");
-    if (F.el.empty()) throw LayoutSpecError("concat_hmm: layout '" + L.name + "' has no forward elements");
+    if (F.el.empty()) throw layout_spec_error("concat_hmm: layout '" + L.name + "' has no forward elements");
     Template R;
     bool mirror = true;
     if (!ridx.empty()) {
@@ -1622,14 +1474,12 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
     }
     M.tpl.push_back(F);
     M.tpl.push_back(R);
-    // every anchor / poly type exists now (auxiliary templates reuse them): check capacity before any
-    // per-anchor array is indexed
+    // check capacity before any per-anchor array is indexed (auxiliary templates add no new types)
     if ((int)M.anch.size() > MAXANCH || (int)M.poly_base.size() > MAXPOLY)
-        throw LayoutSpecError("concat_hmm: layout has " + std::to_string(M.anch.size()) + " static elements (max " + std::to_string(MAXANCH) +
+        throw layout_spec_error("concat_hmm: layout has " + std::to_string(M.anch.size()) + " static elements (max " + std::to_string(MAXANCH) +
                               ") / " + std::to_string(M.poly_base.size()) + " poly types (max " + std::to_string(MAXPOLY) + "), both strands");
-    if (M.anch.empty()) throw LayoutSpecError("concat_hmm: layout '" + L.name + "' produced no anchor pattern");
-    // weak outer anchors (decided on the main templates): an outermost anchor joined by spacers only
-    // to an inner anchor partner (10x 5': forw_primer <bc+umi> tso; rc_tso <umi+bc> rc_forw_primer)
+    if (M.anch.empty()) throw layout_spec_error("concat_hmm: layout '" + L.name + "' produced no anchor pattern");
+    // weak outer anchors: an outermost anchor joined by spacers only to an inner anchor (main templates)
     std::vector<uint8_t> weak(M.anch.size(), 0);
     bool any_weak = false;
     for (int t = 0; t < 2; ++t) {
@@ -1656,7 +1506,7 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
     int nins = 0, r = -1;
     for (int i = 0; i < (int)F.el.size(); ++i)
         if (F.el[i].kind == EK_INSERT) { ++nins; r = i; }
-    auto rc_of = [&](int fi) -> TElem {  // reverse-complement of F.el[fi]: the mirrored R element
+    auto rc_of = [&](int fi) -> TElem {
         TElem t = M.tpl[1].el[F.el.size() - 1 - fi];
         return t;
     };
@@ -1735,9 +1585,9 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
     M.A = (int)M.anch.size();
     M.Q = (int)M.poly_base.size();
     if (M.A > MAXANCH || M.Q > MAXPOLY)
-        throw LayoutSpecError("concat_hmm: layout has " + std::to_string(M.A) + " static elements (max " + std::to_string(MAXANCH) +
+        throw layout_spec_error("concat_hmm: layout has " + std::to_string(M.A) + " static elements (max " + std::to_string(MAXANCH) +
                               ") / " + std::to_string(M.Q) + " poly types (max " + std::to_string(MAXPOLY) + ")");
-    if (M.A == 0) throw LayoutSpecError("concat_hmm: layout '" + L.name + "' produced no anchor pattern");
+    if (M.A == 0) throw layout_spec_error("concat_hmm: layout '" + L.name + "' produced no anchor pattern");
     M.NTYPE = M.A + M.Q;
     for (int a = 0; a < M.A; ++a) M.anch[a].weak = weak[a] != 0;
     for (auto& T : M.tpl) {
@@ -1753,7 +1603,6 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
         else if (b == 'T') M.stage0_poly[1] = true;
         else M.other_poly = true;
     }
-    // states
     M.states_by_type.assign(M.NTYPE, {});
     M.open_state.assign(M.NT, -1);
     M.close_state.assign(M.NT, -1);
@@ -1783,7 +1632,7 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
         }
     }
     M.S = (int)M.st_tpl.size();
-    if (M.S > MAXSTATE) throw LayoutSpecError("concat_hmm: too many observable slots (" + std::to_string(M.S) + ")");
+    if (M.S > MAXSTATE) throw layout_spec_error("concat_hmm: too many observable slots (" + std::to_string(M.S) + ")");
     M.head_fix.assign(M.S, -1);
     M.tail_fix.assign(M.S, -1);
     for (int st = 0; st < M.S; ++st) {
@@ -1792,8 +1641,6 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
         if (T.pins[ei] == 0) M.head_fix[st] = (int)std::lround(T.pnom[ei]);
         if (T.pins[T.el.size()] - T.pins[ei + 1] == 0) M.tail_fix[st] = (int)std::lround(T.pnom[T.el.size()] - T.pnom[ei + 1]);
     }
-    // barcode blocks: inner slot <-> barcode-adjacent outer primer joined by spacers only (derived from the layout's
-    // spacer lengths and element order; 10x 5' tso / rc_tso: 26, VisiumHD poly_t / poly_a: 40)
     M.bc_head.assign(M.S, -1);
     M.bc_tail.assign(M.S, -1);
     M.head_rules.clear();
@@ -1814,13 +1661,13 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
         if (ei >= 2 && T.el[0].kind == EK_ANCHOR) M.bc_head[st] = block(1, ei);
         if (ei <= E - 3 && T.el[E - 1].kind == EK_ANCHOR) M.bc_tail[st] = block(ei + 1, E - 1);
         if (poly) continue;
-        auto add_rule = [](std::vector<BcRule>& v, BcRule nr) {
+        auto add_rule = [](std::vector<bc_rule>& v, bc_rule nr) {
             for (const auto& x : v)
                 if (x.prim == nr.prim && x.inner == nr.inner && x.block == nr.block) return;
             v.push_back(nr);
         };
-        if (M.bc_head[st] >= 0) add_rule(M.head_rules, BcRule{T.el[0].anc, T.el[ei].anc, M.bc_head[st]});
-        if (M.bc_tail[st] >= 0) add_rule(M.tail_rules, BcRule{T.el[E - 1].anc, T.el[ei].anc, M.bc_tail[st]});
+        if (M.bc_head[st] >= 0) add_rule(M.head_rules, bc_rule{T.el[0].anc, T.el[ei].anc, M.bc_head[st]});
+        if (M.bc_tail[st] >= 0) add_rule(M.tail_rules, bc_rule{T.el[E - 1].anc, T.el[ei].anc, M.bc_tail[st]});
     }
     M.bc_unit.assign(M.S, 0);
     for (int st = 0; st < M.S; ++st) {
@@ -1846,14 +1693,9 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
         const TElem& a1 = T.el[T.obs.back()];
         bool spacer = false;
         for (auto& e : T.el) spacer |= e.kind == EK_SPACER;
-        // D and the single-primer ends carrying a barcode unit (10x 5' A5 / A5r): terminal anchors reverse-complementary
-        // across a barcode spacer. Since POLICY_ROUND.md round 3 the fold-back decision is the strand-aware arm
-        // similarity (fold_decision), which separates a molecule read twice from a palindromic cDNA insert, so the
-        // single-primer ends are tested too (a fold-back whose second copy lost its inner anchor decodes as A5 / A5r).
+        // D and single-primer ends with a barcode unit: terminal anchors reverse-complementary across a barcode spacer
         if (spacer && a0.kind == EK_ANCHOR && a1.kind == EK_ANCHOR && M.anch[a1.anc].seq == revcomp(M.anch[a0.anc].seq)) M.tpl_fold[t] = 1;
     }
-    // mirror slots of fold-back templates: element i <-> element E-1-i, both anchors with reverse-complementary sequences
-    // (10x 5' D: forw_primer <-> rc_forw_primer, tso <-> rc_tso)
     M.tpl_mirror.assign(M.NT, {});
     for (int t = 0; t < M.NT; ++t) {
         if (!M.tpl_fold[t]) continue;
@@ -1868,7 +1710,6 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
                 if (T.obs[o2] == em && T.el[em].kind == EK_ANCHOR && M.anch[T.el[em].anc].seq == revcomp(M.anch[a.anc].seq)) M.tpl_mirror[t][ob] = o2;
         }
     }
-    // tight neighbour relations (consecutive observables without an insert between), per type
     M.nbr.assign(M.NTYPE, {});
     for (int t = 0; t < M.NT; ++t) {
         const Template& T = M.tpl[t];
@@ -1892,7 +1733,6 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
             add(b, Nbr{a, -1, (int)lo, (int)hi});
         }
     }
-    // minimum construct lengths
     {
         const Template& T = M.tpl[0];
         double s5 = 0, s3 = 0;
@@ -1910,7 +1750,6 @@ inline Model Model::build(const LayoutSpec& L, const Params* p, const ModelOptio
     build_seed_index(M);
     build_descriptors(M);
     make_priors(M);
-    // topology signature
     uint64_t h = 1469598103934665603ULL;
     for (auto& T : M.tpl) {
         h = fnv(h, T.name + T.strand);
@@ -1962,8 +1801,7 @@ inline void Model::finalize() {
             }
             emit[st * NFEAT + f] = sl(q[f]) - sl(nl[f]);
             if ((*qp)[f] > 0) emit_pal[st * NFEAT + f] = sl((*qp)[f]) - sl(nl[f]);
-            // short anchors (< 16 bp, e.g. 10x 5' tso) are supporting evidence: the shuffled null underestimates
-            // AT-rich 13-mers in real cDNA, so their log-likelihood ratio is capped
+            // short anchors: LLR capped at SHORT_LLR_CAP; the excess is kept in emit_bonus
             if (ty < A && anch[ty].shrt) {
                 emit_bonus[st * NFEAT + f] = std::max(0.f, emit[st * NFEAT + f] - SHORT_LLR_CAP);
                 emit[st * NFEAT + f] = std::min(emit[st * NFEAT + f], SHORT_LLR_CAP);
@@ -1973,7 +1811,7 @@ inline void Model::finalize() {
     }
     std::vector<double> pres(pres_names.size());
     for (size_t i = 0; i < pres.size(); ++i) pres[i] = get("pres." + pres_names[i])[0];
-    auto fill = [&](std::vector<DescHot>& H, std::vector<DescCold>& C) {
+    auto fill = [&](std::vector<desc_hot>& H, std::vector<desc_cold>& C) {
         for (int x = 0; x < S * S; ++x) {
             if (!H[x].valid) continue;
             double b = 0;
@@ -2026,7 +1864,7 @@ inline void Model::finalize() {
     zone3 = (int)std::lround(std::min(std::max(g[1], 40.0), 600.0));
     fast_p = (float)std::min(std::max(g[2], 0.5), 0.99999);
     guard_failed = get("guard")[0] > 0.5;
-    // cDNA strand table: [mean sense score, 4096 log-odds] (policy 10); absent or malformed -> no strand-flip cuts
+    // cDNA strand table: [mean sense score, 4096 log-odds]; absent or malformed -> no strand-flip cuts
     strand_lo.clear();
     strand_mu = 0.f;
     {
@@ -2041,9 +1879,7 @@ inline void Model::finalize() {
             }
         }
     }
-    // D strand table: STRAND_D_N counts (validated by apply_params) -> log-odds of each k-mer against its reverse
-    // complement with one pseudocount, and the count-weighted mean sense score (the unit of D_EVIDENCE_MIN). A table
-    // whose mean is not above 0.01 nats carries no strand information and is not used.
+    // D strand table: counts -> log-odds (pseudocount 1); unused when the mean sense score is <= 0.01 nats
     strand_d_lo.clear();
     strand_d_mu = 0.f;
     {
@@ -2108,12 +1944,9 @@ inline std::string Model::describe() const {
 
 namespace detail {
 
-// =====================================================================================
-// Stage 0: fused scan (2-bit codes, offset-labelled seeds, poly-A/T windows)
-// =====================================================================================
 // s,e: union of detected 12-bp windows (sampled every 4th base). Extend to the exact union of all
 // qualifying windows (<= 1 base different) touching the region, then trim to the base.
-inline void flush_poly(const char* seq, int n, int s, int e, char want_uc, uint8_t q, std::vector<PolyReg>& out) {
+inline void flush_poly(const char* seq, int n, int s, int e, char want_uc, uint8_t q, std::vector<poly_reg>& out) {
     const char want = (char)(want_uc | 0x20);
     auto mis = [&](int j) { return (int)((seq[j] | 0x20) != want); };
     if (s > 0) {
@@ -2150,7 +1983,7 @@ inline void flush_poly(const char* seq, int n, int s, int e, char want_uc, uint8
     }
     while (s < e && (seq[s] | 0x20) != want) ++s;
     while (e > s && (seq[e - 1] | 0x20) != want) --e;
-    if (e - s >= POLY_MIN) out.push_back(PolyReg{s, e, q});
+    if (e - s >= POLY_MIN) out.push_back(poly_reg{s, e, q});
 }
 
 // Byte-equality bitmask of 8 bytes against a broadcast byte (exact SWAR zero-byte test + gather).
@@ -2161,7 +1994,7 @@ inline uint64_t byte_eq_bits(uint64_t x, uint64_t pat) {
     return ((t >> 7) * 0x0102040810204080ULL) >> 56;
 }
 // Exact homopolymer scan for poly bases other than A/T (rare layouts): window of 12 with <= 1 mismatch.
-inline void poly_scan_other(const Model& M, const char* s, int n, std::vector<PolyReg>& out) {
+inline void poly_scan_other(const Model& M, const char* s, int n, std::vector<poly_reg>& out) {
     for (int q = 0; q < M.Q; ++q) {
         char B = M.poly_base[q];
         if (B == 'A' || B == 'T') continue;
@@ -2178,7 +2011,7 @@ inline void poly_scan_other(const Model& M, const char* s, int n, std::vector<Po
         }
         if (run_s >= 0) flush_poly(s, n, run_s, last_e, B, (uint8_t)q, out);
     }
-    std::sort(out.begin(), out.end(), [](const PolyReg& x, const PolyReg& y) { return x.s < y.s; });
+    std::sort(out.begin(), out.end(), [](const poly_reg& x, const poly_reg& y) { return x.s < y.s; });
 }
 
 inline void stage0(const Model& M, const char* seq, int n, Scratch& S) {
@@ -2233,19 +2066,19 @@ inline void stage0(const Model& M, const char* seq, int n, Scratch& S) {
                               (bloom[b3 >> 6] >> (b3 & 63)) | (bloom[b4 >> 6] >> (b4 & 63)) | (bloom[b5 >> 6] >> (b5 & 63)) |
                               (bloom[b6 >> 6] >> (b6 & 63)) | (bloom[b7 >> 6] >> (b7 & 63))) & 1;
         // poly windows tested at bases i+3 and i+7: <= 1 non-A (non-T) base in 12 <=> z & (z-1) == 0.
-        // Two-lane SIMD on NEON / SSE4.1 (GCC does not SLP-vectorise the scalar form); identical scalar fallback.
+        // Two-lane SIMD on NEON / SSE4.1; identical scalar fallback.
 #if defined(CONCAT_HMM_NEON)
         uint64_t pfl;
         {
             const uint64x2_t xv = vcombine_u64(vcreate_u64((hist >> 8) & 0xFFFFFFULL), vcreate_u64(hist & 0xFFFFFFULL));
             const uint64x2_t f12 = vdupq_n_u64(F12), one = vdupq_n_u64(1);
             const uint64x2_t xs = vshrq_n_u64(xv, 1);
-            const uint64x2_t zA = vandq_u64(vorrq_u64(xv, xs), f12);
-            const uint64x2_t zT = vbicq_u64(f12, vandq_u64(xv, xs));
-            const uint64x2_t eA = vceqzq_u64(vandq_u64(zA, vsubq_u64(zA, one)));
-            const uint64x2_t eT = vceqzq_u64(vandq_u64(zT, vsubq_u64(zT, one)));
-            const uint64x2_t mA = vcombine_u64(vcreate_u64(2), vcreate_u64(8)), mT = vcombine_u64(vcreate_u64(4), vcreate_u64(16));
-            pfl = vaddvq_u64(vorrq_u64(vandq_u64(eA, mA), vandq_u64(eT, mT)));
+            const uint64x2_t z_a = vandq_u64(vorrq_u64(xv, xs), f12);
+            const uint64x2_t z_t = vbicq_u64(f12, vandq_u64(xv, xs));
+            const uint64x2_t e_a = vceqzq_u64(vandq_u64(z_a, vsubq_u64(z_a, one)));
+            const uint64x2_t e_t = vceqzq_u64(vandq_u64(z_t, vsubq_u64(z_t, one)));
+            const uint64x2_t m_a = vcombine_u64(vcreate_u64(2), vcreate_u64(8)), m_t = vcombine_u64(vcreate_u64(4), vcreate_u64(16));
+            pfl = vaddvq_u64(vorrq_u64(vandq_u64(e_a, m_a), vandq_u64(e_t, m_t)));
         }
         const uint64_t fl = any | (pfl & polymask);
 #elif defined(CONCAT_HMM_SSE41)
@@ -2254,21 +2087,21 @@ inline void stage0(const Model& M, const char* seq, int n, Scratch& S) {
             const __m128i xv = _mm_set_epi64x((long long)(hist & 0xFFFFFFULL), (long long)((hist >> 8) & 0xFFFFFFULL));
             const __m128i f12 = _mm_set1_epi64x((long long)F12), one = _mm_set1_epi64x(1);
             const __m128i xs = _mm_srli_epi64(xv, 1);
-            const __m128i zA = _mm_and_si128(_mm_or_si128(xv, xs), f12);
-            const __m128i zT = _mm_andnot_si128(_mm_and_si128(xv, xs), f12);
+            const __m128i z_a = _mm_and_si128(_mm_or_si128(xv, xs), f12);
+            const __m128i z_t = _mm_andnot_si128(_mm_and_si128(xv, xs), f12);
             const __m128i z0 = _mm_setzero_si128();
-            const __m128i eA = _mm_cmpeq_epi64(_mm_and_si128(zA, _mm_sub_epi64(zA, one)), z0);
-            const __m128i eT = _mm_cmpeq_epi64(_mm_and_si128(zT, _mm_sub_epi64(zT, one)), z0);
-            const __m128i v = _mm_or_si128(_mm_and_si128(eA, _mm_set_epi64x(8, 2)), _mm_and_si128(eT, _mm_set_epi64x(16, 4)));
+            const __m128i e_a = _mm_cmpeq_epi64(_mm_and_si128(z_a, _mm_sub_epi64(z_a, one)), z0);
+            const __m128i e_t = _mm_cmpeq_epi64(_mm_and_si128(z_t, _mm_sub_epi64(z_t, one)), z0);
+            const __m128i v = _mm_or_si128(_mm_and_si128(e_a, _mm_set_epi64x(8, 2)), _mm_and_si128(e_t, _mm_set_epi64x(16, 4)));
             pfl = (uint64_t)_mm_cvtsi128_si64(v) | (uint64_t)_mm_extract_epi64(v, 1);
         }
         const uint64_t fl = any | (pfl & polymask);
 #else
         const uint64_t x1 = (hist >> 8) & 0xFFFFFFULL, x2 = hist & 0xFFFFFFULL;
-        const uint64_t zA1 = (x1 | (x1 >> 1)) & F12, zT1 = ~(x1 & (x1 >> 1)) & F12;
-        const uint64_t zA2 = (x2 | (x2 >> 1)) & F12, zT2 = ~(x2 & (x2 >> 1)) & F12;
-        const uint64_t pa1 = (zA1 & (zA1 - 1)) == 0, pt1 = (zT1 & (zT1 - 1)) == 0;
-        const uint64_t pa2 = (zA2 & (zA2 - 1)) == 0, pt2 = (zT2 & (zT2 - 1)) == 0;
+        const uint64_t z_a1 = (x1 | (x1 >> 1)) & F12, z_t1 = ~(x1 & (x1 >> 1)) & F12;
+        const uint64_t z_a2 = (x2 | (x2 >> 1)) & F12, z_t2 = ~(x2 & (x2 >> 1)) & F12;
+        const uint64_t pa1 = (z_a1 & (z_a1 - 1)) == 0, pt1 = (z_t1 & (z_t1 - 1)) == 0;
+        const uint64_t pa2 = (z_a2 & (z_a2 - 1)) == 0, pt2 = (z_t2 & (z_t2 - 1)) == 0;
         const uint64_t fl = any | (((pa1 << 1) | (pt1 << 2) | (pa2 << 3) | (pt2 << 4)) & polymask);
 #endif
         hits[nh] = ((uint32_t)(i >> 3) << 5) | (uint32_t)fl;  // step index (i is a multiple of 8): reads up to 2^30 bp
@@ -2295,8 +2128,8 @@ inline void stage0(const Model& M, const char* seq, int n, Scratch& S) {
         if ((bits[km >> 6] >> (km & 63)) & 1) seed_hit(i, km);
         if (polymask) {
             const uint64_t x = hist & 0xFFFFFFULL;
-            const uint64_t zA = (x | (x >> 1)) & F12, zT = ~(x & (x >> 1)) & F12;
-            const bool pa = (zA & (zA - 1)) == 0, pt = (zT & (zT - 1)) == 0;
+            const uint64_t z_a = (x | (x >> 1)) & F12, z_t = ~(x & (x >> 1)) & F12;
+            const bool pa = (z_a & (z_a - 1)) == 0, pt = (z_t & (z_t - 1)) == 0;
             if (pa | pt) poly_hit(i, pa, pt);
         }
     }
@@ -2304,7 +2137,7 @@ inline void stage0(const Model& M, const char* seq, int n, Scratch& S) {
     if (t_s >= 0) flush_poly(seq, n, t_s, t_e, 'T', qt, S.poly);
     if (M.other_poly) poly_scan_other(M, seq, n, S.poly);
     if (S.poly.size() > 1)
-        std::sort(S.poly.begin(), S.poly.end(), [](const PolyReg& x, const PolyReg& y) { return x.s < y.s; });
+        std::sort(S.poly.begin(), S.poly.end(), [](const poly_reg& x, const poly_reg& y) { return x.s < y.s; });
     // seed clusters per anchor (implied element start within 4 + n of the cluster)
     S.sc.clear();
     int cur[MAXANCH];
@@ -2316,7 +2149,7 @@ inline void stage0(const Model& M, const char* seq, int n, Scratch& S) {
         const int en = st + M.anch[a].m;
         const int ci = cur[a];
         if (ci >= 0 && std::abs(st - S.sc[ci].s) <= 4 + (int)S.sc[ci].n) {
-            SeedCluster& c = S.sc[ci];
+            seed_cluster& c = S.sc[ci];
             c.e = std::max(c.e, en);
             c.s = std::min(c.s, st);
             if (c.n < 255) c.n++;
@@ -2325,25 +2158,22 @@ inline void stage0(const Model& M, const char* seq, int n, Scratch& S) {
             c.ohi = (int16_t)std::max<int>(c.ohi, off);
         } else {
             cur[a] = (int)S.sc.size();
-            S.sc.push_back(SeedCluster{st, en, (uint8_t)a, 1, ex, (int16_t)off, (int16_t)off});
+            S.sc.push_back(seed_cluster{st, en, (uint8_t)a, 1, ex, (int16_t)off, (int16_t)off});
         }
     }
 }
 
-// =====================================================================================
-// Myers bit-parallel engine
-// =====================================================================================
-inline void clu_add(Clu& c, int j, int sc, int pat, std::vector<RawEv>& out) {
+inline void clu_add(Clu& c, int j, int sc, int pat, std::vector<raw_ev>& out) {
     if (c.last >= 0 && j - c.last > KGAP) {
-        out.push_back(RawEv{c.best_end, c.first, c.last, (uint8_t)pat, (uint8_t)c.best});
+        out.push_back(raw_ev{c.best_end, c.first, c.last, (uint8_t)pat, (uint8_t)c.best});
         clu_reset(c);
     }
     if (c.first < 0) c.first = j;
     c.last = j;
     if (sc < c.best) { c.best = sc; c.best_end = j; }
 }
-inline void clu_flush(Clu& c, int pat, std::vector<RawEv>& out) {
-    if (c.first >= 0) out.push_back(RawEv{c.best_end, c.first, c.last, (uint8_t)pat, (uint8_t)c.best});
+inline void clu_flush(Clu& c, int pat, std::vector<raw_ev>& out) {
+    if (c.first >= 0) out.push_back(raw_ev{c.best_end, c.first, c.last, (uint8_t)pat, (uint8_t)c.best});
     clu_reset(c);
 }
 template <int NW>
@@ -2352,14 +2182,14 @@ template <int NW>
 #if defined(__GNUC__)
 __attribute__((noinline))
 #endif
-void report_hits(const PWord* Wd, SWords<NW> sw, int j, Clu* cl, std::vector<RawEv>& out) {
+void report_hits(const PWord* Wd, SWords<NW> sw, int j, Clu* cl, std::vector<raw_ev>& out) {
     for (int w = 0; w < NW; ++w) {
         const PWord& W = Wd[w];
-        int a = (int)((sw.S[w] >> W.tA) & W.FA);
-        if (a <= W.kA) clu_add(cl[W.pa], j, a, W.pa, out);
+        int a = (int)((sw.S[w] >> W.t_a) & W.FA);
+        if (a <= W.k_a) clu_add(cl[W.pa], j, a, W.pa, out);
         if (W.pb >= 0) {
-            int b = (int)(sw.S[w] >> W.tB);
-            if (b <= W.kB) clu_add(cl[W.pb], j, b, W.pb, out);
+            int b = (int)(sw.S[w] >> W.t_b);
+            if (b <= W.k_b) clu_add(cl[W.pb], j, b, W.pb, out);
         }
     }
 }
@@ -2387,10 +2217,9 @@ inline SWords<NW> swords(const PState* st) {
         st.Mv = Ph & Xv;                                             \
     }
 
-// Packed Myers over NW words (2 patterns each). Appends raw events (positions relative to s) to
-// rawA/rawB and returns the final column state in fin[]. Reads >= 4*Wov run as two lockstep halves.
+// Packed Myers over NW words (2 patterns each): raw events to raw_a / raw_b, final column in fin[].
 template <int NW, bool SH>
-inline void myers_scan(const PWord* Wd, int Wov, int NP, const char* s, int n, std::vector<RawEv>& rawA, std::vector<RawEv>& rawB, PState* fin) {
+inline void myers_scan(const PWord* Wd, int Wov, int NP, const char* s, int n, std::vector<raw_ev>& raw_a, std::vector<raw_ev>& raw_b, PState* fin) {
     uint64_t CG[NW], HB[NW], CS[NW], TT[NW], HH[NW];
     PState A[NW], B[NW];
     for (int w = 0; w < NW; ++w) {
@@ -2398,9 +2227,9 @@ inline void myers_scan(const PWord* Wd, int Wov, int NP, const char* s, int n, s
         A[w] = PState{~0ULL, 0, Wd[w].S0};
         B[w] = A[w];
     }
-    Clu clA[MAXPAT], clB[MAXPAT];
-    for (int p = 0; p < NP; ++p) { clu_reset(clA[p]); clu_reset(clB[p]); }
-    rawA.clear(); rawB.clear();
+    Clu cl_a[MAXPAT], cl_b[MAXPAT];
+    for (int p = 0; p < NP; ++p) { clu_reset(cl_a[p]); clu_reset(cl_b[p]); }
+    raw_a.clear(); raw_b.clear();
     const unsigned char* p1 = (const unsigned char*)s;
     uint64_t NH[NW];
     for (int w = 0; w < NW; ++w) NH[w] = SH ? 0 : ~HH[w];
@@ -2413,7 +2242,7 @@ inline void myers_scan(const PWord* Wd, int Wov, int NP, const char* s, int n, s
                 CHMM_STEP(A[w], w, c)
                 z &= ((A[w].S | HH[SH ? 0 : w]) - TT[SH ? 0 : w]) | NH[w];
             }
-            if (__builtin_expect((z & HALL) != HALL, 0)) report_hits<NW>(Wd, swords<NW>(A), j, clA, rawA);
+            if (__builtin_expect((z & HALL) != HALL, 0)) report_hits<NW>(Wd, swords<NW>(A), j, cl_a, raw_a);
         }
         for (int w = 0; w < NW; ++w) fin[w] = A[w];
     } else {
@@ -2429,8 +2258,8 @@ inline void myers_scan(const PWord* Wd, int Wov, int NP, const char* s, int n, s
                 zb &= ((B[w].S | HH[SH ? 0 : w]) - TT[SH ? 0 : w]) | NH[w];
             }
             if (__builtin_expect(((za & zb) & HALL) != HALL, 0)) {
-                if ((za & HALL) != HALL) report_hits<NW>(Wd, swords<NW>(A), j, clA, rawA);
-                if ((zb & HALL) != HALL && j >= Wov) report_hits<NW>(Wd, swords<NW>(B), s2 + j, clB, rawB);
+                if ((za & HALL) != HALL) report_hits<NW>(Wd, swords<NW>(A), j, cl_a, raw_a);
+                if ((zb & HALL) != HALL && j >= Wov) report_hits<NW>(Wd, swords<NW>(B), s2 + j, cl_b, raw_b);
             }
         }
         const int end2 = n - s2;
@@ -2441,18 +2270,18 @@ inline void myers_scan(const PWord* Wd, int Wov, int NP, const char* s, int n, s
                 CHMM_STEP(B[w], w, c2)
                 zb &= ((B[w].S | HH[SH ? 0 : w]) - TT[SH ? 0 : w]) | NH[w];
             }
-            if (__builtin_expect((zb & HALL) != HALL, 0)) report_hits<NW>(Wd, swords<NW>(B), s2 + j, clB, rawB);
+            if (__builtin_expect((zb & HALL) != HALL, 0)) report_hits<NW>(Wd, swords<NW>(B), s2 + j, cl_b, raw_b);
         }
         for (int w = 0; w < NW; ++w) fin[w] = B[w];
     }
-    for (int p = 0; p < NP; ++p) { clu_flush(clA[p], p, rawA); clu_flush(clB[p], p, rawB); }
-    if (!rawB.empty()) {  // merge clusters straddling the split point
+    for (int p = 0; p < NP; ++p) { clu_flush(cl_a[p], p, raw_a); clu_flush(cl_b[p], p, raw_b); }
+    if (!raw_b.empty()) {  // merge clusters straddling the split point
         for (int p = 0; p < NP; ++p) {
-            RawEv* a = nullptr;
-            for (int i = (int)rawA.size() - 1; i >= 0; --i)
-                if (rawA[i].pat == p) { a = &rawA[i]; break; }
+            raw_ev* a = nullptr;
+            for (int i = (int)raw_a.size() - 1; i >= 0; --i)
+                if (raw_a[i].pat == p) { a = &raw_a[i]; break; }
             if (!a) continue;
-            for (auto& b : rawB) {
+            for (auto& b : raw_b) {
                 if (b.pat != p || b.first < 0) continue;
                 if (b.first - a->last <= KGAP) {
                     if (b.score < a->score) { a->score = b.score; a->end = b.end; }
@@ -2466,34 +2295,33 @@ inline void myers_scan(const PWord* Wd, int Wov, int NP, const char* s, int n, s
 }
 #undef CHMM_STEP
 
-// Runs every word group of `words` over s[0,n).
 inline void myers_all(const std::vector<PWord>& words, bool shared, int Wov, int NP, const char* s, int n, Scratch& W, PState* fin,
-                      std::vector<RawEv>& out) {
+                      std::vector<raw_ev>& out) {
     const int NW = (int)words.size();
     for (int wb = 0; wb < NW; wb += 4) {
         const int nw = std::min(NW - wb, 4);
         const PWord* Wd = words.data() + wb;
         if (shared) {
             switch (nw) {
-                case 1: myers_scan<1, true>(Wd, Wov, NP, s, n, W.rawA, W.rawB, fin + wb); break;
-                case 2: myers_scan<2, true>(Wd, Wov, NP, s, n, W.rawA, W.rawB, fin + wb); break;
-                case 3: myers_scan<3, true>(Wd, Wov, NP, s, n, W.rawA, W.rawB, fin + wb); break;
-                default: myers_scan<4, true>(Wd, Wov, NP, s, n, W.rawA, W.rawB, fin + wb); break;
+                case 1: myers_scan<1, true>(Wd, Wov, NP, s, n, W.raw_a, W.raw_b, fin + wb); break;
+                case 2: myers_scan<2, true>(Wd, Wov, NP, s, n, W.raw_a, W.raw_b, fin + wb); break;
+                case 3: myers_scan<3, true>(Wd, Wov, NP, s, n, W.raw_a, W.raw_b, fin + wb); break;
+                default: myers_scan<4, true>(Wd, Wov, NP, s, n, W.raw_a, W.raw_b, fin + wb); break;
             }
         } else {
             switch (nw) {
-                case 1: myers_scan<1, false>(Wd, Wov, NP, s, n, W.rawA, W.rawB, fin + wb); break;
-                case 2: myers_scan<2, false>(Wd, Wov, NP, s, n, W.rawA, W.rawB, fin + wb); break;
-                case 3: myers_scan<3, false>(Wd, Wov, NP, s, n, W.rawA, W.rawB, fin + wb); break;
-                default: myers_scan<4, false>(Wd, Wov, NP, s, n, W.rawA, W.rawB, fin + wb); break;
+                case 1: myers_scan<1, false>(Wd, Wov, NP, s, n, W.raw_a, W.raw_b, fin + wb); break;
+                case 2: myers_scan<2, false>(Wd, Wov, NP, s, n, W.raw_a, W.raw_b, fin + wb); break;
+                case 3: myers_scan<3, false>(Wd, Wov, NP, s, n, W.raw_a, W.raw_b, fin + wb); break;
+                default: myers_scan<4, false>(Wd, Wov, NP, s, n, W.raw_a, W.raw_b, fin + wb); break;
             }
         }
-        for (auto& r : W.rawA) if (r.first >= 0) out.push_back(r);
-        for (auto& r : W.rawB) if (r.first >= 0) out.push_back(r);
+        for (auto& r : W.raw_a) if (r.first >= 0) out.push_back(r);
+        for (auto& r : W.raw_b) if (r.first >= 0) out.push_back(r);
     }
 }
 // Scalar Myers for one pattern: appends clusters (<= L.k) and returns the final column.
-inline void long_scan(const LWord& L, const char* s, int n, std::vector<RawEv>& out, uint64_t& Pv_out, uint64_t& Mv_out) {
+inline void long_scan(const LWord& L, const char* s, int n, std::vector<raw_ev>& out, uint64_t& Pv_out, uint64_t& Mv_out) {
     uint64_t Pv = ~0ULL, Mv = 0;
     int sc = L.m;
     const int sh = L.m - 1;
@@ -2536,11 +2364,8 @@ inline int best_hit(const LWord& L, const char* s, int n, int& best_end, uint64_
     if (Mv_out) *Mv_out = Mv;
     return best;
 }
-// Read-end prefix of a pattern from the final Myers column (bits [off, off+m)): returns the
-// retained length i (adapter offsets [0, i)) maximising v - 3D, where v = informative (non-N) bases
-// of the prefix, subject to v >= PARTIAL_MIN and D <= floor(v/8); -1 if none; `d` gets D. N wildcards
-// match anything, so they never count toward the retained length (an N-gapped linker needs real bases
-// on both sides of its N run).
+// Read-end prefix from the final Myers column (bits [off, off+m)): returns the retained length i maximising
+// v - 3D (v = non-N bases of the prefix, v >= PARTIAL_MIN, D <= v/8), or -1; d_out gets D.
 inline int prefix_from_column(const Pattern& p, uint64_t Pv, uint64_t Mv, int off, int& d_out) {
     int best_i = -1, best_d = 0;
     double best_sc = -1e9;
@@ -2583,13 +2408,13 @@ inline void push_anchor_event(std::vector<Event>& ev, int n, int start, int end,
     ev.push_back(e);
 }
 // Raw pattern-level Myers clusters (positions shifted by `base`) -> anchor events.
-inline void raw_to_events(const Model& M, const std::vector<RawEv>& raw, int base, int n, bool relaxed, std::vector<Event>& ev,
-                          std::vector<RawEv>& chunked) {
-    for (const RawEv& r : raw) {
+inline void raw_to_events(const Model& M, const std::vector<raw_ev>& raw, int base, int n, bool relaxed, std::vector<Event>& ev,
+                          std::vector<raw_ev>& chunked) {
+    for (const raw_ev& r : raw) {
         const Pattern& p = M.pats[r.pat];
         const Anchor& x = M.anch[p.anchor];
         if (x.nchunk != 1 || p.off != 0 || p.m != x.m) {
-            RawEv c = r;
+            raw_ev c = r;
             c.end += base;
             chunked.push_back(c);
             continue;
@@ -2600,12 +2425,11 @@ inline void raw_to_events(const Model& M, const std::vector<RawEv>& raw, int bas
         push_anchor_event(ev, n, end - x.m, end, p.anchor, ed, anchor_class(x, ed), relaxed ? EVF_RELAXED : 0, 0, x.m, ed);
     }
 }
-// Chunked (> 63 bp) anchors: chunk hits with a consistent implied start form one anchor event;
-// missing chunks cost (chunk budget + 1); if the total exceeds the anchor budget the event is partial.
-inline void merge_chunks(const Model& M, std::vector<RawEv>& ch, int n, std::vector<Event>& ev) {
+// Chunked anchors: chunk hits with a consistent start form one event; a missing chunk costs its budget + 1.
+inline void merge_chunks(const Model& M, std::vector<raw_ev>& ch, int n, std::vector<Event>& ev) {
     if (ch.empty()) return;
-    auto istart = [&](const RawEv& r) { const Pattern& p = M.pats[r.pat]; return r.end + 1 - p.m - p.off; };
-    std::sort(ch.begin(), ch.end(), [&](const RawEv& a, const RawEv& b) {
+    auto istart = [&](const raw_ev& r) { const Pattern& p = M.pats[r.pat]; return r.end + 1 - p.m - p.off; };
+    std::sort(ch.begin(), ch.end(), [&](const raw_ev& a, const raw_ev& b) {
         int aa = M.pats[a.pat].anchor, bb = M.pats[b.pat].anchor;
         return aa != bb ? aa < bb : istart(a) < istart(b);
     });
@@ -2637,11 +2461,8 @@ inline void merge_chunks(const Model& M, std::vector<RawEv>& ch, int n, std::vec
         i = j;
     }
 }
-// An adapter running off a read end, seen by exact seeds (cluster implied span [c.s, c.e) crosses the end):
-// retained offsets = the part inside the read ([0, n - c.s) at 3', [-c.s, m) at 5'; the adapter position
-// is implied by the seed diagonal) and its mismatches against the read (sequence evidence: edits >= 0).
-// Used identically by the fast path and the full path.
-inline void seed_truncation(const Model& M, const SeedCluster& c, const char* seq, int n, int& rlo, int& rhi, int& ed) {
+// Retained offsets [rlo, rhi) and mismatches of an adapter whose seed-implied span crosses a read end.
+inline void seed_truncation(const Model& M, const seed_cluster& c, const char* seq, int n, int& rlo, int& rhi, int& ed) {
     const Anchor& x = M.anch[c.a];
     if (c.e > n) { rlo = 0; rhi = std::min(x.m, std::max(0, n - c.s)); }
     else { rlo = std::min(x.m, std::max(0, -c.s)); rhi = x.m; }
@@ -2683,15 +2504,11 @@ inline void dedupe_events(const Model& M, std::vector<Event>& ev) {
     if (replaced) sort_events(ev);
 }
 
-// A barcode-adjacent primer laid over the barcode block of a facing partner anchor is incompatible with that block
-// (10x 5' fused `... rc_tso umi rc_barcode | barcode umi tso ...`: an rc_forw_primer alignment helped by an AGATC
-// micro-homology runs >= 8 bp into the forward barcode; symmetrically a forw_primer over the rc_barcode). Such an
-// event is dropped when the facing partner is anchor-grade at ED <= 1 (a real primer never overlaps the barcode
-// block of the facing unit's own partner anchor by 8 bp). Only layouts with anchor partners (poly runs never certify).
+// Drops primer events laid >= 8 bp over the barcode block of a facing partner anchor (anchor grade, ED <= 1).
 inline void drop_phantom_primers(const Model& M, std::vector<Event>& ev) {
     if (M.head_rules.empty() || M.tail_rules.empty()) return;
     const size_t n = ev.size();
-    size_t i0 = 0;  // nothing to do unless a barcode-adjacent primer event exists
+    size_t i0 = 0;
     while (i0 < n && !(ev[i0].type < M.A && (M.inner_role[ev[i0].type] & 12) && ev[i0].cls <= CL_S8)) ++i0;
     if (i0 == n) return;
     size_t w = i0;
@@ -2699,19 +2516,19 @@ inline void drop_phantom_primers(const Model& M, std::vector<Event>& ev) {
         const Event e = ev[i];
         bool phantom = false;
         if (e.type < M.A && (M.inner_role[e.type] & 12) && e.cls <= CL_S8) {
-            for (const BcRule& tr : M.tail_rules) {  // closing primer over the barcode block of an opening unit after it
+            for (const bc_rule& tr : M.tail_rules) {  // closing primer over the barcode block of an opening unit after it
                 if (tr.prim != e.type) continue;
-                for (const BcRule& hr : M.head_rules)
+                for (const bc_rule& hr : M.head_rules)
                     for (size_t j = i + 1; j < n && ev[j].start < e.end + hr.block && !phantom; ++j) {
                         const Event& t = ev[j];
                         if (t.type != hr.inner || t.cls != CL_S4 || t.ed < 0 || t.ed > 1 || t.start < e.end - 4) continue;
                         phantom = std::min(e.end, t.start) - std::max(e.start, t.start - hr.block) >= 8;
                     }
             }
-            for (const BcRule& hr : M.head_rules) {  // opening primer over the barcode block of a closing unit before it
+            for (const bc_rule& hr : M.head_rules) {  // opening primer over the barcode block of a closing unit before it
                 if (phantom || hr.prim != e.type) continue;
-                for (const BcRule& tr : M.tail_rules)
-                    for (size_t j = w; j-- > 0 && !phantom;) {  // survivors so far, in read order
+                for (const bc_rule& tr : M.tail_rules)
+                    for (size_t j = w; j-- > 0 && !phantom;) {
                         const Event& t = ev[j];
                         if (t.start < e.start - tr.block - 80) break;
                         if (t.type != tr.inner || t.cls != CL_S4 || t.ed < 0 || t.ed > 1 || t.end > e.start + 4) continue;
@@ -2724,18 +2541,17 @@ inline void drop_phantom_primers(const Model& M, std::vector<Event>& ev) {
     ev.resize(w);
 }
 
-// Stage 2: anchor / poly events for the decoder. whole = scan the whole read (calibration, option);
-// otherwise only windows implied by the stage-0 evidence.
+// Stage 2: events for the decoder; whole = scan the whole read, else only the stage-0 evidence windows.
 inline void extract_events(const Model& M, const char* seq, int n, Scratch& W, bool whole) {
     std::vector<Event>& ev = W.ev;
     ev.clear();
     if (n <= 0) return;
-    std::vector<RawEv>& raw = W.rawX;
-    std::vector<RawEv>& chunked = W.rawCh;
+    std::vector<raw_ev>& raw = W.raw_x;
+    std::vector<raw_ev>& chunked = W.raw_ch;
     raw.clear(); chunked.clear();
     PState fin[MAXPAT];
     PState fin_end[MAXPAT];
-    uint64_t lPv[MAXPAT], lMv[MAXPAT];
+    uint64_t l_pv[MAXPAT], l_mv[MAXPAT];
     bool have_end = false;
     auto scan = [&](int lo, int hi) {
         raw.clear();
@@ -2750,7 +2566,7 @@ inline void extract_events(const Model& M, const char* seq, int n, Scratch& W, b
             uint64_t Pv, Mv;
             long_scan(M.lwords[l], seq + lo, hi - lo, raw, Pv, Mv);
             raw_to_events(M, raw, lo, n, false, ev, chunked);
-            if (hi == n) { lPv[l] = Pv; lMv[l] = Mv; }
+            if (hi == n) { l_pv[l] = Pv; l_mv[l] = Mv; }
         }
     };
     if (whole) {
@@ -2764,12 +2580,11 @@ inline void extract_events(const Model& M, const char* seq, int n, Scratch& W, b
             if (hi > lo) Wn.push_back({lo, hi});
         };
         bool open5 = false, close3 = false;
-        for (const SeedCluster& c : W.sc) {
+        for (const seed_cluster& c : W.sc) {
             if (!c.valid()) continue;
             const Anchor& x = M.anch[c.a];
             const int pad = 8 + x.k;
-            // a seed cluster covering the whole element with exact seeds is an exact match: emit it
-            // directly and scan only towards its junction partner
+            // exact full-length seed cluster: emit it directly and scan only towards its junction partner
             const bool perfect = c.s >= 0 && c.e <= n && x.nchunk == 1 && c.olo == 0 && c.ohi == x.m - M.K &&
                                  (int)c.nx >= x.m - M.K + 1 && informative(x.seq) == x.m && x.m <= PAT_MAXLEN;
             if (x.opening && c.s <= M.zone5) open5 = true;
@@ -2791,7 +2606,7 @@ inline void extract_events(const Model& M, const char* seq, int n, Scratch& W, b
                 else add(c.s - nb.hi - mb - pb, c.s - nb.lo + pb);
             }
         }
-        for (const PolyReg& p : W.poly) {
+        for (const poly_reg& p : W.poly) {
             const int ty = M.A + p.q;
             for (const Nbr& nb : M.nbr[ty]) {
                 if (nb.other >= M.A) continue;
@@ -2818,7 +2633,6 @@ inline void extract_events(const Model& M, const char* seq, int n, Scratch& W, b
         Wn.resize(m);
         if (m == 1) scan(Wn[0].first, Wn[0].second);
         else if (m > 1) {
-            // one scan over the concatenated windows (fewer calls, the 4-chain split kernel)
             std::string& C = W.cat;
             C.clear();
             W.cat_off.clear();
@@ -2849,7 +2663,7 @@ inline void extract_events(const Model& M, const char* seq, int n, Scratch& W, b
                 long_scan(M.lwords[l], C.data(), nc, raw, Pv, Mv);
                 for (auto& r : raw) { r.end = map_pos(r.end); r.first = map_pos(r.first); r.last = map_pos(r.last); }
                 raw_to_events(M, raw, 0, n, false, ev, chunked);
-                if (Wn[m - 1].second == n) { lPv[l] = Pv; lMv[l] = Mv; }
+                if (Wn[m - 1].second == n) { l_pv[l] = Pv; l_mv[l] = Mv; }
             }
         }
     }
@@ -2870,9 +2684,9 @@ inline void extract_events(const Model& M, const char* seq, int n, Scratch& W, b
         for (size_t w = 0; w < M.words.size(); ++w) {
             const PWord& Wd = M.words[w];
             try_prefix(Wd.pa, fin_end[w].Pv, fin_end[w].Mv, 0);
-            if (Wd.pb >= 0) try_prefix(Wd.pb, fin_end[w].Pv, fin_end[w].Mv, Wd.mA + 1);
+            if (Wd.pb >= 0) try_prefix(Wd.pb, fin_end[w].Pv, fin_end[w].Mv, Wd.m_a + 1);
         }
-        for (size_t l = 0; l < M.lwords.size(); ++l) try_prefix(M.lwords[l].pat, lPv[l], lMv[l], 0);
+        for (size_t l = 0; l < M.lwords.size(); ++l) try_prefix(M.lwords[l].pat, l_pv[l], l_mv[l], 0);
     }
     // relaxed opener scan right after strong closers (junction spacing)
     if (M.opt.relaxed_openers && !M.rwords.empty()) {
@@ -2897,7 +2711,7 @@ inline void extract_events(const Model& M, const char* seq, int n, Scratch& W, b
         }
     }
     // seed-only events: adapters running off a read end; internal partial chains
-    for (const SeedCluster& c : W.sc) {
+    for (const seed_cluster& c : W.sc) {
         if (!c.valid()) continue;
         const Anchor& x = M.anch[c.a];
         if (x.nchunk != 1) continue;
@@ -2918,7 +2732,7 @@ inline void extract_events(const Model& M, const char* seq, int n, Scratch& W, b
             push_anchor_event(ev, n, c.s, c.e, c.a, FEAT_SEEDPART + seedpart_bin(rhi - rlo), CL_SP, EVF_SEEDPART, rlo, rhi, -1);
         }
     }
-    for (const PolyReg& p : W.poly) {
+    for (const poly_reg& p : W.poly) {
         if ((int)ev.size() >= MAX_EVENTS) break;
         Event e;
         e.start = p.s; e.end = p.e;
@@ -2940,12 +2754,8 @@ inline void extract_events(const Model& M, const char* seq, int n, Scratch& W, b
 
 namespace detail {
 
-// Expected window of slot `o` of template t, from the nearest seen slot connected without an
-// insert (ostart/oend: -1 = not seen), else the construct bounds [cs, ce). es_out: the expected start
-// of the element (INT32_MIN when no geometry places it: the window is then the construct).
-// cs_slack / ce_slack: the construct start / end was not observed and defaults to the read start / end;
-// the element may then lie up to that much further inside (the read-start / read-end zones zone5 /
-// zone3: ONT adapter + barcode flank), so a window placed from that bound is widened inward.
+// Expected window [ws, we) of slot o from the nearest seen slot without an insert between, else from [cs, ce).
+// es_out: expected element start, INT32_MIN if unplaced. cs_slack / ce_slack widen it inward.
 inline void expected_window(const Model& M, int t, int o, const int* ostart, const int* oend, int cs, int ce, int pad, int& ws, int& we,
                             int& spread, int* es_out = nullptr, int cs_slack = 0, int ce_slack = 0) {
     if (es_out) *es_out = INT32_MIN;
@@ -2983,7 +2793,7 @@ inline int check_element(const Model&, const TElem& e) { return e.spec; }
 
 inline void add_check(Result& R, const Model& M, const TElem& el, char strand, int construct, Status st, int ws, int we, int rf, int rt,
                       int ed, float conf, int n) {
-    CheckRegion c;
+    check_region c;
     c.start = std::max(0, ws);
     c.end = std::min(n, we);
     if (c.end <= c.start) {
@@ -2992,7 +2802,7 @@ inline void add_check(Result& R, const Model& M, const TElem& el, char strand, i
         c.end = c.start;
     }
     c.element = check_element(M, el);
-    // CheckRegion::element indexes LayoutSpec::elements; bind_spec() binds every anchor / poly slot
+    // check_region::element indexes layout_spec::elements; bind_spec() binds every anchor / poly slot
     assert(c.element >= 0 && c.element < (int)M.spec.elements.size());
     if (c.element < 0 || c.element >= (int)M.spec.elements.size()) return;
     c.strand = strand;
@@ -3005,10 +2815,8 @@ inline void add_check(Result& R, const Model& M, const TElem& el, char strand, i
     R.checks.push_back(c);
 }
 
-// Slot completion: the decoded path expects anchor `a` inside [ws, we) but no event was assigned. Look
-// for a retained prefix (3' part lost) or suffix (5' part lost) of >= 10 bp with D <= floor(i/8)
-// (Myers column D(i) = popcount(Pv & 1..i) - popcount(Mv & 1..i), free start). Returns the retained
-// adapter offsets [rlo, rhi), the read span and the edits of the best (longest - 3*edits) hit.
+// Slot completion: finds a retained prefix / suffix (>= 10 bp, D <= i/8) of anchor a inside [ws, we).
+// Returns its adapter offsets [rlo, rhi), read span [ps, pe) and edits.
 inline bool partial_in_window(const Model& M, int a, const char* s, int n, int ws, int we, int& ps, int& pe, int& rlo, int& rhi, int& ed) {
     const Anchor& x = M.anch[a];
     if (x.nchunk != 1 || x.m < 16 || x.m > PAT_MAXLEN || informative(x.seq) != x.m) return false;
@@ -3066,16 +2874,11 @@ inline bool partial_in_window(const Model& M, int a, const char* s, int n, int w
     return found;
 }
 
-// Check region of an expected slot that has no observed event (fast path and full path alike):
-//  1. slot completion: a retained prefix / suffix inside the expected window -> PARTIAL, or
-//     TRUNCATED_AT_READ_END when it ends <= 6 bp from the read end (prefix) / starts <= 6 bp from the
-//     read start (suffix); the window covers the full adapter extent the piece implies, padded;
-//  2. geometry only (edits -1): TRUNCATED_AT_READ_END only when the expected extent [es, es + m) runs
-//     past a read end, retained = the part inside the read ([0, n - es) at 3', [-es, m) at 5'; poly
-//     slots carry no offsets); otherwise MISSING_EXPECTED over the (clipped) expected window.
+// Check region of an expected slot with no event: PARTIAL / TRUNCATED_AT_READ_END from slot completion, else
+// TRUNCATED_AT_READ_END when the expected extent runs past a read end, else MISSING_EXPECTED.
 inline void missing_slot_check(Result& R, const Model& M, const TElem& el, char strand, int cidx, const char* seq, int n, int ws, int we,
                                int es, float conf_partial, float conf_geom) {
-    if (ws >= n || we <= 0) return;  // lies entirely beyond a read end
+    if (ws >= n || we <= 0) return;
     const int pad = M.opt.seen_pad;
     if (el.kind == EK_ANCHOR) {
         int ps, pe, rlo, rhi, ed;
@@ -3103,11 +2906,8 @@ inline void missing_slot_check(Result& R, const Model& M, const TElem& el, char 
     add_check(R, M, el, strand, cidx, st, ws, we, rf, rt, -1, conf_geom, n);
 }
 
-// A degraded full-length hit (ED above the anchor grade) of a closing / opening anchor over [s, e): when a
-// retained prefix (closer: its outward 3' part lost) or suffix (opener: its outward 5' part lost) of
-// >= 12 bp at D <= floor(i/8) explains the window clearly better (i - 3D > m - 3 ed + 2), report that
-// fragment instead, so alignment searches for the piece (e.g. a truncated rev_primer fused to an ONT
-// barcode flank). Returns the PARTIAL check's window and offsets.
+// True when an outward-truncated fragment explains a degraded full-length hit better (i - 3D > m - 3 ed + 2);
+// returns the fragment's PARTIAL window and offsets.
 inline bool degraded_as_fragment(const Model& M, int a, const char* seq, int n, int s, int e, int ed, int& ws, int& we, int& rlo, int& rhi,
                                  int& fed) {
     const Anchor& x = M.anch[a];
@@ -3123,15 +2923,13 @@ inline bool degraded_as_fragment(const Model& M, int a, const char* seq, int n, 
     return true;
 }
 
-// =====================================================================================
-// Stage 1: gate
-// =====================================================================================
+// Stage 1: decides a clean single construct (k = 1) from seeds; false sends the read to the full path.
 inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) {
     int cnt[MAXANCH], first[MAXANCH];
     for (int a = 0; a < M.A; ++a) { cnt[a] = 0; first[a] = -1; }
     int nvalid = 0;
     for (size_t i = 0; i < S.sc.size(); ++i) {
-        const SeedCluster& c = S.sc[i];
+        const seed_cluster& c = S.sc[i];
         if (!c.valid()) continue;
         if (cnt[c.a]++ == 0) first[c.a] = (int)i;
         ++nvalid;
@@ -3163,7 +2961,7 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
             cl[o] = -1; ostart[o] = oend[o] = -1;
             const TElem& e = T.el[T.obs[o]];
             if (e.kind != EK_ANCHOR || cnt[e.anc] == 0) continue;
-            const SeedCluster& c = S.sc[first[e.anc]];
+            const seed_cluster& c = S.sc[first[e.anc]];
             const int st = st0 + o;
             if (M.head_fix[st] >= 0 && c.s > M.zone5 + M.head_fix[st]) { ok = false; break; }
             if (M.tail_fix[st] >= 0 && c.e < n - M.zone3 - M.tail_fix[st]) { ok = false; break; }
@@ -3199,7 +2997,7 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
         int poly_slot_seen[16];
         for (int o = 0; o < nobs; ++o) poly_slot_seen[o] = -1;
         for (size_t pi = 0; pi < S.poly.size() && ok; ++pi) {
-            const PolyReg& p = S.poly[pi];
+            const poly_reg& p = S.poly[pi];
             bool expl = false;
             for (int o = 0; o < nobs && !expl; ++o) {
                 const int eo = T.obs[o];
@@ -3252,9 +3050,9 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
         for (int o = 0; o < nobs; ++o) {
             oed[o] = ced[o] = -1;
             if (cl[o] < 0) continue;
-            const SeedCluster& c = S.sc[cl[o]];
+            const seed_cluster& c = S.sc[cl[o]];
             const Anchor& x = M.anch[c.a];
-            if (c.s < 0 || c.e > n) continue;  // runs off a read end
+            if (c.s < 0 || c.e > n) continue;
             if (c.nx >= x.m - M.K + 1 && c.olo == 0 && c.ohi == x.m - M.K && x.nchunk == 1 && informative(x.seq) == x.m) {
                 oed[o] = 0;
                 continue;
@@ -3268,11 +3066,7 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
                 ostart[o] = std::max(0, oend[o] - x.m);
             } else if (be >= 0) ced[o] = ed;  // chunked anchor: edit distance of its first chunk
         }
-        // Certification on the refined edit distances (the full path's rules), so seeds alone never make
-        // a construct: an anchor-grade slot (ED <= strong, non-weak, >= 16 bp); a weak outer anchor at
-        // ED <= strong with another element; or a tight pair (no insert between) at layout spacing with an
-        // anchor at ED <= budget. Otherwise (e.g. adapters at ED >= 7, or two lone ED5-6 adapters) the
-        // read goes to the full path.
+        // certification on the refined edit distances (the full path's rules): seeds alone never make a construct
         {
             auto grade = [&](int o, bool strong) {
                 const Anchor& x = M.anch[T.el[T.obs[o]].anc];
@@ -3297,7 +3091,7 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
                 int lo = 0, hi = 0;
                 for (int o2 = o1 + 1; o2 < nobs && !cert2; ++o2) {
                     const int e2 = T.obs[o2];
-                    if (T.pins[e2] - T.pins[e1 + 1] != 0) break;  // an insert lies between
+                    if (T.pins[e2] - T.pins[e1 + 1] != 0) break;
                     for (int x2 = (o2 == o1 + 1 ? e1 + 1 : T.obs[o2 - 1] + 1); x2 < e2; ++x2) {
                         const TElem& te = T.el[x2];
                         if (te.kind == EK_POLY) hi += 60;
@@ -3323,7 +3117,6 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
             }
             if (!cert2) continue;
         }
-        // ---- fast path: k = 1 ----
         R.k = 1;
         R.cuts.clear(); R.segs.clear(); R.checks.clear(); R.cut_post.clear();
         R.p_single = M.fast_p;
@@ -3359,7 +3152,7 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
                 const TElem& el = T.el[T.obs[o]];
                 if (el.kind == EK_POLY) {
                     if (poly_slot_seen[o] >= 0) {
-                        const PolyReg& p = S.poly[poly_slot_seen[o]];
+                        const poly_reg& p = S.poly[poly_slot_seen[o]];
                         add_check(R, M, el, T.strand, 0, Status::FULL, p.s - M.opt.seen_pad, p.e + M.opt.seen_pad, -1, -1, -1, M.fast_p, n);
                     } else {
                         int ws, we, spr, es;
@@ -3372,7 +3165,7 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
                 }
                 const Anchor& x = M.anch[el.anc];
                 if (cl[o] >= 0) {
-                    const SeedCluster& c = S.sc[cl[o]];
+                    const seed_cluster& c = S.sc[cl[o]];
                     if (c.e > n || c.s < 0) {
                         int rlo, rhi, ed;
                         seed_truncation(M, c, seq, n, rlo, rhi, ed);
@@ -3395,7 +3188,7 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
                 for (int y = 0; y < nobs; ++y) { ps2[y] = (cl[y] >= 0) ? ostart[y] : (poly_slot_seen[y] >= 0 ? S.poly[poly_slot_seen[y]].s : -1); pe2[y] = (ps2[y] >= 0) ? pend(y) : -1; }
                 int ws, we, spr, es;
                 expected_window(M, t, o, ps2, pe2, sg.start, sg.end, M.opt.check_pad, ws, we, spr, &es, cs_slack, ce_slack);
-                if (ws >= n || we <= 0) continue;  // lies entirely beyond a read end
+                if (ws >= n || we <= 0) continue;
                 // a closer expected at / beyond the read end: test a truncated prefix at the read end
                 if (x.closing && o == nobs - 1 && we >= n - 4 && x.nchunk == 1) {
                     const int lo = std::max(0, n - x.m - 8);
@@ -3422,10 +3215,7 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
 
 namespace detail {
 
-// =====================================================================================
-// Stage 3: event HSMM
-// =====================================================================================
-inline float gap_score(const Model& M, const DescHot& d, int gap) {
+inline float gap_score(const Model& M, const desc_hot& d, int gap) {
     const int x = gap - d.fixed;
     if (d.kind == 0) {
         const int lo = M.tight_lo[d.tid];
@@ -3463,7 +3253,7 @@ inline bool cert_alone(const Model& M, int st, const Event& e) { return (M.st_fl
 
 // Same-construct transition (j,sp) -> (i,st): weight and the certification it adds.
 inline bool tr_same(const Model& M, const Event& ej, int sp, const Event& ei, int st, int gap, int L, float& w, uint8_t& hadd) {
-    const DescHot& d = M.same[sp * M.S + st];
+    const desc_hot& d = M.same[sp * M.S + st];
     if (!d.valid || ei.cls == CL_S8) return false;
     const float g = gap_score(M, d, gap);
     if (g <= NEG_HALF) return false;
@@ -3475,8 +3265,7 @@ inline bool tr_same(const Model& M, const Event& ej, int sp, const Event& ei, in
             if (d.kind == 0) {
                 h = std::abs(gap - d.fixed) <= d.slack;
             } else {
-                // across an insert: a weak outer anchor (ED <= strong) or an exact short anchor needs an
-                // anchor-grade partner or a poly tail of the same construct
+                // across an insert: a weak or short anchor needs an anchor-grade partner or a poly tail
                 auto weakish = [&](const Event& e, int s) {
                     if (e.cls == CL_S4 && (M.st_flags[s] & SF_WEAK)) return true;
                     if ((M.st_flags[s] & SF_SHORT) && e.cls == CL_S4 && e.ed >= 0 && e.ed <= 1) return true;
@@ -3492,7 +3281,7 @@ inline bool tr_same(const Model& M, const Event& ej, int sp, const Event& ei, in
             }
         }
     }
-    // a short anchor tightly paired with another anchor (10x 5' forw_primer <26> tso): full LLR
+    // a short anchor tightly paired with another anchor: full LLR
     if (d.kind == 0 && ((M.st_flags[st] | M.st_flags[sp]) & SF_SHORT) && ej.cls != CL_POLY && ei.cls != CL_POLY &&
         std::abs(gap - d.fixed) <= d.slack) {
         if (M.st_flags[st] & SF_SHORT) w += M.emit_bonus[st * NFEAT + ei.feat];
@@ -3503,7 +3292,7 @@ inline bool tr_same(const Model& M, const Event& ej, int sp, const Event& ei, in
 }
 // Junction transition (j,sp) -> new construct at (i,st).
 inline bool tr_cross(const Model& M, const Event& ej, int sp, const Event& ei, int st, int gap, float& w, uint8_t& hadd, uint8_t& h0ok) {
-    const DescHot& d = M.cross[sp * M.S + st];
+    const desc_hot& d = M.cross[sp * M.S + st];
     if (!d.valid) return false;
     const bool strong_closer = (M.st_flags[sp] & SF_CLOSE) && ej.cls == CL_S4 && !(M.st_flags[sp] & SF_WEAK);
     const bool junc = strong_closer && (M.st_flags[st] & SF_OPEN) && gap >= -10 && gap <= 10;
@@ -3520,12 +3309,10 @@ inline bool tr_cross(const Model& M, const Event& ej, int sp, const Event& ei, i
     }
     bool h = cert_alone(M, st, ei) || (junc && !(M.st_flags[st] & SF_SHORT) && (ei.cls == CL_S4 || ei.cls == CL_S6));
     if (!h && d.kind == 0 && (ej.cls == CL_S4 || ej.cls == CL_S6) && (M.st_flags[sp] & SF_ANCHOR) && (M.st_flags[st] & SF_ANCHOR)) {
-        // junction geometry: an anchor-grade element of the previous construct and an anchor of the new one
-        // joined by fixed-length elements only (e.g. 10x 5' rc_forw_primer | [forw_primer lost] bc umi | tso)
+        // junction geometry: the two constructs' anchors joined by fixed-length elements only
         const int x = gap - d.fixed;
         const bool geo = x >= -d.slack && x <= d.slack + 60;
-        // the same with barcode-adjacent primers physically deleted (unobserved primers count as 0 bp): the barcode
-        // blocks abut, -DEL_GMIN bp of overlap .. 30 bp of filler (10x 5' fused rc_tso <umi bc | bc umi> tso at 52 + g)
+        // the same with barcode-adjacent primers deleted: the blocks abut within [DEL_GMIN, DEL_GMAX_CERT] bp
         bool geo_del = false;
         if (!geo && (d.dela | d.delb)) {
             const int dl[3] = {d.dela, d.delb, d.dela + d.delb};
@@ -3534,10 +3321,9 @@ inline bool tr_cross(const Model& M, const Event& ej, int sp, const Event& ei, i
         if (geo || geo_del) {
             if (M.st_flags[st] & SF_SHORT) {
                 h = ei.cls == CL_S4 && ei.ed >= 0 && ei.ed <= 1;
-                if (h) w += M.emit_bonus[st * NFEAT + ei.feat];  // geometry-anchored short element: full LLR
+                if (h) w += M.emit_bonus[st * NFEAT + ei.feat];
             } else h = ei.cls == CL_S4 || ei.cls == CL_S6;
-            // two facing partner anchors of the barcode blocks (both short, ED <= 1): the pair certifies the construct it
-            // closes as well, and the closing one regains its full LLR
+            // two facing short partner anchors (ED <= 1) also certify the closed construct; both get the full LLR
             if (h && geo_del && (M.st_flags[st] & SF_SHORT) && (M.st_flags[sp] & SF_SHORT) && ej.cls == CL_S4 && ej.ed >= 0 && ej.ed <= 1) {
                 h0ok = 1;
                 w += M.emit_bonus[sp * NFEAT + ej.feat];
@@ -3551,8 +3337,7 @@ inline bool tr_cross(const Model& M, const Event& ej, int sp, const Event& ei, i
     hadd = h;
     return true;
 }
-// An exact short anchor (e.g. 10x 5' tso) at the layout-implied distance from the physical read start
-// (head side) or read end (tail side) certifies a terminal construct (random match < 1e-5 per read).
+// An exact short anchor at its layout distance from the read start / end certifies a terminal construct.
 inline bool begin_geom(const Model& M, int st, const Event& e) {
     if (!(M.st_flags[st] & SF_SHORT) || e.cls != CL_S4 || e.ed != 0 || M.head_fix[st] < 0) return false;
     const int s0 = e.start - M.head_fix[st];
@@ -3567,10 +3352,8 @@ inline int head_start(const Model& M, int st, const Event& e, int lo) {
     return M.head_fix[st] >= 0 ? std::max(lo, e.start - M.head_fix[st]) : lo;
 }
 
-// Viterbi. Cell (event i, state st, h): h = the current construct is certified (an anchor-grade
-// element, a tight pair, a weak anchor with a partner, or a junction-anchored opener). Junctions may
-// leave, and the read may end in, certified cells only; constructs shorter than the minimum length
-// may not be closed. Returns k (0 = no construct); fills the path.
+// Viterbi over cells (event, state, h = construct certified); junctions leave, and the read ends in, certified
+// cells only. Returns k (0 = no construct) and fills the path.
 inline int viterbi(const Model& M, const Event* ev, int n, int L, Scratch& W) {
     const int S = M.S;
     W.path_ev.clear(); W.path_st.clear(); W.path_cross.clear();
@@ -3583,10 +3366,10 @@ inline int viterbi(const Model& M, const Event* ev, int n, int L, Scratch& W) {
     int32_t* bp = W.bp.data();
     int32_t* cs = W.cs.data();
     W.tr.clear();
-    const float logL = std::log((float)std::max(L, 100));
+    const float log_l = std::log((float)std::max(L, 100));
     float best = NEG;
     int bi = -1, bs = -1, bh = 1;
-    const bool any_force = !W.force.empty();  // facing-anchor rescue: junctions forced by a large bonus
+    const bool any_force = !W.force.empty();
     for (int i = 0; i < n; ++i) {
         const Event& ei = ev[i];
         for (int st : M.states_by_type[ei.type]) {
@@ -3597,7 +3380,7 @@ inline int viterbi(const Model& M, const Event* ev, int n, int L, Scratch& W) {
             if (ei.cls != CL_S8) {
                 const bool bg = begin_geom(M, st, ei);
                 const int h = (cert_alone(M, st, ei) || bg) ? 1 : 0;
-                cur[h] = M.lbegin[st] - logL + (bg ? M.emit_bonus[st * NFEAT + ei.feat] : 0.f);
+                cur[h] = M.lbegin[st] - log_l + (bg ? M.emit_bonus[st * NFEAT + ei.feat] : 0.f);
                 cb[h] = -1;
                 cc[h] = (head_start(M, st, ei, 0) << 2) | 1;
             }
@@ -3691,11 +3474,11 @@ inline int viterbi(const Model& M, const Event* ev, int n, int L, Scratch& W) {
     return k;
 }
 
-// Scaled forward-backward over the same graph with a count layer (k = 1 / k >= 2): fills W.lZ, W.lZ1
+// Scaled forward-backward over the same graph with a count layer (k = 1 / k >= 2): fills W.l_z, W.l_z1
 // and W.jpost[x] = P(a junction lies between event x and x+1). Requires viterbi() to have run.
 inline void forward_backward(const Model& M, const Event* ev, int n, int L, Scratch& W, bool backward) {
     const int S = M.S;
-    W.lZ = M.lp0; W.lZ1 = NEG;
+    W.l_z = M.lp0; W.l_z1 = NEG;
     W.jpost.assign(n + 1, 0.f);
     if (n == 0) return;
     const size_t NC = (size_t)n * S;
@@ -3708,9 +3491,8 @@ inline void forward_backward(const Model& M, const Event* ev, int n, int L, Scra
     const int32_t* cs = W.cs.data();
     std::fill(F, F + NC * 4, 0.f);
     for (size_t c = 0; c < NC; ++c) scale[c] = std::max(dp[c * 2], dp[c * 2 + 1]);
-    const float logL = std::log((float)std::max(L, 100));
+    const float log_l = std::log((float)std::max(L, 100));
     const float V = W.best_score;
-    // BEGIN terms
     for (int i = 0; i < n; ++i) {
         const Event& ei = ev[i];
         if (ei.cls == CL_S8) continue;
@@ -3720,7 +3502,7 @@ inline void forward_backward(const Model& M, const Event* ev, int n, int L, Scra
             if (e <= NEG_HALF || scale[c] <= NEG_HALF) continue;
             const bool bg = begin_geom(M, st, ei);
             const int h = (cert_alone(M, st, ei) || bg) ? 1 : 0;
-            F[c * 4 + h * 2] = fexp(M.lbegin[st] - logL + e + (bg ? M.emit_bonus[st * NFEAT + ei.feat] : 0.f) - scale[c]);
+            F[c * 4 + h * 2] = fexp(M.lbegin[st] - log_l + e + (bg ? M.emit_bonus[st * NFEAT + ei.feat] : 0.f) - scale[c]);
         }
     }
     // transitions (grouped by target, targets ascending): m = exp(w + e_dst + scale_src - scale_dst)
@@ -3743,7 +3525,6 @@ inline void forward_backward(const Model& M, const Event* ev, int n, int L, Scra
             }
         } else f[t.ha * 2 + 1] += (fp[2] + fp[3] + ((t.cross & 2) ? fp[0] + fp[1] : 0.f)) * m;
     }
-    // END terms
     auto endw = [&](int i, int st, int h) -> float {
         const Event& ei = ev[i];
         const int c = cs[((size_t)i * S + st) * 2 + h];
@@ -3768,8 +3549,8 @@ inline void forward_backward(const Model& M, const Event* ev, int n, int L, Scra
             }
         }
     const double z0 = std::exp(std::min(700.0, (double)(M.lp0 - V)));
-    W.lZ = V + (float)std::log(std::max(zsum + z0, 1e-300));
-    W.lZ1 = z1sum > 0 ? V + (float)std::log(z1sum) : NEG;
+    W.l_z = V + (float)std::log(std::max(zsum + z0, 1e-300));
+    W.l_z1 = z1sum > 0 ? V + (float)std::log(z1sum) : NEG;
     if (!backward || !M.opt.posteriors) return;
     // backward: B(c,h,l) = exp(b - (V - scale_c)); END terms, then transitions in reverse order (push to source)
     std::fill(B, B + NC * 4, 0.f);
@@ -3786,7 +3567,7 @@ inline void forward_backward(const Model& M, const Event* ev, int n, int L, Scra
                 B[c * 4 + h * 2 + 1] = m;
             }
         }
-    const double zf = std::exp(std::max(-700.0, std::min(700.0, (double)(V - W.lZ))));
+    const double zf = std::exp(std::max(-700.0, std::min(700.0, (double)(V - W.l_z))));
     for (size_t x = NT; x-- > 0;) {
         const Scratch::Tr& t = W.tr[x];
         const float m = TM[x];
@@ -3820,13 +3601,8 @@ inline void forward_backward(const Model& M, const Event* ev, int n, int L, Scra
 
 namespace detail {
 
-// Fold-back test on s[a,b): reverse-complement 11-mer matches across the region vote for the
-// palindrome centre (x + y + k = 2 * centre). A fold-back (one molecule read twice) gives many
-// matches on one anti-diagonal spread along a long arm; a short inverted repeat in a cDNA gives a
-// compact cluster. Low-complexity k-mers are ignored. Barcode-free.
-// relaxed (D constructs only): also accepted without the arm-fraction rule (span >= 0.4 arm) -- noisy nanopore
-// fold-back arms match over only ~70-180 bp of a 130-270 bp arm -- when the match density reaches 0.22 (a compact
-// inverted repeat in a cDNA still fails the 60-bp span floor). See FIXES_5P.md for the 10x 5' evidence.
+// Palindrome centre of s[a, b) from reverse-complement k-mer votes (x + y + k = 2 * centre). True when the votes
+// span a long arm; `relaxed` also accepts a dense shorter span.
 inline bool foldback_centre(const char* s, int a, int b, Scratch& W, int& centre, float& frac, bool relaxed = false) {
     const int k = 10;
     const int len = b - a;
@@ -3910,17 +3686,11 @@ inline bool foldback_centre(const char* s, int a, int b, Scratch& W, int& centre
     const int span = xmax - xmin + k;
     frac = (float)span / std::max(1, arm);
     centre = ctr;
-    // calibrated on the 10x 5' dev evidence: fold-back arms give >= 0.17 matches per bp of arm span
     if (cnt >= 20 && arm >= 50 && span >= std::max(60, (int)(0.4 * arm)) && cnt >= 0.17 * span) return true;
     return relaxed && cnt >= 16 && arm >= 50 && span >= 60 && cnt >= 0.22 * span;
 }
 
-// ---- POLICY_ROUND.md round 3: strand-aware arm similarity (policy 9) and the cDNA strand flip (policy 10) ----
-
-// Jaccard index of the FOLD_K-mer sets of the left arm s[a, c) and the REVERSE COMPLEMENT of the right arm s[c, b)
-// (k-mers containing N are skipped). One molecule read forward and then back (a fold-back) shares most of its
-// k-mers across the fold; two different molecules, or the two units of a D read, share almost none. Barcode-free:
-// the arms are cDNA only (the caller passes the insert between the units' inner anchors).
+// Jaccard index of the FOLD_K-mer sets of the left arm s[a, c) and the reverse complement of the right arm s[c, b).
 inline float arm_jaccard(const char* s, int a, int c, int b, Scratch& W) {
     const int k = FOLD_K;
     if (c - a < FOLD_ARM_MIN || b - c < FOLD_ARM_MIN) return 0.f;
@@ -3960,8 +3730,7 @@ inline float arm_jaccard(const char* s, int a, int c, int b, Scratch& W) {
     return uni ? (float)inter / (float)uni : 0.f;
 }
 
-// Identity of s[l0, l1) against the reverse complement of s[r0, r1): 1 - (banded global edit distance) / (longer
-// segment). Band = |length difference| + 32. Used by the fold-back decision on the mirrored core of the two arms.
+// 1 - banded edit distance / longer length of s[l0, l1) against rc(s[r0, r1)); band = |length difference| + 32.
 inline float seg_identity(const char* s, int l0, int l1, int r0, int r1, Scratch& W) {
     const int n = l1 - l0, m = r1 - r0;
     if (n <= 0 || m <= 0) return 0.f;
@@ -3990,16 +3759,13 @@ inline float seg_identity(const char* s, int l0, int l1, int r0, int r1, Scratch
     return 1.f - (float)ed / (float)std::max(n, m);
 }
 
-// Where the shared k-mers of the two arms lie: the dominant anti-diagonal (j - i within +-8 of the mode, i = position
-// in the left arm s[a, c), j = position in rc(right arm s[c, b)); both count from the arms' unit-side ends) and the
-// first / last positions on it. A molecule read twice mirrors its whole cDNA, so the diagonal starts near i = 0 and
-// j = 0; an inverted repeat inside one cDNA, or a segment two molecules share next to the junction, leaves the
-// unit-side ends unmatched. k-mers occurring more than 4 times in an arm are skipped (low complexity).
+// Dominant anti-diagonal of the k-mers shared by the left arm and rc(right arm), positions counted from the arms'
+// unit-side ends: gets its first / last positions and k-mer count `non`; false when non < FOLD_DIAG_MIN.
 inline bool arm_mirror_reach(const char* s, int a, int c, int b, Scratch& W, int& min_i, int& min_j, int& max_i, int& max_j, int& non) {
     const int k = FOLD_K;
     min_i = min_j = 1 << 30; max_i = max_j = -1; non = 0;
-    const int nL = c - a, nR = b - c;
-    if (nL < k || nR < k) return false;
+    const int n_l = c - a, n_r = b - c;
+    if (n_l < k || n_r < k) return false;
     const uint32_t km = (1u << (2 * k)) - 1;
     auto collect = [&](std::vector<std::pair<uint32_t, int32_t>>& out, int lo, int hi, bool rc) {
         out.clear();
@@ -4038,13 +3804,13 @@ inline bool arm_mirror_reach(const char* s, int a, int c, int b, Scratch& W, int
         i = i2; j = j2;
     }
     if (W.fb_diag.size() < 2 * (size_t)FOLD_DIAG_MIN) return false;
-    W.fb_hist.assign((size_t)nL + nR + 1, 0);
-    for (size_t q = 0; q < W.fb_diag.size(); q += 2) W.fb_hist[W.fb_diag[q + 1] - W.fb_diag[q] + nL]++;
+    W.fb_hist.assign((size_t)n_l + n_r + 1, 0);
+    for (size_t q = 0; q < W.fb_diag.size(); q += 2) W.fb_hist[W.fb_diag[q + 1] - W.fb_diag[q] + n_l]++;
     int best = -1, bestd = 0;
-    for (int d = 0; d <= nL + nR; ++d) {
+    for (int d = 0; d <= n_l + n_r; ++d) {
         int cnt = 0;
-        for (int e = -8; e <= 8; ++e) if (d + e >= 0 && d + e <= nL + nR) cnt += W.fb_hist[d + e];
-        if (cnt > best) { best = cnt; bestd = d - nL; }
+        for (int e = -8; e <= 8; ++e) if (d + e >= 0 && d + e <= n_l + n_r) cnt += W.fb_hist[d + e];
+        if (cnt > best) { best = cnt; bestd = d - n_l; }
     }
     for (size_t q = 0; q < W.fb_diag.size(); q += 2) {
         const int pi = W.fb_diag[q], pj = W.fb_diag[q + 1];
@@ -4056,37 +3822,28 @@ inline bool arm_mirror_reach(const char* s, int a, int c, int b, Scratch& W, int
     return non >= FOLD_DIAG_MIN;
 }
 
-// Fold-back decision for the insert s[a, b) between two barcode units facing each other (D / single-primer-end
-// constructs) or between an F and an R construct whose junction adapters were lost. The fold centre comes from the
-// reverse-complement k-mer votes (foldback_centre; the midpoint when there are too few votes); the decision is the
-// strand-aware arm similarity: Jaccard(left arm, rc(right arm)) >= FOLD_J, or >= FOLD_J_LO with a banded identity
-// >= FOLD_NW_ID, and the mirrored diagonal reaching both arms' unit-side ends (within reach_l / reach_r bp: FOLD_REACH
-// when the unit's inner anchor bounds the arm, FOLD_REACH_OPEN when it was not observed, i.e. the arm may still hold
-// a lost unit's barcode block). No barcode content and no adapter geometry take part (user policy 9).
+// Fold-back decision for the insert s[a, b): arm Jaccard >= FOLD_J_LO, the mirrored diagonal reaching both arms'
+// unit-side ends within reach_l / reach_r bp, and banded identity >= FOLD_NW_ID. Gets the centre, J and identity.
 inline bool fold_decision(const char* s, int a, int b, Scratch& W, int& centre, float& J, float& ident, int reach_l = FOLD_REACH,
                           int reach_r = FOLD_REACH) {
     J = 0.f; ident = 0.f;
     centre = (a + b) / 2;
     if (b - a < 2 * FOLD_ARM_MIN) return false;
     float fr;
-    foldback_centre(s, a, b, W, centre, fr, true);  // centre estimate only; the acceptance below is the arm similarity
+    foldback_centre(s, a, b, W, centre, fr, true);
     centre = std::min(std::max(centre, a + FOLD_ARM_MIN), b - FOLD_ARM_MIN);
     J = arm_jaccard(s, a, centre, b, W);
     if (J < FOLD_J_LO) return false;
-    // the mirrored diagonal must reach both arms' unit-side ends ...
     int mi, mj, xi, xj, non;
     if (!arm_mirror_reach(s, a, centre, b, W, mi, mj, xi, xj, non)) return false;
     if (mi > reach_l || mj > reach_r) return false;
-    // ... and the mirrored core (first to last shared k-mer on it; the junction junk of lost adapters and a lost unit's
-    // barcode block stay outside) must align: a chance diagonal of sparse shared k-mers does not
     const int l0 = a + mi, l1 = std::min(centre, a + xi), r1 = b - mj, r0 = std::max(centre, b - xj);
     ident = seg_identity(s, l0, l1, r0, r1, W);
     return ident >= FOLD_NW_ID;
 }
 
 
-// Per-position strand score of s[i, i + STRAND_K): the calibrated log-odds of the k-mer on the sense strand against
-// its reverse complement (0 for k-mers with N).
+// Strand score of the k-mer at s[i] (0 for k-mers with N).
 inline float strand_score_at(const Model& M, const char* s, int i) {
     uint32_t v = 0;
     for (int x = 0; x < STRAND_K; ++x) {
@@ -4097,13 +3854,8 @@ inline float strand_score_at(const Model& M, const char* s, int i) {
     return M.strand_lo[v];
 }
 
-// Strand-flip cut (user policy 10). s[lo, hi) spans the two cDNAs of an FR_RF junction whose junction adapters were
-// lost: the F construct's cDNA (sense) on the left, the R construct's (antisense) on the right. cut = argmax over c of
-// (sum of scores left of c) - (sum of scores right of c), each arm >= FLIP_ARM_MIN bp. Accepted when the left arm's
-// mean score is >= FLIP_MARGIN * strand_mu and the right arm's <= -FLIP_MARGIN * strand_mu, each arm's score sum
-// reaches FLIP_EVIDENCE_MIN * strand_mu (short arms need a mean well above the margin) and each arm holds enough
-// distinct k-mers (FLIP_DISTINCT_MIN: a microsatellite or homopolymer arm repeats one k-mer and is no strand
-// evidence); `margin` reports min(left mean, -right mean) / strand_mu. O(hi - lo).
+// Strand-flip cut in s[lo, hi) (sense cDNA left, antisense right): cut = argmax of left sum - right sum. True when
+// both arms pass min_margin, FLIP_EVIDENCE_MIN and the low-complexity guard; margin = min(left, -right mean) / strand_mu.
 inline bool strand_flip_cut(const Model& M, const char* s, int lo, int hi, Scratch& W, int& cut, float& margin,
                             float min_margin = FLIP_MARGIN, int arm_min = FLIP_ARM_MIN) {
     cut = (lo + hi) / 2;
@@ -4131,7 +3883,7 @@ inline bool strand_flip_cut(const Model& M, const char* s, int lo, int hi, Scrat
     margin = std::min(left, -right) / std::max(M.strand_mu, 1e-6f);
     if (!(left >= t && right <= -t)) return false;
     if (std::min(ps[best], -(total - ps[best])) < (float)FLIP_EVIDENCE_MIN * M.strand_mu) return false;
-    auto distinct_frac = [&](int a, int b) {  // distinct STRAND_K-mers / k-mer positions of s[a, b)
+    auto distinct_frac = [&](int a, int b) {
         std::vector<uint8_t>& seen = W.flip_seen;
         seen.assign((size_t)STRAND_N, 0);
         uint32_t v = 0;
@@ -4147,7 +3899,7 @@ inline bool strand_flip_cut(const Model& M, const char* s, int lo, int hi, Scrat
     return distinct_frac(lo, cut) >= FLIP_DISTINCT_MIN && distinct_frac(cut, hi) >= FLIP_DISTINCT_MIN;
 }
 
-// Per-position score of s[i, i + STRAND_D_K) on the D strand table (0 for k-mers with N).
+// D strand score of the k-mer at s[i] (0 for k-mers with N).
 inline float strand_d_score_at(const Model& M, const char* s, int i) {
     uint32_t v = 0;
     for (int x = 0; x < STRAND_D_K; ++x) {
@@ -4158,8 +3910,7 @@ inline float strand_d_score_at(const Model& M, const char* s, int i) {
     return M.strand_d_lo[v];
 }
 
-// Low-complexity guard of the D strand rule: distinct STRAND_K-mers / k-mer positions of s[a, b) (the same measure as
-// the arm guard of strand_flip_cut; a microsatellite or homopolymer stretch repeats one k-mer and is no strand evidence).
+// Low-complexity guard: distinct STRAND_K-mers / k-mer positions of s[a, b).
 inline float distinct_kmer_frac(const char* s, int a, int b, Scratch& W) {
     std::vector<uint8_t>& seen = W.flip_seen;
     seen.assign((size_t)STRAND_N, 0);
@@ -4174,27 +3925,9 @@ inline float distinct_kmer_frac(const char* s, int a, int b, Scratch& W) {
     return pos ? (float)d / (float)pos : 0.f;
 }
 
-// D strand rule. s[lo, hi) is the cDNA between the inner anchors of the two barcode units of a
-// D geometry (10x 5': tso ... rc_tso). Per-position scores come from the D strand table, in units of its calibrated
-// mean sense score mu ("average sense positions"):
-//   T = (sum of all scores) / mu, the evidence of one direction (sense as read: T > 0; antisense: T < 0);
-//   c = argmax over cuts (each arm >= FLIP_ARM_MIN bp) of (left sum - right sum), S = min(left sum, -right sum) / mu, the
-//       evidence of the weaker arm for "sense on the left, antisense on the right": two cDNAs tail to tail, the strand
-//       change the two outward-pointing barcode units predict (each unit at its cDNA's 5' end);
-//   c' = argmin of the same difference, S' = min(-left sum, right sum) / mu, the evidence of the weaker arm for
-//       "antisense on the left, sense on the right": two cDNAs head to head (neither unit at its cDNA's 5' end), or a
-//       third arm. Measured on a 10x 5' truth set: 6 of 1,800 two-cDNA reads (0.3%) and 5 of 7,767 kept one-cDNA
-//       records (0.06%) have S' >= D_EVIDENCE_MIN.
-//   DRULE_UNCLEAR    S' >= D_EVIDENCE_MIN: no record (a kept record would hold both molecules; a split would still hold a
-//                    strand change in one half)
-//   DRULE_TWO        S >= D_EVIDENCE_MIN and both arms pass the low-complexity guard: two cDNAs tail to tail, cut = lo + c
-//   DRULE_ONE_LEFT   S <= 0 (no arm pair with flip evidence) and T >= D_EVIDENCE_MIN: one cDNA, sense from the left unit
-//   DRULE_ONE_RIGHT  S <= 0 and -T >= D_EVIDENCE_MIN: one cDNA, sense from the right unit (antisense as read)
-//   DRULE_UNCLEAR    otherwise, or no D table
-// O(hi - lo). Measured against minimap2 on 13,241 10x 5' D reads: the kept
-// unit is the one at the cDNA 5' end in 99.98% of the one-cDNA reads, 0.08% of them are split, 0.12% of the D reads
-// are two cDNAs written as one record (two cDNAs on one strand, which no strand rule can see), 97% of the splits lie
-// within 60 bp of the mapping breakpoint.
+// D strand rule on the cDNA s[lo, hi) of a D geometry, in strand_d_mu units: T = total score; S / S' = weaker-arm
+// evidence at the best sense-antisense / antisense-sense cut. DRULE_UNCLEAR if S' >= D_EVIDENCE_MIN; DRULE_TWO (cut
+// set) if S >= D_EVIDENCE_MIN; DRULE_ONE_LEFT / _RIGHT if S <= 0 and |T| >= D_EVIDENCE_MIN; else DRULE_UNCLEAR.
 enum : int { DRULE_UNCLEAR = 0, DRULE_ONE_LEFT = 1, DRULE_ONE_RIGHT = 2, DRULE_TWO = 3 };
 inline int d_strand_rule(const Model& M, const char* s, int lo, int hi, Scratch& W, int& cut, float& evidence) {
     cut = -1;
@@ -4218,7 +3951,7 @@ inline int d_strand_rule(const Model& M, const char* s, int lo, int hi, Scratch&
         S = std::min(ps[best], -(total - ps[best])) / mu;
         Sp = std::min(-ps[bestp], total - ps[bestp]) / mu;
     }
-    if (Sp >= D_EVIDENCE_MIN) return DRULE_UNCLEAR;  // head to head (antisense left, sense right), or a third arm: no record
+    if (Sp >= D_EVIDENCE_MIN) return DRULE_UNCLEAR;  // head to head, or a third arm
     if (S >= D_EVIDENCE_MIN && distinct_kmer_frac(s, lo, lo + best, W) >= FLIP_DISTINCT_MIN &&
         distinct_kmer_frac(s, lo + best, hi, W) >= FLIP_DISTINCT_MIN) {
         cut = lo + best;
@@ -4233,15 +3966,8 @@ inline int d_strand_rule(const Model& M, const char* s, int lo, int hi, Scratch&
     return DRULE_UNCLEAR;
 }
 
-// Cut between a construct whose last path slot is sa (event A) and the next one whose first slot is sb (event B).
-// kind: 0 both junction adapters (midpoint), 1 one adapter (its junction-facing edge), 2 layout geometry, 3 none (the
-// caller places the duration MAP midpoint or a fold-back centre).
-// Barcode-block edges (layout geometry; an unobserved barcode-adjacent primer counts as 0 bp): a construct whose
-// junction-facing slot is an inner barcode-side slot (10x 5' tso / rc_tso, VisiumHD poly_t / poly_a) has its barcode
-// block end bc_tail bp after / start bc_head bp before that slot. A cut never enters such a block: next to an observed
-// primer it is pulled out of the facing block (back into that primer when the primer was laid over the block).
-// Lx / Rx (INT_MIN: none): barcode-block edge of the left / right construct supplied by a partner anchor the decode
-// left off the path (rule bs of score/SCORE.md), used when the junction-facing slot itself gives none.
+// Cut between the construct ending at slot sa (event A) and the next one starting at slot sb (event B); kind gets
+// the CUT_* value. Never enters a known barcode block. Lx / Rx: offpath_edges results (INT32_MIN: none).
 inline int junction_cut(const Model& M, const Event& A, int sa, const Event& B, int sb, uint8_t& kind, int Lx = INT32_MIN,
                         int Rx = INT32_MIN) {
     const bool cl = (M.st_flags[sa] & SF_CLOSE) != 0, op = (M.st_flags[sb] & SF_OPEN) != 0;
@@ -4249,7 +3975,7 @@ inline int junction_cut(const Model& M, const Event& A, int sa, const Event& B, 
     bool fence = false;
     int lo = std::min(A.end, B.start), hi = std::max(A.end, B.start);
     const int bt = M.bc_tail[sa], bh = M.bc_head[sb];
-    const int Lb = bt >= 0 ? A.end + bt : Lx, Rb = bh >= 0 ? B.start - bh : Rx;  // barcode-block edges, if known
+    const int Lb = bt >= 0 ? A.end + bt : Lx, Rb = bh >= 0 ? B.start - bh : Rx;
     if (cl && op) { cut = (A.end + B.start) / 2; kind = 0; }
     else if (cl) {
         cut = A.end; kind = 1;
@@ -4275,13 +4001,8 @@ inline int junction_cut(const Model& M, const Event& A, int sa, const Event& B, 
     return std::min(std::max(cut, lo), hi);
 }
 
-// Rule bs (score/SCORE.md): at a path junction whose junction-facing slot gives no barcode-block edge, the inner
-// barcode-side element of that construct's template which the decode left off the path supplies it, when it lies in
-// the inter-construct gap and is consistent with the other side's edge (Rg - Lg in [-6, 150] for an anchor-grade
-// partner anchor such as 10x 5' rc_tso / tso; [-16, 30] for a poly run such as VisiumHD poly_a / poly_t, whose run
-// edges are fuzzy by a few bp each and which may occur inside cDNA): the last one before the gap end for the left construct, the first
-// one after the gap start for the right construct. Placement only: the junction is already on the decoded path.
-// lanc / ranc (optional): the edge came from an anchor (not a poly run).
+// Barcode-block edges Lx / Rx for a junction whose facing slots give none, from inner barcode-side events the decode
+// left off the path, consistent with the other side's edge. lanc / ranc: the edge came from an anchor.
 inline void offpath_edges(const Model& M, const Event* ev, int nev, const Scratch& W, int sa, const Event& A, int sb, const Event& B,
                           int& Lx, int& Rx, bool* lanc = nullptr, bool* ranc = nullptr) {
     Lx = Rx = INT32_MIN;
@@ -4341,14 +4062,11 @@ inline void offpath_edges(const Model& M, const Event* ev, int nev, const Scratc
 
 // An exact 11-mer seed of the event's own anchor overlaps it (stage-0 seed clusters).
 inline bool exact_seeded(const Scratch& W, const Event& e) {
-    for (const SeedCluster& c : W.sc)
+    for (const seed_cluster& c : W.sc)
         if (c.a == e.type && c.nx >= 1 && c.s < e.end && e.start < c.e) return true;
     return false;
 }
-// The construct on path steps [x0, x1) holds a slot outside its barcode-side units (Model::bc_unit; 10x 5': poly_t /
-// rc_rev_primer for R, poly_a / rev_primer for F, the bare outer primer of a single-primer end; never the barcode unit
-// at the other end of a D construct): a poly run, an anchor at anchor grade (a degraded ED 5-6 primer is noise level), or
-// an adapter truncated at a read end.
+// True when construct path steps [x0, x1) hold cDNA-side evidence (a slot outside Model::bc_unit).
 inline bool cdna_side_anchor(const Model& M, const Scratch& W, const Event* ev, int x0, int x1) {
     for (int x = x0; x < x1; ++x) {
         if (M.bc_unit[W.path_st[x]]) continue;
@@ -4357,26 +4075,14 @@ inline bool cdna_side_anchor(const Model& M, const Scratch& W, const Event* ev, 
     }
     return false;
 }
-// Mirrored evidence for a split made only by the fold-back test inside construct c (template t, path slots ostart / oend /
-// oev per observable slot, fold at `fold`, construct bounds [lo, hi), first / last construct of the read). Every slot on
-// the decoded path counts as observed at its position, including an adapter truncated at a read end (its implied span):
-// a second barcode unit with another geometry is not a mirror image even when its primer is cut by the read end.
-// A fold-back is one molecule read twice, so its two arms carry the same barcode unit reverse-complemented
-// (10x 5' D: forw_primer bc umi tso | cDNA | rc(cDNA) | rc_tso rc_umi rc_bc rc_forw_primer). Required:
-//  - at least one mirror pair (tso / rc_tso, forw_primer / rc_forw_primer) observed on both arms, at matching
-//    distances from the fold: |d1 - d2| <= max(12, arm / 8) (the palindrome centre is estimated from k-mer votes);
-//  - when two pairs are observed, both arms' barcode units have the same geometry (their d1 - d2 agree within
-//    FOLD_SPREAD bp);
-//  - every element observed on one arm whose mirror is missing: the mirror would lie past a read end (within
-//    FOLD_ROOM bp of it) or past the construct's cut, and no event of the mirror's anchor (ED <= budget) lies elsewhere
-//    on that arm (a barcode unit at another offset: the arms are not mirror images).
+// unused
 inline bool fold_mirrored(const Model& M, const Event* ev, int nev, int t, const int* ostart, const int* oend, const int* oev, int nobs,
                           int fold, int lo, int hi, bool first, bool last, int L) {
     if (t >= (int)M.tpl_mirror.size() || M.tpl_mirror[t].empty()) return false;
     const Template& T = M.tpl[t];
     const std::vector<int>& mir = M.tpl_mirror[t];
     auto seen = [&](int o) { return ostart[o] >= 0 && oev[o] >= 0; };
-    int c2 = INT32_MIN, best_el = -1;  // 2 x centre from the innermost observed pair
+    int c2 = INT32_MIN, best_el = -1;
     for (int o = 0; o < nobs; ++o) {
         const int mo = mir[o];
         if (mo < 0 || mo >= nobs || T.pins[T.obs[o]] != 0 || !seen(o) || !seen(mo)) continue;
@@ -4393,12 +4099,12 @@ inline bool fold_mirrored(const Model& M, const Event* ev, int nev, int t, const
             ddmin = std::min(ddmin, dd); ddmax = std::max(ddmax, dd);
             mind = std::min(mind, std::abs(dd));
             arm = std::min(arm, std::min(d1, d2));
-        } else if (sh) {  // tail-arm mirror missing
+        } else if (sh) {
             const int a = T.el[T.obs[mo]].anc, s0 = c2 - oend[o], e0 = s0 + M.anch[a].m;
             if (e0 <= (last ? L - FOLD_ROOM : hi)) return false;
             for (int i = 0; i < nev; ++i)
                 if (ev[i].type == a && ev[i].cls <= CL_S6 && ev[i].start >= fold && ev[i].start < (last ? L : hi)) return false;
-        } else if (st) {  // head-arm mirror missing
+        } else if (st) {
             const int a = T.el[T.obs[o]].anc, e0 = c2 - ostart[mo], s0 = e0 - M.anch[a].m;
             if (s0 >= (first ? FOLD_ROOM : lo)) return false;
             for (int i = 0; i < nev; ++i)
@@ -4426,12 +4132,8 @@ inline void seen_check(Result& R, const Model& M, const TElem& elm, char strand,
     else add_check(R, M, elm, strand, cidx, Status::PARTIAL, ws, we, e.rlo, e.rhi, e.ed, conf, L);
 }
 
-// Check regions of one half [lo, hi) of a construct split at a fold-back (policy 9), described by the main template of
-// its strand (F for the left half, R for the right): every slot of that template observed on the half (an event of the
-// same anchor / poly type on the decoded path of the folded construct) gets its seen check; an unobserved slot joined
-// to an observed one without an insert (the barcode-side partner, e.g. 10x 5' rc_tso next to a seen rc_forw_primer)
-// gets a MISSING_EXPECTED window at the layout offset. Slots across the insert from every observed one (the lost
-// junction adapters at the fold) get no window: nothing is expected there.
+// Check regions of a split half [lo, hi), described by main template tmain: seen checks for observed slots, and
+// MISSING_EXPECTED windows only for slots tied to an observed one without an insert.
 inline void emit_half_checks(Result& R, const Model& M, const char* seq, int L, int tmain, int cidx, int lo, int hi, const Event* ev,
                              const Template& T, const int* ostart, const int* oend, const int* oev, int nobs, float conf) {
     const Template& H = M.tpl[tmain];
@@ -4474,22 +4176,21 @@ inline void emit_half_checks(Result& R, const Model& M, const char* seq, int L, 
     }
 }
 
+// Builds the Result (cuts, segments, check regions, strand call, abstain flag) from the decoded path.
 inline void derive_result(const Model& M, const char* seq, const Event* ev, int nev, int L, Scratch& W, int k, bool fb_done, Result& R) {
     R.k = 0;
     R.cuts.clear(); R.segs.clear(); R.checks.clear(); R.cut_post.clear(); R.cut_lo.clear(); R.cut_hi.clear(); R.cut_kind.clear(); R.cut_aux.clear();
     R.p_single = 0.f;
     if (k == 0) { R.strand_call = '?'; return; }
-    if (fb_done) R.p_single = (float)std::exp(std::min(0.f, W.lZ1 - W.lZ));
+    if (fb_done) R.p_single = (float)std::exp(std::min(0.f, W.l_z1 - W.l_z));
     else R.p_single = k == 1 ? 1.f : 0.f;
     const int np = (int)W.path_ev.size();
-    // constructs = runs of path steps
     std::vector<int>& cstart = W.cidx;
     cstart.clear();
     for (int x = 0; x < np; ++x)
         if (W.path_cross[x]) cstart.push_back(x);
     const int nc = (int)cstart.size();
     cstart.push_back(np);
-    // cuts; kind: 0 both junction adapters, 1 one adapter, 2 layout geometry, 3 whole interval (MAP), 4 fold-back centre
     int prev_cut = 0;
     std::vector<int>& cuts = R.cuts;
     std::vector<uint8_t>& ckind = W.ckind;
@@ -4509,16 +4210,8 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         float aux = 0.f;
         int cut = junction_cut(M, A, sa, B, sb, kind, Lx, Rx);
         const int bt = M.bc_tail[sa], bh = M.bc_head[sb];
-        // A junction made only by a pairing: a construct delimited here by a short partner anchor of its barcode-side unit
-        // (10x 5' rc_tso closing an R construct, tso opening an F construct) facing the other construct's partner anchor
-        // (fused rc_tso <umi bc> | <bc umi> tso) or a degraded primer (an anchor-grade primer on the other side certifies
-        // the junction by itself). Such a junction needs a strong pairing -- both junction-facing anchors strong (anchor
-        // grade; a short anchor also at ED <= 1 or with an exact seed) near the fused geometry (gap g between the
-        // barcode-block edges <= DEL_GMAX_CERT) -- or a cDNA-side anchor in both constructs (10x 5': rc_rev_primer / poly_t
-        // of R before it, poly_a / rev_primer of F after it; then the two cannot be one construct, whereas e.g. a D or
-        // single-primer end next to an F, or an R next to a D, can). Otherwise a stray tso / rc_tso in cDNA plus a chance
-        // partner (scan, rescue, deletion regime) splits a single construct confidently. Weak -> junction posterior capped
-        // (the read abstains).
+        // a junction made only by a pairing of partner anchors needs a strong pairing or a cDNA-side anchor in both
+        // constructs; otherwise its posterior is capped at WEAK_POST
         uint8_t weak = 0;
         int gap_pair = INT32_MIN;
         {
@@ -4538,8 +4231,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         W.cweak.push_back(weak);
         W.cgap.push_back(gap_pair);
         if (kind == 3) {
-            // nothing located the junction: fold-back (policy 9, strand-aware arm Jaccard) > cDNA strand flip at an
-            // FR_RF junction (policy 10, calibrated strand table) > duration-MAP midpoint (low confidence)
+            // no located junction: fold-back > strand flip (F then R) > duration-MAP midpoint
             const int ja = std::min(A.end, B.start), jb = std::max(A.end, B.start);
             int ctr;
             float fj, fid;
@@ -4556,10 +4248,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             }
         }
         cut = std::max(cut, prev_cut + 1);
-        // child windows: a side whose barcode-block edge comes from an anchor-grade partner anchor (its own junction-facing
-        // slot, or one the decode left off the path) keeps its whole block even when the cut lies inside it (facing blocks
-        // that overlap at a micro-homology, or a 1-2 bp anchor end difference); never past the facing construct's first /
-        // last event. Poly-derived edges (VisiumHD poly_t / poly_a) are fuzzy and are not used.
+        // child windows: an anchor-derived barcode block stays whole, but never past the facing construct's events
         const int Le = (bt >= 0 && A.type < M.A) ? A.end + bt : lanc ? Lx : INT32_MIN;
         const int Re = (bh >= 0 && B.type < M.A) ? B.start - bh : ranc ? Rx : INT32_MIN;
         int whi = cut, wlo = cut;
@@ -4574,7 +4263,6 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         cb.push_back(W.path_ev[xb]);
         prev_cut = cut;
     }
-    // junction posteriors per cut
     std::vector<float>& cpost = W.cpost;
     cpost.clear();
     for (int c = 0; c + 1 < nc; ++c) {
@@ -4590,8 +4278,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
     bcut.assign(cuts.begin(), cuts.end());
     std::vector<float>& spost = W.spost;  // posterior of the cut to the right of each output segment
     spost.clear();
-    // segments + check regions
-    bool anyF = false, anyR = false, anyO = false, anyU = false;
+    bool any_f = false, any_r = false, any_o = false, any_u = false;
     int ostart[64], oend[64], oev[64];
     for (int c = 0; c < nc; ++c) {
         const int x0 = cstart[c], x1 = cstart[c + 1];
@@ -4612,7 +4299,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         Segment sg;
         sg.strand = T.strand;
         sg.flags = (uint16_t)((has_open ? 0 : SEG_PARTIAL_LEFT) | (has_close ? 0 : SEG_PARTIAL_RIGHT) | (T.art && !T.dtpl ? SEG_ARTIFACT : 0));
-        int cs_slack = 0, ce_slack = 0;  // construct bounds defaulted to the read ends (see expected_window)
+        int cs_slack = 0, ce_slack = 0;
         if (c > 0) sg.start = bcut[c - 1];
         else {
             // read-end bound at the barcode-block edge when the barcode-adjacent primer was not observed
@@ -4639,7 +4326,6 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         }
         sg.conf = conf;
         if (conf < M.opt.tau_junction) sg.flags |= SEG_LOWCONF;
-        // empty insert
         {
             const int E = (int)T.el.size();
             int ins_el = -1;
@@ -4654,9 +4340,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
                 if (seen5 && seen3 && (sg.end - sg.start) - l5 - l3 < 30) sg.flags |= SEG_EMPTY;
             }
         }
-        // a single-primer end (artifact template carrying one barcode unit) takes its strand from the barcode-side
-        // partner anchor; without it (10x 5' forw_primer ... rc_forw_primer with tso / rc_tso unseen) the read has no
-        // strand evidence: strand '?'
+        // a single-primer end without its barcode-side partner anchor has no strand evidence
         if (T.art && !T.dtpl && (T.strand == 'F' || T.strand == 'R')) {
             bool partner = false;
             for (int o = 0; o < nobs && !partner; ++o) {
@@ -4665,17 +4349,12 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             }
             if (!partner) sg.strand = '?';
         }
-        // D construct (and single-primer ends: both terminal anchors are the barcode-side primer):
-        // fold-back -> two constructs; otherwise the D strand rule (D geometry): one construct of the kept unit
-        // (SEG_D_KEPT), two constructs split at the cDNA strand change (SEG_D_SPLIT), or SEG_DOUBLE_BC (no clear direction)
+        // fold-back -> two constructs; otherwise, for a D construct, the D strand rule
         int fold_cut = -1;
-        float fold_aux = 0.f, flip_conf = -1.f;  // flip_conf >= 0: a D geometry split by the D strand rule (its cut posterior)
-        uint8_t in_kind = CUT_FOLDBACK;  // kind of a split made inside this construct (fold-back centre or strand flip)
-        int d_keep = DRULE_UNCLEAR;      // D strand rule: DRULE_ONE_LEFT / DRULE_ONE_RIGHT when one unit is kept
-        const int cut_right = sg.end;    // the cut to the next construct (bcut[c]; the read-end bound for the last one). A kept-left D
-                                         // construct trims sg.end to the removed unit's inner anchor below; the cut, and so the next
-                                         // construct's window, stays at the junction (the removed unit lies between the two and belongs
-                                         // to neither)
+        float fold_aux = 0.f, flip_conf = -1.f;  // flip_conf >= 0: cut posterior of a D strand rule split
+        uint8_t in_kind = CUT_FOLDBACK;
+        int d_keep = DRULE_UNCLEAR;
+        const int cut_right = sg.end;    // stays at the junction even when a kept-left D construct trims sg.end
         if (M.tpl_fold[t]) {
             int a = sg.start, b = sg.end;
             int rl = FOLD_REACH_OPEN, rr = FOLD_REACH_OPEN;  // an arm bounded by an observed inner anchor is closed
@@ -4686,33 +4365,22 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
                 if (T.pins[eo] == 0) { if (oend[o] >= a) { a = oend[o]; rl = inner ? FOLD_REACH : FOLD_REACH_OPEN; } }
                 else if (ostart[o] <= b) { b = ostart[o]; rr = inner ? FOLD_REACH : FOLD_REACH_OPEN; }
             }
-            // policy 9: fold-back iff the strand-aware arm similarity says so (Jaccard of the left arm against the
-            // reverse complement of the right arm); the barcode units and their geometry take no part
             int ctr;
             float fj, fid;
             if (M.opt.foldback_split && b - a >= 2 * FOLD_ARM_MIN && fold_decision(seq, a, b, W, ctr, fj, fid, rl, rr)) { fold_cut = ctr; fold_aux = fj; }
             else if (T.dtpl) {
-                // D strand rule: the cDNA between the two units' inner anchors is read with the
-                // D strand table (d_strand_rule). One direction: the unit at the cDNA 5' end is kept and the other unit
-                // removed (the segment ends at the removed unit's inner anchor: the read element never enters it). A strand
-                // change: two cDNAs tail to tail, split at the change (two plain constructs, as a fold-back split). No clear
-                // direction, or no D table: SEG_DOUBLE_BC (RAD writes nothing). The decode's p_single takes no part: the
-                // D template and the F + R alternative with every junction element lost have the same shape, and the
-                // strand table is the evidence that separates them (whole reads and D children alike).
-                // The rule's span: the inner anchor's observed edge, or, for an unobserved inner anchor (tso / rc_tso),
-                // the layout offset from the observed outer one (spacers plus the anchor's nominal length), so that the
-                // removed unit's barcode block is never part of the kept construct.
+                // D strand rule on the cDNA between the units' inner anchors (layout offset when one was not observed)
                 int lo = a, hi = b;
                 int ins_el = -1;
                 for (int x = 0; x < (int)T.el.size(); ++x) if (T.el[x].kind == EK_INSERT) { ins_el = x; break; }
                 if (ins_el >= 0) {
-                    int oL = -1, oR = -1;
+                    int o_l = -1, o_r = -1;
                     for (int o = 0; o < nobs; ++o) {
                         if (ostart[o] < 0) continue;
-                        if (T.obs[o] < ins_el) oL = o; else if (oR < 0) oR = o;
+                        if (T.obs[o] < ins_el) o_l = o; else if (o_r < 0) o_r = o;
                     }
-                    if (oL >= 0) lo = oend[oL] + (int)std::lround(T.pnom[ins_el] - T.pnom[T.obs[oL] + 1]);
-                    if (oR >= 0) hi = ostart[oR] - (int)std::lround(T.pnom[T.obs[oR]] - T.pnom[ins_el + 1]);
+                    if (o_l >= 0) lo = oend[o_l] + (int)std::lround(T.pnom[ins_el] - T.pnom[T.obs[o_l] + 1]);
+                    if (o_r >= 0) hi = ostart[o_r] - (int)std::lround(T.pnom[T.obs[o_r]] - T.pnom[ins_el + 1]);
                     lo = std::max(a, std::min(lo, L));
                     hi = std::min(b, std::max(hi, 0));
                 }
@@ -4721,7 +4389,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
                 const int rule = hi > lo ? d_strand_rule(M, seq, lo, hi, W, dc, dev) : (int)DRULE_UNCLEAR;
                 if (rule == DRULE_TWO) {
                     fold_cut = dc; fold_aux = dev; in_kind = CUT_STRAND_FLIP;
-                    flip_conf = 1.f;  // decided by the rule's evidence threshold; the halves' cut posterior reaches tau_junction
+                    flip_conf = 1.f;
                 } else if (rule == DRULE_ONE_LEFT || rule == DRULE_ONE_RIGHT) {
                     d_keep = rule;
                     if (rule == DRULE_ONE_LEFT) { sg.strand = 'F'; sg.end = std::max(hi, sg.start + 1); sg.flags |= SEG_PARTIAL_RIGHT; }
@@ -4729,9 +4397,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
                     sg.flags = (uint16_t)((sg.flags & ~SEG_LOWCONF) | SEG_D_KEPT);
                 } else {
                     sg.flags |= SEG_DOUBLE_BC;
-                    // insert-length evidence: a D insert beyond what one cDNA explains (the calibrated one-insert length
-                    // density's p99) where two inserts are more likely (an FR_RF junction with every junction element lost,
-                    // or an undetected fold-back) -> uncertain (RAD writes nothing for a SEG_DOUBLE_BC construct either way)
+                    // insert longer than one cDNA explains (two inserts more likely): uncertain
                     const int X = b - a;
                     if (X > M.ins1_p99 && gap_score_ins(M, 2, X) > gap_score_ins(M, 1, X)) sg.flags |= SEG_LOWCONF;
                 }
@@ -4739,17 +4405,14 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         }
         const int ci = (int)R.segs.size();
         if (fold_cut > sg.start && fold_cut < sg.end) {
-            // the two halves are plain F and R constructs of the same molecule (the artifact / D template that
-            // decoded them is not carried over); the split's confidence is the construct's own (policy 9: the
-            // arm similarity is the decision, no barcode-unit mirror test)
+            // the halves are plain F and R constructs; the split's confidence is the construct's own
             Segment s1 = sg, s2 = sg;
-            const uint16_t dsplit = (T.dtpl && in_kind == CUT_STRAND_FLIP) ? SEG_D_SPLIT : 0;  // D strand rule: both halves marked
+            const uint16_t dsplit = (T.dtpl && in_kind == CUT_STRAND_FLIP) ? SEG_D_SPLIT : 0;
             s1.end = fold_cut; s1.strand = 'F';
             s1.flags = (uint16_t)((sg.flags & ~(SEG_PARTIAL_RIGHT | SEG_SAME_MOLECULE_R | SEG_UNANCHORED_R | SEG_ARTIFACT | SEG_DOUBLE_BC)) | SEG_PARTIAL_RIGHT |
                                   (in_kind == CUT_FOLDBACK ? SEG_SAME_MOLECULE_R : SEG_UNANCHORED_R) | dsplit);
             s2.start = fold_cut; s2.strand = 'R'; s2.flags = (uint16_t)((sg.flags & ~(SEG_PARTIAL_LEFT | SEG_ARTIFACT | SEG_DOUBLE_BC)) | SEG_PARTIAL_LEFT | dsplit);
-            // a D geometry split by the D strand rule carries the rule's decision as its cut posterior; the halves'
-            // confidence is that value, which reaches tau_junction, so the construct's own low-confidence mark (p_single < tau) is lifted
+            // a D strand rule split: the halves take the rule's decision as confidence
             const float fpost = flip_conf >= 0.f ? flip_conf : conf;
             if (flip_conf >= 0.f) {
                 s1.conf = s2.conf = fpost;
@@ -4768,7 +4431,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             W.skind.push_back(0);
             W.scut.push_back(fold_cut);
             W.scut.push_back(cut_right);
-            anyF = true; anyR = true;
+            any_f = true; any_r = true;
         } else {
             R.segs.push_back(sg);
             spost.push_back(c + 1 < nc ? cpost[c] : 1.f);
@@ -4776,34 +4439,30 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             W.saux.push_back(c + 1 < nc ? W.caux[c] : 0.f);
             W.skind.push_back(0);
             W.scut.push_back(cut_right);
-            if (sg.strand == 'F') anyF = true;
-            else if (sg.strand == 'R') anyR = true;
-            else anyO = true;
-            if (sg.strand == '?') anyU = true;
+            if (sg.strand == 'F') any_f = true;
+            else if (sg.strand == 'R') any_r = true;
+            else any_o = true;
+            if (sg.strand == '?') any_u = true;
         }
         if (!M.opt.check_regions) continue;
         if (fold_cut > sg.start && fold_cut < sg.end) {
             // fold-back halves: the main templates describe them (F left of the fold, R right of it)
-            int tF = -1, tR = -1;
-            for (int tm : M.main_tpl) (M.tpl[tm].strand == 'F' ? tF : tR) = tm;
-            if (tF >= 0) emit_half_checks(R, M, seq, L, tF, ci, sg.start, fold_cut, ev, T, ostart, oend, oev, nobs, conf);
-            if (tR >= 0) emit_half_checks(R, M, seq, L, tR, ci + 1, fold_cut, sg.end, ev, T, ostart, oend, oev, nobs, conf);
+            int t_f = -1, t_r = -1;
+            for (int tm : M.main_tpl) (M.tpl[tm].strand == 'F' ? t_f : t_r) = tm;
+            if (t_f >= 0) emit_half_checks(R, M, seq, L, t_f, ci, sg.start, fold_cut, ev, T, ostart, oend, oev, nobs, conf);
+            if (t_r >= 0) emit_half_checks(R, M, seq, L, t_r, ci + 1, fold_cut, sg.end, ev, T, ostart, oend, oev, nobs, conf);
             continue;
         }
         if (d_keep != DRULE_UNCLEAR) {
-            // D strand rule, kept unit: the main template of its strand describes the construct over the kept span; the
-            // removed unit's events lie outside it and get no window, and nothing is expected across the insert (the
-            // read element ends at the removed unit's inner anchor, the segment edge)
+            // kept D unit: the main template of its strand describes the kept span
             int tm = -1;
             for (int x : M.main_tpl) if (M.tpl[x].strand == sg.strand) tm = x;
             if (tm >= 0) emit_half_checks(R, M, seq, L, tm, ci, sg.start, sg.end, ev, T, ostart, oend, oev, nobs, conf);
             continue;
         }
-        // check regions for every expected static element of the construct
         const int left_kind = c > 0 ? ckind[c - 1] : -1, right_kind = c + 1 < nc ? ckind[c] : -1;
-        // a junction located by nothing (duration-MAP midpoint): hand the whole inter-construct interval to alignment
-        // for the junction-facing slots; one located by the strand flip alone: the interval around the flip (the lost
-        // adapters, if any trace remains, sit at the flip)
+        // junction-facing slots next to a midpoint cut get the whole inter-construct interval; next to a strand-flip
+        // cut, 40 bp on each side of it
         for (int o = 0; o < nobs; ++o) {
             const TElem& elm = T.el[T.obs[o]];
             if (oev[o] >= 0) { seen_check(R, M, elm, T.strand, ci, seq, L, ev[oev[o]], conf); continue; }
@@ -4846,13 +4505,12 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         R.cut_kind.resize(kc - 1);
         R.cut_aux.resize(kc - 1);
         R.k = kc;
-        auto it = std::remove_if(R.checks.begin(), R.checks.end(), [&](const CheckRegion& c) { return c.construct >= kc; });
+        auto it = std::remove_if(R.checks.begin(), R.checks.end(), [&](const check_region& c) { return c.construct >= kc; });
         R.checks.erase(it, R.checks.end());
     }
-    if (anyU && R.k == 1) R.strand_call = '?';  // single construct without strand evidence
-    else if (anyO || (anyF && anyR)) R.strand_call = 'M';
-    else R.strand_call = anyF ? 'F' : anyR ? 'R' : '?';
-    // unexplained opposite-strand anchor evidence
+    if (any_u && R.k == 1) R.strand_call = '?';
+    else if (any_o || (any_f && any_r)) R.strand_call = 'M';
+    else R.strand_call = any_f ? 'F' : any_r ? 'R' : '?';
     if (R.strand_call == 'F' || R.strand_call == 'R') {
         const int tmain = R.strand_call == 'F' ? M.main_tpl[0] : M.main_tpl[1];
         bool in_t[MAXANCH];
@@ -4871,30 +4529,24 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             }
         }
     }
-    // abstain
     bool abst = false;
-    // a D geometry whose unit the D strand rule kept (SEG_D_KEPT): the alternative the decode weighed against the D
-    // template (F + R with every junction element lost) is the one the strand table decided, so p_single is no doubt here
+    // a kept D unit does not abstain on p_single: the strand table decided it
     if (R.k == 1) abst = R.p_single < M.opt.tau_single && !(R.segs[0].flags & SEG_D_KEPT);
     else if (R.k >= 2) {
-        // splits made only by the fold-back test inside one decoded construct (user convention: a fold-back is two
-        // constructs): that construct must be confident; otherwise the decode itself must exclude k = 1. A D geometry
-        // split by the D strand rule carries the rule's decision as its cut posterior below.
+        // nc >= 2: the decode must exclude k = 1; a fold-back split of one construct: that construct must be confident
         const bool flip_split = nc == 1 && R.k == 2 && !R.cut_kind.empty() && R.cut_kind[0] == CUT_STRAND_FLIP;
         abst = nc >= 2 ? R.p_single > 1.f - M.opt.tau_single : (flip_split ? false : R.p_single < M.opt.tau_single);
         for (float p : R.cut_post) abst = abst || p < M.opt.tau_junction;
     }
     if (R.flags & RES_OPPOSITE_EVIDENCE) abst = true;
-    if (R.k == 1 && (R.segs[0].flags & SEG_LOWCONF)) abst = true;  // e.g. a D insert longer than one cDNA explains
+    if (R.k == 1 && (R.segs[0].flags & SEG_LOWCONF)) abst = true;
     if (abst) R.flags |= RES_ABSTAIN;
 }
 
 }  // namespace detail
 
 namespace detail {
-// Second look at unanchored junctions (both junction elements missing on the decoded path): scan the
-// interval between the two constructs with the full Myers engine for adapters the evidence windows
-// missed (no seed, no poly nearby). Returns true when new events were added.
+// Rescans the gap of each unanchored junction with the full Myers engine. Returns true when events were added.
 inline bool rescan_unanchored(const Model& M, const char* seq, int n, Scratch& W) {
     if (!M.opt.windowed_myers) return false;
     const int np = (int)W.path_ev.size();
@@ -4906,23 +4558,22 @@ inline bool rescan_unanchored(const Model& M, const char* seq, int n, Scratch& W
         if ((M.st_flags[sa] & SF_CLOSE) || (M.st_flags[sb] & SF_OPEN)) continue;
         const int lo0 = std::max(0, W.ev[W.path_ev[x - 1]].end - 8), hi0 = std::min(n, W.ev[W.path_ev[x]].start + 8);
         if (hi0 - lo0 < 20) continue;
-        // skip the parts already covered by the evidence windows
         int lo = lo0;
         for (const auto& w : W.win) {
             if (w.second <= lo || w.first >= hi0) continue;
             if (w.first > lo) {
-                W.rawX.clear();
+                W.raw_x.clear();
                 PState fin[MAXPAT];
-                myers_all(M.words, M.words_shared, M.Wov, (int)M.pats.size(), seq + lo, w.first - lo, W, fin, W.rawX);
-                raw_to_events(M, W.rawX, lo, n, false, W.ev, W.rawCh);
+                myers_all(M.words, M.words_shared, M.Wov, (int)M.pats.size(), seq + lo, w.first - lo, W, fin, W.raw_x);
+                raw_to_events(M, W.raw_x, lo, n, false, W.ev, W.raw_ch);
             }
             lo = std::max(lo, w.second);
         }
         if (hi0 > lo) {
-            W.rawX.clear();
+            W.raw_x.clear();
             PState fin[MAXPAT];
-            myers_all(M.words, M.words_shared, M.Wov, (int)M.pats.size(), seq + lo, hi0 - lo, W, fin, W.rawX);
-            raw_to_events(M, W.rawX, lo, n, false, W.ev, W.rawCh);
+            myers_all(M.words, M.words_shared, M.Wov, (int)M.pats.size(), seq + lo, hi0 - lo, W, fin, W.raw_x);
+            raw_to_events(M, W.raw_x, lo, n, false, W.ev, W.raw_ch);
         }
     }
     if (W.ev.size() > ne0) {
@@ -4936,18 +4587,8 @@ inline bool rescan_unanchored(const Model& M, const char* seq, int n, Scratch& W
 }  // namespace detail
 
 namespace detail {
-// Facing partner anchors (fused barcode-side junctions, 10x 5' rc_tso <umi bc> | <bc umi> tso at 52 + g): the partner
-// of an anchor-grade inner barcode-side event may carry no seed (a 13-mer at ED 1-2 with an indel) and lie outside
-// every evidence window. After a first decode, the facing window of each such event that could take part in a fused
-// junction is scanned with the partner's single-pattern word: an inner event that faces outward at the edge of its
-// decoded construct (an rc_tso that is the construct's last slot, symmetrically a tso), window g in [RESCUE_GMIN,
-// RESCUE_GMAX]; one whose construct is closed (opened) by its barcode-adjacent primer P, beyond P only (the facing
-// unit's primer present, deleted, or P laid over its barcode block; P near a read end leaves no room) and only when
-// other evidence lies beyond the window (that construct cannot be certified by the partner alone); hits up to the anchor
-// grade (13-mer: ED <= 2, the grade the rescue was validated at); an off-path inner
-// event, g in [RESCUE_GMIN,
-// RESCUE_GMAX_OFF] (RESCUE_GMAX when nothing was decoded). Returns true when partner events were added (the caller
-// re-decodes). Lazy, so constructs closed by their barcode-adjacent primer (the common case) cost nothing.
+// Scans the facing window of each anchor-grade inner barcode-side event for a seedless partner anchor (fused
+// barcode-side junction). Returns true when events were added (the caller re-decodes).
 inline bool facing_partner_scan(const Model& M, const char* seq, int n, Scratch& W) {
     if (M.head_rules.empty() || M.tail_rules.empty()) return false;
     std::vector<Event>& ev = W.ev;
@@ -4980,27 +4621,24 @@ inline bool facing_partner_scan(const Model& M, const char* seq, int n, Scratch&
     for (size_t i = 0; i < ne; ++i) {
         const Event e = ev[i];
         if (e.type >= M.A || e.cls != CL_S4 || !M.inner_role[e.type]) continue;
-        int x = -1;  // index on the decoded path (path events are in read order)
+        int x = -1;
         for (int y = 0; y < np && x < 0 && W.path_ev[y] <= (int)i; ++y)
             if (W.path_ev[y] == (int)i) x = y;
-        for (const BcRule& tr : M.tail_rules)
-            for (const BcRule& hr : M.head_rules) {
+        for (const bc_rule& tr : M.tail_rules)
+            for (const bc_rule& hr : M.head_rules) {
                 const int B = tr.block + hr.block;
-                // the facing construct must reach the minimum construct length inside the read: its partner anchor lies
-                // at least min_terminal - block bp from the read end (tso) / start (rc_tso)
+                // the facing construct must fit min_terminal inside the read
                 const int mo = M.anch[hr.inner].m, mc = M.anch[tr.inner].m;
                 if (tr.inner == e.type) {
                     int lo = e.end + B + RESCUE_GMIN - 2;
                     int hi = std::min(e.end + B + (x < 0 && np ? RESCUE_GMAX_OFF : RESCUE_GMAX) + mo + 2, n - M.min_terminal + hr.block + mo);
                     bool want = x < 0 || is_last(x);
                     if (!want && is_last(x + 1)) {
-                        // closed by its barcode-adjacent primer P: the next unit's partner lies beyond P (its own primer
-                        // present, deleted, or P laid over its whole barcode block: from P.end - 6)
+                        // closed by its primer P: the next unit's partner lies beyond P.end - 6
                         const Event& p = ev[W.path_ev[x + 1]];
                         if (p.type == tr.prim) {
                             lo = std::max(lo, p.end - 6);
-                            // the next construct needs evidence of its own beyond the window (the partner pairs with a
-                            // primer here, which certifies nothing by itself)
+                            // the next construct needs evidence of its own beyond the window
                             want = ev[ne - 1].end > hi + 10;
                         }
                     }
@@ -5011,12 +4649,11 @@ inline bool facing_partner_scan(const Model& M, const char* seq, int n, Scratch&
                     int hi = e.start - B - RESCUE_GMIN + 2;
                     bool want = x < 0 || W.path_cross[x];
                     if (!want && x > 0 && W.path_cross[x - 1]) {
-                        // opened by its barcode-adjacent primer P: the previous unit's partner ends before P (that unit's
-                        // primer present, deleted, or P laid over its whole barcode block: up to P.start + 6)
+                        // opened by its primer P: the previous unit's partner ends before P.start + 6
                         const Event& p = ev[W.path_ev[x - 1]];
                         if (p.type == hr.prim) {
                             hi = std::min(hi, p.start + 6);
-                            want = ev[0].start < lo - 10;  // the previous construct needs evidence of its own before the window
+                            want = ev[0].start < lo - 10;  // the previous construct needs evidence of its own
                         }
                     }
                     if (want) scan_partner(tr.inner, lo, hi, M.anch[tr.inner].strong_ed);
@@ -5031,20 +4668,12 @@ inline bool facing_partner_scan(const Model& M, const char* seq, int n, Scratch&
     return added;
 }
 
-// Facing-anchor rescue (benchmarks/concat_hmm/layouts_5p/rf_dropout/score/SCORE.md, rule bs_rescue2_150, validated
-// on prototype C paths: 0 firings in 720k decoys, NEG false splits unchanged). Two facing barcode-side partner
-// anchors at the fused-junction geometry (10x 5' rc_tso <umi bc> | <bc umi> tso: tso.start - rc_tso.end = 52 + g,
-// both anchor-grade) mark a junction the decode left out:
-//  - one on the decoded path, g in [-6, 150]: an rc_tso that is the last slot of its construct (or followed only by a
-//    closing barcode-adjacent primer laid >= 8 bp over the facing barcode block: looked through), or a tso that is the
-//    first slot of its construct (or preceded only by such an opening primer); no other path event between them;
-//  - both off the path, g in [-6, 30] (the near-fused range), no path event between them;
-//  - no junction cut of the decoded path between them already.
-// Queues the pairs in Scratch::force (the next Viterbi forces a junction there) and returns true when any was found.
+// Facing-anchor rescue: queues in Scratch::force each pair of facing anchor-grade partner anchors at the
+// fused-junction geometry that marks a junction the decode left out. Returns true when any was queued.
 inline bool facing_rescue(const Model& M, const Event* ev, int n, Scratch& W) {
     W.force.clear();
     if (M.head_rules.empty() || M.tail_rules.empty() || n < 2) return false;
-    {   // a facing pair needs an anchor-grade tail-rule inner anchor followed, within range, by a head-rule one
+    {   // quick reject: no tail-rule inner anchor followed in range by a head-rule one
         int last_c = INT32_MIN / 2;
         bool cand = false;
         int reach = RESCUE_GMAX, bt = 0, bh = 0;
@@ -5073,9 +4702,9 @@ inline bool facing_rescue(const Model& M, const Event* ev, int n, Scratch& W) {
     for (int ia = 0; ia < n; ++ia) {
         const Event& a = ev[ia];
         if (a.type >= M.A || a.cls != CL_S4) continue;
-        for (const BcRule& tr : M.tail_rules) {
+        for (const bc_rule& tr : M.tail_rules) {
             if (tr.inner != a.type) continue;
-            for (const BcRule& hr : M.head_rules) {
+            for (const bc_rule& hr : M.head_rules) {
                 const int B = tr.block + hr.block;
                 for (int ib = ia + 1; ib < n && ev[ib].start <= a.end + B + RESCUE_GMAX; ++ib) {
                     const Event& b = ev[ib];
@@ -5155,14 +4784,14 @@ inline void segment(const Model& M, const char* seq, int len, Scratch& S, Result
         nev = (int)S.ev.size();
         k = viterbi(M, S.ev.data(), nev, len, S);
     }
-    // (a read already beyond the construct cap is flagged too-many and left to RAD's existing path: no second look)
+    // reads beyond the construct cap get no second look
     if (k <= M.opt.k_cap && facing_partner_scan(M, seq, len, S)) {
         nev = (int)S.ev.size();
         k = viterbi(M, S.ev.data(), nev, len, S);
     }
     bool rescued = false;
     if (k >= 1 && k <= M.opt.k_cap && facing_rescue(M, S.ev.data(), nev, S)) {
-        k = viterbi(M, S.ev.data(), nev, len, S);  // the queued junctions carry a large bonus
+        k = viterbi(M, S.ev.data(), nev, len, S);
         for (size_t x = 1; x < S.path_ev.size() && !rescued; ++x)
             if (S.path_cross[x])
                 for (const auto& fp : S.force) rescued = rescued || (fp.first == S.path_ev[x - 1] && fp.second == S.path_ev[x]);
@@ -5177,9 +4806,6 @@ inline void segment(const Model& M, const char* seq, int len, Scratch& S, Result
 #endif
 }
 
-// =====================================================================================
-// Parameter serialisation (hmm_* columns of the position map)
-// =====================================================================================
 namespace detail {
 inline std::string row_or(const Model& M, const char* klass, char dir, const char* canon) {
     for (auto& e : M.spec.elements)
@@ -5191,12 +4817,8 @@ inline std::string insert_row(const Model& M, char dir, const char* canon) {
         if (is_insert_elem(e) && e.direction == dir) return e.id;
     return canon;
 }
-// Tight duration tables are serialised compactly: only tables that calibration moved away from the
-// layout prior (max |log ratio| > 0.05) are written, as [count, then per table: table id, lo, ncore,
-// ncore pmf values over x in [lo, -lo], ntail, ntail means of 10-bp bins of the junction-spacer tail].
-// The packed form is canonical: the "moved" test is made on the table as it will be read back, a bin of
-// equal values stores that value, and unpack_tables does not renormalise a valid table, so
-// pack(unpack(pack(v))) == pack(v) (a params -> columns -> params round trip is idempotent).
+// Packs the tight tables of `row` that differ from the prior (max |log ratio| > 0.05) as [count, then per table:
+// id, lo, ncore, ncore pmf values, ntail, ntail 10-bp bin means]. Canonical: pack(unpack(pack(v))) == pack(v).
 inline void pack_tables(const Model& M, const PMap& par, const std::string& row, std::vector<double>& out) {
     out.clear();
     out.push_back(0);
@@ -5235,15 +4857,12 @@ inline void pack_tables(const Model& M, const PMap& par, const std::string& row,
         out[0] += 1;
     }
 }
-// A finite integer-valued cell entry in [lo, hi].
 inline bool cell_int(double x, int lo, int hi, int& out) {
     if (!std::isfinite(x) || x < lo - 0.5 || x > hi + 0.5) return false;
     out = (int)std::lround(x);
     return true;
 }
-// A valid pmf: finite, non-negative, positive where the prior is positive, positive sum. A table that
-// is far from normalised (|sum - 1| > 1e-3, e.g. hand-edited) is renormalised; a valid one is kept
-// bit-exact.
+// A valid pmf (finite, >= 0, > 0 where the prior is); renormalised only when |sum - 1| > 1e-3 (else bit-exact).
 inline bool sane_pmf(std::vector<double>& v, const std::vector<double>& prior) {
     if (v.size() != prior.size()) return false;
     double tot = 0;
@@ -5256,17 +4875,14 @@ inline bool sane_pmf(std::vector<double>& v, const std::vector<double>& prior) {
         for (auto& x : v) x /= tot;
     return true;
 }
-// Per-base null rates: finite, in [0, 1], positive wherever the feature can be emitted (emission prior
-// q > 0; a zero null there would make the feature unemittable).
-// (calibration floors them at 1e-10; a smaller rate would give an absurd log-likelihood ratio).
+// Null rates: finite, in [0, 1], and >= 1e-12 where the emission prior is positive.
 inline bool sane_rates(const std::vector<double>& v, const std::vector<double>& q_prior) {
     if (v.size() != q_prior.size()) return false;
     for (size_t i = 0; i < v.size(); ++i)
         if (!std::isfinite(v[i]) || v[i] < 0 || v[i] > 1 || (q_prior[i] > 0 && v[i] < 1e-12)) return false;
     return true;
 }
-// Returns false when the packed cell is malformed (structure or values); valid tables are stored in
-// `par` (tables of another topology / row are skipped silently).
+// False when the packed cell is malformed; valid tables of this row are stored in `par`.
 inline bool unpack_tables(const Model& M, PMap& par, const std::string& row, const std::vector<double>& in) {
     if (in.empty()) return true;
     int ntab = 0;
@@ -5321,10 +4937,9 @@ inline Params Model::export_params() const {
     }
     P.cells[insert_row(*this, 'F', "read")]["hmm_cdna"] = get("ins1");
     P.cells[insert_row(*this, 'R', "rc_read")]["hmm_cdna2"] = get("ins2");
-    {   // cDNA strand table (policy 10), only when calibrated: [mean sense score, 4096 log-odds]
+    {   // cDNA strand table, only when calibrated: [mean sense score, 4096 log-odds]
         auto it = par.find("strand");
         if (it != par.end() && it->second.size() == (size_t)STRAND_N + 1) P.cells[insert_row(*this, 'F', "read")]["hmm_strand"] = it->second;
-        // D strand table (D strand rule), only when calibrated: the STRAND_D_N k-mer counts (integers: compact in the CSV)
         auto itd = par.find("strand_d");
         if (itd != par.end() && itd->second.size() == (size_t)STRAND_D_N) P.cells[insert_row(*this, 'F', "read")]["hmm_strand_d"] = itd->second;
     }
@@ -5363,10 +4978,8 @@ inline Params Model::export_params() const {
     return P;
 }
 
-// Applies cached parameters. Every cell is validated: a cell with a non-finite or out-of-range value
-// (NaN / inf, a negative or zero probability or rate, a malformed table) is rejected, its tables keep the
-// layout prior, the rejection is listed in param_warnings and the model is marked guard_failed (RAD then
-// sends every read down its existing path), so a corrupted cache never silently changes calls.
+// Applies cached parameters. An invalid cell keeps the layout prior, is listed in param_warnings and marks the
+// model guard_failed.
 inline void Model::apply_params(const Params& P) {
     using namespace detail;
     param_warnings.clear();
@@ -5380,7 +4993,7 @@ inline void Model::apply_params(const Params& P) {
         if (c == r->second.end() || c->second.empty()) return nullptr;
         return &c->second;
     };
-    // pmf / rate arrays keyed like the prior; a size mismatch is a different layout version (silently ignored)
+    // a size mismatch is a different layout version (ignored)
     auto setv = [&](const std::string& key, const std::string& row, const char* col, bool rates) {
         const std::vector<double>* v = cell(row, col);
         if (!v) return;
@@ -5418,13 +5031,13 @@ inline void Model::apply_params(const Params& P) {
     }
     setv("ins1", insert_row(*this, 'F', "read"), "hmm_cdna", false);
     setv("ins2", insert_row(*this, 'R', "rc_read"), "hmm_cdna2", false);
-    if (auto sv = cell(insert_row(*this, 'F', "read"), "hmm_strand")) {  // cDNA strand table (policy 10)
+    if (auto sv = cell(insert_row(*this, 'F', "read"), "hmm_strand")) {
         bool ok = sv->size() == (size_t)STRAND_N + 1 && (*sv)[0] > 0;
         for (double x : *sv) ok = ok && std::isfinite(x);
         if (!ok) reject(insert_row(*this, 'F', "read"), "hmm_strand", "must hold a positive mean and 4096 finite log-odds");
         else par["strand"] = *sv;
     }
-    if (auto sv = cell(insert_row(*this, 'F', "read"), "hmm_strand_d")) {  // D strand table (D strand rule): k-mer counts
+    if (auto sv = cell(insert_row(*this, 'F', "read"), "hmm_strand_d")) {
         bool ok = sv->size() == (size_t)STRAND_D_N;
         for (double x : *sv) ok = ok && std::isfinite(x) && x >= 0;
         if (!ok) reject(insert_row(*this, 'F', "read"), "hmm_strand_d", "must hold 262144 finite non-negative counts");
@@ -5470,7 +5083,7 @@ inline void Model::apply_params(const Params& P) {
             if (!unpack_tables(*this, par, "", *tv)) reject(r_rstop, "hmm_tight", "malformed or invalid duration table");
         for (size_t t = 0; t < tight_row.size(); ++t) {
             const std::string& r = tight_row[t];
-            if (r.empty() || std::find(tight_row.begin(), tight_row.begin() + t, r) != tight_row.begin() + t) continue;  // each row once
+            if (r.empty() || std::find(tight_row.begin(), tight_row.begin() + t, r) != tight_row.begin() + t) continue;
             if (auto sv = cell(r, "hmm_spacer"))
                 if (!unpack_tables(*this, par, r, *sv)) reject(r, "hmm_spacer", "malformed or invalid duration table");
         }
@@ -5478,9 +5091,7 @@ inline void Model::apply_params(const Params& P) {
     if (gf || !param_warnings.empty()) par["guard"] = {1};
 }
 
-// element id -> {hmm_* column -> ';'-joined numbers}. Numbers are written exactly: integers as such,
-// other values with the shortest %.15g / %.16g / %.17g form that reads back to the same double, so
-// params -> columns -> params is lossless (and, with the canonical table packing, idempotent).
+// element id -> {hmm_* column -> ';'-joined numbers}, each in its shortest exact round-trip form (lossless).
 inline std::map<std::string, std::map<std::string, std::string>> params_to_columns(const Params& P) {
     std::map<std::string, std::map<std::string, std::string>> out;
     char buf[64];
@@ -5503,9 +5114,8 @@ inline std::map<std::string, std::map<std::string, std::string>> params_to_colum
         }
     return out;
 }
-// Tolerant of maps without hmm_* columns (returns an empty Params -> layout priors). Cells are parsed as
-// numbers only; their values are validated when a Model applies them (Model::apply_params).
-inline Params params_from_columns(const LayoutSpec& spec, const std::map<std::string, std::map<std::string, std::string>>& cols) {
+// Parses hmm_* cells as numbers only; Model::apply_params validates them.
+inline Params params_from_columns(const layout_spec& spec, const std::map<std::string, std::map<std::string, std::string>>& cols) {
     (void)spec;
     Params P;
     for (auto& r : cols)
@@ -5556,9 +5166,7 @@ inline std::map<std::string, std::map<std::string, std::string>> read_position_m
     return out;
 }
 
-// =====================================================================================
-// Calibration: hard-EM (Viterbi training), Dirichlet-smoothed toward the layout priors
-// =====================================================================================
+// Calibration: hard-EM (Viterbi training), Dirichlet-smoothed toward the layout priors.
 namespace detail {
 struct Stats {
     std::vector<std::vector<double>> q, qpal, noise, opp, tight;
@@ -5617,7 +5225,7 @@ public:
         strand_cnt_.assign(detail::STRAND_N, 0.0);
         strand_cnt_d_.assign(detail::STRAND_D_N, 0u);
     }
-    // Accumulates one read (call on every read of the calibration chunk; not only perfect matches).
+    // Accumulates one read (call on every calibration read).
     void add_read(const char* seq, int len) {
         using namespace detail;
         if (len <= 0 || !seq) return;
@@ -5634,7 +5242,7 @@ public:
         bases_ += len;
         // base-shuffled null (whole read, normal + relaxed patterns)
         W_.shuf.assign(seq, seq + len);
-        {   // per-read seed (hash of the read): the null does not depend on thread assignment / merge order
+        {   // per-read seed: the null does not depend on thread assignment or merge order
             uint64_t h = 1469598103934665603ULL;
             for (int i = 0; i < len; ++i) h = (h ^ (unsigned char)seq[i]) * 1099511628211ULL;
             rng_.seed(h ^ 0x5eed1234ULL);
@@ -5644,10 +5252,10 @@ public:
         extract_events(M, W_.shuf.data(), len, W_, true);
         for (auto& e : W_.ev) shuf_[e.type][e.feat] += 1;
         if (!M.rwords.empty()) {
-            W_.rawX.clear();
+            W_.raw_x.clear();
             PState fin[MAXPAT];
-            myers_all(M.rwords, M.rwords_shared, M.Wov, (int)M.pats.size(), W_.shuf.data(), len, W_, fin, W_.rawX);
-            for (auto& rr : W_.rawX) {
+            myers_all(M.rwords, M.rwords_shared, M.Wov, (int)M.pats.size(), W_.shuf.data(), len, W_, fin, W_.raw_x);
+            for (auto& rr : W_.raw_x) {
                 const Pattern& p = M.pats[rr.pat];
                 if (rr.score > M.anch[p.anchor].k && rr.score < FEAT_PREFIX) shuf_[p.anchor][rr.score] += 1;
             }
@@ -5671,6 +5279,7 @@ public:
         strand_reads_ += o.strand_reads_;
         strand_bases_ += o.strand_bases_;
     }
+    // Runs hard-EM and the calibration guard; returns the parameters to cache (layout priors if the guard fails).
     Params finalize(int max_iter = 20, double tol = 0.001);
     bool layout_matches() const { return matches_; }
     std::string report() const { return report_; }
@@ -5681,23 +5290,17 @@ public:
 private:
     void accumulate(const detail::Event* ev, int n, int L, int k, detail::Stats& st, uint8_t gate_strand);
     void update(const detail::Stats& st);
-    // cDNA strand table (user policy 10): on a read the gate calls one single-strand construct, count the STRAND_K-mers
-    // of its cDNA on the sense strand (F as read, R reverse-complemented). The cDNA is the part of the construct between
-    // the last observed element before the insert and the first observed one after it (check regions of the fast
-    // path), minus STRAND_MARGIN_BP on each side; barcode blocks, adapters and poly tails never enter. Integer counts
-    // in doubles: the merge order of workers cannot change the table.
+    // Counts the sense-strand k-mers of the cDNA of a gate-called single-strand construct. Integer counts: the merge
+    // order of workers cannot change the table.
     void count_strand(const char* seq, int len, const Result& r) {
         using namespace detail;
         const Model& M = *M_;
         const char st = r.strand_call;
-        // bounds: the observed non-poly elements nearest the insert; an observed poly tail is INSIDE the counted span
-        // (its run is strand evidence: the sense strand carries the poly-A, so AAAAAA scores sense and TTTTTT
-        // antisense, and a flip search lands at the poly-A | poly-T boundary of a junction that lost its adapters).
-        // When a side has only its poly tail observed, that tail's outer edge bounds the span.
+        // bounds: the observed non-poly elements nearest the insert (a poly tail only when its side has nothing else)
         int head = -1, tail = len + 1, head_poly = -1, tail_poly = len + 1;
         for (const auto& c : r.checks) {
             if (c.status == Status::MISSING_EXPECTED || c.strand != st || c.element < 0 || c.element >= (int)M.spec.elements.size()) continue;
-            const LayoutElement& e = M.spec.elements[c.element];
+            const layout_element& e = M.spec.elements[c.element];
             int ins_order = INT32_MIN;
             for (const auto& x : M.spec.elements)
                 if (x.direction == e.direction && is_insert_elem(x)) { ins_order = x.order; break; }
@@ -5713,7 +5316,6 @@ private:
         if (head < 0 || tail > len) return;
         const int a = std::max(0, head + STRAND_MARGIN_BP), b = std::min(len, tail - STRAND_MARGIN_BP);
         if (b - a < STRAND_MIN_CDNA) return;
-        // the 6-mer table (strand-flip cut) and the 9-mer D table (D strand rule) are counted from the same bases in one pass
         const uint32_t km = (uint32_t)STRAND_N - 1, kmd = (uint32_t)STRAND_D_N - 1;
         uint32_t v = 0, vd = 0;
         int valid = 0;
@@ -5742,7 +5344,7 @@ private:
         strand_bases_ += b - a;
     }
     std::vector<double> strand_cnt_;
-    std::vector<uint32_t> strand_cnt_d_;  // D strand table: STRAND_D_K-mer counts of the same cDNA (integers: merge order cannot change them)
+    std::vector<uint32_t> strand_cnt_d_;
     size_t strand_reads_ = 0;
     double strand_bases_ = 0;
     std::shared_ptr<Model> M_;
@@ -5816,8 +5418,8 @@ inline void Calibrator::accumulate(const detail::Event* ev, int n, int L, int k,
     for (int x = 1; x < np; ++x) {
         const int sp = W.path_st[x - 1], s2 = W.path_st[x];
         const bool cr = W.path_cross[x];
-        const DescHot& d = cr ? M.cross[sp * M.S + s2] : M.same[sp * M.S + s2];
-        const DescCold& c = cr ? M.cross_c[sp * M.S + s2] : M.same_c[sp * M.S + s2];
+        const desc_hot& d = cr ? M.cross[sp * M.S + s2] : M.same[sp * M.S + s2];
+        const desc_cold& c = cr ? M.cross_c[sp * M.S + s2] : M.same_c[sp * M.S + s2];
         for (auto& pt : c.pres) (pt.second ? st.pyes : st.pno)[pt.first] += 1;
         const int gap = ev[W.path_ev[x]].start - ev[W.path_ev[x - 1]].end;
         const int xg = gap - d.fixed;
@@ -5941,7 +5543,6 @@ inline Params Calibrator::finalize(int max_iter, double tol) {
         rep << b;
         if (it > 1 && fr < tol) { converged = true; break; }
     }
-    // ---- calibration guard ----
     const double k0 = N ? kd[0] / N : 1.0;
     // reads carrying at least one exact (ED 0) copy of a long static element of the main templates
     size_t n_exact = 0;
@@ -5986,7 +5587,6 @@ inline Params Calibrator::finalize(int max_iter, double tol) {
              (int)M.par["gate"][0], (int)M.par["gate"][1]);
     rep << b;
     if (!converged && matches_) rep << "  note: EM did not converge within the iteration cap\n";
-    // summary of key parameters
     for (int a = 0; a < M.A; ++a) {
         const auto& q = M.par["q." + M.anch[a].seq];
         double pre = 0, sp = 0;
@@ -5997,10 +5597,7 @@ inline Params Calibrator::finalize(int max_iter, double tol) {
         snprintf(b, sizeof b, "  read-end prefix %.3f  partial %.3f\n", pre, sp);
         rep << b;
     }
-    // ---- cDNA strand table (user policy 10) ----
-    // log-odds per STRAND_K-mer of the sense strand against its reverse complement, from the single-strand reads the gate
-    // called (F as read, R reverse-complemented; cDNA only). mean = the average per-position score of the calibration
-    // cDNA, the unit of the strand-flip margin. Written only when the guard passes and the sample is large enough.
+    // cDNA strand table: [mean sense score, log-odds]; written only when the guard passes and the sample is large enough
     {
         double tot = 0;
         for (double x : strand_cnt_) tot += x;
@@ -6024,9 +5621,7 @@ inline Params Calibrator::finalize(int max_iter, double tol) {
             rep << b;
         }
     }
-    // ---- D strand table (D strand rule) ----
-    // the STRAND_D_K-mer counts of the same cDNA, cached as counts (hmm_strand_d; Model::finalize makes the log-odds).
-    // Written when the guard passes and the sample holds STRAND_D_MIN_KMERS counted k-mers (about 8 per entry).
+    // D strand table: cached as counts; written only when the guard passes and STRAND_D_MIN_KMERS k-mers were counted
     {
         double tot = 0;
         for (uint32_t x : strand_cnt_d_) tot += x;
@@ -6096,7 +5691,6 @@ inline std::string debug_read(const Model& M, const char* seq, int len, Scratch&
         os << "\n";
     };
     path("viterbi");
-    // the lazy facing-partner scan and the facing-anchor rescue of segment() (rescan_unanchored not shown)
     const size_t ne0 = S.ev.size();
     if (facing_partner_scan(M, seq, len, S)) {
         os << "facing partner scan: " << S.ev.size() - ne0 << " event(s) added\n";
@@ -6115,7 +5709,6 @@ inline std::string debug_read(const Model& M, const char* seq, int len, Scratch&
         S.force.clear();
         path("rescued");
     }
-    // junction evidence and child windows of derive_result (FIXES_5P.md, review round 2)
     if (k > 0) {
         forward_backward(M, S.ev.data(), (int)S.ev.size(), len, S, k >= 2);
         derive_result(M, seq, S.ev.data(), (int)S.ev.size(), len, S, k, true, R);
