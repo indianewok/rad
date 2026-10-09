@@ -110,6 +110,22 @@ target_link_libraries(rad_config PRIVATE rad_lib)
 target_link_libraries(generate_whitelist PRIVATE rad_lib)
 target_link_libraries(discover_layout PRIVATE rad_lib)
 
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(concat_hmm_boundary_test tests/concat_hmm_boundary_test.cpp)
+    target_link_libraries(concat_hmm_boundary_test PRIVATE rad_lib)
+    add_test(NAME concat_hmm_boundary COMMAND concat_hmm_boundary_test)
+    add_executable(whitelist_relevance_test tests/whitelist_relevance_test.cpp)
+    target_include_directories(whitelist_relevance_test PRIVATE include)
+    add_test(NAME whitelist_relevance COMMAND whitelist_relevance_test)
+    add_executable(whitelist_loader_test tests/whitelist_loader_test.cpp)
+    target_link_libraries(whitelist_loader_test PRIVATE rad_lib)
+    add_test(NAME whitelist_loader COMMAND whitelist_loader_test)
+    add_executable(concat_hmm_router_test tests/concat_hmm_router_test.cpp)
+    target_link_libraries(concat_hmm_router_test PRIVATE rad_lib)
+    add_test(NAME concat_hmm_router COMMAND concat_hmm_router_test)
+endif()
+
 # Keep the bundled layout resources and their registered kit paths in sync.
 # This target is part of the default build so a chemistry-length regression
 # (for example, restoring a 10 bp UMI to the 10x 3' v3 layout) fails loudly.

@@ -9,3 +9,4 @@
 ## Internals
 
 - [`architecture.md`](architecture.md): how layout parsing, whitelist correction, and chunked processing fit together.
+- [`hmm-boundaries-and-whitelist-loading.md`](hmm-boundaries-and-whitelist-loading.md): layout-aware concatemer cuts, preserved unresolved parents, and bounded-memory loading of relevant global barcode targets.

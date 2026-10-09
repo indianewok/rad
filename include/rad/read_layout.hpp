@@ -1627,8 +1627,60 @@ public:
         }
     }
 
-    // load whitelist
-    void load_wl(std::optional<std::string> wl_path,std::optional<int> mut, bool verbose, int nthreads) {
+    // Cheap discovery gate: no catalog contents are loaded. The streaming
+    // loader determines source unique cardinality and retains small true lists
+    // in full. minimum_bytes=0 requests observed loading for any eligible file.
+    bool has_large_single_catalog(std::optional<std::string> wl_path,
+                                  size_t minimum_bytes = 32ULL * 1024 * 1024) const {
+        std::set<std::string> barcode_classes;
+        for (const auto& elem : layout) {
+            if (elem.global_class != "barcode" || elem.type != "variable") continue;
+            barcode_classes.insert(seq_utils::remove_rc(elem.class_id));
+            std::string flags = elem.flags;
+            std::transform(flags.begin(), flags.end(), flags.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (flags.find("joint_barcode") != std::string::npos) {
+                std::cout << "[whitelist-load] using full loading for joint-barcode layout\n";
+                return false;
+            }
+        }
+        // Correcting one barcode may relocate another barcode whose primary
+        // positions refer to it. A pre-correction discovery pass cannot predict
+        // those downstream queries. F/R aliases of a single class are safe.
+        if (barcode_classes.size() != 1) {
+            if (!barcode_classes.empty())
+                std::cout << "[whitelist-load] using full loading for multiple barcode classes\n";
+            return false;
+        }
+        bool eligible = false;
+        for (const auto& elem : layout) {
+            if (elem.global_class != "barcode" || elem.type != "variable") continue;
+            const std::string spec = wl_path.value_or(elem.whitelist_path);
+            const auto specs = whitelist_utils::parse_whitelist_specs(spec);
+            if (specs.empty()) continue;
+            if (specs.size() != 1) {
+                std::cout << "[whitelist-load] using full loading for dual catalog: " << spec << '\n';
+                continue;
+            }
+            if (elem.expected_length.value_or(0) > 32 ||
+                std::any_of(elem.length_candidates.begin(), elem.length_candidates.end(),
+                            [](int length) { return length > 32; })) {
+                std::cout << "[whitelist-load] using full loading for barcode length >32: "
+                          << elem.class_id << '\n';
+                continue;
+            }
+            const std::string path = whitelist_utils::kit_to_path(specs.front());
+            if (boost::filesystem::file_size(path) >= minimum_bytes) eligible = true;
+        }
+        return eligible;
+    }
+
+    // observed must contain every pre-correction barcode extraction from the
+    // same inputs, read limit, router and prepared layout as the final demux.
+    void load_wl(std::optional<std::string> wl_path,std::optional<int> mut, bool verbose, int nthreads,
+                 const whitelist_relevance::observation_map* observed = nullptr,
+                 int observed_mutations = 2) {
         using namespace std::chrono;
         auto t0 = high_resolution_clock::now();
 
@@ -1694,6 +1746,28 @@ public:
             }
         }
 
+        // Shared on-disk catalogs may serve multiple classes. Pool discovery
+        // observations by the SAME resolved source key before importing once;
+        // otherwise the first class could exclude another class's candidates.
+        std::unordered_map<std::string, whitelist_relevance::observations> catalog_observations;
+        const bool selective_allowed = observed && joint_groups.empty() && joint_axis_specs.empty();
+        if (observed && !selective_allowed)
+            std::cout << "[whitelist-load observed] using full loading for joint-barcode layout\n";
+        if (selective_allowed) {
+            std::set<std::pair<std::string, std::string>> merged;
+            for (const auto& elem : layout) {
+                if (elem.global_class != "barcode" || elem.type != "variable") continue;
+                const std::string spec = wl_path.value_or(elem.whitelist_path);
+                if (whitelist_utils::parse_whitelist_specs(spec).size() != 1) continue;
+                const std::string path = whitelist_utils::kit_to_path(spec);
+                const std::string key = seq_utils::remove_rc(elem.class_id);
+                if (!merged.emplace(path, key).second) continue;
+                auto& pooled = catalog_observations[path];
+                const auto it = observed->find(key);
+                if (it != observed->end()) pooled.merge(it->second);
+            }
+        }
+
         // 1) collect static seqs for filter_bcs
         std::vector<std::string> static_seqs;
         for (auto const &elem : layout) {
@@ -1740,7 +1814,14 @@ public:
                 auto t1 = high_resolution_clock::now();
                 memory_utils::get_rss();
                 // import & possibly generate mismatches
-                whitelist::wl_entry entry = wl_map.import_whitelist(spec, verbose, default_length);
+                const auto query_it = catalog_observations.find(path);
+                const whitelist_relevance::observations* queries =
+                    query_it == catalog_observations.end() ? nullptr : &query_it->second;
+                if (selective_allowed && !queries)
+                    std::cout << "[whitelist-load observed] using full loading for dual/unsupported catalog: "
+                              << spec << '\n';
+                whitelist::wl_entry entry = wl_map.import_whitelist(
+                    spec, verbose, default_length, queries, observed_mutations);
                 // hardcoded whitelist size limit for entry so that we don't generate too many mismatches
                 memory_utils::get_rss();
                 // For large true whitelists, pre-build a 3-part seed index and skip mismatch expansion.

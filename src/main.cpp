@@ -43,6 +43,9 @@ static void usage_demux(const char *prog) {
       << "  -g, --global-whitelist            path to custom global whitelist "
          "CSV\n"
       << "  -c, --custom-whitelist            path to custom whitelist CSV\n"
+      << "      --whitelist-load             auto (default), observed, or full;\n"
+      << "                                    stream large single catalogs and retain\n"
+      << "                                    exact/reachable correction targets only\n"
       << "  -R, --bc-correction-mode          'offensive' (default) or "
          "'defensive'\n"
       << "      --joint-bc-mode               'default' (permissive) or "
@@ -119,6 +122,10 @@ static void usage_demux(const char *prog) {
          "cached maps without them\n"
       << "                                    are calibrated from the first "
          "50000 reads\n"
+      << "                                    Unlocated boundaries preserve the raw parent in\n"
+      << "                                    *_boundary_unresolved.fq.gz (or .fa.gz);\n"
+      << "                                    adjacent units receive no forced barcode assignment.\n"
+      << "                                    HB:Z:layout_edge marks a conservative one-sided edge.\n"
       << "      --concat-hmm-abstain=MODE     reads the HMM is unsure about: "
          "drop (default) or\n"
       << "                                    legacy (existing path, as before "
@@ -1262,7 +1269,8 @@ static bool write_demux_run_log(
     const std::string &output_path, const std::string &layout,
     const std::string &input_path, const std::string &output_prefix,
     const sigalign_run_stats &stats, double total_wall_time_seconds,
-    int threads, bool auto_whitelist, bool af_bcs) {
+    int threads, bool auto_whitelist, bool af_bcs,
+    const std::string& whitelist_load_mode, bool whitelist_query_discovery) {
   std::ofstream out(output_path);
   if (!out) {
     std::cerr << "[ERROR] Cannot open run statistics log: " << output_path
@@ -1286,6 +1294,8 @@ static bool write_demux_run_log(
       << "output_prefix=" << output_prefix << "\n"
       << "threads=" << threads << "\n"
       << "auto_whitelist=" << (auto_whitelist ? "true" : "false") << "\n"
+      << "whitelist_load_requested=" << whitelist_load_mode << "\n"
+      << "whitelist_query_discovery=" << (whitelist_query_discovery ? "true" : "false") << "\n"
       << "scan_selection="
       << (auto_whitelist
               ? (af_bcs ? "above_floor" : "high_specificity")
@@ -1365,6 +1375,8 @@ static bool write_demux_run_log(
         << "concat_hmm_full_search_barcodes_rejected=" << stats.hmm_partner_rejected << "\n"
         << "concat_hmm_retry_barcodes_from_partner=" << stats.hmm_retry_from_partner << "\n"
         << "concat_hmm_reads_dropped_unresolved=" << stats.hmm_drop_unresolved << "\n"
+        << "concat_hmm_boundary_unresolved_parents_saved=" << stats.hmm_boundary_unresolved_parents << "\n"
+        << "concat_hmm_boundary_unresolved_children_not_assigned=" << stats.hmm_boundary_unresolved_children << "\n"
         << "concat_hmm_junctions_abstained=" << stats.hmm_junctions_abstained << "\n"
         << "concat_hmm_pieces_suppressed=" << stats.hmm_pieces_suppressed << "\n"
         << "concat_hmm_artifact_reads_piece_rule=" << stats.hmm_art_reads << "\n"
@@ -1646,6 +1658,7 @@ int cmd_demux(int argc, char *argv[]) {
   int min_read_length = -1;    // min cDNA length to keep (-1 = layout static length)
   bool concat_hmm_enabled = false; // --concat-hmm: HMM segmentation before static alignment
   bool concat_hmm_abstain_legacy = false; // --concat-hmm-abstain=legacy: abstained reads take the existing path
+  std::string whitelist_load_mode = "auto";
 
   const char *optstring = "l:q:k:g:c:R:M:m:n:z:o:d:F:wbAt:vDh";
   struct option longopts[] = {
@@ -1678,6 +1691,7 @@ int cmd_demux(int argc, char *argv[]) {
       {"hs-bcs", no_argument, nullptr, 11},
       {"concat-hmm", no_argument, nullptr, 12},
       {"concat-hmm-abstain", required_argument, nullptr, 13},
+      {"whitelist-load", required_argument, nullptr, 14},
       {"threads", required_argument, nullptr, 't'},
       {"verbose", no_argument, nullptr, 'v'},
       {"max-verbose", no_argument, nullptr, 'D'},
@@ -1789,6 +1803,13 @@ int cmd_demux(int argc, char *argv[]) {
         concat_hmm_abstain_legacy = false;
       } else {
         std::cerr << "[ERROR] --concat-hmm-abstain must be 'drop' or 'legacy' (got '" << optarg << "')\n";
+        return 1;
+      }
+      break;
+    case 14:
+      whitelist_load_mode = optarg;
+      if (whitelist_load_mode != "auto" && whitelist_load_mode != "observed" && whitelist_load_mode != "full") {
+        std::cerr << "[ERROR] --whitelist-load must be auto, observed, or full\n";
         return 1;
       }
       break;
@@ -2137,6 +2158,30 @@ int cmd_demux(int argc, char *argv[]) {
           af_bcs, verbose);
     }
 
+    std::optional<std::string> selected_whitelist_spec = whitelist_path;
+    if (auto_wl) selected_whitelist_spec = auto_wl->demux_spec();
+    else if (!selected_whitelist_spec && !custom_kit.empty()) selected_whitelist_spec = custom_kit;
+    std::optional<whitelist_relevance::observation_map> observed_queries;
+    const size_t observed_minimum_bytes = whitelist_load_mode == "observed" ? 0 : 32ULL * 1024 * 1024;
+    if (whitelist_load_mode != "full" &&
+        read_layout.has_large_single_catalog(selected_whitelist_spec, observed_minimum_bytes) &&
+        boost::filesystem::is_regular_file(fastq_path)) {
+      const auto discovery_start = std::chrono::steady_clock::now();
+      std::cout << "[whitelist-load] Collecting native barcode queries before streaming the catalog\n";
+      observed_queries = SigString::observe_whitelist_queries<whitelist_relevance::observation_map>(
+          fastq_path, read_layout, nthreads, chunk_size, max_reads, min_read_length);
+      std::cout << "[whitelist-load] Query discovery completed in "
+                << std::chrono::duration<double>(std::chrono::steady_clock::now() - discovery_start).count()
+                << " s; correction radius=" << gen_mut.value_or(2) << "\n";
+    } else if (whitelist_load_mode == "observed") {
+      throw std::runtime_error("--whitelist-load observed requires replayable regular input and one non-joint barcode class with a single catalog");
+    } else {
+      std::cout << "[whitelist-load] Full loading (mode=" << whitelist_load_mode
+                << "; small or unsupported catalogs retain native behavior)\n";
+    }
+    const auto* relevant_queries = observed_queries ? &*observed_queries : nullptr;
+    const bool whitelist_query_discovery = observed_queries.has_value();
+
     if (auto_wl) {
       const std::string auto_wl_spec = auto_wl->demux_spec();
       if (verbose) {
@@ -2148,20 +2193,21 @@ int cmd_demux(int argc, char *argv[]) {
             << "\n"
             << "  true barcodes    : " << auto_wl->detected_path << "\n";
       }
-      read_layout.load_wl(auto_wl_spec, wl_mut, verbose, nthreads);
+      read_layout.load_wl(auto_wl_spec, wl_mut, verbose, nthreads, relevant_queries, gen_mut.value_or(2));
     } else if (whitelist_path) {
       if (verbose)
         std::cout << "[main] Loading custom kit & whitelist...\n";
-      read_layout.load_wl(whitelist_path.value(), wl_mut, verbose, nthreads);
+      read_layout.load_wl(whitelist_path.value(), wl_mut, verbose, nthreads, relevant_queries, gen_mut.value_or(2));
     } else if (!custom_kit.empty()) {
       if (verbose)
         std::cout << "[main] Loading kit whitelist (overriding layout default)...\n";
-      read_layout.load_wl(custom_kit, wl_mut, verbose, nthreads);
+      read_layout.load_wl(custom_kit, wl_mut, verbose, nthreads, relevant_queries, gen_mut.value_or(2));
     } else {
       if (verbose)
         std::cout << "[main] Loading all whitelists...\n";
-      read_layout.load_wl(std::nullopt, wl_mut, verbose, nthreads);
+      read_layout.load_wl(std::nullopt, wl_mut, verbose, nthreads, relevant_queries, gen_mut.value_or(2));
     }
+    observed_queries.reset();
 
     // Demultiplex
     auto sigalign_start = std::chrono::steady_clock::now();
@@ -2228,7 +2274,7 @@ int cmd_demux(int argc, char *argv[]) {
     if (!write_demux_run_log(
             demux_log_path, layout_key, fastq_path, outbase.string(),
             demux_stats, total_wall_time_seconds, nthreads, auto_whitelist,
-            af_bcs)) {
+            af_bcs, whitelist_load_mode, whitelist_query_discovery)) {
       throw std::runtime_error("could not write post-run statistics log");
     }
     std::cout << "[main] Demux statistics written to: "

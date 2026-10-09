@@ -113,19 +113,28 @@ struct Result {
     float p_single = 0.f;            // P(k == 1 | read)
     char strand_call = '?';          // 'F','R','M','?'
     uint32_t flags = 0;
+    bool boundary_unresolved_seen = false; // survives k_cap truncation of per-junction arrays
     std::vector<float> cut_post;     // per-cut junction posterior (size k-1)
     // per-cut child windows: the left construct ends at cut_hi[i], the right one starts at cut_lo[i]
-    // (cut_lo[i] <= cuts[i] <= cut_hi[i]; children may overlap where facing barcode blocks abut)
+    // (cut_lo[i] <= cuts[i] <= cut_hi[i]; overlap retains uncertain sequence as well as barcode blocks)
     std::vector<int> cut_lo, cut_hi;
     std::vector<uint8_t> cut_kind;   // per cut: CUT_* value
+    // Boundary geometry is independent of cut_post, which measures a junction somewhere between events.
+    std::vector<uint8_t> cut_flags;  // per cut: BOUNDARY_* values
     std::vector<float> cut_aux;      // per cut: fold-back Jaccard or strand-flip evidence (strand_mu units), else 0
 #ifdef CONCAT_HMM_STAGE_TIMERS
     uint64_t stage_ns[4] = {0, 0, 0, 0};  // stage0, gate, stage2 (Myers/events), stage3 (decode+output)
 #endif
 };
 #define CONCAT_HMM_HAS_CUT_KIND 1      // Result::cut_kind
+#define CONCAT_HMM_HAS_BOUNDARY_FLAGS 1 // Result::cut_flags
 #define CONCAT_HMM_HAS_STRAND_TABLE 1  // calibrated strand k-mer table (hmm_strand column), strand-flip cuts
 enum : uint8_t { CUT_BOTH_ADAPTERS = 0, CUT_ONE_ADAPTER = 1, CUT_GEOMETRY = 2, CUT_MIDPOINT = 3, CUT_FOLDBACK = 4, CUT_STRAND_FLIP = 5 };
+enum : uint8_t {
+    BOUNDARY_LEFT_BOUNDED = 1, BOUNDARY_RIGHT_BOUNDED = 2,
+    BOUNDARY_LEFT_INSERT = 4, BOUNDARY_RIGHT_INSERT = 8,
+    BOUNDARY_UNRESOLVED = 16, BOUNDARY_SEQUENCE_RESOLVED = 32
+};
 
 struct model_options {
     int artifact_templates = -1;   // -1 auto (when the layout has a weak outer anchor), 0 off, 1 on
@@ -621,7 +630,7 @@ struct Model {
     std::vector<uint16_t> st_flags;
     std::vector<std::vector<int>> states_by_type;
     std::vector<int> open_state, close_state;
-    std::vector<int> head_fix, tail_fix;   // per state: fixed bp from construct start to slot start / slot end to construct end (-1: insert between)
+    std::vector<int> head_fix, tail_fix;   // nominal non-insert prefix/suffix bp (-1: insert between); boundary retention uses layout ranges
     // per state: bp of the barcode block between the slot and the barcode-adjacent primer at the template start /
     // end, primer counted as absent; -1 if the slot is not such an inner slot
     std::vector<int> bc_head, bc_tail;
@@ -715,6 +724,7 @@ struct Scratch {
     std::vector<uint8_t> ckind;
     std::vector<int> ca, cb, bcut;
     std::vector<int> jlo, jhi, segj;        // per path junction: child window bounds; per output segment: its right junction
+    std::vector<uint8_t> jflags;            // per path junction: boundary geometry, separate from junction posterior
     std::vector<uint8_t> cweak;             // per pairing junction: bit 1 weak (abstain), 2 strong pairing, 4 / 8 partner-delimited
     std::vector<int> cgap;                  // per pairing junction: gap between the barcode-block edges
     std::vector<float> cpost, spost;
@@ -792,6 +802,39 @@ inline void finish_template(const Model& M, Template& T) {
         T.pins[i + 1] = T.pins[i] + (T.el[i].kind == EK_INSERT);
     }
 }
+
+// SF_OPEN / SF_CLOSE describe observable order, not physical template ends. An insert can lie
+// outside the first/last observable (for example Curio's poly-A / reverse linker). Keep that
+// decoder topology unchanged and use the full layout whenever coordinates are being placed.
+struct edge_span {
+    bool bounded = true;
+    int lo = 0, hi = 0;
+};
+inline edge_span template_edge_span(const Model& M, int st, bool head) {
+    const Template& T = M.tpl[M.st_tpl[st]];
+    const int ei = M.st_elem[st];
+    edge_span r;
+    for (int i = head ? 0 : ei + 1, end = head ? ei : (int)T.el.size(); i < end; ++i) {
+        const TElem& e = T.el[i];
+        if (e.kind == EK_INSERT) { r.bounded = false; return r; }
+        r.lo += e.lmin;
+        r.hi += e.lmax;
+    }
+    return r;
+}
+inline bool at_template_edge(const Model& M, int st, bool head) {
+    const edge_span r = template_edge_span(M, st, head);
+    return r.bounded && r.hi == 0;
+}
+inline int retained_template_start(const Model& M, int st, int event_start) {
+    const edge_span r = template_edge_span(M, st, true);
+    return r.bounded ? std::max(0, event_start - r.hi) : 0;
+}
+inline int retained_template_end(const Model& M, int st, int event_end, int read_len) {
+    const edge_span r = template_edge_span(M, st, false);
+    return r.bounded ? std::min(read_len, event_end + r.hi) : read_len;
+}
+
 // Build a template's element chain from layout elements (one direction, in read order).
 inline Template chain_from_spec(Model& M, const layout_spec& L, const std::vector<int>& idx, char strand, const std::string& name) {
     Template T;
@@ -3119,6 +3162,8 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
         }
         R.k = 1;
         R.cuts.clear(); R.segs.clear(); R.checks.clear(); R.cut_post.clear();
+        R.cut_lo.clear(); R.cut_hi.clear(); R.cut_kind.clear(); R.cut_flags.clear(); R.cut_aux.clear();
+        R.boundary_unresolved_seen = false;
         R.p_single = M.fast_p;
         R.strand_call = T.strand;
         R.flags |= RES_FAST_PATH;
@@ -3127,23 +3172,13 @@ inline bool gate(const Model& M, const char* seq, int n, Scratch& S, Result& R) 
         for (int o = 0; o < nobs; ++o) if (ostart[o] >= 0 || poly_slot_seen[o] >= 0) { if (o_open < 0) o_open = o; o_close = o; }
         auto pstart = [&](int o) { return cl[o] >= 0 ? ostart[o] : S.poly[poly_slot_seen[o]].s; };
         auto pend = [&](int o) { return cl[o] >= 0 ? oend[o] : S.poly[poly_slot_seen[o]].e; };
-        if (cl[0] >= 0) sg.start = std::max(0, ostart[0]);
-        else {
-            sg.flags |= SEG_PARTIAL_LEFT;
-            const int st = st0 + o_open;
-            const int hf = M.bc_head[st] >= 0 ? M.bc_head[st] : M.head_fix[st];  // barcode-block edge (primer absent)
-            sg.start = hf >= 0 ? std::max(0, pstart(o_open) - hf) : 0;
-        }
+        if (o_open != 0) sg.flags |= SEG_PARTIAL_LEFT;
+        sg.start = retained_template_start(M, st0 + o_open, pstart(o_open));
         int cs_slack = 0, ce_slack = 0;  // construct bounds defaulted to the read ends (see expected_window)
-        if (cl[0] < 0 && M.head_fix[st0 + o_open] < 0) cs_slack = M.zone5;
-        if (cl[nobs - 1] >= 0) sg.end = std::min(n, oend[nobs - 1]);
-        else {
-            sg.flags |= SEG_PARTIAL_RIGHT;
-            const int st = st0 + o_close;
-            const int tf = M.bc_tail[st] >= 0 ? M.bc_tail[st] : M.tail_fix[st];
-            sg.end = tf >= 0 ? std::min(n, pend(o_close) + tf) : n;
-            if (M.tail_fix[st] < 0) ce_slack = M.zone3;
-        }
+        if (!template_edge_span(M, st0 + o_open, true).bounded) cs_slack = M.zone5;
+        if (o_close != nobs - 1) sg.flags |= SEG_PARTIAL_RIGHT;
+        sg.end = retained_template_end(M, st0 + o_close, pend(o_close), n);
+        if (!template_edge_span(M, st0 + o_close, false).bounded) ce_slack = M.zone3;
         if (sg.end <= sg.start) { sg.start = 0; sg.end = n; }
         if (M.tpl[t].art) sg.flags |= SEG_ARTIFACT;
         R.segs.push_back(sg);
@@ -3969,36 +4004,53 @@ inline int d_strand_rule(const Model& M, const char* s, int lo, int hi, Scratch&
 // Cut between the construct ending at slot sa (event A) and the next one starting at slot sb (event B); kind gets
 // the CUT_* value. Never enters a known barcode block. Lx / Rx: offpath_edges results (INT32_MIN: none).
 inline int junction_cut(const Model& M, const Event& A, int sa, const Event& B, int sb, uint8_t& kind, int Lx = INT32_MIN,
-                        int Rx = INT32_MIN) {
-    const bool cl = (M.st_flags[sa] & SF_CLOSE) != 0, op = (M.st_flags[sb] & SF_OPEN) != 0;
-    int cut;
-    bool fence = false;
-    int lo = std::min(A.end, B.start), hi = std::max(A.end, B.start);
+                        int Rx = INT32_MIN, uint8_t* boundary_flags = nullptr,
+                        int* retained_lo = nullptr, int* retained_hi = nullptr) {
+    const edge_span tail = template_edge_span(M, sa, false), head = template_edge_span(M, sb, true);
+    const bool cl = (M.st_flags[sa] & SF_CLOSE) && tail.bounded && tail.hi == 0;
+    const bool op = (M.st_flags[sb] & SF_OPEN) && head.bounded && head.hi == 0;
+    const int lo = std::min(A.end, B.start), hi = std::max(A.end, B.start);
     const int bt = M.bc_tail[sa], bh = M.bc_head[sb];
-    const int Lb = bt >= 0 ? A.end + bt : Lx, Rb = bh >= 0 ? B.start - bh : Rx;
-    if (cl && op) { cut = (A.end + B.start) / 2; kind = 0; }
-    else if (cl) {
-        cut = A.end; kind = 1;
-        if (Rb != INT32_MIN && cut > Rb) { cut = std::max(Rb, A.start); fence = true; }
-    } else if (op) {
-        cut = B.start; kind = 1;
-        if (Lb != INT32_MIN && cut < Lb) { cut = std::min(Lb, B.end); fence = true; }
-    } else if (Lb != INT32_MIN || Rb != INT32_MIN) {
-        const int ta = M.tail_fix[sa], hb = M.head_fix[sb];
-        const bool hl = Lb != INT32_MIN || ta >= 0, hr = Rb != INT32_MIN || hb >= 0;
-        const int Lg = Lb != INT32_MIN ? Lb : A.end + ta, Rg = Rb != INT32_MIN ? Rb : B.start - hb;
-        cut = hl && hr ? (Lg + Rg) / 2 : hl ? Lg : Rg;
-        kind = 2;
+    bool hl = tail.bounded, hr = head.bounded;
+    int ll = A.end + tail.lo, lh = A.end + tail.hi;
+    int rl = B.start - head.hi, rh = B.start - head.lo;
+    // Existing inner-anchor/off-path barcode edges are usable when a terminal primer was missed.
+    if (bt >= 0) { hl = true; ll = lh = A.end + bt; }
+    else if (!hl && Lx != INT32_MIN) { hl = true; ll = lh = Lx; }
+    if (bh >= 0) { hr = true; rl = rh = B.start - bh; }
+    else if (!hr && Rx != INT32_MIN) { hr = true; rl = rh = Rx; }
+    uint8_t flags = (hl ? BOUNDARY_LEFT_BOUNDED : 0) | (hr ? BOUNDARY_RIGHT_BOUNDED : 0) |
+                    (tail.bounded ? 0 : BOUNDARY_LEFT_INSERT) | (head.bounded ? 0 : BOUNDARY_RIGHT_INSERT);
+    int cut, wlo, whi;
+    const int lp = cl ? 0 : BC_WIN_PAD, rp = op ? 0 : BC_WIN_PAD;
+    if (hl && hr) {
+        cut = (lh + rl) / 2;
+        kind = cl && op ? CUT_BOTH_ADAPTERS : CUT_GEOMETRY;
+        wlo = std::min(cut, rl - rp);
+        whi = std::max(cut, lh + lp);
+        // Inconsistent facing edges do not become an exact boundary just because both markers exist.
+        if (ll > rh) flags |= BOUNDARY_UNRESOLVED;
+    } else if (hl) {
+        cut = (ll + lh) / 2;
+        kind = cl ? CUT_ONE_ADAPTER : CUT_GEOMETRY;
+        wlo = ll - lp; whi = lh + lp;
+    } else if (hr) {
+        cut = (rl + rh) / 2;
+        kind = op ? CUT_ONE_ADAPTER : CUT_GEOMETRY;
+        wlo = rl - rp; whi = rh + rp;
     } else {
-        const int ta = M.tail_fix[sa], hb = M.head_fix[sb];
-        if (ta >= 0 && hb >= 0) { cut = (A.end + ta + B.start - hb) / 2; kind = 2; }
-        else if (ta >= 0) { cut = A.end + ta; kind = 2; }
-        else if (hb >= 0) { cut = B.start - hb; kind = 2; }
-        else { cut = (A.end + B.start) / 2; kind = 3; }
+        cut = (A.end + B.start) / 2;
+        kind = CUT_MIDPOINT;
+        flags |= BOUNDARY_UNRESOLVED;
+        wlo = lo; whi = hi;
     }
-    if (fence) { lo = std::min(lo, A.start); hi = std::max(hi, B.end); }
-    else if (A.end > B.start) cut = (A.end + B.start) / 2;
-    return std::min(std::max(cut, lo), hi);
+    if (cut < lo || cut > hi) flags |= BOUNDARY_UNRESOLVED;
+    if (flags & BOUNDARY_UNRESOLVED) { wlo = std::min(wlo, lo); whi = std::max(whi, hi); }
+    cut = std::min(std::max(cut, lo), hi);
+    if (boundary_flags) *boundary_flags = flags;
+    if (retained_lo) *retained_lo = std::min(wlo, cut);
+    if (retained_hi) *retained_hi = std::max(whi, cut);
+    return cut;
 }
 
 // Barcode-block edges Lx / Rx for a junction whose facing slots give none, from inner barcode-side events the decode
@@ -4008,7 +4060,9 @@ inline void offpath_edges(const Model& M, const Event* ev, int nev, const Scratc
     Lx = Rx = INT32_MIN;
     if (lanc) *lanc = false;
     if (ranc) *ranc = false;
-    const bool need_l = M.bc_tail[sa] < 0 && !(M.st_flags[sa] & SF_CLOSE), need_r = M.bc_head[sb] < 0 && !(M.st_flags[sb] & SF_OPEN);
+    const bool left_edge = (M.st_flags[sa] & SF_CLOSE) && at_template_edge(M, sa, false);
+    const bool right_edge = (M.st_flags[sb] & SF_OPEN) && at_template_edge(M, sb, true);
+    const bool need_l = M.bc_tail[sa] < 0 && !left_edge, need_r = M.bc_head[sb] < 0 && !right_edge;
     if (!need_l && !need_r) return;
     auto inner_of = [&](int t, bool head, int& blk) -> int {  // the template's barcode-side inner slot type (-1: none)
         const int s0 = M.open_state[t], no = (int)M.tpl[t].obs.size();
@@ -4027,8 +4081,8 @@ inline void offpath_edges(const Model& M, const Event* ev, int nev, const Scratc
     const int glo = std::min(A.end, B.start) - 4, ghi = std::max(A.end, B.start) + 4;
     const int ta = M.tail_fix[sa], hb = M.head_fix[sb];
     // the other side's edge: an observed closing (opening) primer bounds its own barcode block at its start (end)
-    const int Lref = (M.st_flags[sa] & SF_CLOSE) ? A.start : M.bc_tail[sa] >= 0 ? A.end + M.bc_tail[sa] : ta >= 0 ? A.end + ta : INT32_MIN;
-    const int Rref = (M.st_flags[sb] & SF_OPEN) ? B.end : M.bc_head[sb] >= 0 ? B.start - M.bc_head[sb] : hb >= 0 ? B.start - hb : INT32_MIN;
+    const int Lref = left_edge ? A.start : M.bc_tail[sa] >= 0 ? A.end + M.bc_tail[sa] : ta >= 0 ? A.end + ta : INT32_MIN;
+    const int Rref = right_edge ? B.end : M.bc_head[sb] >= 0 ? B.start - M.bc_head[sb] : hb >= 0 ? B.start - hb : INT32_MIN;
     if (need_l) {
         int blk = 0;
         const int a = inner_of(M.st_tpl[sa], false, blk);
@@ -4179,7 +4233,8 @@ inline void emit_half_checks(Result& R, const Model& M, const char* seq, int L, 
 // Builds the Result (cuts, segments, check regions, strand call, abstain flag) from the decoded path.
 inline void derive_result(const Model& M, const char* seq, const Event* ev, int nev, int L, Scratch& W, int k, bool fb_done, Result& R) {
     R.k = 0;
-    R.cuts.clear(); R.segs.clear(); R.checks.clear(); R.cut_post.clear(); R.cut_lo.clear(); R.cut_hi.clear(); R.cut_kind.clear(); R.cut_aux.clear();
+    R.boundary_unresolved_seen = false;
+    R.cuts.clear(); R.segs.clear(); R.checks.clear(); R.cut_post.clear(); R.cut_lo.clear(); R.cut_hi.clear(); R.cut_kind.clear(); R.cut_flags.clear(); R.cut_aux.clear();
     R.p_single = 0.f;
     if (k == 0) { R.strand_call = '?'; return; }
     if (fb_done) R.p_single = (float)std::exp(std::min(0.f, W.l_z1 - W.l_z));
@@ -4197,7 +4252,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
     std::vector<int>& ca = W.ca;
     std::vector<int>& cb = W.cb;
     ckind.clear(); ca.clear(); cb.clear();
-    W.jlo.clear(); W.jhi.clear(); W.cweak.clear(); W.segj.clear(); W.cgap.clear(); W.caux.clear(); W.saux.clear(); W.skind.clear(); W.scut.clear();
+    W.jlo.clear(); W.jhi.clear(); W.jflags.clear(); W.cweak.clear(); W.segj.clear(); W.cgap.clear(); W.caux.clear(); W.saux.clear(); W.skind.clear(); W.scut.clear();
     for (int c = 0; c + 1 < nc; ++c) {
         const int xa = cstart[c + 1] - 1, xb = cstart[c + 1];
         const int sa = W.path_st[xa], sb = W.path_st[xb];
@@ -4206,9 +4261,10 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         int Lx = INT32_MIN, Rx = INT32_MIN;
         bool lanc = false, ranc = false;
         offpath_edges(M, ev, nev, W, sa, A, sb, B, Lx, Rx, &lanc, &ranc);
-        uint8_t kind;
+        uint8_t kind, boundary_flags;
+        int boundary_lo, boundary_hi;
         float aux = 0.f;
-        int cut = junction_cut(M, A, sa, B, sb, kind, Lx, Rx);
+        int cut = junction_cut(M, A, sa, B, sb, kind, Lx, Rx, &boundary_flags, &boundary_lo, &boundary_hi);
         const int bt = M.bc_tail[sa], bh = M.bc_head[sb];
         // a junction made only by a pairing of partner anchors needs a strong pairing or a cDNA-side anchor in both
         // constructs; otherwise its posterior is capped at WEAK_POST
@@ -4246,16 +4302,23 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
                 float mg;
                 if (strand_flip_cut(M, seq, ja, jb, W, fc, mg)) { cut = fc; kind = CUT_STRAND_FLIP; aux = mg; }
             }
+            if (kind == CUT_FOLDBACK || kind == CUT_STRAND_FLIP) {
+                boundary_flags = (uint8_t)((boundary_flags & ~BOUNDARY_UNRESOLVED) | BOUNDARY_SEQUENCE_RESOLVED);
+                boundary_lo = boundary_hi = cut;
+            }
         }
         cut = std::max(cut, prev_cut + 1);
         // child windows: an anchor-derived barcode block stays whole, but never past the facing construct's events
         const int Le = (bt >= 0 && A.type < M.A) ? A.end + bt : lanc ? Lx : INT32_MIN;
         const int Re = (bh >= 0 && B.type < M.A) ? B.start - bh : ranc ? Rx : INT32_MIN;
-        int whi = cut, wlo = cut;
-        if (Le != INT32_MIN) whi = std::min(std::min(std::max(cut, Le + BC_WIN_PAD), std::max(cut, B.start)), L);
-        if (Re != INT32_MIN) wlo = std::max(std::max(std::min(cut, Re - BC_WIN_PAD), std::min(cut, A.end)), 0);
+        int whi = std::max(cut, boundary_hi), wlo = std::min(cut, boundary_lo);
+        if (Le != INT32_MIN) whi = std::max(whi, std::min(std::max(cut, Le + BC_WIN_PAD), std::max(cut, B.start)));
+        if (Re != INT32_MIN) wlo = std::min(wlo, std::max(std::min(cut, Re - BC_WIN_PAD), std::min(cut, A.end)));
+        whi = std::min(whi, L); wlo = std::max(wlo, 0);
         W.jlo.push_back(wlo);
         W.jhi.push_back(whi);
+        W.jflags.push_back(boundary_flags);
+        R.boundary_unresolved_seen = R.boundary_unresolved_seen || (boundary_flags & BOUNDARY_UNRESOLVED);
         cuts.push_back(cut);
         ckind.push_back(kind);
         W.caux.push_back(aux);
@@ -4303,9 +4366,8 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         if (c > 0) sg.start = bcut[c - 1];
         else {
             // read-end bound at the barcode-block edge when the barcode-adjacent primer was not observed
-            const int hf = M.bc_head[sfirst] >= 0 ? M.bc_head[sfirst] : M.head_fix[sfirst];
-            sg.start = has_open ? ef.start : (hf >= 0 ? std::max(0, ef.start - hf) : 0);
-            if (!has_open && M.head_fix[sfirst] < 0) cs_slack = M.zone5;
+            sg.start = retained_template_start(M, sfirst, ef.start);
+            if (!template_edge_span(M, sfirst, true).bounded) cs_slack = M.zone5;
         }
         if (c + 1 < nc) {
             sg.end = bcut[c];
@@ -4313,9 +4375,8 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
             if (ckind[c] == 3) sg.flags |= SEG_LOWCONF;
             if (ckind[c] == 4) sg.flags |= SEG_SAME_MOLECULE_R;
         } else {
-            const int tf = M.bc_tail[slast] >= 0 ? M.bc_tail[slast] : M.tail_fix[slast];
-            sg.end = has_close ? el.end : (tf >= 0 ? std::min(L, el.end + tf) : L);
-            if (!has_close && M.tail_fix[slast] < 0) ce_slack = M.zone3;
+            sg.end = retained_template_end(M, slast, el.end, L);
+            if (!template_edge_span(M, slast, false).bounded) ce_slack = M.zone3;
         }
         sg.end = std::max(sg.end, sg.start + 1);
         float conf = R.p_single;
@@ -4483,6 +4544,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
     R.cuts.clear();
     R.cut_post.clear();
     R.cut_kind.clear();
+    R.cut_flags.clear();
     for (int i = 0; i + 1 < R.k; ++i) {
         // the cut is the construct's junction (W.scut), which equals the segment end except for a kept-left D construct
         const int cut = i < (int)W.scut.size() ? W.scut[i] : R.segs[i].end, j = W.segj[i];
@@ -4491,6 +4553,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         R.cut_lo.push_back(j >= 0 ? std::min(W.jlo[j], cut) : cut);
         R.cut_hi.push_back(j >= 0 ? std::max(W.jhi[j], cut) : cut);
         R.cut_kind.push_back(j >= 0 ? ckind[j] : (i < (int)W.skind.size() && W.skind[i] ? W.skind[i] : (uint8_t)CUT_FOLDBACK));
+        R.cut_flags.push_back(j >= 0 ? W.jflags[j] : (uint8_t)BOUNDARY_SEQUENCE_RESOLVED);
         R.cut_aux.push_back(i < (int)W.saux.size() ? W.saux[i] : 0.f);
     }
     if (R.k > M.opt.k_cap) {
@@ -4503,6 +4566,7 @@ inline void derive_result(const Model& M, const char* seq, const Event* ev, int 
         R.cut_lo.resize(kc - 1);
         R.cut_hi.resize(kc - 1);
         R.cut_kind.resize(kc - 1);
+        R.cut_flags.resize(kc - 1);
         R.cut_aux.resize(kc - 1);
         R.k = kc;
         auto it = std::remove_if(R.checks.begin(), R.checks.end(), [&](const check_region& c) { return c.construct >= kc; });
@@ -4753,7 +4817,8 @@ inline void segment(const Model& M, const char* seq, int len, Scratch& S, Result
 #endif
     R.flags = M.guard_failed ? (uint32_t)RES_GUARD_FAILED : 0u;
     R.k = 0;
-    R.cuts.clear(); R.segs.clear(); R.checks.clear(); R.cut_post.clear(); R.cut_lo.clear(); R.cut_hi.clear(); R.cut_kind.clear(); R.cut_aux.clear();
+    R.boundary_unresolved_seen = false;
+    R.cuts.clear(); R.segs.clear(); R.checks.clear(); R.cut_post.clear(); R.cut_lo.clear(); R.cut_hi.clear(); R.cut_kind.clear(); R.cut_flags.clear(); R.cut_aux.clear();
     R.p_single = 0.f;
     R.strand_call = '?';
     if (len <= 0 || !seq) return;
@@ -5724,7 +5789,8 @@ inline std::string debug_read(const Model& M, const char* seq, int len, Scratch&
         for (size_t i = 0; i < R.cuts.size(); ++i)
             os << "cut " << R.cuts[i] << ": " << (i < R.cut_kind.size() && R.cut_kind[i] < 6 ? kind_name[R.cut_kind[i]] : "?")
                << (i < R.cut_aux.size() && R.cut_aux[i] > 0 ? (i < R.cut_kind.size() && R.cut_kind[i] == CUT_FOLDBACK ? " (arm Jaccard " : " (margin ") + std::to_string(R.cut_aux[i]) + ")" : "")
-               << ", posterior " << (i < R.cut_post.size() ? R.cut_post[i] : 0.f) << "\n";
+               << ", posterior " << (i < R.cut_post.size() ? R.cut_post[i] : 0.f)
+               << ", boundary flags " << (i < R.cut_flags.size() ? (int)R.cut_flags[i] : 0) << "\n";
         os << "strand table: " << (M.has_strand() ? "present" : "absent") << "\n";
         os << "D strand table (" << STRAND_D_K << "-mers, D strand rule): " << (M.has_strand_d() ? "present" : "absent") << "\n";
     }

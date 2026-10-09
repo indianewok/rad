@@ -1876,6 +1876,7 @@ struct sigalign_run_stats {
     size_t hmm_both_pass_dropped = 0, hmm_duplet_named = 0;
     size_t hmm_clip_hits = 0, hmm_two_unit_clip_dropped = 0;
     size_t hmm_junctions_abstained = 0, hmm_pieces_suppressed = 0, hmm_drop_unresolved = 0;
+    size_t hmm_boundary_unresolved_parents = 0, hmm_boundary_unresolved_children = 0;
     size_t hmm_cut_kind[6] = {0, 0, 0, 0, 0, 0};
     size_t hmm_win[4] = {0, 0, 0, 0}, hmm_win_ok[4] = {0, 0, 0, 0};  // per concat_hmm::Status
 };
@@ -1957,6 +1958,7 @@ struct concat_hmm_counters {
     std::atomic<size_t> junctions_abstained{0};
     std::atomic<size_t> pieces_suppressed{0};
     std::atomic<size_t> drop_unresolved{0};
+    std::atomic<size_t> boundary_unresolved_parents{0}, boundary_unresolved_children{0};
     std::atomic<size_t> cut_kind[6]{};          // per concat_hmm CUT_* kind
 };
 
@@ -2156,6 +2158,7 @@ class SigString {
     struct hmm_weak_ref { std::string id; std::pair<int, int> aligned, anchored; };
     std::vector<hmm_weak_ref> hmm_weak_refs;
     std::string hmm_note;
+    std::string hmm_boundary_note;
     bool hmm_no_double_count = false;
     // SSW hits refused by the read-end clipping rule in a piece's full search: evidence only, never elements.
     struct hmm_clip_hit { std::string id; std::pair<int, int> pos; bool block_adapter = false; };
@@ -5112,6 +5115,7 @@ public:
     }
 
     void set_hmm_note(const std::string& n) { hmm_note = n; }
+    void set_hmm_boundary_note(const std::string& n) { hmm_boundary_note = n; }
     const std::string& hmm_note_str() const { return hmm_note; }
     void mark_hmm_no_double_count() { hmm_no_double_count = true; }
     bool hmm_no_double_count_set() const { return hmm_no_double_count; }
@@ -5816,7 +5820,8 @@ public:
     // without a record.
     template <class mol_fn>
     static bool concat_hmm_route(const read_streaming::sequence& read, const ReadLayout& layout,
-                                 const concat_layout_info& info, mol_fn&& process_molecule, bool verbose) {
+                                 const concat_layout_info& info, mol_fn&& process_molecule, bool verbose,
+                                 const std::function<void(const read_streaming::sequence&)>& preserve_unresolved = {}) {
         thread_local concat_hmm::Scratch scratch;
         thread_local concat_hmm::Result res;
         concat_hmm_counters& ctr = *info.ctr;
@@ -5832,10 +5837,29 @@ public:
 #endif
             concat_hmm::segment(*layout.concat_model, read.seq.data(), len, scratch, res);
         }
+        // A confident repeat transition need not locate the physical junction.
+        // Keep the original parent, and do not assign the unresolved interval to
+        // either barcode merely by choosing an arithmetic midpoint.
+        std::vector<uint8_t> boundary_blocked(static_cast<size_t>(std::max(0, res.k)), 0);
+        bool has_unresolved_boundary = res.boundary_unresolved_seen;
+        for (size_t j = 0; j < res.cut_flags.size() && j + 1 < boundary_blocked.size(); ++j) {
+            if (!(res.cut_flags[j] & concat_hmm::BOUNDARY_UNRESOLVED)) continue;
+            boundary_blocked[j] = boundary_blocked[j + 1] = 1;
+            has_unresolved_boundary = true;
+        }
+        if (has_unresolved_boundary) {
+            ctr.boundary_unresolved_parents.fetch_add(1, std::memory_order_relaxed);
+            ctr.boundary_unresolved_children.fetch_add(
+                static_cast<size_t>(std::count(boundary_blocked.begin(), boundary_blocked.end(), uint8_t{1})),
+                std::memory_order_relaxed);
+            if (preserve_unresolved) preserve_unresolved(read);
+        }
         const char* legacy = nullptr;
         const char* drop = nullptr;  // written without any record
         bool junction_abstain = false;
-        const bool abstain_legacy = layout.concat_abstain_legacy;
+        // Legacy fallback must not reintroduce a cut through an interval we
+        // have explicitly classified as coordinate-unresolved.
+        const bool abstain_legacy = layout.concat_abstain_legacy && !has_unresolved_boundary;
         if (res.flags & concat_hmm::RES_GUARD_FAILED) { legacy = "guard"; ctr.legacy_guard.fetch_add(1, std::memory_order_relaxed); }
         else if (res.k <= 0) { legacy = "k0"; ctr.legacy_k0.fetch_add(1, std::memory_order_relaxed); }
         else if (res.flags & concat_hmm::RES_TOO_MANY) {
@@ -5914,6 +5938,9 @@ public:
         pieces.reserve(static_cast<size_t>(res.k));
         const bool win = res.cut_lo.size() == res.cuts.size() && res.cut_hi.size() == res.cuts.size();
         for (int c = 0; c < res.k; ++c) {
+            if (boundary_blocked[static_cast<size_t>(c)]) {
+                continue;
+            }
             if (res.segs[c].flags & concat_hmm::SEG_SAME_MOLECULE_R) ctr.same_molecule.fetch_add(1, std::memory_order_relaxed);
             // children may overlap at a cut (cut_lo / cut_hi) so each keeps its whole barcode block
             int start = c == 0 ? 0 : (win ? res.cut_lo[c - 1] : res.cuts[c - 1]);
@@ -6000,6 +6027,15 @@ public:
                 }
             }
             if (p.sig.weak_primer_count()) ctr.retry_from_partner.fetch_add(p.sig.weak_primer_count(), std::memory_order_relaxed);
+            auto one_sided_edge = [&](int j) {
+                if (j < 0 || j >= static_cast<int>(res.cut_flags.size())) return false;
+                const uint8_t f = res.cut_flags[static_cast<size_t>(j)];
+                return !(f & concat_hmm::BOUNDARY_UNRESOLVED) &&
+                       static_cast<bool>(f & concat_hmm::BOUNDARY_LEFT_BOUNDED) !=
+                       static_cast<bool>(f & concat_hmm::BOUNDARY_RIGHT_BOUNDED);
+            };
+            if (one_sided_edge(c - 1) || one_sided_edge(c))
+                p.sig.set_hmm_boundary_note("layout_edge");
             pieces.push_back(std::move(p));
         }
         // At a weak junction keep only the piece with the better barcode unit (ties: HMM confidence, then forward).
@@ -6065,6 +6101,66 @@ public:
         return true;
     }
 
+    // Discover exactly the native pre-correction barcode queries. This pass
+    // does not filter barcodes, change count support, or write demux outputs.
+    // Selective loading is limited to non-joint catalogs, whose extraction is
+    // independent of whitelist membership.
+    template<class ObservationMap>
+    static ObservationMap observe_whitelist_queries(const std::string& fastq_path,
+            const ReadLayout& layout, int num_threads, size_t chunk_size,
+            size_t max_reads, int min_read_length) {
+        std::vector<ObservationMap> worker_observations(static_cast<size_t>(num_threads));
+        concat_hmm_counters ctr;
+        std::unique_ptr<concat_layout_info> hmm_info;
+        if (layout.concat_model) {
+            hmm_info = std::make_unique<concat_layout_info>(build_concat_layout_info(layout, *layout.concat_model));
+            hmm_info->ctr = &ctr;
+        }
+        auto process_chunk = [&](std::vector<read_streaming::sequence>& chunk, const std::string&) {
+            #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
+            for (size_t i = 0; i < chunk.size(); ++i) {
+                const auto& read = chunk[i];
+                auto& observed = worker_observations[static_cast<size_t>(omp_get_thread_num())];
+                auto collect = [&](SigString& molecule, const read_streaming::sequence& molecule_read) {
+                    molecule.sigalign_variable(molecule_read, layout, false);
+                    for (const auto& e : molecule.elements()) {
+                        if (e.global_class != "barcode" || !e.seq || e.seq->empty()) continue;
+                        std::string raw = *e.seq;
+                        std::string expanded = seq_utils::substr_w_padding(molecule_read.seq,
+                            e.position.first, e.position.second, barcode_correction::expanded_window_pad);
+                        if (e.direction == "reverse") {
+                            raw = seq_utils::revcomp(raw);
+                            expanded = seq_utils::revcomp(expanded);
+                        }
+                        observed[seq_utils::remove_rc(e.class_id)].add(raw, expanded);
+                    }
+                };
+                if (hmm_info && concat_hmm_route(read, layout, *hmm_info, collect, false)) continue;
+                SigString sig(read.id, static_cast<int>(read.seq.size()), "undefined", layout.sequencing_type);
+                std::vector<seq_element> additional_hits;
+                sig.sigalign_static(read, layout, false, &additional_hits);
+                const auto segments = sig.group_static_candidates(layout, additional_hits, false, min_read_length);
+                if (segments.empty()) collect(sig, read);
+                else for (size_t j = 0; j < segments.size(); ++j) {
+                    const auto& segment = segments[j];
+                    const int offset = segment.position.first - 1;
+                    const int length = segment.position.second - offset;
+                    read_streaming::sequence child{read.id + "/seg" + std::to_string(j + 1), read.comment,
+                        read.seq.substr(offset, length), read.is_fastq ? read.qual.substr(offset, length) : "", read.is_fastq};
+                    SigString molecule(child.id, length, "undefined", layout.sequencing_type);
+                    if (molecule.assign_static_segment(segment, layout, child)) collect(molecule, child);
+                }
+            }
+        };
+        chunk_streaming<read_streaming::sequence, decltype(process_chunk)> streamer(chunk_size, num_threads);
+        const int64_t limit = max_reads > 0 ? static_cast<int64_t>(max_reads) : -1;
+        streamer.process_chunks(fastq_path, process_chunk, 1, limit);
+        ObservationMap merged;
+        for (const auto& worker : worker_observations)
+            for (const auto& entry : worker) merged[entry.first].merge(entry.second);
+        return merged;
+    }
+
     static sigalign_run_stats sigalign(
         const std::string& fastq_path, 
         const ReadLayout& layout, 
@@ -6091,6 +6187,11 @@ public:
 
     // Primary FASTQA writer
     sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, compress_fastq, false, num_threads);
+    std::unique_ptr<sigstring_writing> unresolved_writer;
+    const std::string unresolved_path = output_prefix + "_boundary_unresolved" + file_out;
+    if (layout.concat_model)
+        unresolved_writer = std::make_unique<sigstring_writing>(unresolved_path,
+            sigstring_writing::format::FASTQA, compress_fastq, false, num_threads);
 
     if (write_debug) {
         std::string sig_path = output_prefix + "_dbg.sig";
@@ -6161,6 +6262,7 @@ public:
 
         // Thread-local buffers for serialized FASTQ output
         std::vector<std::string> thread_buffers(num_threads);
+        std::vector<std::string> unresolved_buffers(num_threads);
         std::atomic<size_t> passed_count{0};
         std::atomic<size_t> demultiplexed_count{0};
         std::atomic<size_t> records_written_count{0};
@@ -6242,7 +6344,17 @@ public:
                             hmm_records += molecule.to_fastqa_append(thread_buffers[tid], rc_umi);
                         }
                     };
-                    if (concat_hmm_route(read, layout, *hmm_info, hmm_molecule, verbose)) {
+                    auto preserve_unresolved = [&](const read_streaming::sequence& parent) {
+                        std::string& b = unresolved_buffers[static_cast<size_t>(tid)];
+                        b += parent.is_fastq ? '@' : '>';
+                        b += parent.id;
+                        if (!parent.comment.empty()) { b += ' '; b += parent.comment; }
+                        b += "\tHU:Z:boundary_unresolved\n";
+                        b += parent.seq;
+                        b += '\n';
+                        if (parent.is_fastq) { b += "+\n"; b += parent.qual; b += '\n'; }
+                    };
+                    if (concat_hmm_route(read, layout, *hmm_info, hmm_molecule, verbose, preserve_unresolved)) {
                         if (hmm_passed) passed_count.fetch_add(1, std::memory_order_relaxed);
                         if (hmm_records > 0) {
                             demultiplexed_count.fetch_add(1, std::memory_order_relaxed);
@@ -6348,6 +6460,8 @@ public:
         }
 
         // === consolidate and write ===
+        if (unresolved_writer)
+            writer.write_slabs(*unresolved_writer, std::move(unresolved_buffers));
         if (passed_count > 0) {
             if (write_debug) {
                 writer.write_debug(debug_sig_writer.get(), debug_csv_writer.get(), debug_fastqa_writer.get(), debug_sigs);
@@ -6488,6 +6602,7 @@ public:
                   << " junctions_abstained=" << hmm_ctr.junctions_abstained.load()
                   << " trim_keep=" << hmm_ctr.trim_keep_F.load() + hmm_ctr.trim_keep_R.load()
                   << " duplets=" << hmm_ctr.duplet_named.load()
+                  << " boundary_unresolved_saved=" << hmm_ctr.boundary_unresolved_parents.load()
                   << " abstain_policy=" << (layout.concat_abstain_legacy ? "legacy" : "drop") << "\n";
     }
 #ifdef RAD_STAGE_TIMERS
@@ -6530,6 +6645,9 @@ public:
         std::cout << "\n[sigalign] Output written to:\n"
                   << "[sigalign][fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n";
     }
+    if (hmm_info)
+        std::cout << "[sigalign][unresolved boundaries]: " << unresolved_path << ".gz ("
+                  << hmm_ctr.boundary_unresolved_parents.load() << " raw parent copies; unresolved intervals unassigned)\n";
 
     sigalign_run_stats run_stats{
         total_reads.load(),
@@ -6583,6 +6701,8 @@ public:
         run_stats.hmm_junctions_abstained = hmm_ctr.junctions_abstained;
         run_stats.hmm_pieces_suppressed = hmm_ctr.pieces_suppressed;
         run_stats.hmm_drop_unresolved = hmm_ctr.drop_unresolved;
+        run_stats.hmm_boundary_unresolved_parents = hmm_ctr.boundary_unresolved_parents;
+        run_stats.hmm_boundary_unresolved_children = hmm_ctr.boundary_unresolved_children;
         for (int kd = 0; kd < 6; ++kd) run_stats.hmm_cut_kind[kd] = hmm_ctr.cut_kind[kd];
         for (int s = 0; s < 4; ++s) {
             run_stats.hmm_win[s] = hmm_ctr.win[s];
@@ -6840,6 +6960,10 @@ public:
                 buffer += umi;
             }
             
+            if (!hmm_boundary_note.empty()) {
+                buffer += "\tHB:Z:";
+                buffer += hmm_boundary_note;
+            }
             buffer += (is_forward ? "\tTS:A:+\n" : "\tTS:A:-\n");
             buffer += read_seq;
             buffer += '\n';
@@ -6987,6 +7111,7 @@ public:
             }
             //adding transcript tag for SAM
             if (!umi.empty()) ss << "\tUB:Z:" << umi;
+            if (!hmm_boundary_note.empty()) ss << "\tHB:Z:" << hmm_boundary_note;
             if(is_forward){
                 ss << "\tTS:A:+";
             } else {
