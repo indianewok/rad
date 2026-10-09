@@ -609,6 +609,13 @@ struct Nbr {                 // tight neighbour relation used for windows / gate
 // Head rule: template start [prim] <block> [inner]; tail rule: [inner] <block> [prim] template end.
 struct bc_rule { int prim, inner, block; };
 
+// Physical prefix/suffix length range up to the first insert. An insert leaves the partial
+// range intact but makes the edge unbounded; observable OPEN/CLOSE flags do not describe it.
+struct edge_span {
+    bool bounded = true;
+    int lo = 0, hi = 0;
+};
+
 inline int pat_k_budget(int m) {
     int k = m < 12 ? 1 : m < 16 ? 2 : m < 20 ? 4 : m < 30 ? 6 : m < 45 ? 8 : 10;
     return std::min(k, m / 2);
@@ -631,6 +638,7 @@ struct Model {
     std::vector<std::vector<int>> states_by_type;
     std::vector<int> open_state, close_state;
     std::vector<int> head_fix, tail_fix;   // nominal non-insert prefix/suffix bp (-1: insert between); boundary retention uses layout ranges
+    std::vector<detail::edge_span> head_edge, tail_edge;  // full layout ranges, fixed once during model construction
     // per state: bp of the barcode block between the slot and the barcode-adjacent primer at the template start /
     // end, primer counted as absent; -1 if the slot is not such an inner slot
     std::vector<int> bc_head, bc_tail;
@@ -806,21 +814,8 @@ inline void finish_template(const Model& M, Template& T) {
 // SF_OPEN / SF_CLOSE describe observable order, not physical template ends. An insert can lie
 // outside the first/last observable (for example Curio's poly-A / reverse linker). Keep that
 // decoder topology unchanged and use the full layout whenever coordinates are being placed.
-struct edge_span {
-    bool bounded = true;
-    int lo = 0, hi = 0;
-};
-inline edge_span template_edge_span(const Model& M, int st, bool head) {
-    const Template& T = M.tpl[M.st_tpl[st]];
-    const int ei = M.st_elem[st];
-    edge_span r;
-    for (int i = head ? 0 : ei + 1, end = head ? ei : (int)T.el.size(); i < end; ++i) {
-        const TElem& e = T.el[i];
-        if (e.kind == EK_INSERT) { r.bounded = false; return r; }
-        r.lo += e.lmin;
-        r.hi += e.lmax;
-    }
-    return r;
+inline const edge_span& template_edge_span(const Model& M, int st, bool head) {
+    return head ? M.head_edge[st] : M.tail_edge[st];
 }
 inline bool at_template_edge(const Model& M, int st, bool head) {
     const edge_span r = template_edge_span(M, st, head);
@@ -1678,11 +1673,25 @@ inline Model Model::build(const layout_spec& L, const Params* p, const model_opt
     if (M.S > MAXSTATE) throw layout_spec_error("concat_hmm: too many observable slots (" + std::to_string(M.S) + ")");
     M.head_fix.assign(M.S, -1);
     M.tail_fix.assign(M.S, -1);
+    M.head_edge.resize(M.S);
+    M.tail_edge.resize(M.S);
     for (int st = 0; st < M.S; ++st) {
         const Template& T = M.tpl[M.st_tpl[st]];
         int ei = M.st_elem[st];
         if (T.pins[ei] == 0) M.head_fix[st] = (int)std::lround(T.pnom[ei]);
         if (T.pins[T.el.size()] - T.pins[ei + 1] == 0) M.tail_fix[st] = (int)std::lround(T.pnom[T.el.size()] - T.pnom[ei + 1]);
+        auto edge_range = [&](int begin, int end) {
+            edge_span r;
+            for (int i = begin; i < end; ++i) {
+                const TElem& e = T.el[i];
+                if (e.kind == EK_INSERT) { r.bounded = false; break; }
+                r.lo += e.lmin;
+                r.hi += e.lmax;
+            }
+            return r;
+        };
+        M.head_edge[st] = edge_range(0, ei);
+        M.tail_edge[st] = edge_range(ei + 1, (int)T.el.size());
     }
     M.bc_head.assign(M.S, -1);
     M.bc_tail.assign(M.S, -1);
@@ -4023,26 +4032,31 @@ inline int junction_cut(const Model& M, const Event& A, int sa, const Event& B, 
                     (tail.bounded ? 0 : BOUNDARY_LEFT_INSERT) | (head.bounded ? 0 : BOUNDARY_RIGHT_INSERT);
     int cut, wlo, whi;
     const int lp = cl ? 0 : BC_WIN_PAD, rp = op ? 0 : BC_WIN_PAD;
-    if (hl && hr) {
+    switch ((hl ? 1 : 0) | (hr ? 2 : 0)) {
+    case 3:  // Both edges: midpoint in the interval bounded by physical layout edges.
         cut = (lh + rl) / 2;
         kind = cl && op ? CUT_BOTH_ADAPTERS : CUT_GEOMETRY;
         wlo = std::min(cut, rl - rp);
         whi = std::max(cut, lh + lp);
         // Inconsistent facing edges do not become an exact boundary just because both markers exist.
         if (ll > rh) flags |= BOUNDARY_UNRESOLVED;
-    } else if (hl) {
+        break;
+    case 1:  // Left edge only: retain the unknown sequence on its right.
         cut = (ll + lh) / 2;
         kind = cl ? CUT_ONE_ADAPTER : CUT_GEOMETRY;
         wlo = ll - lp; whi = lh + lp;
-    } else if (hr) {
+        break;
+    case 2:  // Right edge only: retain the unknown sequence on its left.
         cut = (rl + rh) / 2;
         kind = op ? CUT_ONE_ADAPTER : CUT_GEOMETRY;
         wlo = rl - rp; whi = rh + rp;
-    } else {
+        break;
+    default: // Neither edge: a midpoint is bookkeeping only, not an assigned boundary.
         cut = (A.end + B.start) / 2;
         kind = CUT_MIDPOINT;
         flags |= BOUNDARY_UNRESOLVED;
         wlo = lo; whi = hi;
+        break;
     }
     if (cut < lo || cut > hi) flags |= BOUNDARY_UNRESOLVED;
     if (flags & BOUNDARY_UNRESOLVED) { wlo = std::min(wlo, lo); whi = std::max(whi, hi); }

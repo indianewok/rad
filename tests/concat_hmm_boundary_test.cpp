@@ -1,6 +1,7 @@
 #include "rad/concat_hmm.hpp"
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 using namespace concat_hmm;
 
@@ -49,6 +50,28 @@ detail::Event event(const Model& m, int st, int begin, int end) {
     e.cls = e.type < m.A ? detail::CL_S4 : detail::CL_POLY;
     e.ed = e.type < m.A ? 0 : -1;
     return e;
+}
+
+// Keep the former runtime walk as an independent oracle: in particular, an unbounded edge
+// retains only the lengths encountered before its first insert, even when more elements follow.
+void check_cached_edges(const Model& m, const std::string& context) {
+    require(m.head_edge.size() == (size_t)m.S && m.tail_edge.size() == (size_t)m.S,
+            context + ": missing cached states");
+    for (int st = 0; st < m.S; ++st) for (bool head : {false, true}) {
+        const auto& t = m.tpl[m.st_tpl[st]];
+        const int element = m.st_elem[st];
+        int expected_lo = 0, expected_hi = 0;
+        bool expected_bounded = true;
+        for (int i = head ? 0 : element + 1, end = head ? element : (int)t.el.size(); i < end; ++i) {
+            if (t.el[i].kind == detail::EK_INSERT) { expected_bounded = false; break; }
+            expected_lo += t.el[i].lmin;
+            expected_hi += t.el[i].lmax;
+        }
+        const auto& actual = detail::template_edge_span(m, st, head);
+        require(actual.bounded == expected_bounded && actual.lo == expected_lo && actual.hi == expected_hi,
+                context + ": cached range differs from original walk at state " + std::to_string(st) +
+                (head ? " head" : " tail"));
+    }
 }
 
 struct Fixture {
@@ -108,6 +131,7 @@ void tests() {
     opts.foldback_split = false; // ambiguous F/R gaps must remain unresolved without sequence evidence
     opts.posteriors = false;
     const Model m = Model::build(curio_spec(), nullptr, opts);
+    check_cached_edges(m, "Curio main and artifact templates");
     const int ro = state(m, 'R', true), rc = state(m, 'R', false);
     require((m.st_flags[ro] & detail::SF_OPEN) && (m.st_flags[rc] & detail::SF_CLOSE), "Topology flags changed");
     require(!detail::template_edge_span(m, ro, true).bounded, "Reverse insert mistaken for fixed prefix");
@@ -120,6 +144,24 @@ void tests() {
     require((flags & BOUNDARY_LEFT_BOUNDED) && (flags & BOUNDARY_RIGHT_INSERT) &&
             !(flags & BOUNDARY_UNRESOLVED), "One-sided boundary status incorrect");
     require(lo <= 68 && hi >= 68 && lo <= 319, "R2C2 supported payload start clipped");
+
+    // The four boundary cases have distinct physical meanings even though all use the same anchors.
+    const int fo = state(m, 'F', true), fc = state(m, 'F', false);
+    struct BoundaryCase { int left, right, cut, lo, hi; uint8_t kind, flags; };
+    const BoundaryCase cases[] = {
+        {rc, fo, 441, 441, 441, CUT_GEOMETRY, BOUNDARY_LEFT_BOUNDED | BOUNDARY_RIGHT_BOUNDED},
+        {rc, ro, 68, 66, 70, CUT_GEOMETRY, BOUNDARY_LEFT_BOUNDED | BOUNDARY_RIGHT_INSERT},
+        {fc, fo, 814, 812, 816, CUT_GEOMETRY, BOUNDARY_LEFT_INSERT | BOUNDARY_RIGHT_BOUNDED},
+        {fc, ro, 441, 60, 822, CUT_MIDPOINT,
+         BOUNDARY_LEFT_INSERT | BOUNDARY_RIGHT_INSERT | BOUNDARY_UNRESOLVED}
+    };
+    for (const auto& expected : cases) {
+        const int actual = detail::junction_cut(m, event(m, expected.left, 42, 60), expected.left,
+                                               event(m, expected.right, 822, 844), expected.right,
+                                               kind, INT32_MIN, INT32_MIN, &flags, &lo, &hi);
+        require(actual == expected.cut && lo == expected.lo && hi == expected.hi &&
+                kind == expected.kind && flags == expected.flags, "Physical edge decision table changed");
+    }
 
     for (const std::string strands : {"F", "R", "FFF", "RRR", "RFR", "FRF"}) {
         std::vector<int> lengths;
@@ -168,6 +210,7 @@ void tests() {
     for (bool gate_enabled : {false, true}) {
         model_options inference_opts = opts; inference_opts.gate = gate_enabled;
         const Model im = Model::build(curio_spec(), nullptr, inference_opts);
+        check_cached_edges(im, "Gate inference model");
         Scratch inference_scratch;
         Result inference_result;
         for (const std::string strand : {"F", "R"}) {
@@ -183,6 +226,7 @@ void tests() {
     // Length candidates are a range, not an exact midpoint offset.
     auto variable = curio_spec(); variable.elements[0].length_candidates = {6, 8, 12};
     const Model vm = Model::build(variable, nullptr, opts);
+    check_cached_edges(vm, "Variable barcode lengths");
     const int vro = state(vm, 'R', true), vrc = state(vm, 'R', false);
     detail::junction_cut(vm, event(vm, vrc, 42, 60), vrc, event(vm, vro, 822, 844), vro,
                          kind, INT32_MIN, INT32_MIN, &flags, &lo, &hi);
@@ -198,11 +242,37 @@ void tests() {
     opening.id = "outer_primer"; opening.seq = "CTTCCGATCTATGGCGACCTTATCAG"; opening.klass = "forw_primer"; opening.order = 0;
     two_sided.elements.insert(two_sided.elements.begin(), opening);
     const Model tm = Model::build(two_sided, nullptr, opts);
+    check_cached_edges(tm, "Two-sided main, partial and artifact templates");
     const int tc = state(tm, 'F', false), to = state(tm, 'F', true);
     const int midpoint = detail::junction_cut(tm, event(tm, tc, 80, 100), tc, event(tm, to, 120, 145), to,
                                               kind, INT32_MIN, INT32_MIN, &flags, &lo, &hi);
     require(midpoint == 110 && kind == CUT_BOTH_ADAPTERS && !(flags & BOUNDARY_UNRESOLVED),
             "Two-sided terminal adapter behavior changed");
+
+    // Calibration copies and refinalizes models; exported/reloaded parameters must not change layout geometry.
+    Model copy = vm;
+    check_cached_edges(copy, "Copied model");
+    copy.par = copy.prior;
+    copy.finalize();
+    check_cached_edges(copy, "Prior reset");
+    const Params params = vm.export_params();
+    copy.apply_params(params);
+    copy.finalize();
+    copy.finalize();
+    check_cached_edges(copy, "Parameter reload and repeated finalize");
+    Model moved = std::move(copy);
+    check_cached_edges(moved, "Moved model");
+    const Model restored = Model::build(variable, &params, opts);
+    check_cached_edges(restored, "Parameter round trip during build");
+
+    // All bundled layouts exercise short/long spacers, different anchor classes and both strand templates.
+    for (const char* file : {"nanopore_bulk_rapid_bc_read_layout.csv", "splitseq_read_layout.csv",
+                            "visium_hd_read_layout.csv", "three_prime_read_layout.csv",
+                            "sctagger_sim_read_layout.csv", "visium_three_prime_read_layout.csv",
+                            "five_prime_read_layout.csv"}) {
+        const auto spec = parse_layout_csv(std::string(RAD_SOURCE_DIR) + "/resources/read_layout/" + file);
+        check_cached_edges(Model::build(spec, nullptr, opts), file);
+    }
 }
 } // namespace
 

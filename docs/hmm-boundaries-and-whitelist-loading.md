@@ -6,9 +6,13 @@ reverse Curio reads have an insert before poly(A), and a barcode after the
 reverse-complement linker. A midpoint between the linker of one copy and the
 poly(A) of the next copy can therefore lie inside the next insert.
 
-Boundary placement uses the complete layout, including variable inserts and
-barcode/spacer lengths. Decoder opening/closing flags still describe observable
-state topology. They do not, by themselves, authorize clipping.
+Model construction precomputes physical head and tail ranges for every observable
+state from the complete layout, including variable inserts and barcode/spacer
+lengths. Per-read boundary placement uses these cached ranges: both facing edges
+bounded, one bounded, or neither bounded. It does not walk the layout at each
+junction. Decoder opening/closing flags still describe observable state topology.
+They do not, by themselves, authorize clipping. This simplification preserves
+the same cuts, uncertainty windows and unresolved-boundary policy.
 
 - When both facing layout edges are bounded, the split and extraction windows
   preserve their uncertainty and barcode blocks.
