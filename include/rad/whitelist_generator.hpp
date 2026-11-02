@@ -3013,7 +3013,8 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
                                       bool verbose = false,
                                       scan_whitelist_selection selection =
                                           scan_whitelist_selection::high_specificity,
-                                      whitelist_scan_stats* summary = nullptr)
+                                      whitelist_scan_stats* summary = nullptr,
+                                      bool spatial_low_counts = false)
 {
     // Observations were collapsed online while the FASTQ was scanned, so this
     // stage no longer allocates a second read-sized container.
@@ -3090,7 +3091,14 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
     // default.  It moves left only when the upper-tail hazard has the same
     // prominent interior minimum across three bandwidths and that move adds a
     // material, well-supported population.
-    const double LEGACY_FLOOR = 2.0;
+    // A coordinate-validated spatial catalogue permits a one-observation
+    // candidate floor. Keep the existing adaptive caller and default behaviour
+    // for every non-spatial invocation. This is a sensitivity profile, not a
+    // calibrated tissue/background probability model.
+    const double LEGACY_FLOOR = spatial_low_counts && total_reads > 0.0
+        ? std::min(2.0, std::log1p((1.0 / total_reads) * 1e6)) : 2.0;
+    const double hazard_search_min = spatial_low_counts
+        ? std::min(1.0, LEGACY_FLOOR) : 1.0;
     const double ZTPOIS_RULE = 95.0; // fallback percentile if saddle/50% fail
 
     std::vector<double> legacy_af_x;
@@ -3126,7 +3134,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         }
         adaptive_floor = compute_adaptive_hazard_floor(
             hazard_scores, adaptive_bandwidth, LEGACY_FLOOR,
-            /*search_min=*/1.0, /*min_side_barcodes=*/50,
+            /*search_min=*/hazard_search_min, /*min_side_barcodes=*/50,
             /*min_absolute_gain=*/50,
             /*min_fractional_gain=*/0.01,
             /*max_stability_spread_h=*/0.5,
@@ -3299,7 +3307,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         hazard_result = compute_upper_tail_adjusted_hazard(
             hazard_scores, sd.bw, preliminary_floor,
             preliminary_threshold, upper_mode_bound,
-            /*search_min=*/1.0, /*min_survivors=*/50,
+            /*search_min=*/hazard_search_min, /*min_survivors=*/50,
             /*min_prominence=*/0.05);
     }
 
@@ -4115,6 +4123,8 @@ inline std::string default_scan_wl_rescan_prefix(std::string input_path) {
 }
 
 
+#include "spatial_scan.hpp"
+
 void usage_scan_wl(const char* program_name) {
     std::cout << "Usage: " << program_name << " [options]\n"
               << "Options:\n"
@@ -4143,7 +4153,20 @@ void usage_scan_wl(const char* program_name) {
               << "  -2, --bc2-whitelist FILE    BC2 whitelist kit key or path\n"
               << "  -u, --umi-length INT        UMI length between primer and BC1 [default: 9]\n"
               << "      --offset-min INT        Min extra bases after UMI to start BC1 search [default: 0]\n"
-              << "      --offset-max INT        Max extra bases after UMI to start BC1 search [default: 3]\n";
+              << "      --offset-max INT        Max extra bases after UMI to start BC1 search [default: 3]\n"
+              << "\nSpatial barcode discovery:\n"
+              << "      --spatial              Discover barcodes using a slide coordinate map\n"
+              << "      --visium | --visium-hd | --curio-seeker | --curio-trekker | --stereo-seq\n"
+              << "                             Select exactly one spatial platform\n"
+              << "      --slide FILE_OR_ID     Coordinate table or registered slide/tile ID\n"
+              << "      --slide-map FILE       Explicit coordinate table for the slide ID\n"
+              << "      --slide-dir DIR        Look up DIR/<platform>/<slide>.tsv[.gz] or .csv[.gz]\n"
+              << "      --bc1-axis FILE        HD barcode/array_col table (native 2 um indices)\n"
+              << "      --bc2-axis FILE        HD barcode/array_row table (native 2 um indices)\n"
+              << "  Without -i: export slide barcodes and coordinates. With --rescan: use barcode/count input.\n"
+              << "  HD default: at least 32 of 64 native 2 um spots observed per aligned 16 x 16 um region.\n"
+              << "              Only observed barcodes in passing regions enter the whitelist.\n"
+              << "  Ordinary Visium: regular RAD calling. Curio/Stereo-seq: low-count candidate floor.\n";
 }
 
 inline int cmd_scan_wl(int argc, char* argv[]) {
@@ -4155,6 +4178,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
     double max_error = kDefaultScanWlMaxErrorRatio;
     bool verbose = false, af_bcs = false, hs_bcs = false, rescan = false;
     bool bc_length_explicit = false;
+    rad_scan_spatial::Options spatial;
 
     static struct option long_options[] = {
         {"input",          required_argument, 0, 'i'},
@@ -4177,6 +4201,17 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
         {"af-bcs",          no_argument,       0,  5 },
         {"hs-bcs",          no_argument,       0,  6 },
         {"rescan",          no_argument,       0,  7 },
+        {"spatial",        no_argument,       0, 20 },
+        {"visium",         no_argument,       0, 21 },
+        {"visium-hd",      no_argument,       0, 22 },
+        {"curio-seeker",   no_argument,       0, 23 },
+        {"curio-trekker",  no_argument,       0, 24 },
+        {"stereo-seq",     no_argument,       0, 25 },
+        {"slide",          required_argument, 0, 26 },
+        {"slide-map",      required_argument, 0, 27 },
+        {"slide-dir",      required_argument, 0, 28 },
+        {"bc1-axis",       required_argument, 0, 29 },
+        {"bc2-axis",       required_argument, 0, 30 },
         // Backward-compatible aliases
         {"hd-offset-min",  required_argument, 0,  3 },
         {"hd-offset-max",  required_argument, 0,  4 },
@@ -4211,13 +4246,24 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             case  5 : af_bcs = true; break;
             case  6 : hs_bcs = true; break;
             case  7 : rescan = true; break;
+            case 20: spatial.enabled = true; break;
+            case 21: spatial.platform = "visium"; ++spatial.platform_flags; break;
+            case 22: spatial.platform = "visium-hd"; ++spatial.platform_flags; break;
+            case 23: spatial.platform = "curio-seeker"; ++spatial.platform_flags; break;
+            case 24: spatial.platform = "curio-trekker"; ++spatial.platform_flags; break;
+            case 25: spatial.platform = "stereo-seq"; ++spatial.platform_flags; break;
+            case 26: spatial.slide = optarg; break;
+            case 27: spatial.slide_map = optarg; break;
+            case 28: spatial.slide_dir = optarg; break;
+            case 29: spatial.bc1_axis = optarg; break;
+            case 30: spatial.bc2_axis = optarg; break;
             case 'v': verbose = true; break;
             case 'h': usage_scan_wl(argv[0]); return 0;
             default: usage_scan_wl(argv[0]); return 1;
         }
     }
     
-    if (!rescan && adapter_seq.empty()) {
+    if (!rescan && !spatial.enabled && adapter_seq.empty()) {
         std::cerr << "Error: Missing required adapter sequence\n";
         usage_scan_wl(argv[0]);
         return 1;
@@ -4228,6 +4274,25 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
     }
     if (af_bcs && hs_bcs) {
         std::cerr << "Error: --af-bcs and --hs-bcs are mutually exclusive\n";
+        return 1;
+    }
+    if (spatial.enabled) {
+        if (!batch_csv_file.empty() || !whitelist_file.empty()) {
+            std::cerr << "Error: spatial scans use one slide per run and its coordinate catalogue; --batch-csv/-w do not apply\n";
+            return 1;
+        }
+        if (optind != argc) {
+            std::cerr << "Error: unexpected positional argument\n";
+            return 1;
+        }
+        return rad_scan_spatial::run(spatial, input_file, output_prefix, adapter_seq,
+            bc_length, bc_length_explicit, rescan, m_left, m_right, max_reads, max_error,
+            chunk_size, num_threads, umi_length, offset_min, offset_max,
+            bc1_whitelist_file, bc2_whitelist_file, af_bcs, hs_bcs, verbose);
+    }
+    if (spatial.platform_flags || !spatial.slide.empty() || !spatial.slide_map.empty() ||
+        !spatial.slide_dir.empty() || !spatial.bc1_axis.empty() || !spatial.bc2_axis.empty()) {
+        std::cerr << "Error: spatial platform and slide options require --spatial\n";
         return 1;
     }
 
