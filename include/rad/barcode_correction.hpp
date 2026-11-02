@@ -2496,12 +2496,14 @@ class whitelist {
         return out;
     }
 /**
- * @brief Load barcodes from a specified kit name or file path
+ * @brief Stream parsed barcodes from a specified kit name or file path
  * @param spec: Kit name or file path to load barcodes from
  * @param default_length: Default length of barcodes if not specified
- * @return Unordered set of `int64_seq` representing loaded barcodes
+ * @param consume: Callback receiving each parsed barcode
  */
-    static std::unordered_set<int64_seq> load_barcodes(std::string const &spec, uint16_t default_length, bool verbose) {
+    template <typename Consumer>
+    static void stream_barcodes(std::string const &spec, uint16_t default_length, bool verbose,
+                                Consumer&& consume) {
         if (verbose) std::cout << "[load_barcodes] Loading barcodes from path/kit: " << spec << "\n";
         // check if spec is a kit name or a file path
         if (verbose) {
@@ -2520,9 +2522,7 @@ class whitelist {
             std::cout << "[check_if_bitlist] Detected element " << islist << " a bit-configured whitelist!" << std::endl;
         }
 
-        // Stream whitelist rows directly into the set.  The previous
-        // import_text() call retained every source line while also building the
-        // encoded set, creating an avoidable second full-whitelist peak.
+        // Keep source parsing identical for staged and direct imports.
         std::unique_ptr<std::istream> in;
         if (path.size() > 3 && path.substr(path.size() - 3) == ".gz") {
             in = std::make_unique<igzstream>(path.c_str());
@@ -2533,7 +2533,6 @@ class whitelist {
             throw std::runtime_error("Failed to open whitelist: " + path);
         }
 
-        std::unordered_set<int64_seq> out;
         std::string ln;
         while (std::getline(*in, ln)) {
             if (ln.empty()) continue;
@@ -2551,8 +2550,58 @@ class whitelist {
                 seq.sequence_to_bits(tok);
                 if (seq.bits.empty()) continue;
             }
-            out.insert(seq);
+            consume(seq);
         }
+    }
+
+    static std::unordered_set<int64_seq> load_barcodes(std::string const &spec, uint16_t default_length, bool verbose) {
+        std::unordered_set<int64_seq> out;
+        stream_barcodes(spec, default_length, verbose, [&](const int64_seq& seq) {
+            out.insert(seq);
+        });
+        return out;
+    }
+
+    wl_entry import_single_whitelist(std::string const &spec, uint16_t default_length, bool verbose) {
+        constexpr size_t global_threshold = 100000;
+        wl_entry out;
+        std::unordered_set<int64_seq> prefix;
+        prefix.reserve(global_threshold);
+        bool global = false;
+        auto insert_global = [&](const int64_seq& seq) {
+            if (seq.bits.empty()) return;
+            barcode_entry entry;
+            entry.barcode = seq;
+            entry.filtered = false;
+            out.global_bcs.emplace(seq, std::move(entry));
+        };
+        stream_barcodes(spec, default_length, verbose, [&](const int64_seq& seq) {
+            if (global) {
+                insert_global(seq);
+                return;
+            }
+            // Count the same distinct parsed keys as load_barcodes, including
+            // its length-zero sentinel, before choosing the whitelist role.
+            prefix.insert(seq);
+            if (prefix.size() >= global_threshold) {
+                global = true;
+                for (const auto& buffered : prefix) insert_global(buffered);
+                std::unordered_set<int64_seq>().swap(prefix);
+            }
+        });
+        if (!global) {
+            for (const auto& seq : prefix) {
+                if (seq.bits.empty()) continue;
+                barcode_entry entry;
+                entry.barcode = seq;
+                entry.filtered = false;
+                out.true_bcs.emplace(seq, std::move(entry));
+            }
+        }
+        std::cout << "[populate_entry] Single whitelist populated "
+                  << (global ? "global_bcs: " + std::to_string(out.global_bcs.size())
+                             : "true_bcs: " + std::to_string(out.true_bcs.associations.size()))
+                  << " (classification buffer limited to " << global_threshold << " distinct keys).\n";
         return out;
     }
 /**
@@ -2632,6 +2681,49 @@ class whitelist {
                 //be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
             }
+        }
+    }
+
+    void populate_entry(wl_entry &out, std::vector<std::unordered_set<int64_seq>> &&sets) {
+        auto drain = [&](std::unordered_set<int64_seq>& source, auto& destination,
+                         bool exclude_true = false) {
+            while (!source.empty()) {
+                auto current = source.begin();
+                const auto& seq = *current;
+                if (!seq.bits.empty() && (!exclude_true || !out.true_bcs.check_wl_for(seq))) {
+                    barcode_entry entry;
+                    entry.barcode = seq;
+                    entry.filtered = false;
+                    destination.emplace(seq, std::move(entry));
+                }
+                source.erase(current);
+            }
+            std::unordered_set<int64_seq>().swap(source);
+        };
+        if (sets.size() == 1) {
+            const size_t data_size = sets[0].size();
+            const bool global = data_size >= 100000;
+            std::cout << "[populate_entry] Single whitelist with " << data_size << " barcodes detected.\n";
+            std::cout << "[populate_entry] Populating " << (global ? "global_bcs" : "true_bcs") << "...\n";
+            if (global) drain(sets[0], out.global_bcs);
+            else drain(sets[0], out.true_bcs);
+            std::cout << "[populate_entry] Population complete. Size of "
+                      << (global ? "global_bcs: " + std::to_string(out.global_bcs.size())
+                                 : "true_bcs: " + std::to_string(out.true_bcs.associations.size()))
+                      << "\n";
+            return;
+        }
+        // Choose both roles before draining changes either source cardinality.
+        const size_t size_a = sets[0].size();
+        const size_t size_b = sets[1].size();
+        if (size_a != size_b) {
+            const size_t small = size_a < size_b ? 0 : 1;
+            const size_t large = 1 - small;
+            drain(sets[small], out.true_bcs);
+            drain(sets[large], out.global_bcs, true);
+        } else {
+            drain(sets[0], out.true_bcs);
+            drain(sets[1], out.true_bcs);
         }
     }
     
@@ -2775,6 +2867,9 @@ class whitelist {
                                           : "barcode queries longer than 32 bases") << '\n';
         }
 
+        if (specs.size() == 1)
+            return import_single_whitelist(specs.front(), default_length, verbose);
+
         std::vector<std::unordered_set<int64_seq>> sets;
         for (auto const &spec : specs) {
             sets.push_back(load_barcodes(spec, default_length, verbose));
@@ -2784,7 +2879,7 @@ class whitelist {
         wl_entry out;
         out.global_bcs.clear();
         out.true_bcs.clear();
-        populate_entry(out, sets);
+        populate_entry(out, std::move(sets));
         return out;
     }
 
