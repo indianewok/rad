@@ -16,7 +16,7 @@ static std::string dna(uint64_t word, unsigned length) {
     }
     return result;
 }
-static bool brute(const observations& observed, packed_barcode b, int cap) {
+static bool brute(const observations& observed, whitelist_relevance::packed_barcode b, int cap) {
     if (observed.exact.count(b)) return true;
     for (const auto& query : observed.raw)
         if (query.length == b.length && hamming_distance(query.bits, b.bits) <= cap) return true;
@@ -72,13 +72,42 @@ int main() {
     observations invalid;
     invalid.add("NCGT", "AACGTN");
     require(invalid.raw.empty(), "ambiguous barcode became an observed raw identity");
-    packed_barcode acgt;
+    whitelist_relevance::packed_barcode acgt;
     require(pack("ACGT", acgt), "packing failed");
     candidate_index invalid_index(invalid, 2);
     require(invalid_index.contains(acgt.bits, acgt.length), "valid shifted kmer next to N was lost");
     require(reverse_complement(reverse_complement(acgt)) == acgt, "RC encoding failed");
-    invalid.add(std::string(33, 'A'), std::string(39, 'A'));
+    invalid.add(std::string(65, 'A'), std::string(71, 'A'));
     require(invalid.unsupported_long_queries == 1, "long-query fallback not recorded");
+    observations wide;
+    for (unsigned length : {33U, 63U, 64U}) {
+        for (unsigned i = 0; i < 8; ++i) {
+            std::string raw(length, 'A');
+            for (char& base : raw) base = "ACTG"[random() & 3];
+            wide.add(raw, "GAT" + raw + "TGC");
+        }
+    }
+    require(wide.raw.empty() && !wide.raw_wide.empty(), "wide observations entered the narrow set");
+    observations wide_copy;
+    wide_copy.merge(wide);
+    for (int cap = 0; cap <= 3; ++cap) {
+        candidate_index index(wide_copy, cap);
+        for (const auto& query : wide.raw_wide) {
+            for (int trial = 0; trial < 30; ++trial) {
+                uint128_t target = query.bits;
+                for (int edit = 0; edit < trial % 6; ++edit)
+                    target ^= uint128_t(1 + random() % 3) << (2 * (random() % query.length));
+                bool expected = wide.exact_wide.count({target, query.length}) != 0;
+                for (const auto& raw : wide.raw_wide)
+                    if (raw.length == query.length && hamming_distance(raw.bits, target) <= cap) expected = true;
+                require(index.contains(target, query.length) == expected,
+                        "wide index differs from exhaustive Hamming/exact union");
+                ++comparisons;
+            }
+        }
+        for (const auto& exact : wide.exact_wide)
+            require(index.contains(exact.bits, exact.length), "lost wide exact shifted-window or RC key");
+    }
     observations empty;
     candidate_index empty_index(empty, 2);
     require(!empty_index.contains(acgt.bits, 4), "empty discovery retained an unrelated key");

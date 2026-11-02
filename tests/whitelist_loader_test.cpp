@@ -24,8 +24,8 @@ static std::optional<int64_seq> call(const ReadLayout& layout, const std::string
 }
 static std::unordered_set<int64_seq> identities(const whitelist::wl_entry& entry) {
     std::unordered_set<int64_seq> result;
-    for (const auto* e : entry.global_bcs.get_unique_entries()) result.insert(e->barcode);
-    for (const auto* e : entry.true_bcs.get_unique_entries()) result.insert(e->barcode);
+    for (const auto e : entry.global_bcs.get_unique_entries()) result.insert(e.barcode());
+    for (const auto e : entry.true_bcs.get_unique_entries()) result.insert(e.barcode());
     return result;
 }
 int main() {
@@ -46,7 +46,7 @@ int main() {
         const std::string line = sequence + "\t10\t20\n";
         out << line;
         const int64_seq packed(sequence);
-        bitout << packed.bits[0] << '\n';
+        bitout << static_cast<int64_t>(packed.as_uint64()) << '\n';
         require(gzwrite(compressed, line.data(), static_cast<unsigned>(line.size())) == static_cast<int>(line.size()),
                 "gzip fixture write failed");
     }
@@ -89,9 +89,9 @@ int main() {
         require(selected.wl_map["barcode"].global_bcs.size() < 1000, "unrelated catalog rows retained");
         whitelist_relevance::candidate_index index(observed, cap);
         size_t expected = 0;
-        for (const auto* entry : full.wl_map["barcode"].global_bcs.get_unique_entries()) {
-            const auto& b = entry->barcode;
-            const bool reachable = index.contains(static_cast<uint64_t>(b.bits[0]), b.length);
+        for (const auto entry : full.wl_map["barcode"].global_bcs.get_unique_entries()) {
+            const auto b = entry.barcode();
+            const bool reachable = index.contains(b.as_uint64(), b.length);
             require(selected.wl_map["barcode"].global_bcs.check_wl_for(b) == reachable,
                     "streamed retained set differs from complete catalog reachability set");
             expected += reachable;

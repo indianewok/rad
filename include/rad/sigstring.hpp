@@ -1136,10 +1136,11 @@ namespace barcode_correction {
             }
 
             auto unique_entries = typed_wl.get_unique_entries();
-            for (const auto* entry : unique_entries) {
-                int res = mutation_tools::int64_lvdist(bc, entry->barcode, max_dist);
+            for (const auto entry : unique_entries) {
+                const auto barcode = entry.barcode();
+                int res = mutation_tools::int64_lvdist(bc, barcode, max_dist);
                 if (res >= 0) {
-                    match.emplace_back(entry->barcode, res);
+                    match.emplace_back(barcode, res);
                 }
             }
             return match;
@@ -1411,8 +1412,8 @@ namespace barcode_correction {
         if (!seed_entries.empty()) {
             std::unordered_set<int64_seq> seed_candidates;
             seed_candidates.reserve(seed_entries.size());
-            for (const auto* e : seed_entries) {
-                if (e) seed_candidates.insert(e->barcode);
+            for (const auto e : seed_entries) {
+                if (e) seed_candidates.insert(e.barcode());
             }
 
             auto seed_result = check_against_wl(
@@ -1813,13 +1814,10 @@ namespace barcode_correction {
         exp_bc.sequence_to_bits(expanded_seq);
         const int W = exp_bc.length;
         const int L = result->length;
-        if (exp_bc.is_valid() && result->is_valid() && L >= 1 && L <= 32 && W <= 32 && W >= L) {
-            const int64_t mask = (L == 32) ? ~int64_t{0} : ((int64_t{1} << (2 * L)) - 1);
-            const int64_t wanted = result->bits[0] & mask;
+        if (exp_bc.is_valid() && result->is_valid() && W >= L) {
             int copies = 0, copy_end = -1;
             for (int i = 0; i + L <= W; ++i) {
-                const int64_t kmer = (exp_bc.bits[0] >> (2 * (W - L - i))) & mask;
-                if (kmer == wanted) {
+                if (exp_bc.slice(i, L) == *result) {
                     ++copies;
                     copy_end = i + L - 1;
                 }
@@ -1827,7 +1825,6 @@ namespace barcode_correction {
             if (copies >= 1) {
                 pos->set_from_match(copy_end, copies);
             } else if (pos->kind == bc_position::located && pos->end == W - 1) {
-                // inexact match at the window's last column: the barcode may continue past it
                 pos->kind = bc_position::clipped;
             }
         }
@@ -4128,16 +4125,16 @@ private:
 
         // Single-lookup resolution: find the entry once in true, then global.
         // Stash the counter pointer on the element so update_bc_counts avoids re-lookup.
-        barcode_entry* entry = nullptr;
+        counter* resolved = nullptr;
         bool found_in_true = false;
         bool found_in_global = false;
 
-        entry = wl.true_bcs.find_entry(corrected_barcode);
-        if (entry) {
+        resolved = wl.true_bcs.find_counter(corrected_barcode);
+        if (resolved) {
             found_in_true = true;
         } else {
-            entry = wl.global_bcs.find_entry(corrected_barcode);
-            if (entry) found_in_global = true;
+            resolved = wl.global_bcs.find_counter(corrected_barcode);
+            if (resolved) found_in_global = true;
         }
 
         bool true_wl_empty = wl.true_bcs.empty();
@@ -4150,7 +4147,7 @@ private:
             e.seq = final_bc;
             e.element_pass = true;
             e.write = found_in_true || (true_wl_empty && found_in_global);
-            e.resolved_counter = entry ? &entry->count : nullptr;
+            e.resolved_counter = resolved;
             // Check if corrected: different from original (and not just its RC)
             if (e.original_seq.has_value() && !e.original_seq->empty()) {
                 const std::string& orig = e.original_seq.value();

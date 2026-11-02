@@ -124,6 +124,12 @@ if(BUILD_TESTING)
     add_executable(concat_hmm_router_test tests/concat_hmm_router_test.cpp)
     target_link_libraries(concat_hmm_router_test PRIVATE rad_lib)
     add_test(NAME concat_hmm_router COMMAND concat_hmm_router_test)
+    add_executable(packed_sequence_test tests/packed_sequence_test.cpp)
+    target_link_libraries(packed_sequence_test PRIVATE rad_lib)
+    add_test(NAME packed_sequence COMMAND packed_sequence_test)
+    add_executable(barcode_storage_test tests/barcode_storage_test.cpp)
+    target_link_libraries(barcode_storage_test PRIVATE rad_lib)
+    add_test(NAME barcode_storage COMMAND barcode_storage_test)
 endif()
 
 # Keep the bundled layout resources and their registered kit paths in sync.

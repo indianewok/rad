@@ -1,5 +1,6 @@
 #pragma once
 #include "rad_headers.h"
+#include "packed_sequence.hpp"
 #include <boost/math/distributions/poisson.hpp>
 #include <cerrno>
 
@@ -99,12 +100,49 @@ static inline std::string unpack_scan_barcode(packed_scan_barcode packed) {
 
 // Reference-guided scan-wl keeps its large whitelist as a compact membership
 // set and allocates counters only for barcodes actually observed in the input.
-// Canonical barcodes longer than 31 bases use the existing int64_seq lookup
-// path, which supports multiple 64-bit chunks.
+// Longer barcodes use separate native-word sets without the scan sentinel.
+struct scan_long_whitelist {
+    std::unordered_set<packed_barcode<uint64_t>> narrow;
+    std::unordered_set<packed_barcode<uint128_t>> wide;
+
+    bool empty() const noexcept { return narrow.empty() && wide.empty(); }
+    size_t size() const noexcept { return narrow.size() + wide.size(); }
+    void insert(const int64_seq& sequence) {
+        if (!sequence.is_valid()) return;
+        sequence.visit([&](auto word) {
+            using Word = decltype(word);
+            if constexpr (std::is_same_v<Word, uint64_t>)
+                narrow.insert({word, sequence.length});
+            else
+                wide.insert({word, sequence.length});
+        });
+    }
+    template <typename Word>
+    void emplace(Word word, uint16_t length) { insert(int64_seq::from_word(word, length)); }
+    bool contains(const int64_seq& sequence) const {
+        if (!sequence.is_valid()) return false;
+        return sequence.visit([&](auto word) {
+            using Word = decltype(word);
+            if constexpr (std::is_same_v<Word, uint64_t>)
+                return narrow.count({word, sequence.length}) != 0;
+            else
+                return wide.count({word, sequence.length}) != 0;
+        });
+    }
+};
+
+template <typename Set>
+static inline bool scan_whitelist_contains(const Set& set, const int64_seq& sequence) {
+    return set.find(sequence) != set.end();
+}
+static inline bool scan_whitelist_contains(const scan_long_whitelist& set, const int64_seq& sequence) {
+    return set.contains(sequence);
+}
+
 struct scan_whitelist_filter {
     packed_reference_set packed_barcodes;
     packed_observed_count_map observed_counts;
-    std::unordered_set<int64_seq> long_barcodes;
+    scan_long_whitelist long_barcodes;
 
     bool empty() const {
         return packed_barcodes.empty() && long_barcodes.empty();
@@ -172,35 +210,17 @@ static scan_whitelist_filter load_scan_whitelist(
         }
 
         if (is_bitlist) {
-            size_t consumed = 0;
-            uint64_t raw_bits = 0;
-            try {
-                raw_bits = std::stoull(token, &consumed);
-            } catch (...) {
+            int64_seq encoded;
+            if (!parse_packed_decimal(token, default_length, encoded, true)) {
                 ++malformed;
                 continue;
             }
-            if (consumed != token.size() || default_length == 0) {
-                ++malformed;
-                continue;
-            }
-
             if (default_length <= 31) {
-                const uint64_t max_bits =
-                    (uint64_t{1} << (2 * default_length)) - 1;
-                if (raw_bits > max_bits) {
-                    ++malformed;
-                    continue;
-                }
                 const packed_scan_barcode key =
-                    (uint64_t{1} << (2 * default_length)) | raw_bits;
+                    (uint64_t{1} << (2 * default_length)) | encoded.as_uint64();
                 out.packed_barcodes.insert(key);
-            } else if (default_length == 32) {
-                out.long_barcodes.emplace(
-                    static_cast<int64_t>(raw_bits), default_length);
             } else {
-                // A one-column int64 bitlist cannot encode more than 32 bases.
-                ++malformed;
+                out.long_barcodes.insert(encoded);
             }
             continue;
         }
@@ -211,8 +231,7 @@ static scan_whitelist_filter load_scan_whitelist(
             continue;
         }
 
-        if (token.size() > 31 &&
-            token.size() <= std::numeric_limits<uint16_t>::max()) {
+        if (token.size() > 31 && token.size() <= 64) {
             int64_seq encoded(token);
             if (encoded.is_valid() &&
                 encoded.length == static_cast<uint16_t>(token.size())) {
@@ -1149,8 +1168,7 @@ barcode_count_result process_fastq(const std::string& input_path,
                 }
                 for (const auto& kv : long_chunk_counts) {
                     int64_seq encoded(kv.first);
-                    if (whitelist_filter->long_barcodes.find(encoded) !=
-                        whitelist_filter->long_barcodes.end()) {
+                    if (whitelist_filter->long_barcodes.contains(encoded)) {
                         auto inserted =
                             results.counts.try_emplace(kv.first, 0);
                         inserted.first->second += kv.second;
@@ -3007,8 +3025,9 @@ evaluate_adaptive_hazard_saddle(
     return result;
 }
 
+template <typename WhitelistSet = std::unordered_set<int64_seq>>
 bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barcodes,
-                                      const std::unordered_set<int64_seq>& whitelist_set,
+                                      const WhitelistSet& whitelist_set,
                                       const std::string& output_csv, const std::string text_out,
                                       bool verbose = false,
                                       scan_whitelist_selection selection =
@@ -3055,7 +3074,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         // Skip if whitelist provided and sequence not in whitelist
         if (use_whitelist && !extracted_barcodes.filtered_to_whitelist) {
             int64_seq encoded(seq);
-            if (whitelist_set.find(encoded) == whitelist_set.end()) {
+            if (!scan_whitelist_contains(whitelist_set, encoded)) {
                 continue;
             }
         }
@@ -3866,8 +3885,9 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
 // Two-part barcode mode still needs the observed BC1/BC2 pairs for its pair
 // matrix outputs.  Collapse its combined sequences before entering the shared
 // statistics path and, critically, avoid reserving hash buckets for every read.
+template <typename WhitelistSet = std::unordered_set<int64_seq>>
 bool count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted_barcodes,
-                                      const std::unordered_set<int64_seq>& whitelist_set,
+                                      const WhitelistSet& whitelist_set,
                                       const std::string& output_csv, const std::string text_out,
                                       bool verbose = false,
                                       scan_whitelist_selection selection =

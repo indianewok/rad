@@ -1946,9 +1946,9 @@ public:
             auto &E = entry_ref.get();
             std::unordered_set<int64_seq> to_remove;
             to_remove.reserve(E.true_bcs.size());
-            for (auto const & [bc,be] : E.true_bcs){
-                to_remove.insert(bc);
-            }
+            E.true_bcs.for_each_association([&](const auto& barcode, const auto&) {
+                to_remove.emplace(barcode);
+            });
 
             for (auto const &bc : to_remove){
                 E.global_bcs.remove_bc_entry(bc);
@@ -2005,12 +2005,11 @@ public:
         if (whitelist_type == "true" || whitelist_type == "both") {
             std::unordered_set<int64_seq> seen_true;
             seen_true.reserve(entry.true_bcs.size());
-            for (auto const &kv : entry.true_bcs) {
-                auto cnt = kv.second.count.load(barcode_counts::total);
-                if (cnt > 0) {
-                    seen_true.insert(kv.second.barcode);
+            entry.true_bcs.for_each_entry([&](const auto& value) {
+                if (value.count.load(barcode_counts::total) > 0) {
+                    seen_true.emplace(value.barcode);
                 }
-            }
+            });
 
             if (!seen_true.empty()) {
                 entry.true_bcs.write_wl_summary(out, class_id, &seen_true);
@@ -2020,12 +2019,11 @@ public:
         if ((whitelist_type == "global" || whitelist_type == "both") && full) {
             std::unordered_set<int64_seq> seen_global;
             seen_global.reserve(entry.global_bcs.size());
-            for (auto const &kv : entry.global_bcs) {
-                auto cnt = kv.count.load(barcode_counts::total);
-                if (cnt > 0) {
-                    seen_global.insert(kv.barcode);
+            entry.global_bcs.for_each_entry([&](const auto& value) {
+                if (value.count.load(barcode_counts::total) > 0) {
+                    seen_global.emplace(value.barcode);
                 }
-            }
+            });
             
             if (!seen_global.empty()) {
                 entry.global_bcs.write_wl_summary(out, class_id, &seen_global);

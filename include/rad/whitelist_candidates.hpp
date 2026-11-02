@@ -34,7 +34,8 @@ inline bool parse_nonnegative_int(const char* text, int& value) {
     } catch (...) { return false; }
 }
 
-inline std::string unpack(whitelist_relevance::packed_barcode barcode) {
+template <typename Word>
+inline std::string unpack(::packed_barcode<Word> barcode) {
     std::string sequence(barcode.length, 'A');
     for (size_t i = sequence.size(); i > 0; --i) {
         sequence[i - 1] = "ACTG"[barcode.bits & 3U];
@@ -43,24 +44,22 @@ inline std::string unpack(whitelist_relevance::packed_barcode barcode) {
     return sequence;
 }
 
+template <typename Word>
 inline bool parse_catalog_token(const std::string& token, uint16_t numeric_length,
-        whitelist_relevance::packed_barcode& barcode) {
+        ::packed_barcode<Word>& barcode) {
     if (whitelist_relevance::pack(token, barcode)) return true;
-    if (token.empty() || numeric_length == 0 || numeric_length > 32) return false;
+    if (token.empty() || numeric_length == 0 || numeric_length > sizeof(Word) * 4) return false;
     const size_t first = token.front() == '-' ? 1 : 0;
     if (first == token.size() || !std::all_of(token.begin() + first, token.end(),
             [](unsigned char c) { return std::isdigit(c); })) return false;
-    try {
-        size_t consumed = 0;
-        if (first && numeric_length != 32) return false;
-        const uint64_t bits = first
-            ? static_cast<uint64_t>(std::stoll(token, &consumed))
-            : std::stoull(token, &consumed);
-        if (consumed != token.size() || (numeric_length < 32 &&
-                bits >= (uint64_t{1} << (2 * numeric_length)))) return false;
-        barcode = {bits, numeric_length};
-        return true;
-    } catch (...) { return false; }
+    if (first && numeric_length != 32) return false;
+    int64_seq encoded;
+    if (!parse_packed_decimal(token, numeric_length, encoded, true)) return false;
+    if constexpr (std::is_same_v<Word, uint64_t>)
+        barcode = {encoded.as_uint64(), encoded.length};
+    else
+        barcode = {encoded.as_uint128(), encoded.length};
+    return true;
 }
 
 inline int run(const Options& options, const std::string& input,
@@ -104,10 +103,10 @@ inline int run(const Options& options, const std::string& input,
                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             if (flags.find("joint_barcode") != std::string::npos)
                 throw std::runtime_error("catalogue candidate generation supports non-joint barcode layouts only");
-            if (!element.expected_length || *element.expected_length <= 0 || *element.expected_length > 32 ||
+            if (!element.expected_length || *element.expected_length <= 0 || *element.expected_length > 64 ||
                     std::any_of(element.length_candidates.begin(), element.length_candidates.end(),
-                        [](int length) { return length <= 0 || length > 32; }))
-                throw std::runtime_error("catalogue candidate generation supports barcode lengths 1..32 only");
+                        [](int length) { return length <= 0 || length > 64; }))
+                throw std::runtime_error("catalogue candidate generation supports barcode lengths 1..64 only");
             lengths.insert(static_cast<uint16_t>(*element.expected_length));
             if (layout.position_map.find(element.class_id) == layout.position_map.end())
                 throw std::runtime_error("prepared position map is missing barcode coordinates: " + element.class_id);
@@ -128,9 +127,10 @@ inline int run(const Options& options, const std::string& input,
         const double query_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - query_started).count();
         auto& observed = observations[*classes.begin()];
         if (observed.unsupported_long_queries)
-            throw std::runtime_error("observed barcode queries longer than 32 bases are unsupported for candidate generation");
+            throw std::runtime_error("observed barcode queries longer than 64 bases are unsupported for candidate generation");
         whitelist_relevance::candidate_index index(observed, options.mismatches);
         whitelist_relevance::barcode_set retained;
+        whitelist_relevance::wide_barcode_set retained_wide;
         uint64_t rows = 0, valid_rows = 0, skipped_rows = 0;
         const auto catalog_started = std::chrono::steady_clock::now();
         // zlib transparently reads plain files too, and exposes truncation/CRC
@@ -143,10 +143,20 @@ inline int run(const Options& options, const std::string& input,
             ++rows;
             const auto delimiter = line.find_first_of(",\t");
             const std::string token = seq_utils::trim(delimiter == std::string::npos ? line : line.substr(0, delimiter));
-            whitelist_relevance::packed_barcode barcode;
-            if (!parse_catalog_token(token, *lengths.begin(), barcode)) { ++skipped_rows; return; }
-            ++valid_rows;
-            if (index.contains(barcode.bits, barcode.length)) retained.insert(barcode);
+            auto retain = [&](auto& destination) {
+                using Barcode = typename std::decay_t<decltype(destination)>::value_type;
+                Barcode barcode;
+                if (!parse_catalog_token(token, *lengths.begin(), barcode)) return false;
+                ++valid_rows;
+                if (index.contains(barcode.bits, barcode.length)) destination.insert(barcode);
+                return true;
+            };
+            const bool numeric = !token.empty() &&
+                (std::isdigit(static_cast<unsigned char>(token.front())) || token.front() == '-');
+            const size_t length = numeric ? *lengths.begin() : token.size();
+            const bool parsed = length <= 32 ? retain(retained)
+                              : length <= 64 ? retain(retained_wide) : false;
+            if (!parsed) ++skipped_rows;
         };
         std::array<char, 65536> buffer;
         std::string line;
@@ -167,8 +177,9 @@ inline int run(const Options& options, const std::string& input,
         if (!valid_rows) throw std::runtime_error("catalogue contains no valid barcode identities: " + catalog_path);
         const double catalog_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - catalog_started).count();
         std::vector<std::string> candidates;
-        candidates.reserve(retained.size());
+        candidates.reserve(retained.size() + retained_wide.size());
         for (const auto& barcode : retained) candidates.push_back(unpack(barcode));
+        for (const auto& barcode : retained_wide) candidates.push_back(unpack(barcode));
         std::sort(candidates.begin(), candidates.end());
         if (!ensure_output_directory(prefix)) return 1;
         temporary_outputs temporary;
@@ -188,8 +199,8 @@ inline int run(const Options& options, const std::string& input,
             << "\nrequested_max_reads=" << max_reads << "\nthreads=" << threads
             << "\nconcat_hmm_requested=" << options.concat_hmm << "\ncandidate_mismatches=" << options.mismatches
             << "\nquery_observations=" << observed.observations_seen
-            << "\nraw_orientation_keys=" << observed.raw.size()
-            << "\nexact_window_orientation_keys=" << observed.exact.size()
+            << "\nraw_orientation_keys=" << observed.raw_size()
+            << "\nexact_window_orientation_keys=" << observed.exact_size()
             << "\ncatalogue_rows=" << rows << "\ncatalogue_valid_rows=" << valid_rows
             << "\ncatalogue_skipped_rows=" << skipped_rows << "\nunique_candidate_identities=" << candidates.size()
             << "\nabundance_selection_applied=false\nspatial_selection_applied=false"
