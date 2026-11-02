@@ -685,7 +685,8 @@ public:
                     int num_threads, 
                     int64_t max_seqs = -1,
                     bool verbose = false,
-                    size_t log_every_chunks = 0) {
+                    size_t log_every_chunks = 0,
+                    bool fail_on_read_error = false) {
             file_streaming files(input_path, pigz_threads_);
             read_streaming reader(files);
 
@@ -741,6 +742,11 @@ public:
                         }
                     }
                 }
+            }
+            if (fail_on_read_error && reader.read_failed()) {
+                throw std::runtime_error("Failed while reading sequence input: " +
+                    reader.read_error_path() + " (parser code " +
+                    std::to_string(reader.read_error_code()) + ")");
             }
         }
 

@@ -6101,10 +6101,9 @@ public:
         return true;
     }
 
-    // Discover exactly the native pre-correction barcode queries. This pass
-    // does not filter barcodes, change count support, or write demux outputs.
-    // Selective loading is limited to non-joint catalogs, whose extraction is
-    // independent of whitelist membership.
+    // Collect native pre-correction queries for whitelist candidate generation.
+    // No abundance selection, barcode correction or demux output is performed.
+    // Non-joint catalogs have extraction independent of whitelist membership.
     template<class ObservationMap>
     static ObservationMap observe_whitelist_queries(const std::string& fastq_path,
             const ReadLayout& layout, int num_threads, size_t chunk_size,
@@ -6154,7 +6153,8 @@ public:
         };
         chunk_streaming<read_streaming::sequence, decltype(process_chunk)> streamer(chunk_size, num_threads);
         const int64_t limit = max_reads > 0 ? static_cast<int64_t>(max_reads) : -1;
-        streamer.process_chunks(fastq_path, process_chunk, 1, limit);
+        streamer.process_chunks(fastq_path, process_chunk, 1, limit,
+                                false, 0, /*fail_on_read_error=*/true);
         ObservationMap merged;
         for (const auto& worker : worker_observations)
             for (const auto& entry : worker) merged[entry.first].merge(entry.second);
