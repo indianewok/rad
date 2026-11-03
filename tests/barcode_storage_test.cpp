@@ -34,6 +34,10 @@ static int sequence_distance(const std::string& a, const std::string& b) {
     return a.size() <= b.size() ? infix_distance(a, b) : infix_distance(b, a);
 }
 int main() {
+    static_assert(std::tuple_size<decltype(counter{}.counts)>::value == 3,
+                  "Whitelist entries should store only three counters");
+    static_assert(sizeof(counter) == 3 * sizeof(std::atomic<int>),
+                  "Counter storage should have no removed reporting slots");
     std::mt19937_64 generator(918274);
     const auto short_text = random_dna(generator, 25);
     const auto wide_text = random_dna(generator, 33);
@@ -137,6 +141,43 @@ int main() {
     require(summary.str().find(full_text) != std::string::npos &&
             summary.str().find(short_text) != std::string::npos,
             "summary did not decode both resident widths");
+
+    std::istringstream exported(summary.str());
+    std::string line;
+    require(bool(std::getline(exported, line)) &&
+            line == "class_id,true_barcode,raw_count,total_count,corrected_count",
+            "whitelist summary retained removed counter columns");
+    while (std::getline(exported, line)) {
+        std::istringstream row(line);
+        std::vector<std::string> fields;
+        for (std::string field; std::getline(row, field, ',');) fields.push_back(field);
+        require(fields.size() == 5, "whitelist summary has unexpected counter fields");
+        const int64_seq key(fields[1]);
+        require(std::stoi(fields[2]) == catalog.get_bc_count(key, barcode_counts::raw) &&
+                std::stoi(fields[3]) == catalog.get_bc_count(key, barcode_counts::total) &&
+                std::stoi(fields[4]) == catalog.get_bc_count(key, barcode_counts::corrected),
+                "remaining counter columns changed meaning");
+    }
+    whitelist::wl_entry quality;
+    quality.global_bcs.insert_bc_entry(short_key, entry(short_text));
+    quality.global_bcs.set_bc_count(short_key, 1, barcode_counts::raw);
+    quality.global_bcs.set_bc_count(short_key, 10, barcode_counts::total);
+    quality.global_bcs.set_bc_count(short_key, 10, barcode_counts::corrected);
+    require(!barcode_correction::passes_quality_check(short_key, &quality, "global", "offensive", false) &&
+            quality.global_bcs.get_bc_count(short_key, barcode_counts::total) == -1,
+            "three-counter QC lost its signed rejection state");
+    quality.global_bcs.set_bc_count(short_key, 2, barcode_counts::raw);
+    require(barcode_correction::passes_quality_check(short_key, &quality, "global", "offensive", false) &&
+            quality.global_bcs.get_bc_count(short_key, barcode_counts::total) == 2 &&
+            quality.global_bcs.get_bc_count(short_key, barcode_counts::corrected) == 10,
+            "QC recovery reset the wrong counter");
+    quality.global_bcs.set_bc_count(short_key, 10, barcode_counts::total);
+    quality.global_bcs.set_bc_count(short_key, 9, barcode_counts::corrected);
+    require(!barcode_correction::passes_quality_check(short_key, &quality, "global", "offensive", false),
+            "three-counter QC ignored a high correction ratio");
+    quality.global_bcs.set_bc_count(short_key, 7, barcode_counts::corrected);
+    require(barcode_correction::passes_quality_check(short_key, &quality, "global", "offensive", false),
+            "three-counter QC rejected the passing correction ratio");
 
     const std::string numeric_path = "/tmp/rad-wide-numeric-" + std::to_string(getpid()) + ".tsv";
     const std::string mixed_path = "/tmp/rad-wide-mixed-" + std::to_string(getpid()) + ".tsv";

@@ -177,22 +177,18 @@ template <class T, class F> void for_each_key(const T& input, F&& fn) {
         for (const auto& element : input)
             for_each_key(element, fn);
 }
-using summary_row = std::tuple<std::string, int, int, int, int, int, int, int, int>;
+using summary_row = std::tuple<std::string, int, int, int>;
 inline summary_row summarize(const int64_seq& sequence, const counter* counts) {
     const counter zero;
     const auto& c = counts ? *counts : zero;
-    return {sequence.bits_to_sequence(), c.load(raw),        c.load(total),
-            c.load(corrected),           c.load(forw),       c.load(rev),
-            c.load(forw_concat),         c.load(rev_concat), c.load(filtered)};
+    return {sequence.bits_to_sequence(), c.load(raw), c.load(total), c.load(corrected)};
 }
 inline void write_header(std::ostream& out) {
-    out << "class_id,true_barcode,raw_count,total_count,corrected_count,forw_count,rev_count,"
-           "forw_concat_count,rev_concat_count,filtered_count\n";
+    out << "class_id,true_barcode,raw_count,total_count,corrected_count\n";
 }
 inline void write_row(std::ostream& out, const std::string& class_id, const summary_row& row) {
     out << class_id << ',' << std::get<0>(row) << ',' << std::get<1>(row) << ',' << std::get<2>(row) << ','
-        << std::get<3>(row) << ',' << std::get<4>(row) << ',' << std::get<5>(row) << ',' << std::get<6>(row)
-        << ',' << std::get<7>(row) << ',' << std::get<8>(row) << '\n';
+        << std::get<3>(row) << '\n';
 }
 template <class Word>
 using flat_entries = phmap::parallel_flat_hash_set<basic_barcode_entry<Word>, basic_barcode_entry_hash<Word>,

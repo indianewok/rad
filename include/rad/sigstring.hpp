@@ -865,7 +865,6 @@ namespace barcode_correction {
 
             int raw_count = all_counts.load(barcode_counts::raw);
             int total_count = all_counts.load(barcode_counts::total);
-            int filtered_count = all_counts.load(barcode_counts::filtered);
             int corrected_count = all_counts.load(barcode_counts::corrected);
                     
             if(total_count < 0 & raw_count < 2){
@@ -3177,7 +3176,6 @@ private:
             auto& cnt = *elem.resolved_counter;
 
             if (type == "filtered" || (type != elem.direction && type != "concatenate")) {
-                cnt.increment(barcode_counts::filtered);
                 continue;
             }
 
@@ -3186,16 +3184,6 @@ private:
             cnt.increment(elem.resolved_corrected
                 ? barcode_counts::corrected
                 : barcode_counts::raw);
-
-            if (from_concatemer || type == "concatenate") {
-                cnt.increment(elem.direction == "forward"
-                    ? barcode_counts::forw_concat
-                    : barcode_counts::rev_concat);
-            } else if (type == "forward" && elem.direction == "forward") {
-                cnt.increment(barcode_counts::forw);
-            } else if (type == "reverse" && elem.direction == "reverse") {
-                cnt.increment(barcode_counts::rev);
-            }
         }
     }
 

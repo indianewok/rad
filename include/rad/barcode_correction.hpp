@@ -7,37 +7,30 @@
  * @enum barcode_counts
  * @brief enumeration for different barcode count types
  * This enum defines indices for various barcode count categories used in the `counter` class.
- * The categories include raw counts, forward and reverse counts, concatenation counts,
- * total counts, corrected counts, and filtered counts.
+ * The categories are raw, total, and corrected assignments used by barcode QC.
  */
 enum barcode_counts {
     raw = 0,          // Raw count
-    forw = 1,         // Forward count
-    forw_concat = 2,  // Forward concatenation count
-    rev = 3,          // Reverse count
-    rev_concat = 4,   // Reverse concatenation count
-    total = 5,         // Total count
-    corrected = 6,     // Corrected count
-    filtered = 7       // filtered count
+    total = 1,        // Total count and QC rejection state
+    corrected = 2     // Corrected count
 };
 
 /**
  * @struct counter
  * @brief Thread-safe counter class using atomic integers for multiple barcode count types
  * This class provides atomic operations for counting various barcode-related metrics.
- * It uses an array of 8 atomic integers to store counts for different categories defined in the
+ * It uses an array of 3 atomic integers to store counts for different categories defined in the
  * `barcode_counts` enum. The class supports incrementing, decrementing, loading individual counts,
  * and loading all counts as a tuple.
  */
 struct counter {
-    // Use an array of 8 atomic ints
-    std::array<std::atomic<int>, 8> counts;
+    std::array<std::atomic<int>, 3> counts;
 
     // Default constructor: initialize all counters to 0.
-    counter() : counts{{0, 0, 0, 0, 0, 0, 0, 0}} { }
+    counter() : counts{{0, 0, 0}} { }
 
     // A constructor that initializes all counters to a given value
-    counter(int init) : counts{{init, init, init, init, init, init, init, init}} { }
+    counter(int init) : counts{{init, init, init}} { }
 
     // Copy constructor: copy each counter's current value
     counter(const counter &other) {
@@ -87,16 +80,11 @@ struct counter {
     }
 
     // Load all counter values into a tuple
-    std::tuple<int, int, int, int, int, int, int, int> load_all() const {
+    std::tuple<int, int, int> load_all() const {
         return std::make_tuple(
             counts[barcode_counts::raw].load(std::memory_order_relaxed),
-            counts[barcode_counts::forw].load(std::memory_order_relaxed),
-            counts[barcode_counts::forw_concat].load(std::memory_order_relaxed),
-            counts[barcode_counts::rev].load(std::memory_order_relaxed),
-            counts[barcode_counts::rev_concat].load(std::memory_order_relaxed),
             counts[barcode_counts::total].load(std::memory_order_relaxed),
-            counts[barcode_counts::corrected].load(std::memory_order_relaxed),
-            counts[barcode_counts::filtered].load(std::memory_order_relaxed)
+            counts[barcode_counts::corrected].load(std::memory_order_relaxed)
         );
     }
 };
