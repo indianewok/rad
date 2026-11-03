@@ -1767,6 +1767,7 @@ struct whitelist_scan_stats {
     double floor = 0.0;
     double threshold = 0.0;
     std::string threshold_rule;
+    bool spatial_low_counts = false;
     size_t above_floor_barcodes = 0;
     size_t final_barcodes = 0;
     size_t selected_barcodes = 0;
@@ -1777,7 +1778,8 @@ struct whitelist_scan_stats {
 inline bool write_whitelist_scan_log(const std::string& output_path,
                                      const std::string& input_path,
                                      const whitelist_scan_stats& stats,
-                                     double wall_time_seconds) {
+                                     double wall_time_seconds,
+                                     bool write_calling_profile = true) {
     std::ofstream out(output_path);
     if (!out) {
         std::cerr << "Error: could not open whitelist scan log for writing: "
@@ -1788,8 +1790,10 @@ inline bool write_whitelist_scan_log(const std::string& output_path,
     out << "RAD whitelist scan summary\n"
         << "input=" << input_path << "\n"
         << "selection=" << scan_whitelist_selection_name(stats.selection)
-        << "\n"
-        << "reads_processed=" << stats.reads_processed << "\n"
+        << "\n";
+    if (write_calling_profile)
+        out << "calling_profile=" << (stats.spatial_low_counts ? "spatial_low_counts" : "standard") << "\n";
+    out << "reads_processed=" << stats.reads_processed << "\n"
         << "total_extractions=" << stats.total_extractions << "\n"
         << "unique_sequences=" << stats.unique_sequences << "\n"
         << "total_perfect_matches=" << stats.total_perfect_matches << "\n"
@@ -3110,10 +3114,9 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
     // default.  It moves left only when the upper-tail hazard has the same
     // prominent interior minimum across three bandwidths and that move adds a
     // material, well-supported population.
-    // A coordinate-validated spatial catalogue permits a one-observation
-    // candidate floor. Keep the existing adaptive caller and default behaviour
-    // for every non-spatial invocation. This is a sensitivity profile, not a
-    // calibrated tissue/background probability model.
+    // Spatial discovery permits a one-observation candidate floor without
+    // requiring coordinates. The adaptive caller still selects the final set;
+    // this sensitivity profile does not establish tissue/background membership.
     const double LEGACY_FLOOR = spatial_low_counts && total_reads > 0.0
         ? std::min(2.0, std::log1p((1.0 / total_reads) * 1e6)) : 2.0;
     const double hazard_search_min = spatial_low_counts
@@ -3855,6 +3858,7 @@ bool count_perfect_matches_with_stats(const barcode_count_result& extracted_barc
         summary->floor = FLOOR;
         summary->threshold = threshold;
         summary->threshold_rule = rule;
+        summary->spatial_low_counts = spatial_low_counts;
         summary->above_floor_barcodes = n_above_floor;
         summary->final_barcodes = n_final;
         summary->selected_barcodes = selected_barcodes.size();
@@ -3892,7 +3896,8 @@ bool count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
                                       bool verbose = false,
                                       scan_whitelist_selection selection =
                                           scan_whitelist_selection::high_specificity,
-                                      whitelist_scan_stats* summary = nullptr)
+                                      whitelist_scan_stats* summary = nullptr,
+                                      bool spatial_low_counts = false)
 {
     barcode_count_result counts;
     counts.reads_processed = static_cast<uint64_t>(extracted_barcodes.size());
@@ -3903,7 +3908,7 @@ bool count_perfect_matches_with_stats(const std::vector<extracted_bc>& extracted
     }
     return count_perfect_matches_with_stats(
         counts, whitelist_set, output_csv, text_out, verbose, selection,
-        summary);
+        summary, spatial_low_counts);
 }
 
 struct scan_wl_rescan_input {
@@ -4165,6 +4170,8 @@ void usage_scan_wl(const char* program_name) {
               << "  -k, --chunk-size INT        Chunk size for parallel processing [default: 10000]\n"
               << "      --af-bcs                Write above-floor barcodes to .txt\n"
               << "      --hs-bcs                Write high-specificity final calls to .txt [default]\n"
+              << "      --spatial               Low-abundance calling profile for high-resolution spatial data\n"
+              << "                              Works with single, masked, split, batch and rescan inputs; no coordinates required\n"
               << "      --rescan                Treat --input as barcode/count data and rerun only\n"
               << "                              the statistical selector (no FASTQ scan)\n"
               << "  -v, --verbose               Enable verbose/debug output\n"
@@ -4181,11 +4188,11 @@ void usage_scan_wl(const char* program_name) {
               << "  -u, --umi-length INT        UMI length between primer and BC1 [default: 9]\n"
               << "      --offset-min INT        Min extra bases after UMI to start BC1 search [default: 0]\n"
               << "      --offset-max INT        Max extra bases after UMI to start BC1 search [default: 3]\n"
-              << "\nSpatial barcode discovery:\n"
-              << "      --spatial              Discover barcodes using a slide coordinate map\n"
+              << "\nOptional coordinate-based spatial discovery (also requires --spatial):\n"
+              << "      --spatial-slide FILE_OR_ID  Apply slide validation and supported spatial occupancy filters\n"
               << "      --visium | --visium-hd | --curio-seeker | --curio-trekker | --stereo-seq\n"
               << "                             Select exactly one spatial platform\n"
-              << "      --slide FILE_OR_ID     Coordinate table or registered slide/tile ID\n"
+              << "      --slide FILE_OR_ID     Legacy coordinate workflow (HD occupancy without abundance calling)\n"
               << "      --slide-map FILE       Explicit coordinate table for the slide ID\n"
               << "      --slide-dir DIR        Look up DIR/<platform>/<slide>.tsv[.gz] or .csv[.gz]\n"
               << "      --bc1-axis FILE        HD barcode/array_col table (native 2 um indices)\n"
@@ -4246,6 +4253,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
         {"position-map",   required_argument, 0, 33 },
         {"candidate-mismatches", required_argument, 0, 34 },
         {"concat-hmm",     no_argument,       0, 35 },
+        {"spatial-slide",  required_argument, 0, 36 },
         // Backward-compatible aliases
         {"hd-offset-min",  required_argument, 0,  3 },
         {"hd-offset-max",  required_argument, 0,  4 },
@@ -4303,6 +4311,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
                 candidates.mismatches_explicit = true;
                 break;
             case 35: candidates.concat_hmm = true; break;
+            case 36: spatial.slide = optarg; spatial.slide_filter = true; break;
             case 'v': verbose = true; break;
             case 'h': usage_scan_wl(argv[0]); return 0;
             default: usage_scan_wl(argv[0]); return 1;
@@ -4312,7 +4321,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
     if (candidates.enabled) {
         if (optind != argc || !batch_csv_file.empty() || rescan || af_bcs || hs_bcs ||
             pattern_options_explicit || !bc1_whitelist_file.empty() || !bc2_whitelist_file.empty() ||
-            spatial.enabled || spatial.platform_flags || !spatial.slide.empty() || !spatial.slide_map.empty() ||
+            spatial.enabled || spatial.slide_filter || spatial.platform_flags || !spatial.slide.empty() || !spatial.slide_map.empty() ||
             !spatial.slide_dir.empty() || !spatial.bc1_axis.empty() || !spatial.bc2_axis.empty()) {
             std::cerr << "Error: --catalog-candidates uses a prepared layout; adapter, selector, batch, rescan, split-barcode and spatial options do not apply\n";
             return 1;
@@ -4326,7 +4335,14 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
         return 1;
     }
     
-    if (!rescan && !spatial.enabled && adapter_seq.empty()) {
+    const bool spatial_coordinates = spatial.slide_filter || spatial.platform_flags || !spatial.slide.empty() ||
+        !spatial.slide_map.empty() || !spatial.slide_dir.empty() ||
+        !spatial.bc1_axis.empty() || !spatial.bc2_axis.empty();
+    if (spatial_coordinates && !spatial.enabled) {
+        std::cerr << "Error: spatial platform and slide options require --spatial\n";
+        return 1;
+    }
+    if (!rescan && !spatial_coordinates && adapter_seq.empty()) {
         std::cerr << "Error: Missing required adapter sequence\n";
         usage_scan_wl(argv[0]);
         return 1;
@@ -4339,7 +4355,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
         std::cerr << "Error: --af-bcs and --hs-bcs are mutually exclusive\n";
         return 1;
     }
-    if (spatial.enabled) {
+    if (spatial_coordinates) {
         if (!batch_csv_file.empty() || !whitelist_file.empty()) {
             std::cerr << "Error: spatial scans use one slide per run and its coordinate catalogue; --batch-csv/-w do not apply\n";
             return 1;
@@ -4353,10 +4369,12 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             chunk_size, num_threads, umi_length, offset_min, offset_max,
             bc1_whitelist_file, bc2_whitelist_file, af_bcs, hs_bcs, verbose);
     }
-    if (spatial.platform_flags || !spatial.slide.empty() || !spatial.slide_map.empty() ||
-        !spatial.slide_dir.empty() || !spatial.bc1_axis.empty() || !spatial.bc2_axis.empty()) {
-        std::cerr << "Error: spatial platform and slide options require --spatial\n";
-        return 1;
+    if (spatial.enabled) {
+        if (optind != argc) {
+            std::cerr << "Error: unexpected positional argument\n";
+            return 1;
+        }
+        std::cout << "Calling profile: spatial_low_counts (coordinate-free abundance selection)\n";
     }
 
     const bool using_single = !input_file.empty();
@@ -4421,7 +4439,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
         const std::unordered_set<int64_seq> no_secondary_filter;
         if (!count_perfect_matches_with_stats(
                 retained.counts, no_secondary_filter, csv_output, text_output,
-                verbose, selection, &scan_stats)) {
+                verbose, selection, &scan_stats, spatial.enabled)) {
             return 1;
         }
         const double rescan_wall_seconds =
@@ -4545,7 +4563,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             std::unordered_set<int64_seq> empty_wl;
             if (!count_perfect_matches_with_stats(
                     barcodes, empty_wl, csv_output, text_output, verbose,
-                    selection, &scan_stats)) {
+                    selection, &scan_stats, spatial.enabled)) {
                 run_failed = true;
                 return;
             }
@@ -4613,7 +4631,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
                 if (!count_perfect_matches_with_stats(
                         barcodes, wl_filter.long_barcodes,
                         csv_output, text_output, verbose, selection,
-                        &scan_stats)) {
+                        &scan_stats, spatial.enabled)) {
                     run_failed = true;
                     return;
                 }
@@ -4623,7 +4641,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
                 if (!count_perfect_matches_with_stats(
                         barcodes, empty_whitelist,
                         csv_output, text_output, verbose, selection,
-                        &scan_stats)) {
+                        &scan_stats, spatial.enabled)) {
                     run_failed = true;
                     return;
                 }

@@ -242,6 +242,25 @@ modes the reference kit/file remains the global whitelist and the selected
 scan set becomes the true-cell whitelist.
 For split-barcode kits (SPLiT-seq, Visium HD), run `scan-wl` in two-part mode (`-1/-2/-u`).
 
+For low-abundance high-resolution spatial data, add `--spatial` to the scan.
+This selects one common calling profile for Visium HD, Stereo-seq and
+Curio/AIR-SPACE barcode structures. Continue to specify the appropriate adapter,
+single or masked capture pattern, or BC1/BC2 catalogs. Coordinates, platform flags
+and tissue membership are not prerequisites for this profile. It also works with
+batch input and `--rescan` on existing barcode/count CSVs.
+
+The profile admits one-observation barcodes into the abundance analysis; the
+adaptive high-specificity selector still decides final calls. `--af-bcs` requests
+the above-floor candidate set instead. A valid catalog singleton is therefore
+eligible for analysis without automatically being called a biological spot.
+
+`--spatial-slide FILE_OR_ID` adds an optional slide-validation/occupancy layer
+after this same abundance profile. Platform flags describe its coordinate format.
+HD applies the existing 32-of-64 observed-spot rule to the abundance-selected
+barcodes; other platforms currently validate coordinate membership. This layer
+is the extension point for further occupancy work. The older `--slide` option
+retains its legacy coordinate-selection behavior.
+
 ## Custom whitelist files
 
 Explicit file paths always work and are usually the safest in production scripts:

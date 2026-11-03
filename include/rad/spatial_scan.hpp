@@ -11,6 +11,7 @@
 namespace rad_scan_spatial {
 struct Options {
     bool enabled = false;
+    bool slide_filter = false;
     std::string platform, slide, slide_map, slide_dir, bc1_axis, bc2_axis;
     int platform_flags = 0;
 };
@@ -400,8 +401,8 @@ inline int run(const Options& options, const std::string& input, const std::stri
             !std::isfinite(error) || error < 0 || error > 1 || umi < 0 || offset_min > offset_max)
             throw std::runtime_error("Invalid spatial scan parameter");
         const bool hd = options.platform == "visium-hd";
-        const bool regular_visium = options.platform == "visium";
-        if (hd && (af || hs)) throw std::runtime_error("HD uses 32-of-64 native 2 um spots per 16 um region; --af-bcs/--hs-bcs do not apply");
+        const bool regular_visium = options.platform == "visium" && !options.slide_filter;
+        if (hd && !options.slide_filter && (af || hs)) throw std::runtime_error("HD uses 32-of-64 native 2 um spots per 16 um region; --af-bcs/--hs-bcs do not apply");
         if (!hd && (!bc1_file.empty() || !bc2_file.empty()))
             throw std::runtime_error("Spatial split-barcode options require --visium-hd");
         auto slide = load_slide(options, bc1_file, bc2_file);
@@ -495,33 +496,37 @@ inline int run(const Options& options, const std::string& input, const std::stri
                     throw std::runtime_error("Capture length disagrees with slide barcode length");
                 length = map_length;
                 found = process_fastq(input, adapter, length, left, right, max_reads, error,
-                                      chunk_size, threads, &filter);
+                                      chunk_size, threads, options.slide_filter ? nullptr : &filter);
                 if (!found.succeeded) return 1;
             }
         }
         const uint64_t extracted = found.total_extractions;
-        uint64_t unmapped = 0;
+        uint64_t mapped_observations = 0;
         std::map<Region, std::bitset<64>> occupancy;
         for (auto it = found.counts.begin(); it != found.counts.end();) {
             auto p = slide.lookup(it->first);
-            if (!p) { it = found.counts.erase(it); continue; }
+            if (!p) {
+                if (options.slide_filter) ++it;
+                else it = found.counts.erase(it);
+                continue;
+            }
+            mapped_observations += it->second;
             if (hd) occupancy[region(*p)].set(subbin(*p));
             ++it;
         }
-        found.total_extractions = 0;
-        for (const auto& item : found.counts) found.total_extractions += item.second;
-        unmapped = extracted - found.total_extractions;
-        const uint64_t mapped_observations = found.total_extractions;
+        const uint64_t unmapped = extracted - mapped_observations;
         // Ordinary Visium retains the regular caller's all-extraction
         // normalization and thresholds. Coordinates only annotate its calls.
-        if (regular_visium) found.total_extractions = extracted;
-        if (found.counts.empty()) throw std::runtime_error("No observed barcodes match this slide; check input, map and capture pattern");
-        found.filtered_to_whitelist = true;
-        found.reference_whitelist_size = slide.size();
+        if (!options.slide_filter) {
+            found.total_extractions = regular_visium ? extracted : mapped_observations;
+            found.filtered_to_whitelist = true;
+            found.reference_whitelist_size = slide.size();
+        }
+        if (!mapped_observations) throw std::runtime_error("No observed barcodes match this slide; check input, map and capture pattern");
 
         std::unordered_set<std::string> selected;
         whitelist_scan_stats stats;
-        if (!hd) {
+        if (!hd || options.slide_filter) {
             if (!count_perfect_matches_with_stats(found, {}, prefix + "_rad.csv", prefix + "_rad.txt",
                     verbose, af ? scan_whitelist_selection::above_floor : scan_whitelist_selection::high_specificity,
                     &stats, !regular_visium)) return 1;
@@ -540,8 +545,34 @@ inline int run(const Options& options, const std::string& input, const std::stri
             stats.final_barcodes = stats.selected_barcodes = selected.size();
             stats.threshold_rule = "hd_32_of_64_2um_spots_in_16um_region";
         }
+        const size_t abundance_selected = selected.size();
+        const size_t abundance_high_specificity = stats.final_barcodes;
+        std::unordered_set<std::string> final_calls;
+        // Slide occupancy refines the common abundance calls. The historical
+        // --slide route retains its original occupancy-only HD behavior.
+        if (options.slide_filter) {
+            auto passes_slide = [&](const std::string& barcode) {
+                const auto point = slide.lookup(barcode);
+                return point && (!hd || occupancy.at(region(*point)).count() >= 32);
+            };
+            for (auto it = selected.begin(); it != selected.end();) {
+                if (!passes_slide(*it))
+                    it = selected.erase(it);
+                else
+                    ++it;
+            }
+            Table abundance(prefix + "_rad.csv");
+            while (abundance.next()) {
+                const auto barcode = abundance.get("barcode");
+                if (abundance.get("final_barcode") == "TRUE" && passes_slide(barcode))
+                    final_calls.insert(barcode);
+            }
+            stats.final_barcodes = final_calls.size();
+            stats.selected_barcodes = selected.size();
+        }
         std::vector<std::string> keys;
-        for (const auto& item : found.counts) keys.push_back(item.first);
+        for (const auto& item : found.counts)
+            if (slide.lookup(item.first)) keys.push_back(item.first);
         std::sort(keys.begin(), keys.end());
         std::ofstream csv(prefix + ".csv"), text(prefix + ".txt");
         csv << "barcode,count,x,y,coordinate_units,selected,final_barcode,occupied_2um_spots,region_x,region_y\n";
@@ -550,8 +581,10 @@ inline int run(const Options& options, const std::string& input, const std::stri
         for (const auto& barcode : keys) {
             auto p = *slide.lookup(barcode);
             bool pass = selected.count(barcode);
+            const bool final = options.slide_filter ? final_calls.count(barcode) != 0 : pass;
             csv << std::setprecision(17) << barcode << ',' << found.counts.at(barcode) << ','
-                << p.x << ',' << p.y << ',' << slide.units << ',' << (pass ? "TRUE,TRUE," : "FALSE,FALSE,");
+                << p.x << ',' << p.y << ',' << slide.units << ',' << (pass ? "TRUE," : "FALSE,")
+                << (final ? "TRUE," : "FALSE,");
             if (hd) {
                 auto r = region(p);
                 csv << occupancy.at(r).count() << ',' << r.first << ',' << r.second;
@@ -576,7 +609,7 @@ inline int run(const Options& options, const std::string& input, const std::stri
             if (!regions) throw std::runtime_error("Failed writing occupancy output");
         }
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-        if (hd) {
+        if (hd && !options.slide_filter) {
             std::ofstream summary(prefix + "_scan_wl.log");
             summary << "RAD spatial whitelist scan summary\ninput=" << input
                     << "\nselection=hd_occupancy\nreads_processed=" << found.reads_processed
@@ -588,7 +621,8 @@ inline int run(const Options& options, const std::string& input, const std::stri
                     << "\nwall_time_seconds=" << elapsed << '\n';
             summary.close();
             if (!summary) throw std::runtime_error("Failed writing HD scan summary");
-        } else if (!write_whitelist_scan_log(prefix + "_scan_wl.log", input, stats, elapsed)) return 1;
+        } else if (!write_whitelist_scan_log(prefix + "_scan_wl.log", input, stats, elapsed,
+                                             options.slide_filter)) return 1;
         std::ofstream log(prefix + "_scan_wl.log", std::ios::app);
         log << "spatial_platform=" << options.platform << "\nslide=" << options.slide
             << "\ncoordinate_source=" << slide.source << "\ncoordinate_units=" << slide.units
@@ -596,9 +630,15 @@ inline int run(const Options& options, const std::string& input, const std::stri
             << "\nbarcode_kind=" << (slide.spot_labels ? "hd_spot_id" : "nucleotide")
             << "\nslide_barcodes=" << slide.size() << "\nextracted_observations=" << extracted
             << "\nmapped_observations=" << mapped_observations
-            << "\nunmapped_observations=" << unmapped
-            << "\ncalling_profile=" << (hd ? "hd_occupancy" : regular_visium ? "rad_standard" : "rad_spatial_low_count")
-            << "\nselected_barcodes=" << selected.size() << '\n';
+            << "\nunmapped_observations=" << unmapped << '\n';
+        if (!options.slide_filter)
+            log << "calling_profile=" << (hd ? "hd_occupancy" : regular_visium ? "rad_standard" : "rad_spatial_low_count") << '\n';
+        else
+            log << "abundance_selected_barcodes=" << abundance_selected
+                << "\nabundance_high_specificity_barcodes=" << abundance_high_specificity
+                << "\nspatial_selected_barcodes=" << selected.size()
+                << "\nspatial_filter_rule=" << (hd ? "hd_32_of_64_2um_spots_in_16um_region" : "coordinate_membership") << '\n';
+        log << "selected_barcodes=" << selected.size() << '\n';
         log.close();
         if (!log) throw std::runtime_error("Failed writing spatial provenance");
         std::cout << "Spatial whitelist: " << selected.size() << " barcodes; " << prefix << ".txt\n";

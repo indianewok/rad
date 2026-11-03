@@ -113,10 +113,48 @@ Common options:
 - `--af-bcs` — put every barcode passing the scan's noise floor in `<prefix>.txt`
 - `--hs-bcs` — put only the high-specificity final calls in `<prefix>.txt`
   (default)
+- `--spatial` — use the shared low-abundance calling profile for high-resolution
+  spatial data, including Visium HD, Stereo-seq and Curio/AIR-SPACE structures.
+  No platform flag, slide coordinates or tissue mask is required. Supply the
+  usual adapter/capture pattern and reference catalog(s) for the read structure.
+  The profile applies to single, masked, two-part, batch and `--rescan` inputs.
 - `-v, --verbose`, `-h, --help`
 
 Two-part barcode mode (BC1+BC2, e.g. SPLiT-seq / Visium HD): `-1/--bc1-whitelist`,
 `-2/--bc2-whitelist`, `-u/--umi-length` (default `9`), `--offset-min`/`--offset-max`.
+
+`--spatial` lowers the candidate floor to admit one-observation barcodes while
+retaining the adaptive abundance selector. High-specificity calls remain the
+default; a singleton is not automatically a final call or an on-tissue spot.
+`--af-bcs` still requests the more sensitive above-floor output. The scan log
+records `calling_profile=spatial_low_counts` (or `standard` without the flag).
+
+```bash
+# Reuse existing barcode counts without a coordinate map or another read scan.
+build/rad scan-wl --spatial --rescan -i barcode_counts.csv -o spatial_calls
+
+# HD component catalogs describe the read structure; --spatial selects the caller.
+build/rad scan-wl --spatial -i reads.fq.gz -p CTACACGACGCTCTTCCGATCT \
+  -1 visium_hd_bc1 -2 visium_hd_bc2 -u 9 -o hd_calls
+```
+
+Add `--spatial-slide FILE_OR_ID` to enable the slide-filtering layer after the
+same spatial abundance caller. A platform flag (`--visium`, `--visium-hd`,
+`--curio-seeker`, `--curio-trekker` or `--stereo-seq`) describes the coordinate
+format. With HD, abundance calls are intersected with the existing rule requiring
+at least 32 observed native 2 um spots per aligned 16 x 16 um region. Other
+platforms currently validate coordinate membership; additional occupancy rules
+can be added in this layer independently of abundance calling.
+
+```bash
+build/rad scan-wl --spatial --spatial-slide hd_slide.tsv --visium-hd \
+  --rescan -i barcode_counts.csv -o hd_slide_calls
+```
+
+The older `--slide` spelling retains the legacy coordinate workflow, including
+HD occupancy-only selection, for compatibility.
+`--catalog-candidates` remains a separate reference-guided candidate-generation
+step and does not run this abundance selector.
 
 Files written:
 
