@@ -4149,7 +4149,6 @@ inline std::string default_scan_wl_rescan_prefix(std::string input_path) {
 
 
 #include "spatial_scan.hpp"
-#include "whitelist_candidates.hpp"
 
 void usage_scan_wl(const char* program_name) {
     std::cout << "Usage: " << program_name << " [options]\n"
@@ -4176,12 +4175,6 @@ void usage_scan_wl(const char* program_name) {
               << "                              the statistical selector (no FASTQ scan)\n"
               << "  -v, --verbose               Enable verbose/debug output\n"
               << "  -h, --help                  Show this help message\n"
-              << "\nReference-guided candidate generation (no abundance or tissue selection):\n"
-              << "      --catalog-candidates   Generate PREFIX_candidates.txt from -i reads and -w catalogue\n"
-              << "      --layout FILE          Prepared RAD layout CSV (from rad prep)\n"
-              << "      --position-map FILE    Prepared position-map CSV; no calibration is performed\n"
-              << "      --candidate-mismatches INT  Retain all substitution neighbours [default: 2]\n"
-              << "      --concat-hmm           Use frozen hmm_* parameters from the position map\n"
               << "\nTwo-part barcode options (BC1+BC2 mode):\n"
               << "  -1, --bc1-whitelist FILE    BC1 whitelist kit key or path (activates two-part mode)\n"
               << "  -2, --bc2-whitelist FILE    BC2 whitelist kit key or path\n"
@@ -4212,9 +4205,7 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
     double max_error = kDefaultScanWlMaxErrorRatio;
     bool verbose = false, af_bcs = false, hs_bcs = false, rescan = false;
     bool bc_length_explicit = false;
-    bool pattern_options_explicit = false;
     rad_scan_spatial::Options spatial;
-    rad_whitelist_candidates::Options candidates;
 
     static struct option long_options[] = {
         {"input",          required_argument, 0, 'i'},
@@ -4248,11 +4239,6 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
         {"slide-dir",      required_argument, 0, 28 },
         {"bc1-axis",       required_argument, 0, 29 },
         {"bc2-axis",       required_argument, 0, 30 },
-        {"catalog-candidates", no_argument,    0, 31 },
-        {"layout",         required_argument, 0, 32 },
-        {"position-map",   required_argument, 0, 33 },
-        {"candidate-mismatches", required_argument, 0, 34 },
-        {"concat-hmm",     no_argument,       0, 35 },
         {"spatial-slide",  required_argument, 0, 36 },
         // Backward-compatible aliases
         {"hd-offset-min",  required_argument, 0,  3 },
@@ -4268,24 +4254,23 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             case 'i': input_file = optarg; break;
             case 'b': batch_csv_file = optarg; break;
             case 'o': output_prefix = optarg; break;
-            case 'p': adapter_seq = optarg; pattern_options_explicit = true; break;
+            case 'p': adapter_seq = optarg; break;
             case 'n':
                 bc_length = std::atoi(optarg);
                 bc_length_explicit = true;
-                pattern_options_explicit = true;
                 break;
-            case 'l': m_left = std::atoi(optarg); pattern_options_explicit = true; break;
-            case 'r': m_right = std::atoi(optarg); pattern_options_explicit = true; break;
+            case 'l': m_left = std::atoi(optarg); break;
+            case 'r': m_right = std::atoi(optarg); break;
             case 'm': max_reads = std::atoi(optarg); break;
-            case 'e': max_error = std::atof(optarg); pattern_options_explicit = true; break;
+            case 'e': max_error = std::atof(optarg); break;
             case 'w': whitelist_file = optarg; break;
             case 't': num_threads = std::atoi(optarg); break;
             case 'k': chunk_size = std::atoi(optarg); break;
             case '1': bc1_whitelist_file = optarg; break;
             case '2': bc2_whitelist_file = optarg; break;
-            case 'u': umi_length = std::atoi(optarg); pattern_options_explicit = true; break;
-            case  3 : offset_min = std::atoi(optarg); pattern_options_explicit = true; break;
-            case  4 : offset_max = std::atoi(optarg); pattern_options_explicit = true; break;
+            case 'u': umi_length = std::atoi(optarg); break;
+            case  3 : offset_min = std::atoi(optarg); break;
+            case  4 : offset_max = std::atoi(optarg); break;
             case  5 : af_bcs = true; break;
             case  6 : hs_bcs = true; break;
             case  7 : rescan = true; break;
@@ -4300,17 +4285,6 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
             case 28: spatial.slide_dir = optarg; break;
             case 29: spatial.bc1_axis = optarg; break;
             case 30: spatial.bc2_axis = optarg; break;
-            case 31: candidates.enabled = true; break;
-            case 32: candidates.layout = optarg; break;
-            case 33: candidates.position_map = optarg; break;
-            case 34:
-                if (!rad_whitelist_candidates::parse_nonnegative_int(optarg, candidates.mismatches)) {
-                    std::cerr << "Error: --candidate-mismatches must be a nonnegative integer\n";
-                    return 1;
-                }
-                candidates.mismatches_explicit = true;
-                break;
-            case 35: candidates.concat_hmm = true; break;
             case 36: spatial.slide = optarg; spatial.slide_filter = true; break;
             case 'v': verbose = true; break;
             case 'h': usage_scan_wl(argv[0]); return 0;
@@ -4318,23 +4292,6 @@ inline int cmd_scan_wl(int argc, char* argv[]) {
         }
     }
 
-    if (candidates.enabled) {
-        if (optind != argc || !batch_csv_file.empty() || rescan || af_bcs || hs_bcs ||
-            pattern_options_explicit || !bc1_whitelist_file.empty() || !bc2_whitelist_file.empty() ||
-            spatial.enabled || spatial.slide_filter || spatial.platform_flags || !spatial.slide.empty() || !spatial.slide_map.empty() ||
-            !spatial.slide_dir.empty() || !spatial.bc1_axis.empty() || !spatial.bc2_axis.empty()) {
-            std::cerr << "Error: --catalog-candidates uses a prepared layout; adapter, selector, batch, rescan, split-barcode and spatial options do not apply\n";
-            return 1;
-        }
-        return rad_whitelist_candidates::run(candidates, input_file, output_prefix,
-            whitelist_file, max_reads, num_threads, chunk_size, verbose);
-    }
-    if (!candidates.layout.empty() || !candidates.position_map.empty() ||
-        candidates.mismatches_explicit || candidates.concat_hmm) {
-        std::cerr << "Error: --layout, --position-map, --candidate-mismatches and --concat-hmm require --catalog-candidates\n";
-        return 1;
-    }
-    
     const bool spatial_coordinates = spatial.slide_filter || spatial.platform_flags || !spatial.slide.empty() ||
         !spatial.slide_map.empty() || !spatial.slide_dir.empty() ||
         !spatial.bc1_axis.empty() || !spatial.bc2_axis.empty();

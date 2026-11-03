@@ -1,4 +1,4 @@
-# Concatemer boundaries and selective whitelist loading
+# Concatemer boundaries and whitelist loading
 
 The concatemer HMM identifies ordered observable elements. Its first and last
 observable elements are not necessarily physical molecule ends. For example,
@@ -33,56 +33,27 @@ Explicitly unresolved coordinates take precedence over
 returned segment list. The ordinary HMM abstention policy otherwise remains
 unchanged. `--concat-hmm` remains opt-in.
 
-`rad demux --whitelist-load auto` is the default whitelist loading policy.
-For replayable regular input with one non-joint barcode class and a single
-catalog file of at least 32 MiB on disk, RAD first collects native barcode
-queries using the same prepared layout, read limit and extraction route as the
-final run. Forward/reverse aliases count as one barcode class. RAD then streams
-the source catalog, retaining only targets reachable by native global lookup:
+`rad demux` loads the supplied whitelist in full. Single-catalog imports stream
+parsed rows into resident storage after bounded role classification. Dual-catalog
+imports consume their staging sets during population, avoiding a second complete
+retained copy. These loading changes preserve barcode identities, true/global
+whitelist roles and the existing correction policy.
 
-- Raw barcode identities and their reverse complements.
-- Exact same-length barcode sequences in the expanded correction window.
-- Substitution neighbors within the runtime `-m` correction radius.
-
-The relevance index uses packed, disjoint seeds followed by full Hamming
-distance confirmation. A shared seed alone never retains a catalog entry.
-Source rows are streamed rather than stored, and index/retained-entry memory
-scales with the queries and relevant targets. The entire catalog must still be
-read once; this is not an on-disk random-access index.
-
-The original source cardinality determines whether a catalog is global or
-true. A small retained subset of a large global source remains global, so
-reducing memory does not switch correction algorithms. Small true catalogs
-keep their complete native indel/infix search. Dual catalogs, joint barcodes,
-multiple barcode classes and unsupported long queries retain full loading.
-This also avoids changing downstream barcode queries when correction of one
-barcode moves another barcode's extraction coordinates.
-
-Use `--whitelist-load observed` to request query discovery for an eligible
-smaller file (including compressed files below the automatic size threshold).
-Unsupported input/layouts are rejected in this explicit mode. A small source
-still remains a complete true whitelist. `--whitelist-load full` retains the
-original loader and is useful for controlled comparisons. The existing
-distinction between `-m` runtime mutation lookup and `-M` whitelist setup is
+The distinction between `-m` runtime mutation lookup and `-M` whitelist setup is
 unchanged.
-
-Streaming logs report source rows, original role, retained entries, observed
-keys, correction radius and index bytes. The demux log records the requested
-loading mode and whether query discovery ran. Relevance is a lookup
-optimization, not a tissue or spatial-density mask.
 
 Run the focused regression checks with:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target rad concat_hmm_boundary_test concat_hmm_router_test \
-  whitelist_relevance_test whitelist_loader_test
+  whitelist_loader_test packed_sequence_test barcode_storage_test
 ctest --test-dir build --output-on-failure
 ```
 
 The tests cover known insert boundaries in both orientations, mixed and
 unlocated junctions, retention across construct caps, sequence/quality
-preservation, indexed-versus-exhaustive target selection, and native full versus
-selective lookup behavior. They distinguish boundary correctness from the
-separate question of whether an internal adapter-like sequence was correctly
-classified as another capture unit.
+preservation, whitelist formats and role classification, shared catalog loading,
+and barcode packing and matching across widths. They distinguish boundary
+correctness from the separate question of whether an internal adapter-like
+sequence was correctly classified as another capture unit.

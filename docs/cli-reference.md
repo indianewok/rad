@@ -153,8 +153,6 @@ build/rad scan-wl --spatial --spatial-slide hd_slide.tsv --visium-hd \
 
 The older `--slide` spelling retains the legacy coordinate workflow, including
 HD occupancy-only selection, for compatibility.
-`--catalog-candidates` remains a separate reference-guided candidate-generation
-step and does not run this abundance selector.
 
 Files written:
 

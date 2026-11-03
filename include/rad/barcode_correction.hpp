@@ -1,7 +1,6 @@
 #pragma once
 #include "rad_headers.h"
 #include "packed_sequence.hpp"
-#include "whitelist_relevance.hpp"
 
 /**
  * @enum barcode_counts
@@ -1298,88 +1297,7 @@ class whitelist {
  * an arbitrary threshold for the number of true barcodes to be kept because ideally after a certain size of barcodes
  * you really just want to treat them both the same way
  */
-    // Stream a single catalog while retaining the exact global-lookup superset
-    // for the discovery pass. At most 100,000 unique source keys are held to
-    // establish the ORIGINAL catalog role. A retained subset must never turn
-    // a large global catalog into a small true whitelist: those paths differ.
-    wl_entry import_relevant_whitelist(const std::string& spec, bool verbose,
-                                      uint16_t default_length,
-                                      const whitelist_relevance::observations& observed,
-                                      int mutation_distance) {
-        constexpr size_t global_threshold = 100000;
-        const std::string path = whitelist_utils::kit_to_path(spec);
-        const bool bitlist = whitelist_utils::check_if_bitlist(spec, verbose, 10);
-        std::unique_ptr<std::istream> in;
-        if (path.size() > 3 && path.substr(path.size() - 3) == ".gz")
-            in = std::make_unique<igzstream>(path.c_str());
-        else
-            in = std::make_unique<std::ifstream>(path);
-        if (!in || !*in) throw std::runtime_error("Failed to open whitelist: " + path);
-        whitelist_relevance::candidate_index index(observed, mutation_distance);
-        wl_entry out;
-        std::unordered_set<int64_seq> prefix;
-        prefix.reserve(global_threshold);
-        bool global = false;
-        size_t rows = 0, parsed_rows = 0, wide_rows = 0;
-        auto keep = [&](const int64_seq& sequence) {
-            return !sequence.length || sequence.visit([&](auto word) {
-                return index.contains(word, sequence.length);
-            });
-        };
-        auto insert_global = [&](const int64_seq& sequence) {
-            if (!keep(sequence)) return;
-            barcode_entry entry;
-            entry.barcode = sequence;
-            out.global_bcs.emplace(sequence, std::move(entry));
-        };
-        std::string line;
-        while (std::getline(*in, line)) {
-            ++rows;
-            if (line.empty()) continue;
-            const auto delimiter = line.find_first_of(",\t");
-            const std::string_view token(line.data(), delimiter == std::string::npos ? line.size() : delimiter);
-            int64_seq sequence;
-            if (bitlist) {
-                if (!parse_packed_decimal(token, default_length, sequence)) continue;
-            } else {
-                sequence.sequence_to_bits(token);
-            }
-            ++parsed_rows;
-            wide_rows += sequence.is_wide();
-            if (global) {
-                insert_global(sequence);
-            } else {
-                prefix.insert(sequence);
-                if (prefix.size() >= global_threshold) {
-                    global = true;
-                    for (const auto& buffered : prefix) insert_global(buffered);
-                    std::unordered_set<int64_seq>().swap(prefix);
-                }
-            }
-        }
-        if (in->bad()) throw std::runtime_error("Error while reading whitelist: " + path);
-        if (!global) {
-            for (const auto& sequence : prefix) {
-                barcode_entry entry;
-                entry.barcode = sequence;
-                out.true_bcs.emplace(sequence, std::move(entry));
-            }
-        }
-        std::cout << "[whitelist-load observed] source=" << path
-                  << " rows=" << rows << " parsed_rows=" << parsed_rows
-                  << " role=" << (global ? "global" : "true-full")
-                  << " retained=" << (global ? out.global_bcs.size() : out.true_bcs.size())
-                  << " observed_raw=" << observed.raw_size()
-                  << " exact_window_keys=" << observed.exact_size()
-                  << " mutation_cap=" << std::max(0, mutation_distance)
-                  << " index_bytes=" << index.bytes()
-                  << " wide_rows=" << wide_rows << '\n';
-        return out;
-    }
-
-    wl_entry import_whitelist(std::string const &field, bool verbose, uint16_t default_length = 16,
-                              const whitelist_relevance::observations* observed = nullptr,
-                              int mutation_distance = 2) {
+    wl_entry import_whitelist(std::string const &field, bool verbose, uint16_t default_length = 16) {
         if(verbose) std::cout << "[import_whitelist] Importing whitelist from " << field << "\n";
         // split into 1 or 2 specs
         auto specs = whitelist_utils::parse_whitelist_specs(field);
@@ -1390,15 +1308,6 @@ class whitelist {
             for (auto const &spec : specs) {
                 if(verbose) std::cout << "[import_whitelist] whitelist kit or path:" << spec << "\n";
             }
-        }
-
-        if (observed && specs.size() == 1 && !observed->unsupported_long_queries)
-            return import_relevant_whitelist(specs.front(), verbose, default_length,
-                                             *observed, mutation_distance);
-        if (observed) {
-            std::cout << "[whitelist-load observed] using full loader: "
-                      << (specs.size() != 1 ? "dual catalog roles require full source cardinalities"
-                                          : "barcode queries longer than 64 bases") << '\n';
         }
 
         if (specs.size() == 1)

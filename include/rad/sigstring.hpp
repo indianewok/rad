@@ -6082,66 +6082,6 @@ public:
         return true;
     }
 
-    // Collect native pre-correction queries for whitelist candidate generation.
-    // No abundance selection, barcode correction or demux output is performed.
-    // Non-joint catalogs have extraction independent of whitelist membership.
-    template<class ObservationMap>
-    static ObservationMap observe_whitelist_queries(const std::string& fastq_path,
-            const ReadLayout& layout, int num_threads, size_t chunk_size,
-            size_t max_reads, int min_read_length) {
-        std::vector<ObservationMap> worker_observations(static_cast<size_t>(num_threads));
-        concat_hmm_counters ctr;
-        std::unique_ptr<concat_layout_info> hmm_info;
-        if (layout.concat_model) {
-            hmm_info = std::make_unique<concat_layout_info>(build_concat_layout_info(layout, *layout.concat_model));
-            hmm_info->ctr = &ctr;
-        }
-        auto process_chunk = [&](std::vector<read_streaming::sequence>& chunk, const std::string&) {
-            #pragma omp parallel for num_threads(num_threads) schedule(dynamic)
-            for (size_t i = 0; i < chunk.size(); ++i) {
-                const auto& read = chunk[i];
-                auto& observed = worker_observations[static_cast<size_t>(omp_get_thread_num())];
-                auto collect = [&](SigString& molecule, const read_streaming::sequence& molecule_read) {
-                    molecule.sigalign_variable(molecule_read, layout, false);
-                    for (const auto& e : molecule.elements()) {
-                        if (e.global_class != "barcode" || !e.seq || e.seq->empty()) continue;
-                        std::string raw = *e.seq;
-                        std::string expanded = seq_utils::substr_w_padding(molecule_read.seq,
-                            e.position.first, e.position.second, barcode_correction::expanded_window_pad);
-                        if (e.direction == "reverse") {
-                            raw = seq_utils::revcomp(raw);
-                            expanded = seq_utils::revcomp(expanded);
-                        }
-                        observed[seq_utils::remove_rc(e.class_id)].add(raw, expanded);
-                    }
-                };
-                if (hmm_info && concat_hmm_route(read, layout, *hmm_info, collect, false)) continue;
-                SigString sig(read.id, static_cast<int>(read.seq.size()), "undefined", layout.sequencing_type);
-                std::vector<seq_element> additional_hits;
-                sig.sigalign_static(read, layout, false, &additional_hits);
-                const auto segments = sig.group_static_candidates(layout, additional_hits, false, min_read_length);
-                if (segments.empty()) collect(sig, read);
-                else for (size_t j = 0; j < segments.size(); ++j) {
-                    const auto& segment = segments[j];
-                    const int offset = segment.position.first - 1;
-                    const int length = segment.position.second - offset;
-                    read_streaming::sequence child{read.id + "/seg" + std::to_string(j + 1), read.comment,
-                        read.seq.substr(offset, length), read.is_fastq ? read.qual.substr(offset, length) : "", read.is_fastq};
-                    SigString molecule(child.id, length, "undefined", layout.sequencing_type);
-                    if (molecule.assign_static_segment(segment, layout, child)) collect(molecule, child);
-                }
-            }
-        };
-        chunk_streaming<read_streaming::sequence, decltype(process_chunk)> streamer(chunk_size, num_threads);
-        const int64_t limit = max_reads > 0 ? static_cast<int64_t>(max_reads) : -1;
-        streamer.process_chunks(fastq_path, process_chunk, 1, limit,
-                                false, 0, /*fail_on_read_error=*/true);
-        ObservationMap merged;
-        for (const auto& worker : worker_observations)
-            for (const auto& entry : worker) merged[entry.first].merge(entry.second);
-        return merged;
-    }
-
     static sigalign_run_stats sigalign(
         const std::string& fastq_path, 
         const ReadLayout& layout, 
