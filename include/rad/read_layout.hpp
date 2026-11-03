@@ -2004,7 +2004,7 @@ public:
         
         if (whitelist_type == "true" || whitelist_type == "both") {
             std::unordered_set<int64_seq> seen_true;
-            seen_true.reserve(entry.true_bcs.size());
+            // Allocate only for the positive-count barcodes selected below.
             entry.true_bcs.for_each_entry([&](const auto& value) {
                 if (value.count.load(barcode_counts::total) > 0) {
                     seen_true.emplace(value.key());
@@ -2018,7 +2018,7 @@ public:
         
         if ((whitelist_type == "global" || whitelist_type == "both") && full) {
             std::unordered_set<int64_seq> seen_global;
-            seen_global.reserve(entry.global_bcs.size());
+            // The catalog can be huge even when few barcodes have counts.
             entry.global_bcs.for_each_entry([&](const auto& value) {
                 if (value.count.load(barcode_counts::total) > 0) {
                     seen_global.emplace(value.key());
