@@ -2007,7 +2007,7 @@ public:
             seen_true.reserve(entry.true_bcs.size());
             entry.true_bcs.for_each_entry([&](const auto& value) {
                 if (value.count.load(barcode_counts::total) > 0) {
-                    seen_true.emplace(value.barcode);
+                    seen_true.emplace(value.key());
                 }
             });
 
@@ -2021,7 +2021,7 @@ public:
             seen_global.reserve(entry.global_bcs.size());
             entry.global_bcs.for_each_entry([&](const auto& value) {
                 if (value.count.load(barcode_counts::total) > 0) {
-                    seen_global.emplace(value.barcode);
+                    seen_global.emplace(value.key());
                 }
             });
             

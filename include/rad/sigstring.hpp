@@ -4260,10 +4260,6 @@ private:
                     log_verbose("Adding failed barcode to filter: " + failed_bc.bits_to_sequence());
                 }
                 
-                barcode_entry failed_entry;
-                failed_entry.barcode = failed_bc;
-                failed_entry.filtered = true;
-                
                 // Double-check that it's still not present
                 auto failed_range = wl.filter_bcs.equal_range(failed_bc);
                 auto rc_failed_range = wl.filter_bcs.equal_range(rc_failed_bc);
@@ -4271,7 +4267,7 @@ private:
                 if ((failed_range.first == failed_range.second) && 
                     (rc_failed_range.first == rc_failed_range.second)) {
                     // Entry doesn't exist - insert it
-                    //wl.filter_bcs.insert_bc_entry(failed_bc, failed_entry);
+                    // Insertion into filter_bcs remains disabled.
                 }
             }
         }

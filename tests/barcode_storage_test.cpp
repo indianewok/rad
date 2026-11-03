@@ -1,5 +1,6 @@
 #include "rad/rad_headers.h"
 #include <cstdlib>
+#include <cstddef>
 #include <random>
 #include <sstream>
 
@@ -34,6 +35,13 @@ static int sequence_distance(const std::string& a, const std::string& b) {
     return a.size() <= b.size() ? infix_distance(a, b) : infix_distance(b, a);
 }
 int main() {
+    using NarrowEntry = basic_barcode_entry<uint64_t>;
+    using WideEntry = basic_barcode_entry<uint128_t>;
+    static_assert(sizeof(NarrowEntry) == 24 && sizeof(WideEntry) == 32,
+                  "Resident barcode entries should retain the flat memory layout");
+    static_assert(offsetof(NarrowEntry, count) % alignof(counter) == 0 &&
+                  offsetof(WideEntry, count) % alignof(counter) == 0,
+                  "Atomic counters must remain naturally aligned");
     static_assert(std::tuple_size<decltype(counter{}.counts)>::value == 3,
                   "Whitelist entries should store only three counters");
     static_assert(sizeof(counter) == 3 * sizeof(std::atomic<int>),

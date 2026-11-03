@@ -91,20 +91,17 @@ struct counter {
 
 /**
  * @struct barcode_entry
- * @brief Struct representing a barcode entry with its sequence, count, and filtering status
+ * @brief Transient barcode entry carrying a sequence and its counters
  * @param barcode `int64_seq` representing the barcode sequence
  * @param count `counter` atomic counter for tracking counts
- * @param filtered `bool` flag indicating if the barcode is filtered
  */
 struct barcode_entry {
     int64_seq barcode;
     mutable counter count;
-    bool filtered;
 
     barcode_entry()
       : barcode(0,1),
-       count(0),
-       filtered(false)
+       count(0)
        { }
 
     bool operator==(const barcode_entry &o) const noexcept {
@@ -944,7 +941,6 @@ class whitelist {
                     barcode_entry original;
                     original.barcode = handle.barcode();
                     original.count = *handle.counts();
-                    original.filtered = handle.filtered();
                     const auto& orig_bits = original.barcode;
 
                     // Time individual barcode processing for first few
@@ -1142,7 +1138,6 @@ class whitelist {
             if (seq.empty()) return;
             barcode_entry entry;
             entry.barcode = seq;
-            entry.filtered = false;
             out.global_bcs.emplace(seq, std::move(entry));
         };
         stream_barcodes(spec, default_length, verbose, [&](const int64_seq& seq) {
@@ -1164,7 +1159,6 @@ class whitelist {
                 if (seq.empty()) continue;
                 barcode_entry entry;
                 entry.barcode = seq;
-                entry.filtered = false;
                 out.true_bcs.emplace(seq, std::move(entry));
             }
         }
@@ -1193,7 +1187,6 @@ class whitelist {
                 if (seq.empty()) continue;
                 barcode_entry be;
                 be.barcode = seq;
-                be.filtered = false;
                 if(populate_global){
                     out.global_bcs.emplace(seq, std::move(be));
                 } else {
@@ -1219,7 +1212,6 @@ class whitelist {
                 if (seq.empty()) continue;
                 barcode_entry be;
                 be.barcode = seq;
-                be.filtered = false;
                 out.true_bcs.emplace(seq, std::move(be));
             }
             for (auto const &seq : large) {
@@ -1228,7 +1220,6 @@ class whitelist {
                     if (seq.empty()) continue;
                     barcode_entry be{};
                     be.barcode   = seq;
-                    be.filtered  = false;
                     out.global_bcs.emplace(seq, be);
                 }
             }
@@ -1239,7 +1230,6 @@ class whitelist {
                 if (seq.empty()) continue;
                 barcode_entry be;
                 be.barcode = seq;
-                be.filtered = false;
                 //be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
             }
@@ -1247,7 +1237,6 @@ class whitelist {
                 if (seq.empty()) continue;
                 barcode_entry be;
                 be.barcode = seq;
-                be.filtered = false;
                 //be.flags = "";
                 out.true_bcs.emplace(seq, std::move(be));
             }
@@ -1263,7 +1252,6 @@ class whitelist {
                 if (!seq.empty() && (!exclude_true || !out.true_bcs.check_wl_for(seq))) {
                     barcode_entry entry;
                     entry.barcode = seq;
-                    entry.filtered = false;
                     destination.emplace(seq, std::move(entry));
                 }
                 source.erase(current);

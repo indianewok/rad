@@ -3,9 +3,11 @@
 // Included after counter and the transient barcode_entry are defined.
 // Resident entries have a fixed word width; temporary queries may widen.
 template <class Word> struct basic_barcode_entry {
-    packed_barcode<Word> barcode{};
+    static_assert(std::is_same_v<Word, uint64_t> || std::is_same_v<Word, uint128_t>,
+                  "Resident barcodes require an unsigned 64-bit or 128-bit word");
+    Word bits{};
     mutable counter count{};
-    bool filtered = false;
+    uint16_t length{};
     basic_barcode_entry() = default;
     static Word word_bits(const int64_seq& sequence) {
         if constexpr (std::is_same_v<Word, uint64_t>)
@@ -14,14 +16,19 @@ template <class Word> struct basic_barcode_entry {
             return sequence.as_uint128();
     }
     explicit basic_barcode_entry(const barcode_entry& entry)
-        : barcode{word_bits(entry.barcode), entry.barcode.length}, count(entry.count),
-          filtered(entry.filtered) {}
-    bool operator==(const basic_barcode_entry& other) const noexcept { return barcode == other.barcode; }
-    bool is_valid() const noexcept { return barcode.is_valid(); }
+        : bits(word_bits(entry.barcode)), count(entry.count), length(entry.barcode.length) {}
+    explicit basic_barcode_entry(const packed_barcode<Word>& key)
+        : bits(key.bits), length(key.length) {}
+    packed_barcode<Word> key() const noexcept { return {bits, length}; }
+    int64_seq sequence() const { return int64_seq::from_word(bits, length); }
+    bool operator==(const basic_barcode_entry& other) const noexcept {
+        return bits == other.bits && length == other.length;
+    }
+    bool is_valid() const noexcept { return length > 0 && length <= sizeof(Word) * 4; }
 };
 template <class Word> struct basic_barcode_entry_hash {
     size_t operator()(const basic_barcode_entry<Word>& entry) const noexcept {
-        return std::hash<packed_barcode<Word>>{}(entry.barcode);
+        return std::hash<packed_barcode<Word>>{}(entry.key());
     }
 };
 
@@ -43,22 +50,18 @@ class barcode_entry_handle {
     int64_seq barcode() const {
         if (!pointer_)
             return {};
-        return visit([](const auto& entry) { return int64_seq(entry.barcode); });
+        return visit([](const auto& entry) { return entry.sequence(); });
     }
     counter* counts() const {
         if (!pointer_)
             return nullptr;
         return visit([](const auto& entry) { return &entry.count; });
     }
-    bool filtered() const {
-        return pointer_ && visit([](const auto& entry) { return entry.filtered; });
-    }
     barcode_entry snapshot() const {
         barcode_entry result;
         result.barcode = barcode();
         if (const auto* c = counts())
             result.count = *c;
-        result.filtered = filtered();
         return result;
     }
     bool operator==(const barcode_entry_handle& other) const noexcept {
@@ -162,7 +165,7 @@ template <class Word> int64_seq key_of(const packed_barcode<Word>& sequence) {
     return int64_seq(sequence);
 }
 template <class Word> int64_seq key_of(const basic_barcode_entry<Word>& entry) {
-    return int64_seq(entry.barcode);
+    return entry.sequence();
 }
 template <class T> auto key_of(const T* pointer) -> decltype(key_of(*pointer)) {
     return key_of(*pointer);
@@ -241,13 +244,13 @@ struct bc_flat_set {
         barcode_entry_handle result;
         if (sequence.is_wide()) {
             if (const auto* table = entries_.wide()) {
-                basic_barcode_entry<uint128_t> probe;
-                probe.barcode = barcode_storage_detail::pack_key<uint128_t>(sequence);
+                basic_barcode_entry<uint128_t> probe(
+                    barcode_storage_detail::pack_key<uint128_t>(sequence));
                 table->if_contains(probe, [&](const auto& entry) { result = barcode_entry_handle(&entry); });
             }
         } else {
-            basic_barcode_entry<uint64_t> probe;
-            probe.barcode = barcode_storage_detail::pack_key<uint64_t>(sequence);
+            basic_barcode_entry<uint64_t> probe(
+                barcode_storage_detail::pack_key<uint64_t>(sequence));
             entries_.narrow().if_contains(probe,
                                           [&](const auto& entry) { result = barcode_entry_handle(&entry); });
         }
@@ -313,12 +316,12 @@ struct bc_flat_set {
             auto* table = entries_.wide();
             if (!table)
                 return 0;
-            basic_barcode_entry<uint128_t> probe;
-            probe.barcode = barcode_storage_detail::pack_key<uint128_t>(sequence);
+            basic_barcode_entry<uint128_t> probe(
+                barcode_storage_detail::pack_key<uint128_t>(sequence));
             return table->erase(probe);
         }
-        basic_barcode_entry<uint64_t> probe;
-        probe.barcode = barcode_storage_detail::pack_key<uint64_t>(sequence);
+        basic_barcode_entry<uint64_t> probe(
+            barcode_storage_detail::pack_key<uint64_t>(sequence));
         return entries_.narrow().erase(probe);
     }
     template <class T> void remove_bc_entry(const T& input) { erase(input); }
@@ -368,7 +371,7 @@ struct bc_flat_set {
                     rows.push_back(barcode_storage_detail::summarize(sequence, entry.counts()));
         } else
             for_each_entry([&](const auto& entry) {
-                rows.push_back(barcode_storage_detail::summarize(int64_seq(entry.barcode), &entry.count));
+                rows.push_back(barcode_storage_detail::summarize(entry.sequence(), &entry.count));
             });
         return rows;
     }
@@ -385,7 +388,7 @@ struct bc_flat_set {
         } else
             for_each_entry([&](const auto& entry) {
                 barcode_storage_detail::write_row(
-                    out, class_id, barcode_storage_detail::summarize(int64_seq(entry.barcode), &entry.count));
+                    out, class_id, barcode_storage_detail::summarize(entry.sequence(), &entry.count));
             });
     }
     size_t unique_storage_bytes() const {
@@ -468,9 +471,8 @@ template <class Key, class Value> struct bc_multimap {
     void copy_from(const bc_multimap& other) {
         other.for_each_entry([&](const auto& entry) {
             value snapshot;
-            snapshot.barcode = int64_seq(entry.barcode);
+            snapshot.barcode = entry.sequence();
             snapshot.count = entry.count;
-            snapshot.filtered = entry.filtered;
             insert_canonical(snapshot);
         });
         other.for_each_association([&](const auto& observed, const auto& values) {
