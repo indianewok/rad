@@ -249,6 +249,39 @@ void tests() {
     require(midpoint == 110 && kind == CUT_BOTH_ADAPTERS && !(flags & BOUNDARY_UNRESOLVED),
             "Two-sided terminal adapter behavior changed");
 
+    // Noisy facing terminal-anchor coordinates may overlap by up to five bases.
+    // Keep both complete anchor spans in the child windows in either orientation.
+    for (char strand : {'F', 'R'}) {
+        const int closing = state(tm, strand, false), opening_state = state(tm, strand, true);
+        for (int overlap : {0, 1, 2, 3, 4, 5, 6, 12}) {
+            const auto left = event(tm, closing, 74, 100);
+            const auto right = event(tm, opening_state, 100 - overlap, 126 - overlap);
+            const int actual = detail::junction_cut(tm, left, closing, right, opening_state,
+                                                     kind, INT32_MIN, INT32_MIN, &flags, &lo, &hi);
+            require(bool(flags & BOUNDARY_UNRESOLVED) == (overlap > 5),
+                    "Facing terminal-anchor overlap tolerance differs from five bases");
+            require((flags & BOUNDARY_LEFT_BOUNDED) && (flags & BOUNDARY_RIGHT_BOUNDED),
+                    "Facing terminal-anchor bounds were lost");
+            require(kind == CUT_BOTH_ADAPTERS && right.start <= actual && actual <= left.end,
+                    "Facing terminal-anchor cut left its observed interval");
+            require(lo <= right.start && hi >= left.end,
+                    "Overlapping terminal-anchor windows clip a complete facing anchor");
+        }
+    }
+
+    // A small overlap does not waive the independent observed-interval check.
+    // Here a bounded four-base prefix places the nominal cut before both events.
+    Model outside = tm;
+    outside.head_edge[to] = detail::edge_span{true, 4, 4};
+    outside.bc_head[to] = -1;
+    outside.bc_tail[tc] = -1;
+    const int clamped = detail::junction_cut(outside, event(outside, tc, 80, 100), tc,
+                                             event(outside, to, 100, 126), to,
+                                             kind, INT32_MIN, INT32_MIN, &flags, &lo, &hi);
+    require((flags & BOUNDARY_LEFT_BOUNDED) && (flags & BOUNDARY_RIGHT_BOUNDED) &&
+            (flags & BOUNDARY_UNRESOLVED) && clamped == 100,
+            "Small overlap bypassed an out-of-interval boundary rejection");
+
     // Calibration copies and refinalizes models; exported/reloaded parameters must not change layout geometry.
     Model copy = vm;
     check_cached_edges(copy, "Copied model");

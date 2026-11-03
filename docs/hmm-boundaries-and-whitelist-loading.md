@@ -15,7 +15,10 @@ They do not, by themselves, authorize clipping. This simplification preserves
 the same cuts, uncertainty windows and unresolved-boundary policy.
 
 - When both facing layout edges are bounded, the split and extraction windows
-  preserve their uncertainty and barcode blocks.
+  preserve their uncertainty and barcode blocks. An overlap of up to five bases
+  is accepted, matching the decoder's existing microhomology allowance. Both
+  children retain the shared interval; larger conflicts and cuts outside the
+  observed-marker interval remain unresolved.
 - When only one edge is bounded, that edge supplies a conservative allocation.
   The insert and unknown adjacent scaffold remain available for extraction.
   Such records have `HB:Z:layout_edge` in normal and debug FASTQ/A output. This

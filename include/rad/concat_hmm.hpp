@@ -4038,8 +4038,9 @@ inline int junction_cut(const Model& M, const Event& A, int sa, const Event& B, 
         kind = cl && op ? CUT_BOTH_ADAPTERS : CUT_GEOMETRY;
         wlo = std::min(cut, rl - rp);
         whi = std::max(cut, lh + lp);
-        // Inconsistent facing edges do not become an exact boundary just because both markers exist.
-        if (ll > rh) flags |= BOUNDARY_UNRESOLVED;
+        // Honor the decoder's microhomology allowance at physical edges too.
+        // Retained windows keep both blocks intact; larger conflicts remain unresolved.
+        if (rh - ll < DEL_GMIN) flags |= BOUNDARY_UNRESOLVED;
         break;
     case 1:  // Left edge only: retain the unknown sequence on its right.
         cut = (ll + lh) / 2;
