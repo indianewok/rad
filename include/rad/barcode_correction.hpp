@@ -423,6 +423,152 @@ namespace mutation_tools {
         return all_mutations;
     }
 
+    // Global-only shortlist. Legacy true/filter mutation generation is unchanged.
+    // Bit L-1 selects target length L; zero is an unrestricted compatibility mask.
+    inline std::vector<int64_seq> generate_lv_candidates(const int64_seq& seq, int edit_rounds,
+                                                        uint64_t target_length_mask) {
+        std::vector<int64_seq> output;
+        if (!seq.is_valid() || edit_rounds <= 0) return output;
+        const uint64_t targets = target_length_mask ? target_length_mask : ~uint64_t{0};
+        const auto eligible = [&](int length) {
+            return (targets & (uint64_t{1} << (length - 1))) != 0;
+        };
+        const auto reachable = [&](int length, int remaining) {
+            if (length < 1 || length > 64) return false;
+            const int margin = std::min(remaining, 64);
+            const int low = std::max(1, length - margin), high = std::min(64, length + margin);
+            const uint64_t range = (~uint64_t{0} << (low - 1)) & (~uint64_t{0} >> (64 - high));
+            return (targets & range) != 0;
+        };
+        if (!reachable(seq.length, edit_rounds)) return output;
+
+        // At equal length, <=2 edits are substitutions or a deletion/insertion.
+        // Insertion/deletion in the other order either commutes to D/I or is a
+        // cancellation/substitution already covered below. No frontier is needed.
+        const bool canonical = seq.visit([&](auto word) {
+            using Word = std::decay_t<decltype(word)>;
+            return (word & base_mask<Word>(seq.length)) == word;
+        });
+        if (canonical && edit_rounds <= 2 && targets == (uint64_t{1} << (seq.length - 1))) {
+            seq.visit([&](auto original) {
+                using Word = std::decay_t<decltype(original)>;
+                const int length = seq.length;
+                size_t bound = static_cast<size_t>(length) * 3;
+                if (edit_rounds == 2)
+                    bound += static_cast<size_t>(length) * (length - 1) * 9 / 2 +
+                             static_cast<size_t>(length) * length * 4;
+                phmap::flat_hash_set<Word, raw_word_hash<Word>> seen;
+                seen.reserve(bound + 1);
+                output.reserve(bound);
+                seen.insert(original);
+                const auto add = [&](Word raw) {
+                    if (seen.insert(raw).second) output.push_back(int64_seq::from_word(raw, length));
+                };
+                for (int first = 0; first < length; ++first) {
+                    const int shift = 2 * first;
+                    const Word mask = Word{3} << shift, old = (original & mask) >> shift;
+                    for (Word nucleotide = 0; nucleotide < 4; ++nucleotide) {
+                        if (nucleotide == old) continue;
+                        const Word one = (original & ~mask) | (nucleotide << shift);
+                        add(one);
+                        if (edit_rounds < 2) continue;
+                        for (int second = first + 1; second < length; ++second) {
+                            const int other_shift = 2 * second;
+                            const Word other_mask = Word{3} << other_shift;
+                            const Word other_old = (original & other_mask) >> other_shift;
+                            for (Word other = 0; other < 4; ++other)
+                                if (other != other_old) add((one & ~other_mask) | (other << other_shift));
+                        }
+                    }
+                }
+                if (edit_rounds < 2 || length == 1) return;
+                for (int deleted = 0; deleted < length; ++deleted) {
+                    const Word low = original & base_mask<Word>(deleted);
+                    const Word high = deleted + 1 == word_capacity<Word>
+                        ? Word{0} : original >> (2 * (deleted + 1));
+                    const Word shorter = (low | (high << (2 * deleted))) & base_mask<Word>(length - 1);
+                    for (int inserted = 0; inserted < length; ++inserted) {
+                        const Word prefix = shorter & base_mask<Word>(inserted);
+                        const Word suffix = shorter >> (2 * inserted);
+                        const Word shifted = inserted + 1 == word_capacity<Word>
+                            ? Word{0} : suffix << (2 * (inserted + 1));
+                        for (Word nucleotide = 0; nucleotide < 4; ++nucleotide)
+                            add(prefix | (nucleotide << (2 * inserted)) | shifted);
+                    }
+                }
+            });
+            return output;
+        }
+
+        using Narrow = packed_barcode<uint64_t>;
+        using Wide = packed_barcode<uint128_t>;
+        phmap::flat_hash_set<Narrow> seen_narrow;
+        phmap::flat_hash_set<Wide> seen_wide;
+        std::vector<Narrow> current_narrow, next_narrow;
+        std::vector<Wide> current_wide, next_wide;
+        if (seq.is_wide()) {
+            const Wide initial{seq.as_uint128(), seq.length};
+            seen_wide.insert(initial); current_wide.push_back(initial);
+        } else {
+            const Narrow initial{seq.as_uint64(), seq.length};
+            seen_narrow.insert(initial); current_narrow.push_back(initial);
+        }
+        for (int round = 0; round < edit_rounds; ++round) {
+            const int remaining = edit_rounds - round - 1;
+            next_narrow.clear(); next_wide.clear();
+            const auto add = [&](auto raw, int length) {
+                if (length <= 32) {
+                    const Narrow candidate{static_cast<uint64_t>(raw), static_cast<uint16_t>(length)};
+                    if (!seen_narrow.insert(candidate).second) return;
+                    if (eligible(length)) output.push_back(int64_seq(candidate));
+                    if (remaining) next_narrow.push_back(candidate);
+                } else {
+                    const Wide candidate{static_cast<uint128_t>(raw), static_cast<uint16_t>(length)};
+                    if (!seen_wide.insert(candidate).second) return;
+                    if (eligible(length)) output.push_back(int64_seq(candidate));
+                    if (remaining) next_wide.push_back(candidate);
+                }
+            };
+            const auto expand = [&](const auto& candidate) {
+                const auto original = candidate.bits;
+                using Word = std::decay_t<decltype(original)>;
+                const int length = candidate.length;
+                if (reachable(length, remaining))
+                    for_each_point_mutation(original, length, [&](Word raw) { add(raw, length); });
+                if (length > 1 && reachable(length - 1, remaining)) {
+                    for (int position = 0; position < length; ++position) {
+                        const Word low = original & base_mask<Word>(position);
+                        const Word high = position + 1 == word_capacity<Word>
+                            ? Word{0} : original >> (2 * (position + 1));
+                        add((low | (high << (2 * position))) & base_mask<Word>(length - 1), length - 1);
+                    }
+                }
+                if (length < 64 && reachable(length + 1, remaining)) {
+                    const auto insert = [&](auto source) {
+                        using InsertWord = std::decay_t<decltype(source)>;
+                        source &= base_mask<InsertWord>(length);
+                        for (int position = 0; position <= length; ++position) {
+                            const InsertWord low = source & base_mask<InsertWord>(position);
+                            const InsertWord high = source >> (2 * position);
+                            const InsertWord shifted = position + 1 == word_capacity<InsertWord>
+                                ? InsertWord{0} : high << (2 * (position + 1));
+                            for (InsertWord nucleotide = 0; nucleotide < 4; ++nucleotide)
+                                add(low | (nucleotide << (2 * position)) | shifted, length + 1);
+                        }
+                    };
+                    // A 32-base insertion must widen before doing any shifts.
+                    if (length < 32) insert(static_cast<uint64_t>(original));
+                    else insert(static_cast<uint128_t>(original));
+                }
+            };
+            for (const auto& candidate : current_narrow) expand(candidate);
+            for (const auto& candidate : current_wide) expand(candidate);
+            if (!remaining || (next_narrow.empty() && next_wide.empty())) break;
+            current_narrow.swap(next_narrow); current_wide.swap(next_wide);
+        }
+        return output;
+    }
+
     inline bool detect_hp(const std::string& sequence, int max_hp) {
         if (sequence.empty() || max_hp <= 0) return false;
         const int length = static_cast<int>(sequence.size());

@@ -235,6 +235,9 @@ struct bc_flat_set {
     using value = barcode_entry;
 
   private:
+    // Structural mutation is quiescent, as for the resident NullMutex tables.
+    // Erasure may retain old bits: this mask is a conservative length filter.
+    uint64_t length_mask_ = 0;
     barcode_storage_detail::table_pair<barcode_storage_detail::flat_entries<uint64_t>,
                                        barcode_storage_detail::flat_entries<uint128_t>>
         entries_;
@@ -268,7 +271,8 @@ struct bc_flat_set {
     }
     bool has_wide_storage() const { return entries_.wide() != nullptr; }
     bool empty() const { return size() == 0; }
-    void clear() { entries_.clear(); }
+    uint64_t length_mask() const noexcept { return length_mask_; }
+    void clear() { entries_.clear(); length_mask_ = 0; }
     template <class T> bool check_wl_for(const T& input) const {
         bool found = false;
         barcode_storage_detail::for_each_key(input, [&](const key& sequence) {
@@ -292,6 +296,8 @@ struct bc_flat_set {
     template <class T> void insert_bc_entry(const T&, const value& correct) {
         if (!correct.is_valid())
             return;
+        // Record the stored identity, not the possibly different observed key.
+        length_mask_ |= uint64_t{1} << (correct.barcode.length - 1);
         if (correct.barcode.is_wide())
             entries_.ensure_wide().emplace(basic_barcode_entry<uint128_t>(correct));
         else

@@ -989,7 +989,8 @@ namespace barcode_correction {
  * If a single best match is identified, it also undergoes a quality check before being returned.
  * If no suitable match is found or if quality checks fail, the function returns std::nullopt.
  */
-    std::optional<int64_seq> check_against_wl(const int64_seq& bc, const std::unordered_set<int64_seq>& candidates,
+    template <class Candidates>
+    std::optional<int64_seq> check_against_wl(const int64_seq& bc, const Candidates& candidates,
         const std::string& whitelist_type, int max_dist, bool verbose, const std::string& mode, const whitelist::wl_entry* wl = nullptr,
         bc_position* pos = nullptr
     ) {
@@ -1726,15 +1727,24 @@ namespace barcode_correction {
             return kmer_fuzzy_result;
         }
         
-        auto muts = mutation_tools::generate_mutated_barcodes(bc, mut_dist);
         if (pos) *pos = bc_position{};
+        const auto check_true_mutations = [&]() -> std::optional<int64_seq> {
+            if (wl.true_bcs.empty()) return std::nullopt;
+            auto muts = mutation_tools::generate_mutated_barcodes(bc, mut_dist);
+            return check_against_wl(exp_bc, muts, "true", 2, verbose, mode, &wl, pos);
+        };
+        const auto check_global_mutations = [&]() -> std::optional<int64_seq> {
+            if (wl.global_bcs.empty()) return std::nullopt;
+            auto global_muts = mutation_tools::generate_lv_candidates(bc, mut_dist, wl.global_bcs.length_mask());
+            return check_against_wl(exp_bc, global_muts, "global", max_dist, verbose, mode, &wl, pos);
+        };
         if(mode == "defensive"){
-            auto global_result = check_against_wl(exp_bc, muts, "global", max_dist, verbose, mode, &wl, pos);
+            auto global_result = check_global_mutations();
             if(global_result.has_value()){
                 return(global_result);
             }
 
-            auto true_result = check_against_wl(exp_bc, muts, "true", 2, verbose, mode, &wl, pos);
+            auto true_result = check_true_mutations();
             if(true_result.has_value()){
                 return(true_result);
             }
@@ -1743,7 +1753,7 @@ namespace barcode_correction {
         // IF OFFENSIVE: Check against true first, and then global
         
         if(mode == "offensive") {
-            auto true_result = check_against_wl(exp_bc, muts, "true", 2, verbose, mode, &wl, pos);
+            auto true_result = check_true_mutations();
             if (true_result.has_value()) {
                 if (verbose) {
                     #pragma omp critical
@@ -1755,7 +1765,7 @@ namespace barcode_correction {
                 return true_result;
             }
 
-            auto global_result = check_against_wl(exp_bc, muts, "global", max_dist, verbose, mode, &wl, pos);
+            auto global_result = check_global_mutations();
             if (global_result.has_value()) {
                 if (verbose) {
                     #pragma omp critical
