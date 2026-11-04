@@ -1862,15 +1862,11 @@ public:
 
         for (auto & [key, entry_ref] : wl_map.maps) {
             auto &E = entry_ref.get();
-            std::unordered_set<int64_seq> to_remove;
-            to_remove.reserve(E.true_bcs.size());
+            // The true and global tables own separate storage, so removing
+            // global overlaps does not invalidate this association traversal.
             E.true_bcs.for_each_association([&](const auto& barcode, const auto&) {
-                to_remove.emplace(barcode);
+                E.global_bcs.remove_bc_entry(barcode);
             });
-
-            for (auto const &bc : to_remove){
-                E.global_bcs.remove_bc_entry(bc);
-            }
 
             // final report
             std::cout << "[load_wl]"
@@ -1905,6 +1901,8 @@ public:
         for (auto & [pool_key, E] : wl_map.lists) {
             E.build_part_idx(verbose);
         }
+
+        memory_utils::release_unused_heap();
 
         auto t3 = high_resolution_clock::now();
         double total_s = duration<double>(t3 - t0).count();

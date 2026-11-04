@@ -807,7 +807,28 @@ class whitelist {
             void build(const std::vector<barcode_entry_handle>& entries, bool verbose) {
                 index.clear();
                 ready = false;
-                index.reserve(entries.size() * 3);
+                // Reserve distinct seed keys, not one hash bucket for every
+                // posting. Many barcodes share the same short partition.
+                std::map<size_t, size_t> length_counts;
+                for (const auto entry : entries) {
+                    if (!entry) continue;
+                    const auto barcode = entry.barcode();
+                    if (barcode.is_valid() && barcode.length >= 3)
+                        ++length_counts[barcode.length];
+                }
+                size_t seed_keys = 0;
+                for (const auto& by_length : length_counts) {
+                    for (const auto& window : partitions(by_length.first)) {
+                        const size_t length = window.second - window.first;
+                        const size_t possible = length >= std::numeric_limits<size_t>::digits / 2
+                            ? std::numeric_limits<size_t>::max() : size_t(1) << (2 * length);
+                        const size_t bound = std::min(by_length.second, possible);
+                        if (bound > std::numeric_limits<size_t>::max() - seed_keys)
+                            throw std::length_error("Barcode seed index size exceeds size_t");
+                        seed_keys += bound;
+                    }
+                }
+                index.reserve(seed_keys);
                 for (const auto entry : entries) {
                     if (!entry) continue;
                     const auto barcode = entry.barcode();
@@ -911,6 +932,9 @@ class whitelist {
                 groups.clear();
                 n_entries = entries.size();
                 ready = false;
+                std::map<int, size_t> length_counts;
+                for (const auto e : entries)
+                    if (comparable(e)) ++length_counts[e.barcode().length];
                 std::map<int, size_t> by_len;
                 for (const auto e : entries) {
                     if (!comparable(e)) continue;
@@ -920,6 +944,7 @@ class whitelist {
                         it = by_len.emplace(m, groups.size()).first;
                         groups.emplace_back();
                         groups.back().m = m;
+                        groups.back().entries.reserve(length_counts.at(m));
                     }
                     groups[it->second].entries.push_back(e);
                 }
@@ -1313,6 +1338,61 @@ class whitelist {
                   << " (classification buffer limited to " << global_threshold << " distinct keys).\n";
         return out;
     }
+
+    // Stage dual inputs in the same packed flat storage used by global_bcs.
+    // The larger table can then be moved into its final home without copying
+    // every catalog barcode through a node-based temporary set.
+    struct staged_whitelist {
+        bc_flat_set barcodes;
+        phmap::flat_hash_set<int64_seq> ignored_keys;
+
+        size_t parsed_size() const { return barcodes.size() + ignored_keys.size(); }
+    };
+
+    static staged_whitelist stage_whitelist(std::string const& spec,
+                                            uint16_t default_length, bool verbose) {
+        staged_whitelist out;
+        stream_barcodes(spec, default_length, verbose, [&](const int64_seq& seq) {
+            if (seq.is_valid()) {
+                out.barcodes.insert_bc_entry(seq);
+            } else {
+                // Legacy role selection counts distinct parsed keys before
+                // population ignores invalid/empty keys. Preserve that count,
+                // including distinct length-zero numeric bitlist keys.
+                out.ignored_keys.insert(seq);
+            }
+        });
+        return out;
+    }
+
+    wl_entry import_dual_whitelist(const std::string& first, const std::string& second,
+                                   uint16_t default_length, bool verbose) {
+        auto a = stage_whitelist(first, default_length, verbose);
+        auto b = stage_whitelist(second, default_length, verbose);
+        const size_t size_a = a.parsed_size(), size_b = b.parsed_size();
+        wl_entry out;
+        auto add_true = [&](const auto& resident) {
+            const auto sequence = resident.sequence();
+            out.true_bcs.insert_bc_entry(sequence);
+            out.global_bcs.remove_bc_entry(sequence);
+        };
+        if (size_a != size_b) {
+            auto& smaller = size_a < size_b ? a : b;
+            auto& larger = size_a < size_b ? b : a;
+            out.global_bcs = std::move(larger.barcodes);
+            smaller.barcodes.for_each_entry(add_true);
+        } else {
+            // Preserve the legacy equal-cardinality union into true_bcs.
+            a.barcodes.for_each_entry(add_true);
+            b.barcodes.for_each_entry(add_true);
+        }
+        if (verbose) {
+            std::cout << "[populate_entry] Dual packed whitelists: parsed=" << size_a
+                      << "/" << size_b << ", global=" << out.global_bcs.size()
+                      << ", true=" << out.true_bcs.size() << '\n';
+        }
+        return out;
+    }
 /**
  * @brief Populate a whitelist entry with true and global barcodes based on provided sets
  * @param out: Reference to the `wl_entry` to populate
@@ -1459,17 +1539,7 @@ class whitelist {
         if (specs.size() == 1)
             return import_single_whitelist(specs.front(), default_length, verbose);
 
-        std::vector<std::unordered_set<int64_seq>> sets;
-        for (auto const &spec : specs) {
-            sets.push_back(load_barcodes(spec, default_length, verbose));
-        }
-
-        // assemble the wl_entry
-        wl_entry out;
-        out.global_bcs.clear();
-        out.true_bcs.clear();
-        populate_entry(out, std::move(sets));
-        return out;
+        return import_dual_whitelist(specs[0], specs[1], default_length, verbose);
     }
 
 };
