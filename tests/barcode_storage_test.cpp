@@ -1,7 +1,9 @@
 #include "rad/rad_headers.h"
 #include <cstdlib>
 #include <cstddef>
+#include <map>
 #include <random>
+#include <set>
 #include <sstream>
 
 static void require(bool pass, const char* message) {
@@ -34,6 +36,187 @@ static int infix_distance(const std::string& pattern, const std::string& text) {
 static int sequence_distance(const std::string& a, const std::string& b) {
     return a.size() <= b.size() ? infix_distance(a, b) : infix_distance(b, a);
 }
+
+using expected_associations = std::map<std::string, std::set<std::string>>;
+static void require_associations(const bc_map& table, const std::vector<int64_seq>& probes,
+                                 const expected_associations& expected) {
+    expected_associations traversed;
+    table.for_each_association([&](const auto& observed, const auto& handles) {
+        const auto text = barcode_storage_detail::key_of(observed).bits_to_sequence();
+        require(traversed.count(text) == 0 && !handles.empty(),
+                "association traversal duplicated a key or emitted an empty mapping");
+        auto& targets = traversed[text];
+        for (const auto handle : handles) {
+            require(bool(handle), "association traversal emitted a null handle");
+            require(targets.insert(handle.barcode().bits_to_sequence()).second,
+                    "association traversal duplicated a canonical target");
+        }
+        require(targets.size() == handles.size(), "association view has an inconsistent size");
+    });
+    require(traversed == expected, "implicit identity traversal changed association mappings");
+    require(table.size() == expected.size() && table.association_size() == expected.size() &&
+            table.empty() == expected.empty(), "logical association cardinality changed");
+    size_t narrow = 0;
+    for (const auto& pair : expected) narrow += pair.first.size() <= 32;
+    require(table.narrow_association_size() == narrow &&
+            table.wide_association_size() == expected.size() - narrow,
+            "logical association widths changed");
+    require(table.validate_association_keys() == 0 && table.validate_association_values() == 0,
+            "implicit association validation failed");
+    for (const auto& probe : probes) {
+        const auto text = probe.bits_to_sequence();
+        const auto found = expected.find(text);
+        const std::set<std::string> targets = found == expected.end()
+            ? std::set<std::string>{} : found->second;
+        require(table.check_wl_for(probe) == !targets.empty() && table.count(probe) == targets.size(),
+                "implicit lookup changed membership or candidate count");
+        require(table.has_identity_mapping(probe) == (targets.count(text) != 0),
+                "canonical existence was confused with an active identity mapping");
+        std::set<std::string> returned;
+        for (const auto& target : table.return_putative_correct_bcs(probe))
+            returned.insert(target.bits_to_sequence());
+        require(returned == targets, "implicit lookup changed candidate identities");
+        std::set<std::string> ranged;
+        const auto range = table.equal_range(probe);
+        for (auto it = range.first; it != range.second; ++it) {
+            require(bool(*it), "implicit equal_range emitted a null handle");
+            require(ranged.insert(it->barcode().bits_to_sequence()).second,
+                    "implicit equal_range duplicated a candidate");
+        }
+        require(ranged == targets, "implicit equal_range differs from candidate lookup");
+    }
+    const auto rows = table.summarize_counts();
+    std::set<std::string> summary_keys;
+    for (const auto& row : rows)
+        require(summary_keys.insert(std::get<0>(row)).second, "summary duplicated an implicit identity");
+    require(rows.size() == expected.size(), "summary omitted an implicit identity or included a cleared key");
+    for (const auto& pair : expected)
+        require(summary_keys.count(pair.first), "summary lost an association key");
+}
+
+static void check_implicit_identity_contract(const std::string& a, const std::string& b,
+                                            const std::string& c) {
+    std::string alias_text = a;
+    alias_text[0] = alias_text[0] == 'A' ? 'C' : 'A';
+    const int64_seq ka(a), kb(b), kc(c), alias(alias_text);
+    const std::vector<int64_seq> probes{ka, kb, kc, alias};
+    expected_associations expected{{a, {a}}, {b, {b}}, {c, {c}}};
+    bc_map identities;
+    identities.insert_bc_entry(ka, entry(a));
+    identities.set_bc_count(ka, 7, barcode_counts::raw);
+    auto* const stable_a = identities.find_counter(ka);
+    identities.insert_bc_entry(kb, entry(b));
+    identities.insert_bc_entry(kc, entry(c));
+    identities.insert_bc_entry(ka, entry(a));
+    require(identities.stored_alias_size() == 0 && identities.physical_alias_handle_count() == 0,
+            "identity-only whitelist allocated explicit alias records");
+    require(identities.unique_val_size() == 3 && identities.narrow_size() == 1 && identities.wide_size() == 2,
+            "implicit identities changed canonical cardinality or width");
+    require(identities.find_counter(ka) == stable_a && stable_a->load(barcode_counts::raw) == 7,
+            "canonical insertion or duplicate identity invalidated shared counters");
+    require_associations(identities, probes, expected);
+
+    identities.insert_bc_entry(alias, entry(a));
+    expected[alias_text] = {a};
+    require(identities.stored_alias_size() == 1 && identities.physical_alias_handle_count() == 1 &&
+            identities.find_counter(alias) == stable_a, "alias did not share the canonical identity counter");
+    identities.update_bc_count(alias, barcode_counts::corrected);
+    require(stable_a->load(barcode_counts::corrected) == 1, "alias updated a separate counter copy");
+    require(identities.erase(ka) == 1 && identities.erase(ka) == 0,
+            "erasing an implicit identity changed erase cardinality");
+    expected.erase(a);
+    require(!identities.find_counter(ka) && identities.find_counter(alias) == stable_a &&
+            identities.unique_val_size() == 3, "identity erase deleted a shared canonical entry");
+    require_associations(identities, probes, expected);
+    identities.insert_bc_entry(ka, entry(a));
+    expected[a] = {a};
+    require(identities.find_counter(ka) == stable_a && stable_a->load(barcode_counts::raw) == 7,
+            "identity reinsertion reset counters or replaced the canonical node");
+
+    identities.insert_bc_entry(ka, entry(b));
+    identities.insert_bc_entry(ka, entry(b));
+    expected[a] = {a, b};
+    require(identities.stored_alias_size() == 2 && identities.physical_alias_handle_count() == 2,
+            "identity-plus-alias duplicated an explicit identity edge or alias");
+    require_associations(identities, probes, expected);
+    identities.update_bc_count(ka);
+    require(stable_a->load(barcode_counts::total) == 1 && identities.get_bc_count(kb) == 1,
+            "mixed identity/alias updates did not visit every canonical target exactly once");
+    identities.subtract_bc_count(ka);
+    require(stable_a->load(barcode_counts::total) == 0 && identities.get_bc_count(kb) == 0,
+            "mixed identity/alias subtraction changed fanout");
+    require(identities.erase(ka) == 1, "mixed identity/alias erase returned edge count instead of key count");
+    expected.erase(a);
+    identities.insert_bc_entry(ka, entry(b));
+    expected[a] = {b};
+    require(!identities.has_identity_mapping(ka) && identities.find_counter(ka) == identities.find_counter(kb),
+            "reinserted alias resurrected the erased identity of its canonical lookup key");
+    require_associations(identities, probes, expected);
+
+    bc_map copied = identities;
+    require_associations(copied, probes, expected);
+    require(copied.find_counter(alias) != stable_a && copied.get_bc_count(alias, barcode_counts::raw) == 7,
+            "copy lost a canonical counter or shared its source storage");
+    copied.update_bc_count(alias);
+    require(copied.get_bc_count(alias) == 1 && stable_a->load(barcode_counts::total) == 0,
+            "copy mutates the source canonical counter");
+    bc_map assigned;
+    assigned.insert_bc_entry(kc, entry(c));
+    assigned = copied;
+    require_associations(assigned, probes, expected);
+    auto* const assigned_a = assigned.find_counter(alias);
+    bc_map moved = std::move(assigned);
+    require_associations(moved, probes, expected);
+    require(moved.find_counter(alias) == assigned_a, "move invalidated canonical counter handles");
+    bc_map move_assigned;
+    move_assigned = std::move(moved);
+    require_associations(move_assigned, probes, expected);
+    require(move_assigned.find_counter(alias) == assigned_a, "move assignment invalidated canonical handles");
+    move_assigned.clear_associations();
+    require_associations(move_assigned, probes, {});
+    require(move_assigned.unique_val_size() == 3 && move_assigned.stored_alias_size() == 0 &&
+            assigned_a->load(barcode_counts::total) == 1,
+            "clear_associations discarded canonical values or retained aliases");
+    bc_map cleared_copy = move_assigned;
+    require_associations(cleared_copy, probes, {});
+    require(cleared_copy.unique_val_size() == 3, "copy of a cleared map lost retained canonical values");
+    move_assigned.insert_bc_entry(ka, entry(a));
+    require_associations(move_assigned, probes, {{a, {a}}});
+    require(move_assigned.find_counter(ka) == assigned_a && move_assigned.get_bc_count(ka) == 1 &&
+            move_assigned.stored_alias_size() == 0,
+            "identity reinsertion after clear allocated an alias or reset retained counters");
+    move_assigned.clear();
+    require(move_assigned.unique_val_size() == 0 && move_assigned.empty(), "clear retained canonical entries");
+
+    bc_map target_only;
+    target_only.insert_bc_entry(alias, entry(b));
+    require_associations(target_only, probes, {{alias_text, {b}}});
+    require(!target_only.check_wl_for(kb) && !target_only.find_counter(kb),
+            "alias target gained an identity mapping without identity insertion");
+
+    bc_map concurrent_identities;
+    #pragma omp parallel for num_threads(4)
+    for (int i = 0; i < 2000; ++i) {
+        switch (i % 5) {
+        case 0: concurrent_identities.insert_bc_entry(ka, entry(a)); break;
+        case 1: concurrent_identities.insert_bc_entry(kb, entry(b)); break;
+        case 2: concurrent_identities.insert_bc_entry(kc, entry(c)); break;
+        case 3: concurrent_identities.insert_bc_entry(kc, entry(a)); break;
+        case 4: concurrent_identities.insert_bc_entry(kc, entry(b)); break;
+        }
+    }
+    require_associations(concurrent_identities, probes, {{a, {a}}, {b, {b}}, {c, {a, b, c}}});
+    require(concurrent_identities.unique_val_size() == 3 && concurrent_identities.stored_alias_size() == 1 &&
+            concurrent_identities.physical_alias_handle_count() == 2,
+            "parallel identity/alias insertion duplicated or materialized identity edges");
+    auto handles = concurrent_identities.get_unique_entries();
+    #pragma omp parallel for num_threads(4)
+    for (int i = 0; i < 2000; ++i) concurrent_identities.update_bc_count(kc);
+    for (const auto handle : handles)
+        require(handle.counts()->load(barcode_counts::total) == 2000,
+                "parallel mixed identity/alias counter updates lost or duplicated increments");
+}
+
 int main() {
     using NarrowEntry = basic_barcode_entry<uint64_t>;
     using WideEntry = basic_barcode_entry<uint128_t>;
@@ -51,6 +234,7 @@ int main() {
     const auto wide_text = random_dna(generator, 33);
     const auto full_text = random_dna(generator, 64);
     const int64_seq short_key(short_text), wide_key(wide_text), full_key(full_text);
+    check_implicit_identity_contract(short_text, wide_text, full_text);
     bc_flat_set catalog;
     catalog.insert_bc_entry(short_key, entry(short_text));
     require(catalog.narrow_size() == 1 && catalog.wide_size() == 0 && !catalog.has_wide_storage(),

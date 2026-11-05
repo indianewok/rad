@@ -1875,6 +1875,10 @@ public:
                     << ", true = "  << E.true_bcs.size()
                     << ", filter = "<< E.filter_bcs.size()
                     << "\n";
+            std::cout << "[load_wl] [" << key << "] true logical associations = "
+                      << E.true_bcs.association_size()
+                      << ", explicit alias keys = " << E.true_bcs.physical_alias_size()
+                      << "\n";
             for (auto const &kv : wl_map.maps) {
                 auto const &E = kv.second.get();
                 

@@ -8,7 +8,23 @@ template <class Word> struct basic_barcode_entry {
     Word bits{};
     mutable counter count{};
     uint16_t length{};
+    // The node-based true whitelist uses one padding byte for its implicit
+    // identity association. Flat catalog entries leave this flag unused.
+    mutable std::atomic<bool> identity_mapping{false};
     basic_barcode_entry() = default;
+    basic_barcode_entry(const basic_barcode_entry& other)
+        : bits(other.bits), count(other.count), length(other.length),
+          identity_mapping(other.identity_mapping.load(std::memory_order_relaxed)) {}
+    basic_barcode_entry& operator=(const basic_barcode_entry& other) {
+        if (this != &other) {
+            bits = other.bits;
+            count = other.count;
+            length = other.length;
+            identity_mapping.store(other.identity_mapping.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+        }
+        return *this;
+    }
     static Word word_bits(const int64_seq& sequence) {
         if constexpr (std::is_same_v<Word, uint64_t>)
             return sequence.as_uint64();
@@ -420,12 +436,94 @@ template <class Key, class Value> struct bc_multimap {
     barcode_storage_detail::table_pair<barcode_storage_detail::node_entries<uint64_t>,
                                        barcode_storage_detail::node_entries<uint128_t>>
         canonical_;
+    // Only non-identity edges live here. An active identity is represented by
+    // the flag on its canonical node, with no second key/node/handle-set.
     barcode_storage_detail::table_pair<barcode_storage_detail::alias_map<uint64_t>,
                                        barcode_storage_detail::alias_map<uint128_t>>
         associations_;
-    template <class F> bool with_associations(const key& sequence, F&& fn) const {
-        if (!sequence.is_valid())
-            return false;
+    mutable std::mutex mutation_mutex_;
+    std::atomic<size_t> narrow_keys_{0}, wide_keys_{0};
+    std::atomic<size_t> alias_keys_{0}, alias_handles_{0};
+
+    // A callback-scoped, non-owning union of the implicit identity and explicit
+    // aliases. Exact lookup never allocates a temporary singleton hash set.
+    class association_view {
+        barcode_entry_handle identity_;
+        const handle_set* aliases_ = nullptr;
+
+      public:
+        class iterator {
+            barcode_entry_handle identity_;
+            const handle_set* aliases_ = nullptr;
+            handle_set::const_iterator alias_{};
+            bool at_identity_ = false;
+
+          public:
+            using iterator_category = std::forward_iterator_tag;
+            using value_type = barcode_entry_handle;
+            using difference_type = std::ptrdiff_t;
+            using pointer = const value_type*;
+            using reference = const value_type&;
+            iterator() = default;
+            iterator(barcode_entry_handle identity, const handle_set* aliases, bool end)
+                : identity_(identity), aliases_(aliases), at_identity_(!end && bool(identity)) {
+                if (aliases_) alias_ = end ? aliases_->end() : aliases_->begin();
+            }
+            reference operator*() const { return at_identity_ ? identity_ : *alias_; }
+            pointer operator->() const { return &**this; }
+            iterator& operator++() {
+                if (at_identity_) at_identity_ = false;
+                else ++alias_;
+                return *this;
+            }
+            iterator operator++(int) { auto old = *this; ++*this; return old; }
+            bool operator==(const iterator& other) const {
+                return at_identity_ == other.at_identity_ && aliases_ == other.aliases_ &&
+                       (at_identity_ ? identity_ == other.identity_ : !aliases_ || alias_ == other.alias_);
+            }
+            bool operator!=(const iterator& other) const { return !(*this == other); }
+        };
+        association_view(barcode_entry_handle identity, const handle_set* aliases)
+            : identity_(identity), aliases_(aliases) {}
+        size_t size() const { return size_t(bool(identity_)) + (aliases_ ? aliases_->size() : 0); }
+        bool empty() const { return size() == 0; }
+        iterator begin() const { return iterator(identity_, aliases_, false); }
+        iterator end() const { return iterator(identity_, aliases_, true); }
+    };
+
+    barcode_entry_handle find_canonical(const key& sequence) const {
+        if (!sequence.is_valid()) return {};
+        barcode_entry_handle result;
+        if (sequence.is_wide()) {
+            if (const auto* table = canonical_.wide()) {
+                basic_barcode_entry<uint128_t> probe(
+                    barcode_storage_detail::pack_key<uint128_t>(sequence));
+                table->if_contains(probe, [&](const auto& entry) { result = barcode_entry_handle(&entry); });
+            }
+        } else {
+            basic_barcode_entry<uint64_t> probe(
+                barcode_storage_detail::pack_key<uint64_t>(sequence));
+            canonical_.narrow().if_contains(probe,
+                [&](const auto& entry) { result = barcode_entry_handle(&entry); });
+        }
+        return result;
+    }
+    static bool identity_active(barcode_entry_handle entry) {
+        return entry && entry.visit([](const auto& stored) {
+            return stored.identity_mapping.load(std::memory_order_relaxed);
+        });
+    }
+    static void set_identity(barcode_entry_handle entry, bool active) {
+        if (entry) entry.visit([&](const auto& stored) {
+            stored.identity_mapping.store(active, std::memory_order_relaxed);
+        });
+    }
+    barcode_entry_handle find_identity(const key& sequence) const {
+        const auto entry = find_canonical(sequence);
+        return identity_active(entry) ? entry : barcode_entry_handle{};
+    }
+    template <class F> bool with_stored_aliases(const key& sequence, F&& fn) const {
+        if (!sequence.is_valid() || !alias_keys_.load(std::memory_order_relaxed)) return false;
         if (sequence.is_wide()) {
             const auto* table = associations_.wide();
             return table && table->if_contains(barcode_storage_detail::pack_key<uint128_t>(sequence),
@@ -433,6 +531,15 @@ template <class Key, class Value> struct bc_multimap {
         }
         return associations_.narrow().if_contains(barcode_storage_detail::pack_key<uint64_t>(sequence),
                                                   [&](const auto& pair) { fn(pair.second); });
+    }
+    template <class F> bool with_associations(const key& sequence, F&& fn) const {
+        if (!sequence.is_valid()) return false;
+        const auto identity = find_identity(sequence);
+        const bool stored = with_stored_aliases(sequence, [&](const auto& aliases) {
+            fn(association_view(identity, &aliases));
+        });
+        if (!stored && identity) fn(association_view(identity, nullptr));
+        return stored || bool(identity);
     }
     barcode_entry_handle insert_canonical(const value& correct) {
         barcode_entry_handle result;
@@ -451,28 +558,46 @@ template <class Key, class Value> struct bc_multimap {
             insert(canonical_.narrow(), basic_barcode_entry<uint64_t>(correct));
         return result;
     }
-    void add_association(const key& observed, barcode_entry_handle correct) {
+    // Caller holds mutation_mutex_, so key-union metadata remains exact even
+    // when parallel insertions mix identity and alias edges for the same key.
+    void add_stored_alias(const key& observed, barcode_entry_handle correct) {
+        bool new_key = false, new_handle = false;
         auto insert = [&](auto& table, const auto& packed) {
             table.lazy_emplace_l(
-                packed, [&](auto& pair) { pair.second.insert(correct); },
+                packed, [&](auto& pair) { new_handle = pair.second.insert(correct).second; },
                 [&](const auto& ctor) {
                     handle_set values;
                     values.insert(correct);
                     ctor(packed, std::move(values));
+                    new_key = new_handle = true;
                 });
         };
         if (observed.is_wide())
             insert(associations_.ensure_wide(), barcode_storage_detail::pack_key<uint128_t>(observed));
         else
             insert(associations_.narrow(), barcode_storage_detail::pack_key<uint64_t>(observed));
+        if (new_key) alias_keys_.fetch_add(1, std::memory_order_relaxed);
+        if (new_handle) alias_handles_.fetch_add(1, std::memory_order_relaxed);
     }
     barcode_entry_handle first_handle(const key& sequence) const {
         barcode_entry_handle result;
+        // Multi-candidate iteration order is unspecified; prefer the direct
+        // identity when present rather than materializing/re-hashing its union.
         with_associations(sequence, [&](const auto& values) {
-            if (!values.empty())
-                result = *values.begin();
+            if (!values.empty()) result = *values.begin();
         });
         return result;
+    }
+    std::atomic<size_t>& key_count(const key& sequence) {
+        return sequence.is_wide() ? wide_keys_ : narrow_keys_;
+    }
+    void move_from(bc_multimap& other) {
+        canonical_ = std::move(other.canonical_);
+        associations_ = std::move(other.associations_);
+        narrow_keys_.store(other.narrow_keys_.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
+        wide_keys_.store(other.wide_keys_.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
+        alias_keys_.store(other.alias_keys_.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
+        alias_handles_.store(other.alias_handles_.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
     }
     void copy_from(const bc_multimap& other) {
         other.for_each_entry([&](const auto& entry) {
@@ -483,15 +608,17 @@ template <class Key, class Value> struct bc_multimap {
         });
         other.for_each_association([&](const auto& observed, const auto& values) {
             const key sequence(observed);
-            for (const auto handle : values)
-                add_association(sequence, insert_canonical(handle.snapshot()));
+            for (const auto handle : values) insert_bc_entry(sequence, handle.snapshot());
         });
     }
 
   public:
     bc_multimap() = default;
     bc_multimap(const bc_multimap& other) { copy_from(other); }
-    bc_multimap(bc_multimap&&) = default;
+    bc_multimap(bc_multimap&& other) {
+        std::lock_guard<std::mutex> lock(other.mutation_mutex_);
+        move_from(other);
+    }
     bc_multimap& operator=(const bc_multimap& other) {
         if (this != &other) {
             bc_multimap copy(other);
@@ -499,8 +626,14 @@ template <class Key, class Value> struct bc_multimap {
         }
         return *this;
     }
-    bc_multimap& operator=(bc_multimap&&) = default;
-    size_t size() const { return associations_.size(); }
+    bc_multimap& operator=(bc_multimap&& other) {
+        if (this != &other) {
+            std::scoped_lock lock(mutation_mutex_, other.mutation_mutex_);
+            move_from(other);
+        }
+        return *this;
+    }
+    size_t size() const { return narrow_association_size() + wide_association_size(); }
     size_t association_size() const { return size(); }
     size_t unique_val_size() const { return canonical_.size(); }
     size_t narrow_size() const { return canonical_.narrow().size(); }
@@ -508,23 +641,49 @@ template <class Key, class Value> struct bc_multimap {
         const auto* w = canonical_.wide();
         return w ? w->size() : 0;
     }
-    size_t narrow_association_size() const { return associations_.narrow().size(); }
-    size_t wide_association_size() const {
-        const auto* w = associations_.wide();
-        return w ? w->size() : 0;
-    }
+    size_t narrow_association_size() const { return narrow_keys_.load(std::memory_order_relaxed); }
+    size_t wide_association_size() const { return wide_keys_.load(std::memory_order_relaxed); }
+    size_t stored_alias_size() const { return alias_keys_.load(std::memory_order_relaxed); }
+    size_t physical_alias_size() const { return stored_alias_size(); }
+    size_t physical_alias_handle_count() const { return alias_handles_.load(std::memory_order_relaxed); }
     bool has_wide_storage() const { return canonical_.wide() || associations_.wide(); }
     bool empty() const { return size() == 0; }
-    void clear_associations() { associations_.clear(); }
+    void clear_associations() {
+        std::lock_guard<std::mutex> lock(mutation_mutex_);
+        associations_.clear();
+        canonical_.for_each([](const auto& entry) {
+            entry.identity_mapping.store(false, std::memory_order_relaxed);
+        });
+        narrow_keys_.store(0, std::memory_order_relaxed);
+        wide_keys_.store(0, std::memory_order_relaxed);
+        alias_keys_.store(0, std::memory_order_relaxed);
+        alias_handles_.store(0, std::memory_order_relaxed);
+    }
     void clear() {
+        std::lock_guard<std::mutex> lock(mutation_mutex_);
         associations_.clear();
         canonical_.clear();
+        narrow_keys_.store(0, std::memory_order_relaxed);
+        wide_keys_.store(0, std::memory_order_relaxed);
+        alias_keys_.store(0, std::memory_order_relaxed);
+        alias_handles_.store(0, std::memory_order_relaxed);
     }
     template <class T> void insert_bc_entry(const T& observed, const value& correct) {
         const key observed_sequence = barcode_storage_detail::key_of(observed);
-        if (!observed_sequence.is_valid() || !correct.is_valid())
-            return;
-        add_association(observed_sequence, insert_canonical(correct));
+        if (!observed_sequence.is_valid() || !correct.is_valid()) return;
+        std::lock_guard<std::mutex> lock(mutation_mutex_);
+        if (observed_sequence == correct.barcode) {
+            const auto handle = insert_canonical(correct);
+            const bool existed = identity_active(handle) ||
+                                 with_stored_aliases(observed_sequence, [](const auto&) {});
+            set_identity(handle, true);
+            if (!existed) key_count(observed_sequence).fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const bool existed = bool(find_identity(observed_sequence)) ||
+                                 with_stored_aliases(observed_sequence, [](const auto&) {});
+            add_stored_alias(observed_sequence, insert_canonical(correct));
+            if (!existed) key_count(observed_sequence).fetch_add(1, std::memory_order_relaxed);
+        }
     }
     template <class T> void insert_bc_entry(const T& observed, value&& correct) {
         insert_bc_entry(observed, static_cast<const value&>(correct));
@@ -545,35 +704,34 @@ template <class Key, class Value> struct bc_multimap {
         insert_bc_entry(pair.first, pair.second);
     }
     template <class T> size_t erase(const T& input) {
-        const auto& sequence = barcode_storage_detail::key_of(input);
-        if (!sequence.is_valid())
-            return 0;
-        if (sequence.is_wide()) {
-            auto* table = associations_.wide();
-            return table ? table->erase(barcode_storage_detail::pack_key<uint128_t>(sequence)) : 0;
+        const key sequence = barcode_storage_detail::key_of(input);
+        if (!sequence.is_valid()) return 0;
+        std::lock_guard<std::mutex> lock(mutation_mutex_);
+        const auto identity = find_identity(sequence);
+        size_t removed_handles = 0;
+        with_stored_aliases(sequence, [&](const auto& values) { removed_handles = values.size(); });
+        if (!identity && !removed_handles) return 0;
+        set_identity(identity, false);
+        if (removed_handles) {
+            if (sequence.is_wide())
+                associations_.wide()->erase(barcode_storage_detail::pack_key<uint128_t>(sequence));
+            else
+                associations_.narrow().erase(barcode_storage_detail::pack_key<uint64_t>(sequence));
+            alias_keys_.fetch_sub(1, std::memory_order_relaxed);
+            alias_handles_.fetch_sub(removed_handles, std::memory_order_relaxed);
         }
-        return associations_.narrow().erase(barcode_storage_detail::pack_key<uint64_t>(sequence));
+        key_count(sequence).fetch_sub(1, std::memory_order_relaxed);
+        return 1;
     }
     template <class T> void remove_bc_entry(const T& input) { erase(input); }
     template <class T> bool check_wl_for(const T& input) const {
         bool found = false;
         barcode_storage_detail::for_each_key(input, [&](const key& sequence) {
-            if (!found)
-                found = with_associations(sequence, [](const auto&) {});
+            if (!found) found = with_associations(sequence, [](const auto&) {});
         });
         return found;
     }
-    bool has_identity_mapping(const key& sequence) const {
-        bool identity = false;
-        with_associations(sequence, [&](const auto& values) {
-            for (const auto handle : values)
-                if (handle && handle.barcode() == sequence) {
-                    identity = true;
-                    break;
-                }
-        });
-        return identity;
-    }
+    bool has_identity_mapping(const key& sequence) const { return bool(find_identity(sequence)); }
     size_t count(const key& sequence) const {
         size_t result = 0;
         with_associations(sequence, [&](const auto& values) { result = values.size(); });
@@ -587,8 +745,7 @@ template <class Key, class Value> struct bc_multimap {
     template <class T> std::unordered_set<key> return_matching_barcodes(const T& input) const {
         std::unordered_set<key> result;
         barcode_storage_detail::for_each_key(input, [&](const key& sequence) {
-            if (check_wl_for(sequence))
-                result.insert(sequence);
+            if (check_wl_for(sequence)) result.insert(sequence);
         });
         return result;
     }
@@ -597,8 +754,7 @@ template <class Key, class Value> struct bc_multimap {
         barcode_storage_detail::for_each_key(input, [&](const key& sequence) {
             with_associations(sequence, [&](const auto& values) {
                 for (const auto handle : values)
-                    if (handle)
-                        result.insert(handle.barcode());
+                    if (handle) result.insert(handle.barcode());
             });
         });
         return result;
@@ -613,15 +769,13 @@ template <class Key, class Value> struct bc_multimap {
     template <class T> void update_bc_count(const T& input, barcode_counts slot = total) const {
         with_associations(barcode_storage_detail::key_of(input), [&](const auto& values) {
             for (const auto handle : values)
-                if (auto* counts = handle.counts())
-                    counts->increment(slot);
+                if (auto* counts = handle.counts()) counts->increment(slot);
         });
     }
     template <class T> void subtract_bc_count(const T& input, barcode_counts slot = total) const {
         with_associations(barcode_storage_detail::key_of(input), [&](const auto& values) {
             for (const auto handle : values)
-                if (auto* counts = handle.counts())
-                    counts->subtract(slot);
+                if (auto* counts = handle.counts()) counts->subtract(slot);
         });
     }
     template <class T> int get_bc_count(const T& input, barcode_counts slot = total) const {
@@ -633,8 +787,28 @@ template <class Key, class Value> struct bc_multimap {
             counts->counts[slot].store(count, std::memory_order_relaxed);
     }
     template <class F> void for_each_entry(F&& fn) const { canonical_.for_each(fn); }
+    // Serialize structural mutation/traversal while counters remain atomic.
+    // Direct canonical iteration avoids holding a canonical shard lock across
+    // an alias lookup. Each logical observed key appears once, including keys
+    // with both an identity and aliases. Callbacks must not mutate this map.
     template <class F> void for_each_association(F&& fn) const {
-        associations_.for_each([&](const auto& pair) { fn(pair.first, pair.second); });
+        std::lock_guard<std::mutex> lock(mutation_mutex_);
+        const auto identities = [&](const auto& table) {
+            for (const auto& entry : table) {
+                if (!entry.identity_mapping.load(std::memory_order_relaxed)) continue;
+                const barcode_entry_handle identity(&entry);
+                const key sequence = entry.sequence();
+                const bool stored = with_stored_aliases(sequence, [&](const auto& aliases) {
+                    fn(entry.key(), association_view(identity, &aliases));
+                });
+                if (!stored) fn(entry.key(), association_view(identity, nullptr));
+            }
+        };
+        identities(canonical_.narrow());
+        if (const auto* wide = canonical_.wide()) identities(*wide);
+        associations_.for_each([&](const auto& pair) {
+            if (!find_identity(key(pair.first))) fn(pair.first, association_view({}, &pair.second));
+        });
     }
     std::vector<barcode_entry_handle> get_unique_entries() const {
         std::vector<barcode_entry_handle> result;
@@ -659,8 +833,7 @@ template <class Key, class Value> struct bc_multimap {
     void write_wl_summary(std::ostream& out, const std::string class_id,
                           const std::unordered_set<key>* filter_keys = nullptr,
                           bool write_header = true) const {
-        if (write_header)
-            barcode_storage_detail::write_header(out);
+        if (write_header) barcode_storage_detail::write_header(out);
         if (filter_keys) {
             for (const auto& sequence : *filter_keys)
                 barcode_storage_detail::write_row(
@@ -675,8 +848,7 @@ template <class Key, class Value> struct bc_multimap {
     void write_wl_summary(const std::string& path = "",
                           const std::unordered_set<key>* filter_keys = nullptr) const {
         std::ofstream out(path);
-        if (!out)
-            throw std::runtime_error("Failed to open output file: " + path);
+        if (!out) throw std::runtime_error("Failed to open output file: " + path);
         write_wl_summary(out, "", filter_keys);
     }
     size_t unique_storage_bytes() const {
