@@ -14,6 +14,7 @@ RAD is a read-structure agnostic demultiplexer for dealing with long-read sequen
 | Install + first run (discover barcodes with `scan-wl`, then `demux`) | [`docs/installation.md`](docs/installation.md) |
 | Command flags + output files | [`docs/cli-reference.md`](docs/cli-reference.md) |
 | Layout + whitelist details (origins, sizes, pairings) | [`docs/layouts-and-whitelists.md`](docs/layouts-and-whitelists.md) |
+| Infer a layout CSV and identify a reference barcode catalog | [`docs/discovery.md`](docs/discovery.md) |
 | What RAD does under the hood | [`docs/architecture.md`](docs/architecture.md) |
 | End-to-end smoke test on simulated data | [`test_data/README.md`](test_data/README.md) |
 
@@ -28,6 +29,17 @@ flowchart LR
 
 `rad demux -A/--auto-wl` folds the `scan-wl` step into `demux`, so a single command
 discovers the barcodes and demultiplexes against them.
+
+Given a known flanking primer, identify a nonspatial reference catalog with
+`rad discover --wl -i reads.fastq.gz -p PRIMER -n 16 -o discovery`. It scans raw
+barcodes once and returns the catalog with the most exact matching reads,
+retaining ties. Spatial catalog identification is unsupported.
+
+Layout discovery remains experimental: `rad discover --layout` proposes a
+native CSV from known parts and their observed order/spacing; unresolved
+layouts are written as partial structures. Omitting the mode flags requests
+both results using inferred barcode windows. See [discovery](docs/discovery.md)
+for scope, sampling limits and outputs.
 
 ## Minimal run
 

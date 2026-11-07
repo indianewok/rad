@@ -12,6 +12,7 @@ Commands:
 
 - `prep` — build/validate a read layout and optional position map
 - `scan-wl` — scan reads for the barcodes actually present and build a whitelist
+- `discover` — `--wl -p PRIMER -n LENGTH` identifies a nonspatial reference catalog by its maximum raw read-hit count; experimental `--layout` proposes a native layout CSV. See [discovery](discovery.md) for sampling, modes and outputs.
 - `demux` — correct barcodes against a whitelist, extract elements, tag reads
 - `reformat` — post-process demux output (header rewrite, per-barcode split, coordinates)
 - `list` — list registered layout keys and whitelist kit keys with resolved paths

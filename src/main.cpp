@@ -6,6 +6,12 @@
 #include <csignal>
 #include <fcntl.h>
 #include <system_error>
+#include "include/rad/discovery.hpp"
+// Keep discovery in this translation unit: existing RAD headers define shared
+// implementation functions that must not be instantiated in another main TU.
+#include "discovery_layout.cpp"
+#include "discovery_whitelist.cpp"
+#include "discovery_cli.cpp"
 
 // Version string (single source of truth = CMake project() version, injected
 // via target_compile_definitions). Fallback keeps non-CMake builds compiling.
@@ -29,6 +35,7 @@ static void print_main_usage(const char *prog) {
             << "  modify            Add/remove read layout or whitelist-kit "
                "mappings\n"
             << "  scan-wl           Scan FASTQ for barcodes and generate/validate whitelists\n"
+            << "  discover          Infer read structure and identify known whitelist catalogs\n"
             << "  help              Show help for a specific command\n\n"
             << "Use '" << prog
             << " <command> --help' for command-specific options\n";
@@ -2611,6 +2618,8 @@ int cmd_help(int argc, char *argv[]) {
     usage_list("list");
   } else if (topic == "modify") {
     usage_modify("modify");
+  } else if (topic == "discover") {
+    rad_discovery::cli_detail::usage();
   } else {
     std::cerr << "Unknown command: " << topic << "\n\n";
     print_main_usage("rad");
@@ -2644,6 +2653,8 @@ int main(int argc, char *argv[]) {
     return cmd_modify(argc - 1, argv + 1);
   } else if (command == "scan-wl") {
     return cmd_scan_wl(argc - 1, argv + 1);
+  } else if (command == "discover") {
+    return rad_discovery::run(argc - 1, argv + 1);
   } else if (command == "help") {
     return cmd_help(argc - 1, argv + 1);
   } else if (command == "--help" || command == "-h") {
