@@ -1,5 +1,8 @@
 #pragma once
 #include "rad_headers.h"
+#include <cerrno>
+#include <exception>
+#include <system_error>
 
 // needed a way for IO to work on .gz and non .gz files, and needed a PIGZ/non-PIGZ solution for files.
 // finangled a way to deal with this by just opening two kseq instantiations because you can't trade them off once opened.
@@ -694,10 +697,17 @@ public:
             std::atomic<bool>   more_data{true};
             std::atomic<size_t> seqs_processed{0};
             std::atomic<size_t> chunks_seen{0};
+            std::atomic<bool> worker_failed{false};
+            std::mutex error_mutex;
+            std::exception_ptr worker_error;
 
+            // Exceptions must not leave an OpenMP structured block. Preserve
+            // the first failure and report it to the caller after all workers
+            // have stopped; this also carries asynchronous output errors.
             #pragma omp parallel num_threads(num_threads)
             {
-                while (true) {
+              try {
+                while (!worker_failed.load(std::memory_order_acquire)) {
                     std::vector<T> chunk;
                     {
                         std::lock_guard<std::mutex> lock(reader_mutex);
@@ -728,6 +738,7 @@ public:
                         continue;
                     }
 
+                    if (worker_failed.load(std::memory_order_acquire)) break;
                     const size_t __chunk_bytes = readmem_utils::bytes_of_vec(chunk);
                     const size_t __chunk_id = next_chunk_id_.fetch_add(1, std::memory_order_relaxed);
                     readmem_utils::scoped_in_flight __guard(__chunk_bytes);
@@ -742,7 +753,14 @@ public:
                         }
                     }
                 }
+              } catch (...) {
+                worker_failed.store(true, std::memory_order_release);
+                more_data.store(false, std::memory_order_release);
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!worker_error) worker_error = std::current_exception();
+              }
             }
+            if (worker_error) std::rethrow_exception(worker_error);
             if (fail_on_read_error && reader.read_failed()) {
                 throw std::runtime_error("Failed while reading sequence input: " +
                     reader.read_error_path() + " (parser code " +
@@ -788,9 +806,18 @@ public:
 
     inline void pigz_write(FILE* fp, const char* data, size_t n) {
         if (!n) return;
-        size_t w = std::fwrite(data, 1, n, fp);
-        if (w != n) {
-            throw std::runtime_error("pigz_write: partial write");
+        size_t written = 0;
+        while (written < n) {
+            errno = 0;
+            const size_t count = std::fwrite(data + written, 1, n - written, fp);
+            written += count;
+            if (written == n) break;
+            const int error = errno ? errno : EIO;
+            if (error == EINTR) {
+                std::clearerr(fp);
+                continue;
+            }
+            throw std::system_error(error, std::generic_category(), "writing compressed output");
         }
     }
 
@@ -804,392 +831,394 @@ public:
 namespace boost_stream = boost::iostreams;
 class sigstring_writing {
 public:
-    enum class format { 
-        FASTQA, 
-        SIGSTRING, 
-        CSV 
-    };
+    enum class format { FASTQA, SIGSTRING, CSV };
 
 private:
-    // Common
     format fmt;
     bool compress_;
     bool use_pigz_ = false;
-    bool rc_umi_ = true; // reverse-complement UMIs on reverse reads (FASTQA only)
+    bool rc_umi_ = true;
+    bool finished_ = false;
+    FILE* stream_fp_ = nullptr; // Non-owning; the caller closes its saved stdout.
 
-    // --- pigz path ---
     pigz_writing pigz_;
     FILE* pigz_fp_ = nullptr;
     std::string pigz_buf_;
-    size_t pigz_flush_threshold_ = (8u << 20); // 8MB
+    size_t pigz_flush_threshold_ = (8u << 20);
 
-    // --- zlib/boost path ---
     std::ofstream file_;
-    boost_stream::filtering_ostream out_; // chain: [gzip?] -> file_
+    boost_stream::filtering_ostream out_;
 
-    inline void pigz_flush_if_big_() {
-        if (pigz_buf_.size() >= pigz_flush_threshold_) {
-            pigz_.pigz_write(pigz_fp_, pigz_buf_.data(), pigz_buf_.size());
-            pigz_buf_.clear();
+    static void flush_stream_(FILE* stream) {
+        while (true) {
+            errno = 0;
+            if (std::fflush(stream) == 0) return;
+            const int error = errno ? errno : EIO;
+            if (error == EINTR) {
+                std::clearerr(stream);
+                continue;
+            }
+            throw std::system_error(error, std::generic_category(), "flushing sequence output");
         }
     }
 
-    template <typename T>
-    inline void write_one_(const T& item) {
+    static void write_stream_(FILE* stream, const char* data, size_t size) {
+        size_t written = 0;
+        while (written < size) {
+            errno = 0;
+            const size_t count = std::fwrite(data + written, 1, size - written, stream);
+            written += count;
+            if (written == size) break;
+            const int error = errno ? errno : EIO;
+            if (error == EINTR) {
+                std::clearerr(stream);
+                continue;
+            }
+            throw std::system_error(error, std::generic_category(), "writing sequence output");
+        }
+    }
+
+    void write_bytes_(const std::string& data) {
+        if (finished_) throw std::logic_error("writing to a finished output stream");
+        if (data.empty()) return;
+        if (stream_fp_) {
+            write_stream_(stream_fp_, data.data(), data.size());
+        } else if (use_pigz_) {
+            pigz_buf_.append(data);
+            if (pigz_buf_.size() >= pigz_flush_threshold_) {
+                pigz_.pigz_write(pigz_fp_, pigz_buf_.data(), pigz_buf_.size());
+                pigz_buf_.clear();
+            }
+        } else {
+            out_.write(data.data(), static_cast<std::streamsize>(data.size()));
+            if (!out_) throw std::system_error(EIO, std::generic_category(), "writing output file");
+        }
+    }
+
+    template <typename T> void write_one_(const T& item) {
         switch (fmt) {
             case format::FASTQA:
-                if (use_pigz_) { pigz_buf_.append(item.to_fastqa(rc_umi_)); pigz_flush_if_big_(); }
-                else           { out_ << item.to_fastqa(rc_umi_); }
+                write_bytes_(item.to_fastqa(rc_umi_));
                 break;
-            case format::SIGSTRING:
-                if (use_pigz_) { pigz_buf_.append(item.to_sigstring()); pigz_buf_.push_back('\n'); pigz_flush_if_big_(); }
-                else           { out_ << item.to_sigstring() << "\n"; }
+            case format::SIGSTRING: {
+                auto text = item.to_sigstring();
+                text.push_back('\n');
+                write_bytes_(text);
                 break;
+            }
             case format::CSV:
-                if (use_pigz_) { pigz_buf_.append(item.to_csv()); pigz_flush_if_big_(); }
-                else           { out_ << item.to_csv(); }
+                write_bytes_(item.to_csv());
                 break;
         }
     }
 
 public:
-    /// @param output_path   base filename ("myout"), will add ".gz" if compress==true and it isn't present
-    /// @param output_format which of the three formats to emit
-    /// @param compress      if true, writes gzipped output (pigz if available; else zlib/boost)
-    /// @param append        if true, opens in append mode; otherwise truncates
-    /// @param pigz_threads  pigz worker threads (ignored if not using pigz)
-    /// @param level         gzip compression level [1..9]
-    sigstring_writing(std::string output_path, format output_format, bool compress, bool append, int pigz_threads, int level=1)
-        : fmt(output_format), compress_(compress)
-    {
-        std::ios_base::openmode mode =
-            std::ios::out | std::ios::binary | (append ? std::ios::app : std::ios::trunc);
-
+    sigstring_writing(std::string output_path, format output_format, bool compress,
+                      bool append, int pigz_threads, int level = 1)
+        : fmt(output_format), compress_(compress) {
+        const auto mode = std::ios::out | std::ios::binary |
+                          (append ? std::ios::app : std::ios::trunc);
         if (compress_) {
-            // ensure .gz suffix for either pigz or zlib
-            if (output_path.size() < 3 || output_path.substr(output_path.size()-3) != ".gz")
+            if (output_path.size() < 3 || output_path.substr(output_path.size() - 3) != ".gz")
                 output_path += ".gz";
-
-            // Try pigz first
             pigz_fp_ = pigz_.open_pigz_pipe(output_path, pigz_threads, level);
             if (pigz_fp_) {
                 use_pigz_ = true;
-                // nothing else to open; pigz writes the file
                 return;
             }
-
-            // Fallback: existing Boost gzip chain (single-threaded zlib)
-            file_.open(output_path, mode);
-            if (!file_.is_open()) throw std::runtime_error("Failed to open file: " + output_path);
-
+        }
+        file_.open(output_path, mode);
+        if (!file_.is_open()) throw std::runtime_error("Failed to open file: " + output_path);
+        if (compress_) {
             boost_stream::gzip_params params;
             params.level = level;
             out_.push(boost_stream::gzip_compressor(params));
-            out_.push(file_);
-        } else {
-            // Plain text (no compression)
-            file_.open(output_path, mode);
-            if (!file_.is_open()) throw std::runtime_error("Failed to open file: " + output_path);
-            out_.push(file_);
         }
+        out_.push(file_);
+        out_.exceptions(std::ios::badbit | std::ios::failbit);
     }
 
-    /// FASTQA only: if false, UMIs are written exactly as extracted (minus-strand
-    /// on reverse reads) instead of being flipped to plus-strand. Mirrors the
-    /// primary buffered path (SigString::to_fastqa_append) so --no-umi-rc is
-    /// honored by the debug FASTQA output too.
-    void set_rc_umi(bool v) { rc_umi_ = v; }
-
-    template<typename T>
-    void operator()(const std::vector<T>& chunk) {
-        if (chunk.empty()) return;
-        if (use_pigz_) {
-            // Build big uncompressed buffer for pigz (few syscalls, fewer context switches)
-            for (auto const& item : chunk) write_one_(item);
-        } else {
-            // legacy path (ostream through Boost chain)
-            for (auto const& item : chunk) write_one_(item);
-        }
+    // The data stream is separate from std::cout, which may carry diagnostics.
+    // Flush complete chunks so small stdout runs are visible promptly.
+    sigstring_writing(FILE* stream, format output_format)
+        : fmt(output_format), compress_(false), stream_fp_(stream) {
+        if (!stream_fp_) throw std::invalid_argument("null sequence output stream");
     }
 
-    // Optional: adjust pigz flush size (in bytes)
+    void set_rc_umi(bool value) { rc_umi_ = value; }
     void set_pigz_flush_threshold(size_t bytes) { pigz_flush_threshold_ = bytes; }
 
-    ~sigstring_writing() {
-        try {
-            if (use_pigz_) {
-                // flush tail and close pipe
-                if (!pigz_buf_.empty()) {
-                    pigz_.pigz_write(pigz_fp_, pigz_buf_.data(), pigz_buf_.size());
-                    pigz_buf_.clear();
-                }
-                (void)pigz_.close_pigz_pipe(pigz_fp_);
-                pigz_fp_ = nullptr;
-                use_pigz_ = false;
-            } else {
-                // flush Boost chain + file
-                out_.reset();  // pops filters and flushes
-                file_.flush();
-                file_.close();
-            }
-        } catch (...) {
-        }
+    template <typename T> void operator()(const std::vector<T>& chunk) {
+        if (chunk.empty()) return;
+        for (const auto& item : chunk) write_one_(item);
+        if (stream_fp_) flush_stream_(stream_fp_);
     }
 
-    // in sigstring_writing (public)
     void operator()(const std::string& slab) {
         if (slab.empty()) return;
-        if (use_pigz_) {
-            pigz_buf_.append(slab);
-            pigz_flush_if_big_();
-        } else {
-            out_.write(slab.data(), slab.size());
-        }
+        write_bytes_(slab);
+        if (stream_fp_) flush_stream_(stream_fp_);
     }
 
-     // reuses the existing std::string overload
     void operator()(const std::vector<std::string>& slabs) {
-        if (slabs.empty()) return;
-        for (auto const& s : slabs) {
-            (*this)(s); 
-        }
+        for (const auto& slab : slabs) (*this)(slab);
     }
 
+    // Call explicitly after the asynchronous writer has joined. Destructors
+    // only provide fallback cleanup; successful callers must observe failures.
+    void finish() {
+        if (finished_) return;
+        finished_ = true;
+        if (stream_fp_) {
+            flush_stream_(stream_fp_);
+            return;
+        }
+
+        std::exception_ptr failure;
+        const auto remember_failure = [&] {
+            if (!failure) failure = std::current_exception();
+        };
+        if (use_pigz_) {
+            FILE* pipe = pigz_fp_;
+            pigz_fp_ = nullptr;
+            use_pigz_ = false;
+            try {
+                if (!pigz_buf_.empty())
+                    pigz_.pigz_write(pipe, pigz_buf_.data(), pigz_buf_.size());
+            } catch (...) { remember_failure(); }
+            pigz_buf_.clear();
+            try { flush_stream_(pipe); }
+            catch (...) { remember_failure(); }
+            errno = 0;
+            const int status = pclose(pipe);
+            const int close_error = errno;
+            if (status == -1) {
+                try {
+                    throw std::system_error(close_error ? close_error : EIO,
+                                            std::generic_category(), "closing output compressor");
+                } catch (...) { remember_failure(); }
+            } else if (status != 0) {
+                try {
+                    throw std::runtime_error("Output compressor failed (wait status " +
+                                             std::to_string(status) + ")");
+                } catch (...) { remember_failure(); }
+            }
+        } else {
+            try { out_.flush(); }
+            catch (...) { remember_failure(); }
+            try { out_.reset(); }
+            catch (...) { remember_failure(); }
+            if (file_.is_open()) {
+                try {
+                    file_.flush();
+                    if (!file_) throw std::system_error(EIO, std::generic_category(), "flushing output file");
+                } catch (...) { remember_failure(); }
+                try {
+                    file_.close();
+                    if (file_.fail()) throw std::system_error(EIO, std::generic_category(), "closing output file");
+                } catch (...) { remember_failure(); }
+            }
+        }
+        if (failure) std::rethrow_exception(failure);
+    }
+
+    ~sigstring_writing() noexcept {
+        try { finish(); } catch (...) {}
+    }
 };
 
-/**
- * @brief Parallel writer for asynchronous output--works by queuing jobs and processing them in a separate thread.
- * Each write job is a function to perform the write operation, along with metadata.
- * This class uses a lock-free queue to manage write jobs and a dedicated writer thread to process them. 
- * 
- * What that means is that the main thread lines up write jobs and the writer thread executes them in the background
- * while the main thread continues processing. When single-threaded, the main thread does the writing itself. 
- * 
- * Lock-free means that there are no mutexes or locks used to synchronize the writing--that's handled by atomic operations internally.
- */
+// Completed chunks enter a bounded queue. Output failures are caught in the
+// writer thread and rethrown by the producer or explicit stop(), never allowed
+// to terminate the worker silently while producers wait on a full queue.
 class parallel_writer {
 public:
-/**
- * @brief Constructs a parallel_writer and starts the writer thread
- */
-    parallel_writer() : running(true), jobs_processed(0) {
-        writer_thread = std::thread([this]() {
-            this->process_jobs();
-        });
-    }
-    
-    ~parallel_writer() {
-        stop();
-    }
-    
-    /**
-     * @brief Write multiple data items in parallel
-     * @param fastqa_writer Reference to `sigstring_writing` object for fastqa output
-     * @param data `vector` of data items to write
-     */
-    template<typename T>
-    void write(sigstring_writing& fastqa_writer, std::vector<T>& data) {
-        if (data.empty()) return;
-        
-        auto job_function = [
-            fastq_ptr=&fastqa_writer,
-            data_vec=std::move(data)
-        ]() mutable {
-            (*fastq_ptr)(data_vec);
-            std::vector<T>().swap(data_vec);
-        };
-        
-        auto* job = new WriteJob();
-        job->func = std::move(job_function);
-        job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
-        job->size = data.size();
-        job->queued_time = std::chrono::high_resolution_clock::now();
-        
-        while (!write_queue.push(job)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
-    
-    /**
-     * @brief Write multiple string slabs in parallel
-     * @param fastqa_writer Reference to sigstring_writing object for FASTQ/A output
-     * @param slabs Vector of string slabs to write
-     */
-    void write_slabs(sigstring_writing& fastqa_writer, std::vector<std::string>&& slabs) {
-        size_t total_bytes = 0;
-        for (auto const& s : slabs) total_bytes += s.size();
-        if (total_bytes == 0) return;
-        
-        auto* job = new WriteJob();
-        job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
-        job->size = total_bytes;
-        job->queued_time = std::chrono::high_resolution_clock::now();
-        job->func = [fastq_ptr=&fastqa_writer, slabs_vec=std::move(slabs)]() mutable {
-            (*fastq_ptr)(slabs_vec);
-            std::vector<std::string>().swap(slabs_vec);
-        };
-        
-        while (!write_queue.push(job)) std::this_thread::yield();
-    }
-    
-    /**
-     * @brief Write a raw string in parallel
-     * @param writer Reference to `sigstring_writing` object for output
-     * @param data `string` data to write
-     */
-    void write_raw_string(sigstring_writing& writer, std::string&& data) {
-        if (data.empty()) return;
-        
-        size_t data_size = data.size();
-        
-        auto job_function = [
-            writer_ptr=&writer,
-            data_str=std::move(data)
-        ]() mutable {
-            (*writer_ptr)(data_str);
-            std::string().swap(data_str);
-        };
-        
-        auto* job = new WriteJob();
-        job->func = std::move(job_function);
-        job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
-        job->size = data_size;
-        job->queued_time = std::chrono::high_resolution_clock::now();
-        
-        while (!write_queue.push(job)) {
-            std::this_thread::yield();
-        }
+    parallel_writer() {
+        writer_thread = std::thread([this] { process_jobs(); });
     }
 
-    /**
-     * @brief Write debug information in parallel
-     * @param sig_writer Pointer to sigstring_writing for SIGSTRING output
-     * @param csv_writer Pointer to sigstring_writing for CSV output
-     * @param fastqa_writer Pointer to sigstring_writing for FASTQ/A output
-     * @param data Vector of data to write
-     */
-    template<typename T>
-    void write_debug(sigstring_writing* sig_writer, sigstring_writing* csv_writer, sigstring_writing* fastqa_writer, std::vector<T>& data) {
+    ~parallel_writer() noexcept {
+        try { stop(); } catch (...) {}
+    }
+
+    template <typename T> void write(sigstring_writing& output, std::vector<T>& data) {
         if (data.empty()) return;
-        
-        auto job_function = [
-            sig_ptr=sig_writer,
-            csv_ptr=csv_writer,
-            fastqa_ptr=fastqa_writer,
-            data_vec=std::move(data)
-        ]() mutable {
-            (*sig_ptr)(data_vec);
-            (*csv_ptr)(data_vec);
-            (*fastqa_ptr)(data_vec);
-            std::vector<T>().swap(data_vec);
+        const size_t size = data.size();
+        auto job = std::make_unique<WriteJob>();
+        job->func = [sink = &output, values = std::move(data)]() mutable {
+            (*sink)(values);
         };
-        
-        auto* job = new WriteJob();
-        job->func = std::move(job_function);
-        job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
-        job->size = data.size();
-        job->queued_time = std::chrono::high_resolution_clock::now();
-        
-        while (!write_queue.push(job)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        enqueue(std::move(job), size);
+    }
+
+    void write_slabs(sigstring_writing& output, std::vector<std::string>&& slabs) {
+        size_t size = 0;
+        for (const auto& slab : slabs) size += slab.size();
+        if (!size) return;
+        auto job = std::make_unique<WriteJob>();
+        job->func = [sink = &output, values = std::move(slabs)]() mutable {
+            (*sink)(values);
+        };
+        enqueue(std::move(job), size);
+    }
+
+    void write_raw_string(sigstring_writing& output, std::string&& data) {
+        if (data.empty()) return;
+        const size_t size = data.size();
+        auto job = std::make_unique<WriteJob>();
+        job->func = [sink = &output, value = std::move(data)]() mutable {
+            (*sink)(value);
+        };
+        enqueue(std::move(job), size);
+    }
+
+    template <typename T>
+    void write_debug(sigstring_writing* sig, sigstring_writing* csv,
+                     sigstring_writing* fastqa, std::vector<T>& data) {
+        if (data.empty()) return;
+        const size_t size = data.size();
+        auto job = std::make_unique<WriteJob>();
+        job->func = [sig, csv, fastqa, values = std::move(data)]() mutable {
+            (*sig)(values);
+            (*csv)(values);
+            (*fastqa)(values);
+        };
+        enqueue(std::move(job), size);
+    }
+
+    bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
+
+    void rethrow_if_failed() const {
+        if (!failed()) return;
+        std::exception_ptr error;
+        {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            error = writer_error;
         }
+        if (error) std::rethrow_exception(error);
     }
 
     void stop() {
-        if (!running.load()) return;
-        
+        std::lock_guard<std::mutex> lock(stop_mutex);
         running.store(false, std::memory_order_release);
-        
-        if (writer_thread.joinable()) {
-            writer_thread.join();
-        }
-        
+        if (writer_thread.joinable()) writer_thread.join();
+        discard_pending();
+        rethrow_if_failed();
+        if (statistics_printed) return;
+        statistics_printed = true;
         std::cout << "\n[Writer Thread] Statistics:" << std::endl;
         std::cout << "  Total jobs processed: " << jobs_processed.load() << std::endl;
         std::cout << "  Total write time: " << total_write_time_ms.load() / 1000.0 << " seconds" << std::endl;
-        if (jobs_processed.load() > 0) {
-            std::cout << "  Average write time per chunk: " << total_write_time_ms.load() / jobs_processed.load() << " ms" << std::endl;
-            std::cout << "  Average queue time per chunk: " << total_queue_time_ms.load() / jobs_processed.load() << " ms" << std::endl;
+        if (jobs_processed.load()) {
+            std::cout << "  Average write time per chunk: "
+                      << total_write_time_ms.load() / jobs_processed.load() << " ms" << std::endl;
+            std::cout << "  Average queue time per chunk: "
+                      << total_queue_time_ms.load() / jobs_processed.load() << " ms" << std::endl;
         }
     }
 
-    double get_total_write_time_ms() const {
-        return total_write_time_ms.load();
-    }
-    
-    size_t get_jobs_processed() const {
-        return jobs_processed.load();
-    }
+    double get_total_write_time_ms() const { return total_write_time_ms.load(); }
+    size_t get_jobs_processed() const { return jobs_processed.load(); }
 
 private:
-/**
- * @brief Structure representing a write job
- * @param func Function to perform the write operation
- * @param chunk_id Unique chunk identifier for logging
- * @param size Size of data to write
- * @param queued_time Time when job was queued
- */
     struct WriteJob {
         std::function<void()> func;
-        size_t chunk_id;
-        size_t size;
+        size_t chunk_id = 0;
+        size_t size = 0;
         std::chrono::time_point<std::chrono::high_resolution_clock> queued_time;
     };
-    
-    boost::lockfree::queue<WriteJob*, boost::lockfree::capacity<64>> write_queue; /// lock-free queue for writing via boost
-    std::atomic<bool> running; /// we writing? y/n
-    std::atomic<size_t> next_chunk_id{1}; /// next chunk ID to assign
-    std::atomic<size_t> jobs_processed{0}; /// total jobs processed
-    std::thread writer_thread; /// writer thread
-    
+    struct ProducerGuard {
+        std::atomic<size_t>& active;
+        explicit ProducerGuard(std::atomic<size_t>& value) : active(value) {
+            active.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~ProducerGuard() { active.fetch_sub(1, std::memory_order_release); }
+    };
+
+    boost::lockfree::queue<WriteJob*, boost::lockfree::capacity<64>> write_queue;
+    std::atomic<bool> running{true};
+    std::atomic<bool> failed_{false};
+    std::atomic<size_t> active_producers{0};
+    std::atomic<size_t> next_chunk_id{1};
+    std::atomic<size_t> jobs_processed{0};
+    std::thread writer_thread;
+    mutable std::mutex error_mutex;
+    std::exception_ptr writer_error;
+    std::mutex stop_mutex;
+    bool statistics_printed = false;
     std::atomic<double> total_write_time_ms{0.0};
     std::atomic<double> total_queue_time_ms{0.0};
-    
-    /**
-     * @brief writer function per thread to process queued jobs
-     */
-    void process_jobs() {
-        while (running.load(std::memory_order_acquire)) {
-            WriteJob* job = nullptr;
-            
-            if (write_queue.pop(job)) {
-                auto start_time = std::chrono::high_resolution_clock::now();
-                auto queue_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    start_time - job->queued_time).count();
-                total_queue_time_ms.store(
-                    total_queue_time_ms.load(std::memory_order_relaxed) + queue_time_ms,
-                    std::memory_order_relaxed);
 
-                job->func();
-
-                auto end_time = std::chrono::high_resolution_clock::now();
-                auto write_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    end_time - start_time).count();
-                total_write_time_ms.store(
-                    total_write_time_ms.load(std::memory_order_relaxed) + write_time_ms,
-                    std::memory_order_relaxed);
-                
-                jobs_processed.fetch_add(1, std::memory_order_relaxed);
-                
-                const double size_mib = double(job->size) / (1024.0 * 1024.0);
-                std::cout << "\n[io_writer] chunk=" << job->chunk_id
-                          << " size_mib=" << std::fixed << std::setprecision(2) << size_mib
-                          << " queued_ms=" << queue_time_ms
-                          << " wrote_ms=" << write_time_ms
-                          << std::endl;
-                
-                delete job;
-            } else {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-            }
+    void enqueue(std::unique_ptr<WriteJob> job, size_t size) {
+        ProducerGuard producer(active_producers);
+        rethrow_if_failed();
+        if (!running.load(std::memory_order_acquire))
+            throw std::logic_error("enqueueing output after writer shutdown");
+        job->chunk_id = next_chunk_id.fetch_add(1, std::memory_order_relaxed);
+        job->size = size;
+        job->queued_time = std::chrono::high_resolution_clock::now();
+        while (!write_queue.push(job.get())) {
+            rethrow_if_failed();
+            if (!running.load(std::memory_order_acquire))
+                throw std::logic_error("enqueueing output after writer shutdown");
+            std::this_thread::yield();
         }
-        
-        // Drain remaining jobs
+        job.release(); // Queue owns it, including if failure races this enqueue.
+        rethrow_if_failed();
+    }
+
+    void discard_pending() noexcept {
         WriteJob* job = nullptr;
-        while (write_queue.pop(job)) {
-            job->func();
-            delete job;
-            jobs_processed.fetch_add(1, std::memory_order_relaxed);
+        while (write_queue.pop(job)) delete job;
+    }
+
+    void record_failure() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            if (!writer_error) writer_error = std::current_exception();
+        }
+        failed_.store(true, std::memory_order_release);
+        running.store(false, std::memory_order_release);
+    }
+
+    void process_jobs() noexcept {
+        try {
+            while (true) {
+                if (failed_.load(std::memory_order_acquire)) break;
+                WriteJob* raw_job = nullptr;
+                if (write_queue.pop(raw_job)) {
+                    std::unique_ptr<WriteJob> job(raw_job);
+                    const auto start = std::chrono::high_resolution_clock::now();
+                    const auto queued_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        start - job->queued_time).count();
+                    total_queue_time_ms.store(total_queue_time_ms.load(std::memory_order_relaxed) + queued_ms,
+                                              std::memory_order_relaxed);
+                    job->func();
+                    const auto wrote_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::high_resolution_clock::now() - start).count();
+                    total_write_time_ms.store(total_write_time_ms.load(std::memory_order_relaxed) + wrote_ms,
+                                              std::memory_order_relaxed);
+                    jobs_processed.fetch_add(1, std::memory_order_relaxed);
+                    std::cout << "\n[io_writer] chunk=" << job->chunk_id
+                              << " size_mib=" << std::fixed << std::setprecision(2)
+                              << double(job->size) / (1024.0 * 1024.0)
+                              << " queued_ms=" << queued_ms << " wrote_ms=" << wrote_ms << std::endl;
+                } else {
+                    if (!running.load(std::memory_order_acquire) &&
+                        active_producers.load(std::memory_order_acquire) == 0) break;
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+            }
+        } catch (...) {
+            record_failure();
+        }
+        // A producer may have observed healthy state just before the failure.
+        // Wait for those enqueues and free their buffers without further writes.
+        if (failed_.load(std::memory_order_acquire)) {
+            while (active_producers.load(std::memory_order_acquire)) {
+                discard_pending();
+                std::this_thread::yield();
+            }
+            discard_pending();
         }
     }
 };

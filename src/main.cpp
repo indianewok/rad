@@ -2,6 +2,10 @@
 #include "include/rad/rad_headers.h"
 #include "include/rad/seqspec.hpp"  // seqspec YAML -> RAD layout (auto-detected)
 #include "include/rad/spatial.hpp"
+#include <cerrno>
+#include <csignal>
+#include <fcntl.h>
+#include <system_error>
 
 // Version string (single source of truth = CMake project() version, injected
 // via target_compile_definitions). Fallback keeps non-CMake builds compiling.
@@ -139,6 +143,10 @@ static void usage_demux(const char *prog) {
          "output)\n"
       << "  -d, --dir                         output directory (default: "
          "current)\n"
+      << "      --stdout                      stream uncompressed FASTA/Q to stdout;\n"
+      << "                                    diagnostics go to stderr. Suppresses debug\n"
+      << "                                    and unresolved-read files; --dir/--output\n"
+      << "                                    still name layout, whitelist and run reports.\n"
       << "  -F, --log-file                    save output to log file\n"
       << "  -w, --write-dbg                   write debug files (.sig, .csv, "
          "metrics)\n"
@@ -1266,7 +1274,7 @@ static bool write_demux_run_log(
     const std::string &output_path, const std::string &layout,
     const std::string &input_path, const std::string &output_prefix,
     const sigalign_run_stats &stats, double total_wall_time_seconds,
-    int threads, bool auto_whitelist, bool af_bcs) {
+    int threads, bool auto_whitelist, bool af_bcs, bool stdout_mode = false) {
   std::ofstream out(output_path);
   if (!out) {
     std::cerr << "[ERROR] Cannot open run statistics log: " << output_path
@@ -1295,6 +1303,8 @@ static bool write_demux_run_log(
               ? (af_bcs ? "above_floor" : "high_specificity")
               : "not_applicable")
       << "\n";
+  if (stdout_mode)
+    out << "output_destination=stdout\n";
   if (auto_whitelist) {
     out << "whitelist_scan_log=" << output_prefix << "_scan_wl.log\n";
   }
@@ -1369,7 +1379,8 @@ static bool write_demux_run_log(
         << "concat_hmm_full_search_barcodes_rejected=" << stats.hmm_partner_rejected << "\n"
         << "concat_hmm_retry_barcodes_from_partner=" << stats.hmm_retry_from_partner << "\n"
         << "concat_hmm_reads_dropped_unresolved=" << stats.hmm_drop_unresolved << "\n"
-        << "concat_hmm_boundary_unresolved_parents_saved=" << stats.hmm_boundary_unresolved_parents << "\n"
+        << "concat_hmm_boundary_unresolved_parents_saved="
+        << (stdout_mode ? 0 : stats.hmm_boundary_unresolved_parents) << "\n"
         << "concat_hmm_boundary_unresolved_children_not_assigned=" << stats.hmm_boundary_unresolved_children << "\n"
         << "concat_hmm_junctions_abstained=" << stats.hmm_junctions_abstained << "\n"
         << "concat_hmm_pieces_suppressed=" << stats.hmm_pieces_suppressed << "\n"
@@ -1395,6 +1406,9 @@ static bool write_demux_run_log(
         << "concat_hmm_spacer_offset_retries=" << stats.hmm_spacer_retry << "\n"
         << "concat_hmm_spacer_offset_retries_confirmed=" << stats.hmm_spacer_retry_ok << "\n"
         << "concat_hmm_spacer_read_end_confirmed=" << stats.hmm_read_end_ok << "\n";
+    if (stdout_mode)
+      out << "concat_hmm_boundary_unresolved_parents_flagged="
+          << stats.hmm_boundary_unresolved_parents << "\n";
   }
 
   if (current_rss) {
@@ -1628,11 +1642,117 @@ static std::string companion_position_map(const std::string &layout_path) {
          "_position_map.csv";
 }
 
+// Keep the FASTA/Q destination separate from FD 1, which is redirected to
+// stderr for every diagnostic producer (including C stdio) in stdout mode.
+// Both saved descriptors are close-on-exec so helper processes cannot keep
+// the downstream pipe open after RAD has finished.
+class stdout_fastx_stream {
+  int original_fd_ = -1;
+  FILE *stream_ = nullptr;
+  bool redirected_ = false;
+  bool sigpipe_changed_ = false;
+  struct sigaction old_sigpipe_ {};
+
+  void reset() noexcept {
+    if (original_fd_ < 0 && !stream_ && !sigpipe_changed_)
+      return;
+    if (stream_) {
+      std::fclose(stream_);
+      stream_ = nullptr;
+    }
+    try { std::cout.flush(); } catch (...) {}
+    std::fflush(stdout);
+    if (redirected_ && original_fd_ >= 0)
+      (void)::dup2(original_fd_, STDOUT_FILENO);
+    if (original_fd_ >= 0)
+      ::close(original_fd_);
+    original_fd_ = -1;
+    redirected_ = false;
+    if (sigpipe_changed_)
+      (void)::sigaction(SIGPIPE, &old_sigpipe_, nullptr);
+    sigpipe_changed_ = false;
+  }
+
+public:
+  stdout_fastx_stream() = default;
+  stdout_fastx_stream(const stdout_fastx_stream &) = delete;
+  stdout_fastx_stream &operator=(const stdout_fastx_stream &) = delete;
+  ~stdout_fastx_stream() { reset(); }
+
+  void open() {
+    try {
+      std::cout.flush();
+      if (std::fflush(stdout) != 0)
+        throw std::system_error(errno ? errno : EIO, std::generic_category(), "flush stdout before streaming");
+      original_fd_ = ::fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
+      if (original_fd_ < 0)
+        throw std::system_error(errno, std::generic_category(), "save stdout destination");
+      const int data_fd = ::fcntl(original_fd_, F_DUPFD_CLOEXEC, 3);
+      if (data_fd < 0)
+        throw std::system_error(errno, std::generic_category(), "open stdout stream");
+      stream_ = ::fdopen(data_fd, "wb");
+      if (!stream_) {
+        const int error = errno;
+        ::close(data_fd);
+        throw std::system_error(error, std::generic_category(), "open stdout stream");
+      }
+      struct sigaction ignore {};
+      ignore.sa_handler = SIG_IGN;
+      ::sigemptyset(&ignore.sa_mask);
+      if (::sigaction(SIGPIPE, &ignore, &old_sigpipe_) != 0)
+        throw std::system_error(errno, std::generic_category(), "configure stdout pipe handling");
+      sigpipe_changed_ = true;
+      if (::dup2(STDERR_FILENO, STDOUT_FILENO) < 0)
+        throw std::system_error(errno, std::generic_category(), "route diagnostics to stderr");
+      redirected_ = true;
+    } catch (...) {
+      reset();
+      throw;
+    }
+  }
+
+  FILE *get() const noexcept { return stream_; }
+
+  void finish() {
+    if (!stream_)
+      return;
+    FILE *stream = stream_;
+    stream_ = nullptr;
+    errno = 0;
+    if (std::fclose(stream) != 0)
+      throw std::system_error(errno ? errno : EIO, std::generic_category(), "close stdout stream");
+  }
+};
+
+// Logging is configured before path/layout setup, so early validation errors
+// also need to restore the buffers before the tee and log file are destroyed.
+class demux_log_restore {
+  std::streambuf *&cout_saved_;
+  std::streambuf *&cerr_saved_;
+
+public:
+  demux_log_restore(std::streambuf *&out, std::streambuf *&err)
+      : cout_saved_(out), cerr_saved_(err) {}
+  ~demux_log_restore() { restore(); }
+  void restore() noexcept {
+    if (cout_saved_) {
+      try { std::cout.flush(); } catch (...) {}
+      std::cout.rdbuf(cout_saved_);
+      cout_saved_ = nullptr;
+    }
+    if (cerr_saved_) {
+      try { std::cerr.flush(); } catch (...) {}
+      std::cerr.rdbuf(cerr_saved_);
+      cerr_saved_ = nullptr;
+    }
+  }
+};
+
 int cmd_demux(int argc, char *argv[]) {
   std::string layout_key, fastq_path, custom_kit, global_whitelist_path,
       custom_whitelist_path, output_prefix, output_dir, log_file;
   bool verbose = false, max_verbose = false, split_bc = false,
-       write_debug = false;
+       write_debug = false, stdout_mode = false;
   std::optional<int> wl_mut, gen_mut;
   int nthreads = 1;
   size_t max_reads = -1;
@@ -1684,6 +1804,7 @@ int cmd_demux(int argc, char *argv[]) {
       {"hs-bcs", no_argument, nullptr, 11},
       {"concat-hmm", no_argument, nullptr, 12},
       {"concat-hmm-abstain", required_argument, nullptr, 13},
+      {"stdout", no_argument, nullptr, 14},
       {"threads", required_argument, nullptr, 't'},
       {"verbose", no_argument, nullptr, 'v'},
       {"max-verbose", no_argument, nullptr, 'D'},
@@ -1798,6 +1919,9 @@ int cmd_demux(int argc, char *argv[]) {
         return 1;
       }
       break;
+    case 14:
+      stdout_mode = true;
+      break;
     case 't':
       nthreads = std::stoi(optarg);
       break;
@@ -1855,139 +1979,153 @@ int cmd_demux(int argc, char *argv[]) {
                  "any cDNA)\n";
     return 1;
   }
+  if (stdout_mode && split_bc) {
+    std::cerr << "[ERROR] --stdout and --bc-split cannot be combined\n";
+    return 1;
+  }
 
   // Setup logging
   std::ofstream log_stream;
   std::unique_ptr<tee_buff> tee_buf;
   std::streambuf *cout_backup = nullptr;
   std::streambuf *cerr_backup = nullptr;
-
-  if (!log_file.empty()) {
-    boost::filesystem::path log_path(log_file);
-    if (log_path.has_parent_path()) {
-      boost::filesystem::create_directories(log_path.parent_path());
-    }
-
-    log_stream.open(log_file);
-    if (!log_stream.is_open()) {
-      std::cerr << "[ERROR] Cannot open log file: " << log_file << "\n";
-      return 1;
-    }
-
-    cout_backup = std::cout.rdbuf();
-    cerr_backup = std::cerr.rdbuf();
-    if (max_verbose) {
-      // In max verbose mode, send all stdout/stderr to the log file to avoid
-      // flooding the terminal.
-      std::cout.rdbuf(log_stream.rdbuf());
-      std::cerr.rdbuf(log_stream.rdbuf());
-      std::cerr << "[main] Max verbose output redirected to log file: "
-                << log_file << "\n";
-    } else {
-      tee_buf =
-          std::make_unique<tee_buff>(std::cout.rdbuf(), log_stream.rdbuf());
-      std::cout.rdbuf(tee_buf.get());
-      std::cerr << "[main] Logging output to: " << log_file << "\n";
-    }
-  }
-
-  // Output paths
-  boost::filesystem::path outdir = output_dir.empty()
-                                       ? boost::filesystem::current_path()
-                                       : boost::filesystem::path(output_dir);
-
-  auto ensure_dir = [](const boost::filesystem::path &dir_path) -> bool {
-    if (dir_path.empty())
-      return true;
-    if (boost::filesystem::exists(dir_path))
-      return true;
-    return boost::filesystem::create_directories(dir_path);
-  };
-
-  boost::filesystem::path outbase;
-  if (output_prefix.empty()) {
-    if (!ensure_dir(outdir)) {
-      std::cerr << "[ERROR] Cannot create output directory: " << outdir.string()
-                << "\n";
-      return 1;
-    }
-    outbase = outdir / "output";
-  } else {
-    boost::filesystem::path prefix_path(output_prefix);
-    if (prefix_path.is_absolute()) {
-      outbase = prefix_path;
-    } else {
-      if (!ensure_dir(outdir)) {
-        std::cerr << "[ERROR] Cannot create output directory: "
-                  << outdir.string() << "\n";
-        return 1;
-      }
-      outbase = outdir / prefix_path;
-    }
-  }
-
-  boost::filesystem::path outbase_parent = outbase.parent_path();
-  if (!outbase_parent.empty() && !ensure_dir(outbase_parent)) {
-    std::cerr << "[ERROR] Cannot create output directory: "
-              << outbase_parent.string() << "\n";
-    return 1;
-  }
-
-  std::string base = outbase.filename().string();
-  std::string outdir_display =
-      outbase_parent.empty() ? outdir.string() : outbase_parent.string();
-
-  if (verbose) {
-    std::cout << "============= Configuration =============\n"
-              << "  Layout key/path              : " << layout_key << "\n"
-              << "  FASTA/Q input                : " << fastq_path << "\n"
-              << "  custom kit                   : "
-              << (custom_kit.empty() ? "[none]" : custom_kit) << "\n"
-              << "  global whitelist             : "
-              << (global_whitelist_path.empty() ? "[none]"
-                                                : global_whitelist_path)
-              << "\n"
-              << "  custom whitelist             : "
-              << (custom_whitelist_path.empty() ? "[none]"
-                                                : custom_whitelist_path)
-              << "\n"
-              << "  barcode correction mode      : " << bc_corr_mode << "\n"
-              << "  joint barcode mode           : " << joint_bc_mode << "\n"
-              << "  auto-whitelist (scan-wl)     : " << std::boolalpha
-              << auto_whitelist << "\n"
-              << "  scan barcode selection       : "
-              << (auto_whitelist
-                      ? (af_bcs ? "above_floor" : "high_specificity")
-                      : "not_applicable")
-              << "\n"
-              << "  reverse-complement UMIs      : " << std::boolalpha
-              << rc_umi << "\n"
-              << "  whitelist-generated mutations: "
-              << (wl_mut ? std::to_string(*wl_mut) : "default(2)") << "\n"
-              << "  read-generated mutations     : "
-              << (gen_mut ? std::to_string(*gen_mut) : "default(2)") << "\n"
-              << "  max reads                    : "
-              << (max_reads == -1 ? "all" : std::to_string(max_reads)) << "\n"
-              << "  chunk size                   : " << chunk_size << "\n"
-              << "  output directory             : " << outdir_display << "\n"
-              << "  write debug files            : " << std::boolalpha
-              << write_debug << "\n"
-              << "  filename base                : " << base << "\n"
-              << "  log file                     : "
-              << (log_file.empty() ? "[none]" : log_file) << "\n"
-              << "  barcode split                : " << std::boolalpha
-              << split_bc << "\n"
-              << "  threads                      : " << nthreads << "\n"
-              << "  verbose                      : " << std::boolalpha
-              << verbose << "\n"
-              << "  max_threads avail.           : " << omp_get_max_threads()
-              << "\n\n";
-  }
-
-  std::cout << "[main] Starting main processing...\n";
-  auto main_start = std::chrono::steady_clock::now();
+  stdout_fastx_stream stdout_stream;
+  demux_log_restore log_restore(cout_backup, cerr_backup);
 
   try {
+    if (stdout_mode)
+      stdout_stream.open();
+
+    if (!log_file.empty()) {
+      boost::filesystem::path log_path(log_file);
+      if (log_path.has_parent_path()) {
+        boost::filesystem::create_directories(log_path.parent_path());
+      }
+
+      log_stream.open(log_file);
+      if (!log_stream.is_open()) {
+        std::cerr << "[ERROR] Cannot open log file: " << log_file << "\n";
+        return 1;
+      }
+
+      cout_backup = std::cout.rdbuf();
+      cerr_backup = std::cerr.rdbuf();
+      if (max_verbose) {
+        // In max verbose mode, send all stdout/stderr to the log file to avoid
+        // flooding the terminal.
+        std::cout.rdbuf(log_stream.rdbuf());
+        std::cerr.rdbuf(log_stream.rdbuf());
+        std::cerr << "[main] Max verbose output redirected to log file: "
+                  << log_file << "\n";
+      } else {
+        tee_buf =
+            std::make_unique<tee_buff>(std::cout.rdbuf(), log_stream.rdbuf());
+        std::cout.rdbuf(tee_buf.get());
+        std::cerr << "[main] Logging output to: " << log_file << "\n";
+      }
+    }
+
+    if (stdout_mode) {
+      std::cout << "[main] Streaming uncompressed FASTA/Q to stdout; debug and unresolved-read files are suppressed\n";
+      write_debug = false;
+    }
+
+    // Output paths
+    boost::filesystem::path outdir = output_dir.empty()
+                                         ? boost::filesystem::current_path()
+                                         : boost::filesystem::path(output_dir);
+
+    auto ensure_dir = [](const boost::filesystem::path &dir_path) -> bool {
+      if (dir_path.empty())
+        return true;
+      if (boost::filesystem::exists(dir_path))
+        return true;
+      return boost::filesystem::create_directories(dir_path);
+    };
+
+    boost::filesystem::path outbase;
+    if (output_prefix.empty()) {
+      if (!ensure_dir(outdir)) {
+        std::cerr << "[ERROR] Cannot create output directory: " << outdir.string()
+                  << "\n";
+        return 1;
+      }
+      outbase = outdir / "output";
+    } else {
+      boost::filesystem::path prefix_path(output_prefix);
+      if (prefix_path.is_absolute()) {
+        outbase = prefix_path;
+      } else {
+        if (!ensure_dir(outdir)) {
+          std::cerr << "[ERROR] Cannot create output directory: "
+                    << outdir.string() << "\n";
+          return 1;
+        }
+        outbase = outdir / prefix_path;
+      }
+    }
+
+    boost::filesystem::path outbase_parent = outbase.parent_path();
+    if (!outbase_parent.empty() && !ensure_dir(outbase_parent)) {
+      std::cerr << "[ERROR] Cannot create output directory: "
+                << outbase_parent.string() << "\n";
+      return 1;
+    }
+
+    std::string base = outbase.filename().string();
+    std::string outdir_display =
+        outbase_parent.empty() ? outdir.string() : outbase_parent.string();
+
+    if (verbose) {
+      std::cout << "============= Configuration =============\n"
+                << "  Layout key/path              : " << layout_key << "\n"
+                << "  FASTA/Q input                : " << fastq_path << "\n"
+                << "  custom kit                   : "
+                << (custom_kit.empty() ? "[none]" : custom_kit) << "\n"
+                << "  global whitelist             : "
+                << (global_whitelist_path.empty() ? "[none]"
+                                                  : global_whitelist_path)
+                << "\n"
+                << "  custom whitelist             : "
+                << (custom_whitelist_path.empty() ? "[none]"
+                                                  : custom_whitelist_path)
+                << "\n"
+                << "  barcode correction mode      : " << bc_corr_mode << "\n"
+                << "  joint barcode mode           : " << joint_bc_mode << "\n"
+                << "  auto-whitelist (scan-wl)     : " << std::boolalpha
+                << auto_whitelist << "\n"
+                << "  scan barcode selection       : "
+                << (auto_whitelist
+                        ? (af_bcs ? "above_floor" : "high_specificity")
+                        : "not_applicable")
+                << "\n"
+                << "  reverse-complement UMIs      : " << std::boolalpha
+                << rc_umi << "\n"
+                << "  whitelist-generated mutations: "
+                << (wl_mut ? std::to_string(*wl_mut) : "default(2)") << "\n"
+                << "  read-generated mutations     : "
+                << (gen_mut ? std::to_string(*gen_mut) : "default(2)") << "\n"
+                << "  max reads                    : "
+                << (max_reads == -1 ? "all" : std::to_string(max_reads)) << "\n"
+                << "  chunk size                   : " << chunk_size << "\n"
+                << "  output directory             : " << outdir_display << "\n"
+                << "  write debug files            : " << std::boolalpha
+                << write_debug << "\n"
+                << "  filename base                : " << base << "\n"
+                << "  log file                     : "
+                << (log_file.empty() ? "[none]" : log_file) << "\n"
+                << "  barcode split                : " << std::boolalpha
+                << split_bc << "\n"
+                << "  threads                      : " << nthreads << "\n"
+                << "  verbose                      : " << std::boolalpha
+                << verbose << "\n"
+                << "  max_threads avail.           : " << omp_get_max_threads()
+                << "\n\n";
+    }
+
+    std::cout << "[main] Starting main processing...\n";
+    auto main_start = std::chrono::steady_clock::now();
+
     // ReadLayout setup
     ReadLayout read_layout;
     std::string layout_csv;
@@ -2179,7 +2317,8 @@ int cmd_demux(int argc, char *argv[]) {
     sigalign_run_stats demux_stats = SigString::sigalign(
         fastq_path, read_layout, outbase.string(), gen_mut, max_verbose,
         nthreads, chunk_size, max_reads_param, write_debug, bc_corr_mode,
-        joint_bc_mode, rc_umi, min_read_length);
+        joint_bc_mode, rc_umi, min_read_length, stdout_stream.get());
+    stdout_stream.finish();
 
     auto sig_time = std::chrono::steady_clock::now() - sigalign_start;
     demux_stats.wall_time_seconds =
@@ -2234,38 +2373,32 @@ int cmd_demux(int argc, char *argv[]) {
     if (!write_demux_run_log(
             demux_log_path, layout_key, fastq_path, outbase.string(),
             demux_stats, total_wall_time_seconds, nthreads, auto_whitelist,
-            af_bcs)) {
+            af_bcs, stdout_mode)) {
       throw std::runtime_error("could not write post-run statistics log");
     }
     std::cout << "[main] Demux statistics written to: "
               << demux_log_path << "\n";
 
-    // Restore cout if logging
-    if (cout_backup) {
-      std::cout.rdbuf(cout_backup);
-    }
-    if (cerr_backup) {
-      std::cerr.rdbuf(cerr_backup);
-    }
+    log_restore.restore();
     if (log_stream.is_open()) {
       log_stream.close();
     }
   } catch (const std::exception &ex) {
-    std::cerr << "[ERROR] " << ex.what() << " (" << __FILE__ << ":" << __LINE__
-              << ")\n";
+    const auto *write_error = dynamic_cast<const std::system_error *>(&ex);
+    const bool pipe_closed = stdout_mode && write_error &&
+        write_error->code() == std::make_error_code(std::errc::broken_pipe);
+    if (pipe_closed)
+      std::cerr << "[main] stdout consumer closed the pipe\n";
+    else
+      std::cerr << "[ERROR] " << ex.what() << " (" << __FILE__ << ":" << __LINE__
+                << ")\n";
 
-    // Restore cout on error too
-    if (cout_backup) {
-      std::cout.rdbuf(cout_backup);
-    }
-    if (cerr_backup) {
-      std::cerr.rdbuf(cerr_backup);
-    }
+    log_restore.restore();
     if (log_stream.is_open()) {
       log_stream.close();
     }
 
-    return 1;
+    return pipe_closed ? 128 + SIGPIPE : 1;
   }
   return 0;
 }

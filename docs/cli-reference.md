@@ -215,6 +215,8 @@ Runtime/output knobs:
 - `-z, --chunk-size` (default `5000`, must be `> 0`)
 - `-o, --output` (default `output`)
 - `-d, --dir` (default current dir)
+- `--stdout` — stream the primary FASTQ/FASTA output uncompressed to stdout;
+  send diagnostics to stderr. Without this flag, RAD writes its usual gzip files.
 - `-F, --log-file` — optional full console-output log (separate from the
   automatically written compact stage summaries)
 - `-w, --write-dbg`
@@ -229,9 +231,27 @@ Practical note:
 
 - `-b/--bc-split` is visible, but split output should be handled by `rad reformat --split-bc` in the current build (the demux-side split is a stub).
 
+With `--stdout`, `--write-dbg` is ignored and the concat-HMM unresolved-read
+FASTQ/FASTA sidecar is suppressed. Layout, position-map, whitelist and run reports
+still use `--dir` and `--output`; streaming does not suppress those reports.
+`--stdout` cannot be combined with `--bc-split`. Verbose messages also stay off
+the sequence stream, and `--log-file` can still capture diagnostics.
+
+For a quick inspection of the first ten streamed FASTQ records:
+
+```bash
+build/rad demux -l LAYOUT -q reads.fq.gz -c cells.txt \
+  --stdout -d reports -o run | head -n 40
+```
+
+If the consumer closes the pipe early, RAD stops and exits with status `141`
+(the conventional SIGPIPE status). A shell using `set -o pipefail` will report
+that status even when the consumer, such as `head`, exits successfully. Other
+output-write failures return a non-zero status.
+
 Files written:
 
-- primary output: `<outdir>/<prefix>.fq.gz` or `<outdir>/<prefix>.fa.gz` (extension follows input-type logic)
+- primary output, without `--stdout`: `<outdir>/<prefix>.fq.gz` or `<outdir>/<prefix>.fa.gz` (extension follows input-type logic)
 - demultiplexing summary: `<outdir>/<prefix>_demux.log` (processed,
   filter-passing, demultiplexed, and serialized-record counts; timing totals;
   and final/peak RSS for the RAD process)
@@ -239,7 +259,7 @@ Files written:
 - with `-A/--auto-wl`: `<outdir>/<prefix>_scanwl.csv`,
   `<outdir>/<prefix>_scanwl.txt`, and `<outdir>/<prefix>_scan_wl.log`
   (detailed calls, selected whitelist, and compact scan summary)
-- with `-w`: `<outdir>/<prefix>_dbg.sig.gz`, `<outdir>/<prefix>_dbg.csv.gz`, `<outdir>/<prefix>_dbg.fq.gz` (or `_dbg.fa.gz` — extension follows input-type logic), `<outdir>/<prefix>.metrics.tsv`
+- with `-w` in file-output mode: `<outdir>/<prefix>_dbg.sig.gz`, `<outdir>/<prefix>_dbg.csv.gz`, `<outdir>/<prefix>_dbg.fq.gz` (or `_dbg.fa.gz` — extension follows input-type logic), `<outdir>/<prefix>.metrics.tsv`
 
 Practical note:
 

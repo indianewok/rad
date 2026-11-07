@@ -127,6 +127,18 @@ if(BUILD_TESTING)
     add_executable(barcode_storage_test tests/barcode_storage_test.cpp)
     target_link_libraries(barcode_storage_test PRIVATE rad_lib)
     add_test(NAME barcode_storage COMMAND barcode_storage_test)
+    add_executable(output_stream_test tests/output_stream_test.cpp)
+    target_link_libraries(output_stream_test PRIVATE rad_lib)
+    add_test(NAME output_stream COMMAND output_stream_test)
+    set_tests_properties(output_stream PROPERTIES TIMEOUT 30)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME stdout_cli
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/stdout_cli_test.py
+                    $<TARGET_FILE:rad>)
+        set_tests_properties(stdout_cli PROPERTIES TIMEOUT 180
+            ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+    endif()
 endif()
 
 # Keep the bundled layout resources and their registered kit paths in sync.

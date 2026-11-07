@@ -6105,22 +6105,30 @@ public:
         std::string mode,
         std::string joint_bc_mode = "default",
         bool rc_umi = true,
-        int min_read_length = -1
+        int min_read_length = -1,
+        FILE* stdout_sink = nullptr
     ) {
     const auto sigalign_wall_t0 = std::chrono::steady_clock::now();
 
     std::string file_out = path_utils::get_fastqa_type(fastq_path);
     std::string fastq_output_path = output_prefix + file_out;
     bool compress_fastq = true;
+    if (stdout_sink) write_debug = false;
 
     std::unique_ptr<std::ofstream> metrics_file_ptr;
     std::unique_ptr<sigstring_writing> debug_sig_writer, debug_csv_writer, debug_fastqa_writer;
 
     // Primary FASTQA writer
-    sigstring_writing fastqa_writer(fastq_output_path, sigstring_writing::format::FASTQA, compress_fastq, false, num_threads);
+    std::unique_ptr<sigstring_writing> primary_writer;
+    if (stdout_sink)
+        primary_writer = std::make_unique<sigstring_writing>(stdout_sink, sigstring_writing::format::FASTQA);
+    else
+        primary_writer = std::make_unique<sigstring_writing>(fastq_output_path, sigstring_writing::format::FASTQA,
+                                                          compress_fastq, false, num_threads);
+    auto& fastqa_writer = *primary_writer;
     std::unique_ptr<sigstring_writing> unresolved_writer;
     const std::string unresolved_path = output_prefix + "_boundary_unresolved" + file_out;
-    if (layout.concat_model)
+    if (layout.concat_model && !stdout_sink)
         unresolved_writer = std::make_unique<sigstring_writing>(unresolved_path,
             sigstring_writing::format::FASTQA, compress_fastq, false, num_threads);
 
@@ -6187,6 +6195,7 @@ public:
         if (chunk.empty()){
             return;
         }
+        writer.rethrow_if_failed();
 
         const size_t my_chunk_id = ++chunk_id_ctr;
         const auto wall_t0 = std::chrono::steady_clock::now();
@@ -6227,6 +6236,7 @@ public:
 
             #pragma omp for schedule(dynamic) nowait
             for (size_t i = 0; i < chunk.size(); ++i) {
+                if (writer.failed()) continue;
                 const auto& read = chunk[i];
 #ifdef RAD_STAGE_TIMERS
                 rad_stage_timers::scope t_read(rad_stage_timers::read_ns);
@@ -6276,6 +6286,7 @@ public:
                         }
                     };
                     auto preserve_unresolved = [&](const read_streaming::sequence& parent) {
+                        if (!unresolved_writer) return;
                         std::string& b = unresolved_buffers[static_cast<size_t>(tid)];
                         b += parent.is_fastq ? '@' : '>';
                         b += parent.id;
@@ -6382,6 +6393,7 @@ public:
             }
         }
 
+        writer.rethrow_if_failed();
         const auto wall_t1 = std::chrono::steady_clock::now();
         
         // Calculate actual work time (max across all threads)
@@ -6484,8 +6496,16 @@ public:
     }
 
     writer.stop();
+    fastqa_writer.finish();
+    if (unresolved_writer) unresolved_writer->finish();
+    if (debug_sig_writer) debug_sig_writer->finish();
+    if (debug_csv_writer) debug_csv_writer->finish();
+    if (debug_fastqa_writer) debug_fastqa_writer->finish();
 
     if (write_debug && metrics_file_ptr) {
+        metrics_file_ptr->flush();
+        if (!*metrics_file_ptr)
+            throw std::runtime_error("Failed while writing debug metrics: " + output_prefix + ".metrics.tsv");
         metrics_file_ptr->close();
     }
 
@@ -6533,8 +6553,12 @@ public:
                   << " junctions_abstained=" << hmm_ctr.junctions_abstained.load()
                   << " trim_keep=" << hmm_ctr.trim_keep_F.load() + hmm_ctr.trim_keep_R.load()
                   << " duplets=" << hmm_ctr.duplet_named.load()
-                  << " boundary_unresolved_saved=" << hmm_ctr.boundary_unresolved_parents.load()
+                  << " boundary_unresolved_saved="
+                  << (unresolved_writer ? hmm_ctr.boundary_unresolved_parents.load() : 0)
                   << " abstain_policy=" << (layout.concat_abstain_legacy ? "legacy" : "drop") << "\n";
+        if (stdout_sink)
+            std::cout << "[sigalign] unresolved boundaries flagged="
+                      << hmm_ctr.boundary_unresolved_parents.load() << "; raw-parent output suppressed\n";
     }
 #ifdef RAD_STAGE_TIMERS
     {
@@ -6566,7 +6590,9 @@ public:
     std::cout << "  - Output staging time: " << queue_s << " seconds\n";
     std::cout << "  - Overhead (writer drain/setup): " << overhead_s << " seconds\n";
 
-    if (write_debug) {
+    if (stdout_sink) {
+        std::cout << "\n[sigalign][fastq]: stdout (uncompressed)\n";
+    } else if (write_debug) {
         std::cout << "\n[sigalign] Output written to:\n"
                   << "[sigalign] [sigstring]: " << output_prefix << ".sig\n"
                   << "[sigalign]       [csv]: " << output_prefix << ".csv\n"
@@ -6576,7 +6602,7 @@ public:
         std::cout << "\n[sigalign] Output written to:\n"
                   << "[sigalign][fastq]: " << fastq_output_path << (compress_fastq ? ".gz" : "") << "\n";
     }
-    if (hmm_info)
+    if (unresolved_writer)
         std::cout << "[sigalign][unresolved boundaries]: " << unresolved_path << ".gz ("
                   << hmm_ctr.boundary_unresolved_parents.load() << " raw parent copies; unresolved intervals unassigned)\n";
 
